@@ -100,13 +100,13 @@ Here are some examples of speed up factors you can expect. The sample T1-weighte
 
 Here are the same testson a desktop computer with twelve cores (24 threads, Ryzen 3900X):
 
-| Command : Seconds (GZ)                                 |  Serial (GZ)  | Parallel (GZ) | |--------------------------------------------------------|--------------:|--------------:|
+| Command : Seconds (GZ)                                 |  Serial (GZ)  | Parallel (GZ) |
+|--------------------------------------------------------|--------------:|--------------:|
 | fslmaths rest -s 2.548 out : 123 (229)                 | 4.2x (2.4x)   | 9.9x (12.1x)  |
 | fslmaths t1 -kernel boxv 7 -dilM out : 156 (159)       | 371x (37x)    | 371x (248x)   |
 | fslmaths rest -Tmean -mul -1 -add rest out : 32 (186)  | 1.7x (2.5x)   | 1.8x (7.6x)   |
 |  niimath rest -demean out (same output as above)       | 2.6x (2.6x)   | 3.0x (10.8x)  |
 | fslmaths rest -bptf 77 8.68 out : 911 (1155)           | 2.6x (2.5x)   | 24x (23.0x)   |
-
 
 ## License
 
