@@ -106,7 +106,7 @@ Here are the same testson a desktop computer with twelve cores (24 threads, Ryze
 | fslmaths t1 -kernel boxv 7 -dilM out : 156 (159)       | 371x (37x)    | 371x (248x)   |
 | fslmaths rest -Tmean -mul -1 -add rest out : 32 (186)  | 1.7x (2.5x)   | 1.8x (7.6x)   |
 |  niimath rest -demean out (same output as above)       | 2.6x (2.6x)   | 3.0x (10.8x)  |
-| fslmaths rest -bptf 77 8.68 out : 911 (1155)           | 2.6x (2.5x)   | 24x (23.0x)   |
+| fslmaths rest -bptf 77 8.68 out : 887 (1019)           | 2.6x (2.5x)   | 23x (23.0x)   |
 
 ## License
 
