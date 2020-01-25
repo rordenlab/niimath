@@ -73,6 +73,7 @@ int show_help( void ) {
 	printf(" -crop <tmin> <tsize> : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -sobel : fast edge detection\n");
 	printf(" -demean : remove average signal across volumes (requires 4D input)\n");
+	printf(" -edt : estimate Euler Distance Transform (distance field). Assumes isotropic input.\n");
 	printf(" -unsharp  <sigma> <amount> : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount)\n");
 	printf("  -tensor_2lower : convert FSL style upper triangle image to NIfTI standard lower triangle order.\n");
 	printf("  -tensor_2upper : convert NIfTI standard lower triangle image to FSL style upper triangle order.\n");

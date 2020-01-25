@@ -48,6 +48,199 @@ static int show_helpx( void ) {
 	exit(1);
 }
 
+static flt vx(flt * f, int p, int q) {
+	if ((f[p] == INFINITY) || (f[q] == INFINITY))
+		return INFINITY;
+	else
+		return ((f[q] + q*q) - (f[p] + p*p)) / (2.0*q - 2.0*p);
+}
+
+static void edt(flt * f, int n) {
+	int q, p, k;
+	flt s, dx;
+	flt * d = (flt *)_mm_malloc((n)*sizeof(flt), 64);
+	flt * z = (flt *)_mm_malloc((n)*sizeof(flt), 64); 
+	int * v = (int *)_mm_malloc((n)*sizeof(int), 64);
+    /*# Find the lower envelope of a sequence of parabolas.
+    #   f...source data (returns the Y of the parabola vertex at X)
+    #   d...destination data (final distance values are written here)
+    #   z...temporary used to store X coords of parabola intersections
+    #   v...temporary used to store X coords of parabola vertices
+    #   i...resulting X coords of parabola vertices
+    #   n...number of pixels in "f" to process
+    # Always add the first pixel to the enveloping set since it is
+    # obviously lower than all parabolas processed so far.*/
+    k = 0;
+    v[0] = 0;
+    z[0] = -INFINITY;
+    z[1] = INFINITY;
+    for (q = 1; q < n; q++ ) {
+	    /* If the new parabola is lower than the right-most parabola in
+        # the envelope, remove it from the envelope. To make this
+        # determination, find the X coordinate of the intersection (s)
+        # between the parabolas with vertices at (q,f[q]) and (p,f[p]).*/
+        p = v[k];
+        s = vx(f, p,q);
+        while (s <= z[k]) {
+            k = k - 1;
+            p = v[k];
+            s = vx(f, p,q);
+        }
+        //# Add the new parabola to the envelope.
+        k = k + 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = INFINITY;
+    }
+    /*# Go back through the parabolas in the envelope and evaluate them
+    # in order to populate the distance values at each X coordinate.*/
+    k = 0;
+    for (q = 0; q < n; q++ ) {
+	    while (z[k + 1] < q)
+            k = k + 1;
+        dx = (q - v[k]);
+        d[q] = dx * dx + f[v[k]];
+    }
+    for (q = 0; q < n; q++ )
+		f[q] = d[q];
+	_mm_free (d);
+	_mm_free (z);
+	_mm_free (v);
+}
+
+static void edt1(flt * df, int n) { //first dimension is simple
+	int q, prevX;
+	flt prevY, v;
+	prevX = 0;
+	prevY = INFINITY;
+	//forward
+	for (q = 0; q < n; q++ ) {
+		if (df[q] == 0) { 
+			prevX = q;
+			prevY = 0;
+		} else
+			df[q] = sqr(q-prevX)+prevY;
+	}
+	//reverse
+	prevX = n;
+	prevY = INFINITY;
+	for (q = (n-1); q >= 0; q-- ) {
+		v = sqr(q-prevX)+prevY;
+		if (df[q] < v) { 
+        	prevX = q;
+        	prevY = df[q];
+    	} else        
+        	df[q] = v;
+    } 
+}
+
+static int nifti_edt(nifti_image * nim) {
+//https://github.com/neurolabusc/DistanceFields
+	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1)) return 1;
+	if (nim->datatype != DT_CALC) return 1;
+	flt * img = (flt *) nim->data; 
+	//int nVol = 1;
+	//for (int i = 4; i < 8; i++ )
+	//	nVol *= MAX(nim->dim[i],1);
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if ((nvox3D * nVol) != nim->nvox) return 1;
+	int nx = nim->nx;
+	int ny = nim->ny;
+	int nz = nim->nz;
+	flt threshold = 0.0;	
+	for (size_t i = 0; i < nim->nvox; i++ ) {
+		if (img[i] > threshold)
+			img[i] = INFINITY;
+		else
+			img[i] = 0;
+	}
+	size_t nRow = 1;
+	for (int i = 2; i < 8; i++ )
+		nRow *= MAX(nim->dim[i],1);
+	//EDT in left-right direction
+	for (int r = 0; r < nRow; r++ ) {
+		flt * imgRow = img + (r * nx);
+		edt1(imgRow, nx);
+	}
+	//EDT in anterior-posterior direction
+	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
+	for (int v = 0; v < nVol; v++ ) { //transpose each volume separately
+		flt * img3D = (flt *)_mm_malloc(nvox3D*sizeof(flt), 64); //alloc for each volume to allow openmp
+		//transpose data
+		size_t vo = v * nvox3D; //volume offset
+		for (int z = 0; z < nz; z++ ) {
+			int zo = z * nx * ny;
+			for (int y = 0; y < ny; y++ ) {
+				int xo = 0;
+				for (int x = 0; x < nx; x++ ) {
+					img3D[zo+xo+y] = img[vo];
+					vo += 1;
+					xo += ny;
+				}
+			}
+		}
+		//perform EDT for all rows
+		for (int r = 0; r < nRow; r++ ) {
+			flt * imgRow = img3D + (r * ny);
+			edt(imgRow, ny);
+		}
+		//transpose data back
+		vo = v * nvox3D; //volume offset
+		for (int z = 0; z < nz; z++ ) {
+			int zo = z * nx * ny;
+			for (int y = 0; y < ny; y++ ) {
+				int xo = 0;
+				for (int x = 0; x < nx; x++ ) {
+					img[vo] = img3D[zo+xo+y];
+					vo += 1;
+					xo += ny;
+				}
+			}
+		}		
+		_mm_free (img3D);
+	} //for each volume
+	//EDT in head-foot direction
+	nRow = nim->nx * nim->ny; //transpose XYZ to ZXY and blur Z columns with XY Rows
+	#pragma omp parallel for
+	for (int v = 0; v < nVol; v++ ) { //transpose each volume separately
+		flt * img3D = (flt *)_mm_malloc(nvox3D*sizeof(flt), 64); //alloc for each volume to allow openmp
+		//transpose data
+		size_t vo = v * nvox3D; //volume offset
+		for (int z = 0; z < nz; z++ ) {
+			for (int y = 0; y < ny; y++ ) {
+				int yo = y * nz * nx;
+				int xo = 0;
+				for (int x = 0; x < nx; x++ ) {
+					img3D[z+xo+yo] = img[vo];
+					vo += 1;
+					xo += nz;
+				}
+			}
+		}
+		//perform EDT for all "rows"
+		for (int r = 0; r < nRow; r++ ) {
+			flt * imgRow = img3D + (r * nz);
+			edt(imgRow, nz);
+		}
+		//transpose data back
+		vo = v * nvox3D; //volume offset
+		for (int z = 0; z < nz; z++ ) {
+			for (int y = 0; y < ny; y++ ) {
+				int yo = y * nz * nx;
+				int xo = 0;
+				for (int x = 0; x < nx; x++ ) {
+					img[vo] = img3D[z+xo+yo];
+					vo += 1;
+					xo += nz;
+				} //x
+			} //y
+		} //z
+		_mm_free (img3D);
+	} //for each volume
+	return 0;
+}
+
 //Gaussian blur, both serial and parallel variants, https://github.com/neurolabusc/niiSmooth
 static void blurS(flt * img, int nx, int ny, flt xmm, flt Sigmamm) {
 //serial blur 
@@ -193,8 +386,6 @@ static int nifti_smooth_gauss(nifti_image * nim, flt SigmammX, flt SigmammY, flt
 	//BLUR Y
 	if (SigmammY <= 0.0) goto DO_Z_BLUR ;
 	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
-	//#pragma omp parallel
-	//#pragma omp for
 	#pragma omp parallel for
 	for (int v = 0; v < nVol; v++ ) { //transpose each volume separately
 		flt * img3D = (flt *)_mm_malloc(nvox3D*sizeof(flt), 64); //alloc for each volume to allow openmp
@@ -3786,7 +3977,9 @@ int main64(int argc, char * argv[]) {
 		} else if ( ! strcmp(argv[ac], "--compare") ) { //--function terminates without saving image
 			ac ++;
 			nifti_compare(nim, argv[ac]); //always terminates
-		} else if ( ! strcmp(argv[ac], "-fillh") ) 
+		} else if ( ! strcmp(argv[ac], "-edt") ) 
+			ok = nifti_edt(nim);
+		else if ( ! strcmp(argv[ac], "-fillh") ) 
 			ok = nifti_fillh(nim, 0);
 		else if ( ! strcmp(argv[ac], "-fillh26") ) 
 			ok = nifti_fillh(nim, 1);
