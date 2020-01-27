@@ -2,11 +2,6 @@ cmake_minimum_required(VERSION 2.8.11)
 
 project(console)
 
-#
-# export CC=/usr/local/bin/gcc-9
-# export CXX=/usr/local/bin/g++-9
-
-
 # Option Choose whether to use static runtime
 include(ucm.cmake)
 option(USE_STATIC_RUNTIME "Use static runtime" ON)
@@ -24,51 +19,32 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 
-if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
+if(${CMAKE_C_COMPILER_ID} STREQUAL "Clang")
     # using Clang
     add_definitions(-fno-caret-diagnostics)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
-elseif(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
+elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     # using GCC
     #GCC 4.4.4 requires us to define
     add_definitions(-std=gnu11)
-    #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -lm -fopenmp")
-    if(NOT (${CMAKE_CXX_COMPILER_VERSION} VERSION_LESS 4.5.0))
-        add_definitions(-Wno-unused-result)    # available since GCC 4.5.0
-    endif()
-    if(NOT (${CMAKE_CXX_COMPILER_VERSION} VERSION_LESS 4.8.0))
-        add_definitions(-fno-diagnostics-show-caret)    # available since GCC 4.8.0
-    endif()
 elseif(MSVC)
     # using Visual Studio C++
     add_definitions(-D_CRT_SECURE_NO_DEPRECATE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4018")   # '<': signed/unsigned mismatch
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4068")   # unknown pragma
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4101")   # unreferenced local variable
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4244")   # 'initializing': conversion from 'double' to 'int', possible loss of data
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4267")   # 'initializing': conversion from 'size_t' to 'int', possible loss of data
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4305")   # 'argument': truncation from 'double' to 'float'
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4308")   # negative integral constant converted to unsigned type
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4334")   # '<<': result of 32-bit shift implicitly converted to 64 bits
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4800")   # 'uint32_t' : forcing value to bool 'true' or 'false'
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4819")   # The file contains a character that cannot be represented in the current code page
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4996")   # 'access': The POSIX name for this item is deprecated
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")  # set "Stack Reserve Size" to 8MB (default value is 1MB)
 endif()
 
 find_package(OpenMP)
 if (OPENMP_FOUND)
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
     set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
 endif()
 
 # Compiler dependent flags
-include (CheckCXXCompilerFlag)
+include (CheckCCompilerFlag)
 if(UNIX)
-    check_cxx_compiler_flag(-msse2 HAS_SSE2)
+    check_c_compiler_flag(-msse2 HAS_SSE2)
     if(HAS_SSE2)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse2 -mfpmath=sse")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse2 -mfpmath=sse")
     endif()
 endif()
 
@@ -98,22 +74,12 @@ if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
         endif()
     endif()
     find_package(ZLIB REQUIRED)
-    add_definitions(-DHAVE_ZLIB) 
+    add_definitions(-DHAVE_ZLIB)
     target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
     target_link_libraries(niimath ${ZLIB_LIBRARIES})
 endif()
 
 #link math library
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -lm")
-# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lm")
 target_link_libraries(niimath m)
-
-MESSAGE(STATUS "Build type: " ${CMAKE_BUILD_TYPE})
-MESSAGE(STATUS "Library Type: " ${LIB_TYPE})
-MESSAGE(STATUS "Compiler flags:" ${CMAKE_CXX_COMPILE_FLAGS})
-MESSAGE(STATUS "Compiler cxx debug flags:" ${CMAKE_CXX_FLAGS_DEBUG})
-MESSAGE(STATUS "Compiler cxx release flags:" ${CMAKE_CXX_FLAGS_RELEASE})
-MESSAGE(STATUS "Compiler cxx min size flags:" ${CMAKE_CXX_FLAGS_MINSIZEREL})
-MESSAGE(STATUS "Compiler cxx flags:" ${CMAKE_CXX_FLAGS})
 
 install(TARGETS ${PROGRAMS} DESTINATION bin)
