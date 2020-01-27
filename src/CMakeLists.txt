@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.11)
+cmake_minimum_required(VERSION 3.1.0)
 
 project(console C)
 
@@ -25,8 +25,7 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "Clang")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     # using GCC
-    #GCC 4.4.4 requires us to define
-    add_definitions(-std=gnu11)
+    set(CMAKE_C_STANDARD 11)
 elseif(MSVC)
     # using Visual Studio C++
     add_definitions(-D_CRT_SECURE_NO_DEPRECATE)
