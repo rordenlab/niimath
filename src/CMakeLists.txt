@@ -30,6 +30,8 @@ if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 elseif(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
     # using GCC
+    #GCC 4.4.4 requires us to define
+    add_definitions(-std=gnu11)
     #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -lm -fopenmp")
     if(NOT (${CMAKE_CXX_COMPILER_VERSION} VERSION_LESS 4.5.0))
         add_definitions(-Wno-unused-result)    # available since GCC 4.5.0
