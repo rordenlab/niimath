@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 2.8.11)
 
-project(console)
+project(console C)
 
 # Option Choose whether to use static runtime
 include(ucm.cmake)
