@@ -13,6 +13,10 @@ It is said that `imitation is the sincerest form of flattery`. This project emul
  7. While the code is completely reverse engineered, the FSL team has been gracious to allow us to copy their error messages and help information. This allows true plug in compatibility. They have also provided pseudo code for poorly documented routines. This will allow the community to better understand the actual algorithms.
  8. This project provides an open-source foundation to introduce new features that fill gaps with the current FSL tools (e.g. unsharp, sobel, resize functions). For future releases, Bob Cox has graciously provided permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools that provide performance unavailable within [FSL](https://neurostars.org/t/bandpass-filtering-different-outputs-from-fsl-and-nipype-custom-function/824). Including them in this project ensures they work in a familiar manner to other FSL tools (and leverage the same environment variables).
  
+The Reason to use fslmaths instead of niimath:
+
+1. niimath is new and largely untested software. There may be unknown corner cases where produces poor results. fslmaths has been used for years and therefore has been battle tested. In the few instances where fslmaths generates results that bear no resemblance to its own documentation (as described below), one could argue it is the `correct` result (with comparison to itself). An example of this is `-dilD`, where fslmaths generates a blurred and spatially shifted image, which is not what the documentation describes. However, many tools may have been developed to assume this loss of high frequency signal and these tools may not perform well when provided with the result specified in the documentation. 
+ 
 ## Installation
 
 You can get niimath using three methods:
@@ -26,7 +30,14 @@ You can get niimath using three methods:
 
 ## Compilation
 
-Assuming you have a C compiler installed, you can compile the software by running the terminal command `make` from the projects folder. 
+The easiest way to build niimath on a Unix computer is to use cmake:
+
+```
+git clone https://github.com/rordenlab/niimath.git
+cd niimath; mkdir build; cd build; cmake ..
+make
+```
+Alternatively, you can compile the software by running the terminal command `make` from the project's `src` folder. 
 
 Advanced users may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler `brew install gcc@9`.
 
@@ -83,6 +94,7 @@ Some operations do generate known meaningfully different results. These are list
 9. The fslmaths function `-rem` returns the **integer** modulus remainder. This is unexected, e.g. in Python `2.7 % 2` is 0.7, as is Matlab's `mod(2.7, 2)`, as is standard C `fmod`. niimath clones the fslmaths idiosyncratic behavior, but perhaps a new function (e.g. `-mod`) could be introduced. 
 10. Be aware that fslmaths takes account of whether the image has a negative determinant or not (flipping the first dimension). However, fslstats does not do this, so fslstats coordinates are often misleading. For example, consider an image in RAS orientation, where the command `fslstats tfRAS -x` will give coordinates that are incompatible with fslmath's `tfceS` function. niimath attempts to emulate the behavior of fslmaths for the relevant functions (-index -roi, -tfceS). 
 11. Neither `-subsamp2` nor `-subsamp2offc` handle anti-aliasing. Be aware thgat `-subsamp2offc` can exhibit odd edge effects. The problem is simple to describe, for slices in the middle of a volume, and output slice is weighted 50% with the center slice, and 25% for the slice below and the slice above. This makes sense. However, bottom slices (as well as first rows, first columns, last rows, last columns, last slices) the filter weights 75% on the central slice and just 25% on the slice above it. Signal from this 2nd slice is heavily diluted. A better mixture would be 66% edge slice and 33% 2nd slice. This latter solution is used by niimath.
+12. fslmaths is unable to process files where the string ".nii" appears in a folder name. For example, consider the folder "test.niim", the command `fslmaths ~/test.niim/RAS -add 0 tst` will [generate an exception](https://github.com/FCP-INDI/C-PAC/issues/976). niimath will recognize that this is a folder name and not a file extension and work correctly. 
 
 Finally, it is possible that there are some edge cases where niimath fails to replicate fslmath. This is new software, and many of the operations applied by fslmaths are undocumented. If users detect any problems, they are encouraged to generate a Github issue to report the error.
 

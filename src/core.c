@@ -8,6 +8,10 @@
 #include <immintrin.h>
 #include <limits.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327
+#endif
+
 int nifti_save(nifti_image * nim, const char *postfix) {
 	char   extnii[5] = ".nii";   /* modifiable, for possible uppercase */
 	char   exthdr[5] = ".hdr";

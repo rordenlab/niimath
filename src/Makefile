@@ -3,7 +3,9 @@ CNAME=gcc
 #linker flags
 LFLAGS=-lm -lz
 #c flags
-CFLAGS=-O3 -DHAVE_ZLIB
+#CFLAGS=-O3 -DHAVE_ZLIB
+# Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
+CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
 
 #run "OMP=1 make -j" for both OpenMP and CloudFlare
 ifeq "$(OMP)" "1"
@@ -12,5 +14,5 @@ ifeq "$(OMP)" "1"
 endif
 
 all:
-	$(CNAME) $(CFLAGS) $(CFLAGS) -o niimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
+	$(CNAME) $(CFLAGS) -o niimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
 	
