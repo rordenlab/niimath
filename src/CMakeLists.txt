@@ -85,4 +85,13 @@ if(NOT MSVC)
     target_link_libraries(niimath m)
 endif()
 
+if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
+    if(USE_STATIC_RUNTIME)
+        execute_process(COMMAND ${CMAKE_C_COMPILER} "--print-file-name=libgomp.a"
+                        OUTPUT_VARIABLE OPENMP_LIBRARY OUTPUT_STRIP_TRAILING_WHITESPACE)
+        target_link_libraries(niimath ${OPENMP_LIBRARY})
+        target_link_libraries(niimath ${CMAKE_DL_LIBS})
+    endif()
+endif()
+
 install(TARGETS ${PROGRAMS} DESTINATION bin)
