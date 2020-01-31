@@ -90,7 +90,11 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
         execute_process(COMMAND ${CMAKE_C_COMPILER} "--print-file-name=libgomp.a"
                         OUTPUT_VARIABLE OPENMP_LIBRARY OUTPUT_STRIP_TRAILING_WHITESPACE)
         target_link_libraries(niimath ${OPENMP_LIBRARY})
-        target_link_libraries(niimath ${CMAKE_DL_LIBS})
+        if(MINGW)
+            target_link_libraries(niimath "-Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive")
+        else()
+            target_link_libraries(niimath ${CMAKE_DL_LIBS})
+        endif()
     endif()
 endif()
 
