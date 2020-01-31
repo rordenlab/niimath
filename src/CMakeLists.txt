@@ -80,7 +80,9 @@ if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
     target_link_libraries(niimath ${ZLIB_LIBRARIES})
 endif()
 
-#link math library
-target_link_libraries(niimath m)
+if(NOT MSVC)
+    # Link math library
+    target_link_libraries(niimath m)
+endif()
 
 install(TARGETS ${PROGRAMS} DESTINATION bin)
