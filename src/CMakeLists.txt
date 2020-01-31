@@ -26,15 +26,14 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
 elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     # using GCC
     set(CMAKE_C_STANDARD 11)
+    find_package(OpenMP)
+    if (OPENMP_FOUND)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+    endif()
 elseif(MSVC)
     # using Visual Studio C++
     add_definitions(-D_CRT_SECURE_NO_DEPRECATE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")  # set "Stack Reserve Size" to 8MB (default value is 1MB)
-endif()
-
-find_package(OpenMP)
-if (OPENMP_FOUND)
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
 endif()
 
 # Compiler dependent flags
