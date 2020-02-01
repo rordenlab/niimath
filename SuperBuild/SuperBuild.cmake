@@ -22,20 +22,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 option(USE_STATIC_RUNTIME "Use static runtime" ON)
 
-if(USE_STATIC_RUNTIME)
-    if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
-        find_file(STATIC_LIBCXX "libstdc++.a" ${CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES})
-        mark_as_advanced(STATIC_LIBCXX)
-        if(NOT STATIC_LIBCXX)
-            unset(STATIC_LIBCXX CACHE)
-            # Only on some Centos/Redhat systems
-            message(FATAL_ERROR
-                "\"USE_STATIC_RUNTIME\" set to ON but \"libstdcxx.a\" not found! \
-                 \"yum install libstdc++-static\" to resolve the error.")
-        endif()
-    endif()
-endif()
-
 include(ExternalProject)
 
 set(DEPENDENCIES)
@@ -68,7 +54,6 @@ ExternalProject_Add(src
         -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
         -DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_BINARY_DIR}
         -DCMAKE_C_FLAGS:STRING=${CMAKE_C_FLAGS}
-        -DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}
         -DCMAKE_VERBOSE_MAKEFILE:BOOL=${CMAKE_VERBOSE_MAKEFILE}
         -DUSE_STATIC_RUNTIME:BOOL=${USE_STATIC_RUNTIME}
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
@@ -77,9 +62,3 @@ ExternalProject_Add(src
 
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION bin
         USE_SOURCE_PERMISSIONS)
-
-option(BUILD_DOCS "Build documentation (manpages)" OFF)
-if(BUILD_DOCS)
-    add_subdirectory(docs)
-endif()
-
