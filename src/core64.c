@@ -853,7 +853,7 @@ static int nifti_grid( nifti_image * nim, double v, int spacing) {
 	return 0;
 }
 
-static int nifti_rem ( nifti_image * nim, double v) {
+static int nifti_rem ( nifti_image * nim, double v, int isFrac) {
 //remainder (modulo) : fslmaths
 /*fmod(0.45, 2) = 0.45 : 0
 fmod(0.9, 2) = 0.9 : 0
@@ -872,9 +872,14 @@ fmod(-1.8, 2) = -1.8 : -1
 	}
 	flt fv = v;
 	flt * f32 = (flt *) nim->data;
-	for (size_t i = 0; i < nim->nvox; i++ ) {
-		//printf("fmod(%g, %g) = %g : %g\n", f32[i], fv, fmod(f32[i],fv), trunc(fmod(f32[i],fv)) );  
-		f32[i] = trunc(fmod(f32[i], fv));
+	if (isFrac) {
+		for (size_t i = 0; i < nim->nvox; i++ ) 
+		f32[i] = fmod(f32[i], fv);
+	} else {
+		for (size_t i = 0; i < nim->nvox; i++ ) {
+			//printf("fmod(%g, %g) = %g : %g\n", f32[i], fv, fmod(f32[i],fv), trunc(fmod(f32[i],fv)) );  
+			f32[i] = trunc(fmod(f32[i], fv));
+		}
 	}
 	return 0;
 }
@@ -1540,8 +1545,10 @@ static int nifti_dim_reduce(nifti_image * nim, enum eDimReduceOp op, int dim, in
 	return 0;
 } //Tar1
 
-enum eOp{unknown, add, sub, mul, divX, rem, mas, thr, thrp, thrP, uthr, uthrp, uthrP, max, 
-	min, seed, inm, ing, smth,
+enum eOp{unknown, add, sub, mul, divX, rem, mod, mas, thr, thrp, thrP, uthr, uthrp, uthrP, 
+	max, min, 
+	power,
+	seed, inm, ing, smth,
 	exp1,log1,sin1,cos1,tan1,asin1,acos1,atan1,sqr1,sqrt1,recip1,abs1,bin1,binv1,edge1, index1,
 	nan1, nanm1, rand1, randn1,range1, rank1, ranknorm1,
 	pval1, pval01, cpval1,
@@ -2638,7 +2645,7 @@ static int essentiallyEqual(float a, float b) {
 static void nifti_compare(nifti_image * nim, char * fin) {
 	if (nim->nvox < 1) exit( 1);
 	if (nim->datatype != DT_CALC) {
-		fprintf(stderr,"nifti_binary: Unsupported datatype %d\n", nim->datatype); 
+		fprintf(stderr,"nifti_compare: Unsupported datatype %d\n", nim->datatype); 
 		exit( 1);
 	}
 	nifti_image * nim2 = nifti_image_read2(fin, 1);
@@ -2788,6 +2795,18 @@ static void nifti_compare(nifti_image * nim, char * fin) {
 	exit(1);
 } //nifti_compare()
 
+static int nifti_binary_power ( nifti_image * nim, double v) {
+	//clone operations from ANTS ImageMath: power
+	//https://manpages.debian.org/jessie/ants/ImageMath.1.en.html
+	if (nim->nvox < 1) return 1;
+	if (nim->datatype!= DT_CALC) return 1;
+	flt fv = v;
+	flt * f32 = (flt *) nim->data;
+	for (size_t i = 0; i < nim->nvox; i++ )
+			f32[i] = pow(f32[i], v);
+		return 0;
+}
+
 static int nifti_binary ( nifti_image * nim, char * fin, enum eOp op) {
 	if (nim->nvox < 1) return 1;
 	if (nim->datatype != DT_CALC) {
@@ -2910,6 +2929,31 @@ static int nifti_binary ( nifti_image * nim, char * fin, enum eOp op) {
 						imga[va+i] = 0.0f;
 					else
 						imga[va+i] = imga[va+i]/imgb[vb+i];
+				}
+			}
+		} else if (op == mod) { //afni mod function, divide by zero yields 0 (unlike Matlab, see remtest.m)
+			//fractional remainder:
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++ ) {
+					//printf("!>[%d]/[%d] %g/%g = %g\n",vb+i, va+i,  imgb[vb+i], imga[va+i], fmod(trunc(imgb[vb+i]), trunc(imga[va+i]))   );
+					if (imga[va+i] != 0.0f)
+						imga[va+i] = fmod(imgb[vb+i], imga[va+i]);
+					else {
+						rem0 = 1;
+						imga[va+i] = 0;//imgb[vb+i];
+					}
+					 
+				}
+			} else { 
+				for (int i = 0; i < nvox3D; i++ ) {
+					//printf("?>[%d]/[%d] %g/%g = %g : %g\n", va+i, vb+i, imga[va+i], imgb[vb+i], fmod(imga[va+i], imgb[vb+i]), fmod(trunc(imga[va+i]), trunc(imgb[vb+i]))  ); 
+					if (imgb[vb+i] != 0.0f)
+						//imga[va+i] = round(fmod(imga[va+i], imgb[vb+i]));
+						imga[va+i] = fmod(imga[va+i], imgb[vb+i]);
+					else {
+						rem0 = 1;
+						imga[va+i] = 0;	
+					}
 				}
 			}
 		} else if (op == rem) { //fmod _rem
@@ -3749,6 +3793,7 @@ int main64(int argc, char * argv[]) {
 		if ( ! strcmp(argv[ac], "-mul") ) op = mul;
 		if ( ! strcmp(argv[ac], "-div") ) op = divX;
 		if ( ! strcmp(argv[ac], "-rem") ) op = rem;
+		if ( ! strcmp(argv[ac], "-mod") ) op = mod;
 		if ( ! strcmp(argv[ac], "-mas") ) op = mas;
 		if ( ! strcmp(argv[ac], "-thr") ) op = thr;
 		if ( ! strcmp(argv[ac], "-thrp") ) op = thrp;
@@ -3758,6 +3803,10 @@ int main64(int argc, char * argv[]) {
 		if ( ! strcmp(argv[ac], "-uthrP") ) op = uthrP;
 		if ( ! strcmp(argv[ac], "-max") ) op = max;
 		if ( ! strcmp(argv[ac], "-min") ) op = min;
+		if ( ! strcmp(argv[ac], "-max") ) op = max;
+		//if ( ! strcmp(argv[ac], "-addtozero") ) op = addtozero; //variation of mas
+		//if ( ! strcmp(argv[ac], "-overadd") ) op = overadd; //variation of mas
+		if ( ! strcmp(argv[ac], "power") ) op = power;
 		if ( ! strcmp(argv[ac], "-seed") ) op = seed;
 		//if ( ! strcmp(argv[ac], "-restart") ) op = restart;
 		//if ( ! strcmp(argv[ac], "-save") ) op = save;		
@@ -4107,7 +4156,7 @@ int main64(int argc, char * argv[]) {
 			double v = strtod(argv[ac], &end);
 			//if (end == argv[ac]) {
 			if (strlen(argv[ac]) != (end - argv[ac])) { // "4d" will return numeric "4"
-				if ((op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed) ) {
+				if ((op == power) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed) ) {
 					fprintf(stderr,"Error: '%s' expects numeric value\n", argv[ac-1]);
 					goto fail;
 				} else
@@ -4121,12 +4170,16 @@ int main64(int argc, char * argv[]) {
 					ok = nifti_rescale(nim , v, 0.0);
 				if (op == divX) 
 					ok = nifti_rescale(nim , 1.0/v, 0.0);
+				if (op == mod) 
+					ok = nifti_rem(nim, v, 1);
 				if (op == rem) 
-					ok = nifti_rem(nim, v);
+					ok = nifti_rem(nim, v, 0);
 				if (op == mas) { 
 					fprintf(stderr,"Error: -mas expects image not number\n");
 					goto fail;	
 				}
+				if (op == power)
+					ok = nifti_binary_power(nim, v);
 				if (op == thr) 
 					ok = nifti_thr(nim, v, 0);
 				if ((op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP))

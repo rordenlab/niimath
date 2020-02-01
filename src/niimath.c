@@ -49,9 +49,7 @@
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
-	printf("Usage: niimath [-dt <datatype>] <first_input> [operations and inputs] <output> [-odt <datatype>]\n");
-	printf("\n");
-	printf("Chris Rorden's dcm2niiX version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
+	printf("Chris Rorden's niimath version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     //printf("Chris Rorden's niimath version %s (%llu-bit %s)\n", kMATHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     printf("    Math for NIfTI images inspired by fslmaths without encumbrance problems\n\n");
 	printf("\n");
@@ -65,21 +63,22 @@ int show_help( void ) {
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
 	#if defined(_OPENMP)
-	printf(" -p <threads> : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ').\n");
+	printf(" -p <threads>            : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ').\n");
 	#else
-	printf(" -p <threads> : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
+	printf(" -p <threads>            : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif
+	printf(" -mod                    : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -resize <X> <Y> <Z> <m> : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
-	printf(" -crop <tmin> <tsize> : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
-	printf(" -sobel : fast edge detection\n");
-	printf(" -demean : remove average signal across volumes (requires 4D input)\n");
-	printf(" -edt : estimate Euler Distance Transform (distance field). Assumes isotropic input.\n");
-	printf(" -unsharp  <sigma> <amount> : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount)\n");
-	printf("  -tensor_2lower : convert FSL style upper triangle image to NIfTI standard lower triangle order.\n");
-	printf("  -tensor_2upper : convert NIfTI standard lower triangle image to FSL style upper triangle order.\n");
-	printf(" -tensor_decomp_lower : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
-	printf(" -bptfm  <hp_sigma> <lp_sigma> : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
-	printf(" --compare <ref> : report if image matches, terminates without saving new image\n");
+	printf(" -crop <tmin> <tsize>    : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
+	printf(" -sobel                  : fast edge detection\n");
+	printf(" -demean                 : remove average signal across volumes (requires 4D input)\n");
+	printf(" -edt                    : estimate Euler Distance Transform (distance field). Assumes isotropic input.\n");
+	printf(" -unsharp  <sigma> <scl> : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
+	printf(" -tensor_2lower          : convert FSL style upper triangle image to NIfTI standard lower triangle order.\n");
+	printf(" -tensor_2upper          : convert NIfTI standard lower triangle image to FSL style upper triangle order.\n");
+	printf(" -tensor_decomp_lower    : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
+	printf(" -bptfm  <hp> <lp>       : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+	printf(" --compare <ref>         : report if images are identical, terminates without saving new image\n");
 	printf("\n");
 	printf("Binary operations:\n");
 	printf("  (some inputs can be either an image or a number)\n");
