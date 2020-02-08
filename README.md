@@ -122,6 +122,6 @@ Here are the same testson a desktop computer with twelve cores (24 threads, Ryze
 
 ## License
 
-niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation.
+niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. The Butterworth Filter Coefficients in `bw.c` are from [Exstrom Labs](http://www.exstrom.com/journal/sigproc/) and the authors provided permission for it to be included in this project under the [LGPL](https://www.gnu.org/licenses/lgpl-3.0.en.html), the file provides additional details. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation.
 
 

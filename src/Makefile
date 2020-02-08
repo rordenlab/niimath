@@ -14,5 +14,5 @@ ifeq "$(OMP)" "1"
 endif
 
 all:
-	$(CNAME) $(CFLAGS) -o niimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
+	$(CNAME) $(CFLAGS) -o niimath niimath.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
 	

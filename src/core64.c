@@ -24,6 +24,7 @@
 #endif
 #include "core.h"
 
+#define bandpass
 #ifdef bandpass
 #include "bw.h"
 #endif
@@ -1107,6 +1108,26 @@ static int compare (const void * a, const void * b) {
 	return (fa > fb) - (fa < fb);
 }
 
+static void dtrend(flt * xx, int npt, int pt0) {
+	//linear detrend, first point is set to zero
+	// if pt0=0 then mean is zero, pt0=1 then first point is zero, if pt0=2 final point is zero
+	double t1,t3,t10 , x0,x1 ;
+	int ii ;
+	if( npt < 2 || xx == NULL ) return ;
+	x0 = xx[0] ; x1 = 0.0 ;
+	for( ii=1 ; ii < npt ; ii++ ){
+		x0 += xx[ii] ;
+		x1 += xx[ii] * ii ;
+	}
+	t1 = npt*x0; t3 = 1.0/npt; t10 = npt*npt;
+	double f0 = (double)(2.0/(npt+1.0)*t3*(2.0*t1-3.0*x1-x0));
+	double f1 = (double)(-6.0/(t10-1.0)*t3*(-x0-2.0*x1+t1));
+	//printf("%.8g %.8g %g\n", f0, f1, xx[0]); 
+	if (pt0 == 1) f0 = xx[0];
+	if (pt0 == 2) f0 = xx[npt-1]- (f1*(npt-1));
+	for( ii=0 ; ii < npt ; ii++ ) xx[ii] -= (f0 + f1*ii) ;
+}
+
 static int nifti_detrend_linear(nifti_image * nim) {
 	if (nim->datatype != DT_CALC) return 1;
 	size_t nvox3D = nim->nx * nim->ny * MAX(1,nim->nz);
@@ -1120,39 +1141,157 @@ static int nifti_detrend_linear(nifti_image * nim) {
 	flt * img = (flt *) nim->data;
 	#pragma omp parallel for
 	for (size_t i = 0; i < nvox3D; i++) {
-		double sum = 0.0;
-		double sumVxI = 0.0; //value * index
-		for (size_t v = i; v < nim->nvox; v+= nvox3D) {
-			sum += img[v];
-			sumVxI += (img[v] * i);
+		flt * data = (flt *)_mm_malloc(nvol*sizeof(flt), 64);
+    	//load one voxel across all timepoints
+    	int j = 0;
+    	for (size_t v = i; v < nim->nvox; v+= nvox3D) {
+			data[j] = img[v];
+			j++;
 		}
-		double t1 = nvol * sum; //very large number
-		double t3 = 1/nvol; //increasingly small number
-		double t10 = nvol * nvol;
-		//AFNI style 1-pass from thd_detrend.c
-		// //https://stackoverflow.com/questions/10048571/python-finding-a-trend-in-a-set-of-numbers
-/*				
-y = [12, 34, 29, 38, 34, 51, 29, 34, 47, 34, 55, 94, 68, 81]
-N = len(y)
-x = range(N)
-B = (sum(x[i] * y[i] for i in xrange(N)) - 1./N*sum(x)*sum(y)) / (sum(x[i]**2 for i in xrange(N)) - 1./N*sum(x)**2)
-A = 1.*sum(y)/N - B * 1.*sum(x)/N
-print "%f + %f * x" % (A, B)
-*/
-		double f0 = (2.0/(nvol+1.0)*t3*(2.0*t1-3.0*sumVxI-sum));
-   		double f1 = (-6.0/(t10-1.0)*t3*(-sum-2.0*sumVxI+t1));
-   		int j = 0;
-   		for (size_t v = i; v < nim->nvox; v+= nvox3D) {
-			img[v] -= (f0 + f1*j) ;
-			j ++;
-		} //_compare
-
+		//detrend
+		dtrend(data, nvol, 0);
+		//save one voxel across all timepoints
+    	j = 0;
+		for (size_t v = i; v < nim->nvox; v+= nvox3D) {
+			img[v] = data[j];
+			j++;
+		}
+    	_mm_free (data);
 	}
 	return 0;
 }
 
 #ifdef bandpass
-static int nifti_bandpass(nifti_image * nim, double lp_hz, double hp_hz, double TRsec) { 
+//https://github.com/QtSignalProcessing/QtSignalProcessing/blob/master/src/iir.cpp
+//https://github.com/rkuchumov/day_plot_diagrams/blob/8df48af431dc76b1656a627f1965d83e8693ddd7/data.c
+//https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
+// Sample rate and desired cutoff frequencies (in Hz).
+//  double highcut = 1250;
+//  double lowcut = 500;
+//  double samp_rate = 5000;
+//[b,a] = butter(2, [0.009, 0.08]);
+//https://afni.nimh.nih.gov/afni/community/board/read.php?1,84373,137180#msg-137180
+//Power 2011, Satterthwaite 2013, Carp 2011, Power's reply to Carp 2012
+
+static int butterworth_filter(flt * img, int nvox3D, int nvol, double samp_rate, double highcut, double lowcut) {
+//sample rate, low cut and high cut are all in Hz
+	int order = 4;
+	if (order <= 0) return 1;
+    if ((highcut <= 0.0) && (lowcut <= 0.0)) return 1;
+    if (highcut == lowcut) return 1;
+    if (samp_rate <= 0.0) return 1;
+    double nyquist = samp_rate / 2.0f;
+    double *b = NULL;
+    int *a = NULL;
+    int n = nvol;
+    double gain = 1.0;
+    int l = order + 1;
+    if ((highcut >= 0.0) && (lowcut >= 0.0)) {
+    	if (lowcut > highcut) {
+    		double tmp = lowcut;
+    		lowcut = highcut;
+    		highcut = tmp;
+    	}
+		if (lowcut >= nyquist || highcut >= nyquist)  {
+			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
+			return 1;
+		}
+		fprintf(stderr,"Applying Butterworth filter (lowcut = %lf, highcut = %lf, order = %d)\n", lowcut, highcut, order);
+		double fl = lowcut / nyquist;
+		double fh = highcut / nyquist;
+    	b = dcof_bwbp(order, fl, fh);
+    	a = ccof_bwbp(order);
+    	gain = sf_bwbp(order, fl, fh); 
+    	l = 2 * order + 1;	
+    } else if (lowcut >= 0.0) { //low-cut ONLY: high-pass
+		if (lowcut >= nyquist)  {
+			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
+			return 1;
+		}
+		fprintf(stderr,"Applying Butterworth high-pass filter (lowcut = %lf, order = %d)\n", lowcut, order);
+		double f = lowcut / nyquist;
+    	b = dcof_bwhp(order, f);
+    	a = ccof_bwhp(order);
+    	gain = sf_bwhp(order, f);  
+    } else { //high cut ONLY: low-pass 
+		if (highcut >= nyquist)  {
+			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
+			return 1;
+		}
+		fprintf(stderr,"Applying Butterworth low-pass filter (highcut = %lf, order = %d)\n", highcut, order);
+		double f = highcut / nyquist;
+    	b = dcof_bwlp(order, f);
+    	a = ccof_bwlp(order);
+    	gain = sf_bwlp(order, f);      
+    
+    }
+    for (int vx = 0; vx < nvox3D; vx++) {
+    	flt * data = (flt *)_mm_malloc(n*sizeof(flt), 64);
+    	size_t vo = vx;
+    	for (int j = 0; j < n; j++) {
+			data[j] = img[vo];
+			vo += nvox3D;	
+		}
+		dtrend(data, nvol, 1); //detrend, start at zero!
+		flt * xv = (flt *)_mm_malloc(l*sizeof(flt), 64);
+		flt * yv = (flt *)_mm_malloc(l*sizeof(flt), 64);
+		for (int i = 0; i < l; i++) {
+			xv[i] = 0;
+			yv[i] = 0;
+		}
+		//forward pass...
+		for (int j = 0; j < n; j++) {
+				for (int k = 1; k < l; k++) {
+					xv[k - 1] = xv[k];
+					yv[k - 1] = yv[k];
+				}
+				xv[l - 1] = gain * data[j];
+				yv[l - 1] = 0;
+				for (int k = 0; k < l; k++)
+					yv[l - 1] += xv[k] * ((double) a[l - k - 1]);
+				for (int k = 0; k < l - 1; k++)
+					yv[l - 1] -= yv[k] * b[l - k - 1];
+				data[j] = yv[l - 1];
+				//printf("%d\n", j);
+		}
+		//reverse pass
+		dtrend(data, nvol, 2); //detrend, end at zero!
+		for (int i = 0; i < l; i++) {
+			xv[i] = 0;
+			yv[i] = 0;
+		}
+		for (int j = (n-1); j > 0; j--) {
+				//printf("-%d\n", j);
+				for (int k = 1; k < l; k++) {
+					xv[k - 1] = xv[k];
+					yv[k - 1] = yv[k];
+				}
+				xv[l - 1] = gain * data[j];
+				yv[l - 1] = 0;
+				for (int k = 0; k < l; k++)
+					yv[l - 1] += xv[k] * ((double) a[l - k - 1]);
+				for (int k = 0; k < l - 1; k++)
+					yv[l - 1] -= yv[k] * b[l - k - 1];
+				data[j] = yv[l - 1];
+		}
+		//detrend
+		dtrend(data, nvol, 0); //detrend, mean is zero
+		//save data to 4D array
+		vo = vx;
+    	for (int j = 0; j < n; j++) {
+			img[vo] = data[j];
+			vo += nvox3D;	
+		}
+		_mm_free (xv);
+    	_mm_free (yv);
+    	_mm_free (data);
+    } //for vx
+    free(b);
+    free(a);
+    return 0;
+}
+
+static int nifti_bandpass(nifti_image * nim, double hp_hz, double lp_hz, double TRsec) { 
 	if (nim->datatype != DT_CALC) return 1;
 	size_t nvox3D = nim->nx * nim->ny * MAX(1,nim->nz);
 	if (TRsec <= 0.0) 
@@ -1169,14 +1308,7 @@ static int nifti_bandpass(nifti_image * nim, double lp_hz, double hp_hz, double 
 		fprintf(stderr,"bandpass requires 4D datasets\n");
 		return 1;
 	}
-	flt * img = (flt *) nim->data;
-	//[b,a] = butter(2, [0.009, 0.08]);
-	//~ 0.01 - 0.1 Hz
-	#ifdef DT32
-	return butterworth_filter32(img, nvox3D, nvol, 1/TRsec, lp_hz, hp_hz);
-	#else
-	return butterworth_filter64(img, nvox3D, nvol, 1/TRsec, lp_hz, hp_hz);
-	#endif
+	return butterworth_filter((flt *) nim->data, nvox3D, nvol, 1/TRsec, hp_hz, lp_hz);
 }
 #endif
 
@@ -3976,17 +4108,6 @@ int main64(int argc, char * argv[]) {
 				goto fail;
 			}
 			  
-		} else if ( ! strcmp(argv[ac], "-bandpass") ) {
-			#ifdef slicetimer
-			ac++;
-		 	double hp_sigma = strtod(argv[ac], &end);
-		 	ac++;
-		 	double lp_sigma = strtod(argv[ac], &end);
-			ok = nifti_bandpass(nim, hp_sigma, lp_sigma);
-			#else
-		 		fprintf(stderr,"Error: recompile to support bandpass filter.\n"); //e.g. volume size might differ
-				ok = 1; 			
-			#endif
 		} else if ( ! strcmp(argv[ac], "-unsharp") ) {
 			ac++;
 		 	double sigma = strtod(argv[ac], &end);

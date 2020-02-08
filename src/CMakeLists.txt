@@ -55,6 +55,7 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     tensor.c
+    bw.c
     core32.c
     core64.c
     niftilib/nifti2_io.c
