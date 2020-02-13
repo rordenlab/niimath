@@ -53,7 +53,7 @@ int show_help( void ) {
     //printf("Chris Rorden's niimath version %s (%llu-bit %s)\n", kMATHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     printf("    Math for NIfTI images inspired by fslmaths without encumbrance problems\n\n");
 	printf("\n");
-	printf("Usage: fslmaths [-dt <datatype>] <first_input> [operations and inputs] <output> [-odt <datatype>]\n");
+	printf("Usage: niimath [-dt <datatype>] <first_input> [operations and inputs] <output> [-odt <datatype>]\n");
 	printf("\n");
 	printf("Datatype information:\n");
 	printf(" -dt sets the datatype used internally for calculations (default float for all except double images)\n");
@@ -79,7 +79,7 @@ int show_help( void ) {
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order.\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -bptfm  <hp> <lp>        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
-	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds\n");  
+	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf("\n");
 	printf("Binary operations:\n");

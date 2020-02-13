@@ -1172,122 +1172,117 @@ static int nifti_detrend_linear(nifti_image * nim) {
 //[b,a] = butter(2, [0.009, 0.08]);
 //https://afni.nimh.nih.gov/afni/community/board/read.php?1,84373,137180#msg-137180
 //Power 2011, Satterthwaite 2013, Carp 2011, Power's reply to Carp 2012
+// https://github.com/lindenmp/rs-fMRI/blob/master/func/ButterFilt.m
+//https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.filtfilt.html
 
-static int butterworth_filter(flt * img, int nvox3D, int nvol, double samp_rate, double highcut, double lowcut) {
+/*
+The function butterworth_filter() emulates Jan Simon's FiltFiltM
+ it uses Gustafsson’s method and padding to reduce ringing at start/end
+https://www.mathworks.com/matlabcentral/fileexchange/32261-filterm?focused=5193423&tab=function
+Copyright (c) 2011, Jan Simon
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in
+      the documentation and/or other materials provided with the distribution
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.*/
+static int butterworth_filter(flt * img, int nvox3D, int nvol, double fs, double highcut, double lowcut) {
 //sample rate, low cut and high cut are all in Hz
-	int order = 4;
+//this attempts to emulate performance of https://www.mathworks.com/matlabcentral/fileexchange/32261-filterm
+//  specifically, prior to the forward and reverse pass the coefficients are estimated by a forward and reverse pass
+	int order = 2;
 	if (order <= 0) return 1;
     if ((highcut <= 0.0) && (lowcut <= 0.0)) return 1;
-    if (highcut == lowcut) return 1;
-    if (samp_rate <= 0.0) return 1;
-    double nyquist = samp_rate / 2.0f;
-    double *b = NULL;
-    int *a = NULL;
-    int n = nvol;
-    double gain = 1.0;
-    int l = order + 1;
-    if ((highcut >= 0.0) && (lowcut >= 0.0)) {
-    	if (lowcut > highcut) {
-    		double tmp = lowcut;
-    		lowcut = highcut;
-    		highcut = tmp;
-    	}
-		if (lowcut >= nyquist || highcut >= nyquist)  {
-			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
-			return 1;
-		}
-		fprintf(stderr,"Applying Butterworth filter (lowcut = %lf, highcut = %lf, order = %d)\n", lowcut, highcut, order);
-		double fl = lowcut / nyquist;
-		double fh = highcut / nyquist;
-    	b = dcof_bwbp(order, fl, fh);
-    	a = ccof_bwbp(order);
-    	gain = sf_bwbp(order, fl, fh); 
-    	l = 2 * order + 1;	
-    } else if (lowcut >= 0.0) { //low-cut ONLY: high-pass
-		if (lowcut >= nyquist)  {
-			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
-			return 1;
-		}
-		fprintf(stderr,"Applying Butterworth high-pass filter (lowcut = %lf, order = %d)\n", lowcut, order);
-		double f = lowcut / nyquist;
-    	b = dcof_bwhp(order, f);
-    	a = ccof_bwhp(order);
-    	gain = sf_bwhp(order, f);  
-    } else { //high cut ONLY: low-pass 
-		if (highcut >= nyquist)  {
-			fprintf(stderr,"Cutoff frequency(ies) should be less than %0.2f (half the sample rate)\n", nyquist);
-			return 1;
-		}
-		fprintf(stderr,"Applying Butterworth low-pass filter (highcut = %lf, order = %d)\n", highcut, order);
-		double f = highcut / nyquist;
-    	b = dcof_bwlp(order, f);
-    	a = ccof_bwlp(order);
-    	gain = sf_bwlp(order, f);      
-    
-    }
+    if (fs <= 0.0) return 1;
+	if ((lowcut > 0.0) && (highcut > 0.0))
+		printf("butter bandpass lowcut=%g highcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", lowcut, highcut, fs, order, 2*order); 	
+	else if (highcut > 0.0)
+		printf("butter lowpass highcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", highcut, fs, order, 2*order); 	
+	else if (lowcut > 0.0)
+		printf("butter highpass lowcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", lowcut, fs, order, 2*order);
+	else {
+		printf("Butterworth parameters do not make sense\n");
+		return 1;
+	}    
+    double * a;
+	double * b;
+	double * IC;
+	int nX = nvol;
+	int nA = 0;
+	nA = butter_design(order, 2.0*lowcut/fs, 2.0*highcut/fs, &a, &b, &IC);
+	int nEdge = 3 * (nA -1);
+	if ((nA < 1) || (nX <= nEdge)) {
+		printf("filter requires at least %d samples\n", nEdge);
+		_mm_free(a);
+		_mm_free(b);
+		_mm_free(IC);
+		return 1;
+	}
+	#pragma omp parallel for	
     for (int vx = 0; vx < nvox3D; vx++) {
-    	flt * data = (flt *)_mm_malloc(n*sizeof(flt), 64);
+    	double * X = (double *)_mm_malloc(nX*sizeof(double), 64);
     	size_t vo = vx;
-    	for (int j = 0; j < n; j++) {
-			data[j] = img[vo];
+    	flt mn = INFINITY;
+    	flt mx = -INFINITY;
+    	for (int j = 0; j < nX; j++) {
+			X[j] = img[vo];
+			mn = MIN(mn, X[j]);
+			mx = MAX(mx, X[j]);
 			vo += nvox3D;	
 		}
-		dtrend(data, nvol, 1); //detrend, start at zero!
-		flt * xv = (flt *)_mm_malloc(l*sizeof(flt), 64);
-		flt * yv = (flt *)_mm_malloc(l*sizeof(flt), 64);
-		for (int i = 0; i < l; i++) {
-			xv[i] = 0;
-			yv[i] = 0;
+		if (mn < mx) { //some variability
+			double * Xi = (double *)_mm_malloc(nEdge * sizeof(double), 64);
+			for (int i = 0; i < nEdge; i++)
+				Xi[nEdge-i-1] = X[0]-(X[i+1]-X[0]);
+			double * CC = (double *)_mm_malloc((nA-1) * sizeof(double), 64);
+			for (int i = 0; i < (nA-1); i++)
+				CC[i] = IC[i]* Xi[0];
+			double * Xf = (double *)_mm_malloc(nEdge * sizeof(double), 64);
+			for (int i = 0; i < nEdge; i++)
+				Xf[i] = X[nX-1]-(X[nX-2-i]-X[nX-1]);
+			Filt(Xi, nEdge, a, b, nA-1, CC); //filter head
+			Filt(X, nX, a, b, nA-1, CC); //filter array
+			Filt(Xf, nEdge, a, b, nA-1, CC); //filter tail
+			//reverse
+			for (int i = 0; i < (nA-1); i++)
+				CC[i] = IC[i]* Xf[nEdge-1];
+			FiltRev(Xf, nEdge, a, b, nA-1, CC); //filter tail
+			FiltRev(X, nX, a, b, nA-1, CC); //filter array
+			_mm_free (Xi);
+    		_mm_free (Xf);
+    		_mm_free (CC);
+		} else { //else no variability: set all voxels to zero
+			for (int j = 0; j < nX; j++)
+				 X[j] = 0;
 		}
-		//forward pass...
-		for (int j = 0; j < n; j++) {
-				for (int k = 1; k < l; k++) {
-					xv[k - 1] = xv[k];
-					yv[k - 1] = yv[k];
-				}
-				xv[l - 1] = gain * data[j];
-				yv[l - 1] = 0;
-				for (int k = 0; k < l; k++)
-					yv[l - 1] += xv[k] * ((double) a[l - k - 1]);
-				for (int k = 0; k < l - 1; k++)
-					yv[l - 1] -= yv[k] * b[l - k - 1];
-				data[j] = yv[l - 1];
-				//printf("%d\n", j);
-		}
-		//reverse pass
-		dtrend(data, nvol, 2); //detrend, end at zero!
-		for (int i = 0; i < l; i++) {
-			xv[i] = 0;
-			yv[i] = 0;
-		}
-		for (int j = (n-1); j > 0; j--) {
-				//printf("-%d\n", j);
-				for (int k = 1; k < l; k++) {
-					xv[k - 1] = xv[k];
-					yv[k - 1] = yv[k];
-				}
-				xv[l - 1] = gain * data[j];
-				yv[l - 1] = 0;
-				for (int k = 0; k < l; k++)
-					yv[l - 1] += xv[k] * ((double) a[l - k - 1]);
-				for (int k = 0; k < l - 1; k++)
-					yv[l - 1] -= yv[k] * b[l - k - 1];
-				data[j] = yv[l - 1];
-		}
-		//detrend
-		dtrend(data, nvol, 0); //detrend, mean is zero
 		//save data to 4D array
 		vo = vx;
-    	for (int j = 0; j < n; j++) {
-			img[vo] = data[j];
+    	for (int j = 0; j < nX; j++) {
+			img[vo] = X[j];
 			vo += nvox3D;	
 		}
-		_mm_free (xv);
-    	_mm_free (yv);
-    	_mm_free (data);
+    	_mm_free (X);
     } //for vx
-    free(b);
-    free(a);
+    _mm_free(b);
+    _mm_free(a);
+    _mm_free(IC);
     return 0;
 }
 
@@ -1299,8 +1294,7 @@ static int nifti_bandpass(nifti_image * nim, double hp_hz, double lp_hz, double 
 	if (TRsec <= 0) {
 		fprintf(stderr,"Unable to determine sample rate\n");
 		return 1;
-	}
-		
+	}	
 	if (nvox3D < 1) return 1; 
 	int nvol = nim->nvox / nvox3D;
 	if ((nvox3D * nvol) != nim->nvox) return 1;
@@ -4079,13 +4073,14 @@ int main64(int argc, char * argv[]) {
 			ok = nifti_bptf(nim, hp_sigma, lp_sigma, 1);
 		#ifdef bandpass
 		} else if ( ! strcmp(argv[ac], "-bandpass") ) {
+			// niimath test4D -bandpass 0.08 0.008 0 c
 			ac++;
 		 	double lp_hz = strtod(argv[ac], &end);
 		 	ac++;
 		 	double hp_hz = strtod(argv[ac], &end);
 		 	ac++;
 		 	double TRsec = strtod(argv[ac], &end);
-			ok = nifti_bandpass(nim, lp_hz, hp_hz, TRsec);
+		 	ok = nifti_bandpass(nim, lp_hz, hp_hz, TRsec);
 		#endif 
 		} else if ( ! strcmp(argv[ac], "-roc") ) {
 			//-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth>

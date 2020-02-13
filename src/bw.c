@@ -45,6 +45,7 @@
  */
 
 #include <stdlib.h>
+#include <immintrin.h>
 #include <math.h>
 
 
@@ -490,4 +491,184 @@ double sf_bwbs( int n, double f1f, double f2f ) {
 		sfi = a - b - c;
     }
     return( 1.0 / sfr );
+}
+
+typedef struct {                   /** 3x3 matrix struct **/
+  float m[25][25] ;
+} matNN ;
+
+//https://www.sanfoundry.com/c-program-find-inverse-matrix/
+double determinant(matNN a, double k) {
+	double s = 1;
+	double det = 0;
+	matNN b;
+	int i, j, m, n, c;
+	if (k == 1)
+		return (a.m[0][0]);
+	else {
+		det = 0;
+		for (c = 0; c < k; c++) {
+			m = 0;
+			n = 0;
+			for (i = 0;i < k; i++) {
+				for (j = 0 ;j < k; j++) {
+					b.m[i][j] = 0;
+					if (i != 0 && j != c) {
+						b.m[m][n] = a.m[i][j];
+						if (n < (k - 2))
+							n++;
+						else {
+							n = 0;
+							m++;
+						}
+					}
+				}
+			}
+			det = det + s * (a.m[0][c] * determinant(b, k - 1));
+			s = -1 * s;
+		}
+	}
+	return (det);
+}
+
+matNN transpose(matNN num, matNN fac, double r) {
+	int i, j;
+	matNN b, inverse;
+	double d;
+	for (i = 0;i < r; i++) {
+		for (j = 0;j < r; j++) {
+			b.m[i][j] = fac.m[j][i];
+		}
+	}
+	d = determinant(num, r);
+	for (i = 0;i < r; i++) {
+		for (j = 0;j < r; j++) {
+			inverse.m[i][j] = b.m[i][j] / d;
+		}
+	}
+	return inverse;
+}
+ 
+matNN cofactor(matNN num, double f) {
+	matNN b, fac;
+	int p, q, m, n, i, j;
+	for (q = 0;q < f; q++) {
+		for (p = 0;p < f; p++) {
+			m = 0;
+			n = 0;
+			for (i = 0;i < f; i++) {
+				for (j = 0;j < f; j++) {
+					if (i != q && j != p) {
+						b.m[m][n] = num.m[i][j];
+						if (n < (f - 2))
+							n++;
+						else {
+							n = 0;
+							m++;
+						}
+					}
+				}
+			}
+			fac.m[q][p] = pow(-1, q + p) * determinant(b, f - 1);
+		}
+	}
+	return transpose(num, fac, f);
+}
+
+int butter_design(int order, double fl, double fh, double ** a, double ** b, double ** IC) {
+//https://www.mathworks.com/help/signal/ref/butter.html
+// [b,a] = butter(order,[fl fh])
+//returns length of b[] and a[]
+// IC are initial coefficients for filtfilt, length is one less than length of b[]/a[]
+	if (order < 1) return 1;
+	int nA = 0;
+	double *af = NULL;
+	int *bi = NULL;
+	double gain = 1.0;
+	if ((fl > 0.0) && (fh > 0.0)) { //lowcut and highcut: band pass
+		//https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
+		//b, a = butter(order, [fl, fh], btype='band')
+		af = dcof_bwbp(order, fl, fh);
+		gain = sf_bwbp(order, fl, fh);
+		bi = ccof_bwbp(order);
+		nA = 2 * order + 1;	
+	} else if (fl > 0.0) { //low cut only: high pass
+		af = dcof_bwhp(order, fl);
+		gain = sf_bwhp(order, fl);
+		bi = ccof_bwhp(order);
+		nA = order + 1;	
+	} else if (fh > 0.0) { //high cut only: low pass
+		////b, a = butter(order, [fh], btype='low')
+		af = dcof_bwlp(order, fh);
+		gain = sf_bwlp(order, fh);
+		bi = ccof_bwlp(order);
+		//printf(">>>>%g\n", fh);
+		nA = order + 1;	
+	} else
+		return 0;
+	* a = (double *)_mm_malloc( nA * sizeof(double), 64);
+	for (int k = 0; k < nA; k++)
+		(*a)[k] = af[k];
+	* b = (double *)_mm_malloc( nA * sizeof(double), 64);
+	for (int k = 0; k < nA; k++)
+		(*b)[k] = gain * ((double)bi[k]);
+	free(bi);
+	free(af);
+	//initial conditions
+	int nM = nA - 1; 
+	matNN K;
+	for (int i = 0; i < nM; i++)
+    	for (int j = 0; j < nM; j++) {
+      		if (i == j)
+      			K.m[i][j] = 1;
+      		else if ((i+1) == j)
+      			K.m[i][j] = -1;
+      		else
+      			K.m[i][j] = 0;	
+      	}
+	for (int i = 0; i < nM; ++i)
+		K.m[i][0] = (*a)[i+1];	
+	K.m[0][0] += 1;
+	matNN  invK = cofactor(K, nM);	
+	    double * ba = (double *)_mm_malloc(nM * sizeof(double), 64);
+	for (int i = 0; i < nM; i++) {
+		ba[i] = (*b)[i+1]-((*a)[i+1] * (*b)[0]);
+		//printf("%g\n", IC[i]);	
+	}
+	* IC = (double *)_mm_malloc(nM * sizeof(double), 64);
+	for (int i = 0; i < nM; i++) {
+		(*IC)[i] = 0.0;
+		for (int j = 0; j < nM; j++)
+			(*IC)[i] += ba[j] * invK.m[i][j];
+	}
+	_mm_free (ba);
+	return nA;
+}
+
+void Filt(double *X, int nX, double *a, double *b, int order, double *Z) {
+	double Xi, Yi;
+	int j, R;
+	for (int i = 0; i < (nX); i++) {
+		Xi = X[i];                       // Get signal
+		Yi = b[0] * Xi + Z[0];           // Filtered value
+		for (j = 1; j < order; j++)    // Update conditions
+			Z[j - 1] = b[j] * Xi + Z[j] - a[j] * Yi;
+		Z[order - 1] = b[order] * Xi - a[order] * Yi;
+		X[i] = Yi;                      // Write to output
+	}
+}
+
+void FiltRev(double *X, int nX, double *a, double *b, int order, double *Z) {
+	double Xi, Yi;
+	int j, R;
+	//i = nX -1;
+	//while (i >= 0) {
+	for (int i = (nX -1); i >= 0; i--) {
+		Xi = X[i];                       // Get signal
+		Yi = b[0] * Xi + Z[0];           // Filtered value
+		for (j = 1; j < order; j++)    // Update conditions
+			Z[j - 1] = b[j] * Xi + Z[j] - a[j] * Yi;
+		Z[order - 1] = b[order] * Xi - a[order] * Yi;
+		X[i] = Yi;                      // Write to output
+	}
 }

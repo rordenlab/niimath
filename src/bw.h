@@ -17,5 +17,8 @@ double sf_bwlp( int n, double fcf );
 double sf_bwhp( int n, double fcf );
 double sf_bwbp( int n, double f1f, double f2f );
 double sf_bwbs( int n, double f1f, double f2f );
+void Filt(double *X, int nX, double *a, double *b, int order, double *Z);
+void FiltRev(double *X, int nX, double *a, double *b, int order, double *Z);
+int butter_design(int order, double fl, double fh, double ** a, double ** b, double ** IC);
 
 #endif // EX_BUTTER_H
