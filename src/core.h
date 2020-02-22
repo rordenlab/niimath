@@ -9,7 +9,7 @@ extern "C" {
 #include <stdlib.h>
 #include <nifti2_io.h>
 #include <float.h> //FLT_EPSILON
-#include <immintrin.h>
+//#include <immintrin.h>
 #include <limits.h>
 
 //CORE32 and CORE64 handle Float32 and Float64 operations, CORE handles shared code 
