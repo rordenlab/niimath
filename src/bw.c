@@ -45,8 +45,12 @@
  */
 
 #include <stdlib.h>
-#include <immintrin.h>
 #include <math.h>
+#ifdef __aarch64__
+  #include "arm_malloc.h"
+#else
+  #include <immintrin.h>
+#endif
 
 
 /**********************************************************************

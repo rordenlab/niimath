@@ -15,7 +15,11 @@
 #include <stdlib.h>
 #include <nifti2_io.h>
 #include <float.h> //FLT_EPSILON
-#include <immintrin.h>
+#ifdef __aarch64__
+  #include "arm_malloc.h"
+#else
+  #include <immintrin.h>
+#endif
 #include <limits.h>
 #include <math.h>
 
