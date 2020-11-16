@@ -53,12 +53,19 @@ static int show_helpx( void ) {
 	exit(1);
 }
 
-static flt vx(flt * f, int p, int q) {
+/*static flt vx(flt * f, int p, int q) {
 	if ((f[p] == INFINITY) || (f[q] == INFINITY))
 		return INFINITY;
 	else
 		return ((f[q] + q*q) - (f[p] + p*p)) / (2.0*q - 2.0*p);
+}*/
+
+static flt vx(flt * f, int p, int q) {
+	flt ret = ((f[q] + q*q) - (f[p] + p*p)) / (2.0*q - 2.0*p);
+	if isnan(ret) ret = INFINITY;
+	return ret;
 }
+
 
 static void edt(flt * f, int n) {
 	int q, p, k;
@@ -86,7 +93,8 @@ static void edt(flt * f, int n) {
         # between the parabolas with vertices at (q,f[q]) and (p,f[p]).*/
         p = v[k];
         s = vx(f, p,q);
-        while (s <= z[k]) {
+        //while (s <= z[k]) {
+        while ((s <= z[k]) && (k > 0)) {
             k = k - 1;
             p = v[k];
             s = vx(f, p,q);
@@ -1310,6 +1318,221 @@ static int nifti_bandpass(nifti_image * nim, double hp_hz, double lp_hz, double 
 }
 #endif
 
+//#define DEBUG_ENABLED
+#ifdef DEBUG_ENABLED
+
+static int xyzt2txyz(nifti_image * nim) {
+	size_t nxyz = nim->nx * nim->ny * nim->nz;
+	size_t nt = nim->nt;
+	if ((nim->nvox < 1) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)  || (nt < 2)) return 1;
+	if (nim->datatype != DT_CALC) return 1;
+	flt * img = (flt *) nim->data;
+	flt * inimg = (flt *)_mm_malloc(nxyz*nt*sizeof(flt), 64); //alloc for each volume to allow openmp
+	memcpy(inimg, img, nim->nvox*sizeof(flt)); 	
+	size_t i = 0;
+	#pragma omp parallel for
+	for (size_t x = 0; x < nxyz; x++ ) {
+		for (size_t t = 0; t < nt; t++ ) {
+			img[i] = inimg[x + t * nxyz];
+			i++;
+		}
+	}
+	_mm_free (inimg);
+	return 0;
+}
+
+static int txyz2xyzt(nifti_image * nim) {
+	size_t nxyz = nim->nx * nim->ny * nim->nz;
+	size_t nt = nim->nt;
+	if ((nim->nvox < 1) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)  || (nt < 2)) return 1;
+	if (nim->datatype != DT_CALC) return 1;
+	flt * img = (flt *) nim->data;
+	flt * inimg = (flt *)_mm_malloc(nxyz*nt*sizeof(flt), 64); //alloc for each volume to allow openmp
+	memcpy(inimg, img, nim->nvox*sizeof(flt)); 	
+	size_t i = 0;
+	#pragma omp parallel for
+	for (size_t x = 0; x < nxyz; x++ ) {
+		for (size_t t = 0; t < nt; t++ ) {
+			img[x + t * nxyz] = inimg[i];
+			i++;
+		}
+	}
+	_mm_free (inimg);
+	return 0;
+}
+
+static int nifti_bptf(nifti_image * nim, double hp_sigma, double lp_sigma, int demean) { 
+//Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
+//5.0.7 highpass temporal filter removes the mean component https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1
+/*
+http://www.fast.u-psud.fr/ezyfit/html/ezfit.html
+fitting functions are: 
+   - linear             y = m * x 
+   - affine or poly1    y = a*x + b 
+   - poly{n}            y = a0 + a1 * x + ... + an * x^n 
+   - power              y = c*x^n 
+   - sin                y = a * sin (b * x) 
+   - cos                y = a * cos (b * x) 
+   - exp                y = a * exp (b * x) 
+   - log                y = a * log (b * x) 
+   - cngauss            y = exp(-x^2/(2*s^2))/(2*pi*s^2)^(1/2) 
+   - cfgauss            y = a*exp(-x^2/(2*s^2)) 
+   - ngauss             y = exp(-(x-x0)^2/(2*s^2))/(2*pi*s^2)^(1/2) 
+   - gauss              y = a*exp(-(x-x0)^2/(2*s^2))
+*/
+    // y = a*exp(-(x-x0)^2/(2*s^2))
+    // regression formula (https://www.mathsisfun.com/data/least-squares-regression.html) modulated by weight
+	if (nim->datatype != DT_CALC) return 1;
+	if ((hp_sigma <= 0) && (lp_sigma <= 0)) return 0;
+	size_t nvox3D = nim->nx * nim->ny * MAX(1,nim->nz);
+	if (nvox3D < 1) return 1; 
+	int nvol = nim->nvox / nvox3D;
+	if ((nvox3D * nvol) != nim->nvox) return 1;
+	if (nvol < 1) {
+		fprintf(stderr,"bptf requires 4D datasets\n");
+		return 1;
+	}
+	int * hpStart, * hpEnd;
+	double * hpSumX, * hpDenom, * hpSumWt, * hp, * hp0;
+	if (hp_sigma > 0) { //initialize high-pass reusables
+		//Spielberg's code uses 8*sigma, does not match current fslmaths:
+		//tested with fslmaths freq4d -bptf 10 -1 nhp
+		//cutoff ~3: most difference: 4->0.0128902 3->2.98023e-08 2->-0.0455322 1->0.379412
+		int cutoffhp = ceil(3*hp_sigma); //to do: check this! ~3
+		hp = (double *)_mm_malloc((cutoffhp+1+cutoffhp)*sizeof(double), 64); //-cutoffhp..+cutoffhp
+		hp0 = hp + cutoffhp; //convert from 0..(2*cutoffhp) to -cutoffhp..+cutoffhp
+		for (int k = -cutoffhp; k <= cutoffhp; k++)  //for each index in kernel
+			hp0[k] = exp(-sqr(k)/(2 * sqr(hp_sigma)));
+		hpStart = (int *)_mm_malloc(nvol*sizeof(int), 64); 
+		hpEnd = (int *)_mm_malloc(nvol*sizeof(int), 64); 
+		hpSumX = (double *)_mm_malloc(nvol*sizeof(double), 64); //
+		hpDenom = (double *)_mm_malloc(nvol*sizeof(double), 64); // N*Sum(x^2) - (Sum(x))^2
+		hpSumWt = (double *)_mm_malloc(nvol*sizeof(double), 64); //sum of weight, N
+		for (int v = 0; v < nvol; v++) {
+			//linear regression with "gauss" fitting
+			hpStart[v] = MAX(0,v-cutoffhp);
+			hpEnd[v] = MIN(nvol-1,v+cutoffhp);
+			double sumX = 0.0;
+			double sumX2 = 0.0;
+			double sumWt = 0.0;
+			for (int k = hpStart[v]; k <= hpEnd[v]; k++) { //for each index in kernel
+				int x = k-v;
+				double wt = hp0[x]; //kernel weight
+				sumX += wt * x;
+				sumX2 += wt * x * x;
+				sumWt += wt;	
+			}
+			hpSumX[v] = sumX;
+			hpDenom[v] = (sumWt * sumX2) - sqr(sumX);  // N*Sum(x^2) - (Sum(x))^2
+			if (hpDenom[v] == 0.0) hpDenom[v] = 1.0; //should never happen, x is known index
+			hpDenom[v] = 1.0 / hpDenom[v]; //use reciprocal so we can use faster multiplication later
+			hpSumWt[v] = sumWt;	
+		} //for each volume
+	} //high-pass reusables
+	//low-pass AFTER high-pass: fslmaths freq4d -bptf 45 5  fbp
+	int * lpStart, * lpEnd;
+	double * lpSumWt, * lp, * lp0;
+	if (lp_sigma > 0) { //initialize low-pass reusables
+		//simple Gaussian blur in time domain
+		//freq4d -bptf -1 5  flp 
+		// fslmaths rest -bptf -1 5  flp
+		// 3->0.00154053 4->3.5204e-05 5->2.98023e-07, 6->identical
+		// Spielberg's code uses 8*sigma, so we will use that, even though precision seems excessive
+		int cutofflp = ceil(8*lp_sigma); //to do: check this! at least 6
+		lp = (double *)_mm_malloc((cutofflp+1+cutofflp)*sizeof(double), 64); //-cutofflp..+cutofflp
+		lp0 = lp + cutofflp; //convert from 0..(2*cutofflp) to -cutofflp..+cutofflp
+		for (int k = -cutofflp; k <= cutofflp; k++) //for each index in kernel
+			lp0[k] = exp(-sqr(k)/(2 * sqr(lp_sigma)));
+		lpStart = (int *)_mm_malloc(nvol*sizeof(int), 64); 
+		lpEnd = (int *)_mm_malloc(nvol*sizeof(int), 64); 
+		lpSumWt = (double *)_mm_malloc(nvol*sizeof(double), 64); //sum of weight, N
+		for (int v = 0; v < nvol; v++) {
+			lpStart[v] = MAX(0,v-cutofflp);
+			lpEnd[v] = MIN(nvol-1,v+cutofflp);
+			double sumWt = 0.0;
+			for (int k = lpStart[v]; k <= lpEnd[v]; k++) //for each index in kernel
+				sumWt += lp0[k-v]; //kernel weight
+			if (sumWt == 0.0) sumWt = 1.0; //will never happen
+			lpSumWt[v] = 1.0 / sumWt; //use reciprocal so we can use faster multiplication later	
+		} //for each volume
+	} //low-pass reusables
+	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=FSL;5b8cace9.0902
+	//if  TR=2s and 100 second cutoff is requested choose "-bptf 50 -1"
+	//The 'cutoff' is defined as the FWHM of the filter, so if you ask for  
+	//100s that means 50 Trs, so the sigma, or HWHM, is 25 TRs.  
+	// -bptf  <hp_sigma> <lp_sigma>	
+	
+	xyzt2txyz(nim);
+	flt * img = (flt *) nim->data;
+	#pragma omp parallel for
+	for (size_t i = 0; i < nvox3D; i++) {
+		//read input data
+		flt * imgIn = (flt *)_mm_malloc((nvol)*sizeof(flt), 64); 
+		flt * imgOut = img + (i * nvol);
+		memcpy(imgIn, imgOut, nvol*sizeof(flt));
+		if (hp_sigma > 0) {
+			double sumOut = 0.0;
+			for (int v = 0; v < nvol; v++) { //each volume
+				double sumY = 0.0;
+				double sumXY = 0.0;
+				for (int k = hpStart[v]; k <= hpEnd[v]; k++) { //for each index in kernel
+					int x = k-v;
+					double wt = hp0[x];
+					flt y = imgIn[k];
+					sumY += wt * y;
+					sumXY += wt * x * y;	
+				}
+				double n = hpSumWt[v];
+				double m = ((n*sumXY) - (hpSumX[v] * sumY) ) * hpDenom[v]; //slope
+				double b = (sumY - (m * hpSumX[v]))/n; //intercept
+				imgOut[v] = imgIn[v] - b;
+				sumOut += imgOut[v];
+			} //for each volume
+			//"fslmaths -bptf removes timeseries mean (for FSL 5.0.7 onward)" n.b. except low-pass
+			double mean = sumOut / (double)nvol; //de-mean AFTER high-pass
+			if (demean) {
+				for (int v = 0; v < nvol; v++) //each volume
+					imgOut[v] -= mean;
+			}	
+		} //hp_sigma > 0
+		if (lp_sigma > 0) { //low pass does not de-mean data
+			//if BOTH low-pass and high-pass, apply low pass AFTER high pass:
+			//  fslmaths freq4d -bptf 45 5  fbp
+			//  difference 1.86265e-08
+			//still room for improvement:
+			//  fslmaths /Users/chris/src/rest -bptf 45 5  fbp
+			//   r=1.0 identical voxels 73% max difference 0.000488281
+			if (hp_sigma > 0) 
+				memcpy(imgIn, imgOut, nvol*sizeof(flt));
+			for (int v = 0; v < nvol; v++) { //each volume
+				double sum = 0.0;
+				for (int k = lpStart[v]; k <= lpEnd[v]; k++) //for each index in kernel
+					sum += imgIn[k] * lp0[k-v];
+				imgOut[v] = sum * lpSumWt[v];
+			} // for each volume
+		}  //lp_sigma > 0
+		_mm_free (imgIn);
+	}
+	txyz2xyzt(nim);
+	if (hp_sigma > 0) { //initialize high-pass reuseables
+		_mm_free (hp);
+		_mm_free (hpStart);
+		_mm_free (hpEnd);
+		_mm_free (hpSumX);
+		_mm_free (hpDenom);
+		_mm_free (hpSumWt);
+	}
+	if (lp_sigma > 0) { //initialize high-pass reuseables
+		_mm_free (lp);
+		_mm_free (lpStart);
+		_mm_free (lpEnd);
+		_mm_free (lpSumWt);
+	}
+	return 0;
+} // nifti_bptf()
+
+#else 
+
 static int nifti_bptf(nifti_image * nim, double hp_sigma, double lp_sigma, int demean) { 
 //Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
 //5.0.7 highpass temporal filter removes the mean component https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1
@@ -1488,6 +1711,7 @@ fitting functions are:
 	return 0;
 } // nifti_bptf()
 
+#endif
 
 static int nifti_demean(nifti_image * nim) {
 	if (nim->datatype != DT_CALC) return 1;
@@ -1679,7 +1903,7 @@ enum eOp{unknown, add, sub, mul, divX, rem, mod, mas, thr, thrp, thrP, uthr, uth
 	max, min, 
 	power,
 	seed, inm, ing, smth,
-	exp1,log1,sin1,cos1,tan1,asin1,acos1,atan1,sqr1,sqrt1,recip1,abs1,bin1,binv1,edge1, index1,
+	exp1, floor1, round1, trunc1, ceil1, log1,sin1,cos1,tan1,asin1,acos1,atan1,sqr1,sqrt1,recip1,abs1,bin1,binv1,edge1, index1,
 	nan1, nanm1, rand1, randn1,range1, rank1, ranknorm1,
 	pval1, pval01, cpval1,
 	ztop1, ptoz1,
@@ -2883,7 +3107,7 @@ static void nifti_compare(nifti_image * nim, char * fin) {
 	vx[2] = (differentVox / (nim->nx*nim->ny)) % nim->nz;
 	vx[1] = (differentVox / nim->nx) % nim->ny;
 	vx[0] = differentVox % nim->nx;	
-	fprintf(stderr,"  Most different voxel locatoin %zux%zux%zu volume %zu\n", vx[0],vx[1],vx[2], vx[3]);
+	fprintf(stderr,"  Most different voxel location %zux%zux%zu volume %zu\n", vx[0],vx[1],vx[2], vx[3]);
 	fprintf(stderr,"Image 1 Descriptives\n");
 	fprintf(stderr," Range: %g..%g Mean %g StDev %g\n", mn, mx, ave, sd);
 	fprintf(stderr,"Image 2 Descriptives\n");
@@ -3434,8 +3658,26 @@ static int nifti_unary ( nifti_image * nim, enum eOp op) {
 		for (size_t i = 0; i < nim->nvox; i++ )
 			f32[i] = exp(f32[i]);
 	} else if (op == log1) {
+		for (size_t i = 0; i < nim->nvox; i++ ) {
+			if (f32[i] <= 0.0)
+				f32[i] = 0.0;
+			else
+				f32[i] = log(f32[i]);
+		}
+		//for (size_t i = 0; i < nim->nvox; i++ )
+		//	f32[i] = log(f32[i]);
+	} else if (op == floor1) {
 		for (size_t i = 0; i < nim->nvox; i++ )
-			f32[i] = log(f32[i]);
+			f32[i] = floor(f32[i]);
+	} else if (op == round1) {
+		for (size_t i = 0; i < nim->nvox; i++ )
+			f32[i] = round(f32[i]);
+	} else if (op == ceil1) {
+		for (size_t i = 0; i < nim->nvox; i++ )
+			f32[i] = ceil(f32[i]);
+	} else if (op == trunc1) {
+		for (size_t i = 0; i < nim->nvox; i++ )
+			f32[i] = trunc(f32[i]);
 	} else if (op == sin1) {
 		for (size_t i = 0; i < nim->nvox; i++ )
 			f32[i] = sin(f32[i]);
@@ -3944,6 +4186,10 @@ int main64(int argc, char * argv[]) {
 		if ( ! strcmp(argv[ac], "-ing") ) op = ing;
 		if ( ! strcmp(argv[ac], "-s") ) op = smth;
 		if ( ! strcmp(argv[ac], "-exp") ) op = exp1;
+		if ( ! strcmp(argv[ac], "-ceil") ) op = ceil1;
+		if ( ! strcmp(argv[ac], "-round") ) op = ceil1;
+		if ( ! strcmp(argv[ac], "-floor") ) op = floor1;
+		if ( ! strcmp(argv[ac], "-trunc") ) op = trunc1;
 		if ( ! strcmp(argv[ac], "-log") ) op = log1;
 		if ( ! strcmp(argv[ac], "-sin") ) op = sin1;
 		if ( ! strcmp(argv[ac], "-cos") ) op = cos1;
@@ -3988,10 +4234,10 @@ int main64(int argc, char * argv[]) {
 			if (nProcessors < 1) { 
 				omp_set_num_threads(maxNumThreads);
 				fprintf(stderr,"Using %d threads\n", maxNumThreads);
-			} else
+			} else {
 				omp_set_num_threads(nProcessors);
-			
-				
+				//printf("Using %d threads\n", nProcessors);
+			}
 			#else
 			fprintf(stderr,"Warning: not compiled for OpenMP: '-p' ignored\n");
 			#endif		

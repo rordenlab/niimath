@@ -16,6 +16,8 @@
 #define M_PI 3.14159265358979323846264338327
 #endif
 
+
+	
 int nifti_save(nifti_image * nim, const char *postfix) {
 	char   extnii[5] = ".nii";   /* modifiable, for possible uppercase */
 	char   exthdr[5] = ".hdr";
@@ -46,6 +48,15 @@ int nifti_save(nifti_image * nim, const char *postfix) {
 	char   pairKey[5] = "PAIR";
 	char *value;
 	value = getenv(key);
+	//set dime[0]
+	int maxDim = 1;
+	for (int i = 2; i < 8; i ++)
+		if (nim->dim[i] > 1)
+			maxDim = i;
+	nim->dim[0] = maxDim;
+	nim->ndim = maxDim;
+	//nim->dim[0] = 3;
+	//nim->dim[4] = 1;
 	int isGz = 0;
 	int isNifti2 = 0;
 	if ((value == NULL) || strstr(value,nii2Key)  ) isNifti2 = 1; //NIFTI2_GZ, NIFTI2_PAIR_GZ, NIFTI_GZ, NIFTI_PAIR_GZ

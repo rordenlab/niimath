@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20191219"
+#define kMTHdate "v1.0.20201102"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -62,24 +62,28 @@ int show_help( void ) {
 	printf(" ""input"" will set the datatype to that of the original image\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
+	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
+	printf(" -bptfm  <hp> <lp>        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
+	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
+	printf(" -detrend                 : remove linear trend (and mean) from input\n");
+	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
+	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
+	printf(" -floor                    : round voxels downwards to the nearest integer\n");
+	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	#if defined(_OPENMP)
-	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ').\n");
+	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
 	#else
 	printf(" -p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif
-	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
-	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
+	printf(" -round                   : round voxels to the nearest integer\n");
 	printf(" -sobel                   : fast edge detection\n");
-	printf(" -detrend                 : remove linear trend (and mean) from input\n");
-	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
-	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input.\n");
-	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
-	printf(" -tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order.\n");
-	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order.\n");
+	printf(" -tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order\n");
+	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
-	printf(" -bptfm  <hp> <lp>        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
-	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
+	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
+	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf("\n");
 	printf("Binary operations:\n");
@@ -182,13 +186,13 @@ int show_help( void ) {
 	printf(" -ranknorm: Transform to Normal dist via ranks\n");
 	printf("\n");
 	printf("Multi-argument operations:\n");
-	printf(" -roi <xmin> <xsize> <ymin> <ysize> <zmin> <zsize> <tmin> <tsize> : zero outside roi (using voxel coordinates). Inputting -1 for a size will set it to the full image extent for that dimension.\n");
+	printf(" -roi <xmin> <xsize> <ymin> <ysize> <zmin> <zsize> <tmin> <tsize> : zero outside roi (using voxel coordinates). Inputting -1 for a size will set it to the full image extent for that dimension\n");
 	printf(" -bptf  <hp_sigma> <lp_sigma> : (-t in ip.c) Bandpass temporal filtering; nonlinear highpass and Gaussian linear lowpass (with sigmas in volumes, not seconds); set either sigma<0 to skip that filter\n");
-	printf(" -roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth> : take (normally binary) truth and test current image in ROC analysis against truth. <AROC-thresh> is usually 0.05 and is limit of Area-under-ROC measure FP axis. <outfile> is a text file of the ROC curve (triplets of values: FP TP threshold). If the truth image contains negative voxels these get excluded from all calculations. If <AROC-thresh> is positive then the [4Dnoiseonly] option needs to be set, and the FP rate is determined from this noise-only data, and is set to be the fraction of timepoints where any FP (anywhere) is seen, as found in the noise-only 4d-dataset. This is then controlling the FWE rate. If <AROC-thresh> is negative the FP rate is calculated from the zero-value parts of the <truth> image, this time averaging voxelwise FP rate over all timepoints. In both cases the TP rate is the average fraction of truth=positive voxels correctly found.\n");
+	printf(" -roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth> : take (normally binary) truth and test current image in ROC analysis against truth. <AROC-thresh> is usually 0.05 and is limit of Area-under-ROC measure FP axis. <outfile> is a text file of the ROC curve (triplets of values: FP TP threshold). If the truth image contains negative voxels these get excluded from all calculations. If <AROC-thresh> is positive then the [4Dnoiseonly] option needs to be set, and the FP rate is determined from this noise-only data, and is set to be the fraction of timepoints where any FP (anywhere) is seen, as found in the noise-only 4d-dataset. This is then controlling the FWE rate. If <AROC-thresh> is negative the FP rate is calculated from the zero-value parts of the <truth> image, this time averaging voxelwise FP rate over all timepoints. In both cases the TP rate is the average fraction of truth=positive voxels correctly found\n");
 	printf("\n");
 	printf("Combining 4D and 3D images:\n");
 	printf(" If you apply a Binary operation (one that takes the current image and a new image together), when one is 3D and the other is 4D,\n");
-	printf(" the 3D image is cloned temporally to match the temporal dimensions of the 4D image.\n");
+	printf(" the 3D image is cloned temporally to match the temporal dimensions of the 4D image\n");
 	printf("\n");
 	printf("e.g. niimath inputVolume -add inputVolume2 output_volume\n");
 	printf("     niimath inputVolume -add 2.5 output_volume\n");
