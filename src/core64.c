@@ -62,7 +62,7 @@ static int show_helpx( void ) {
 
 static flt vx(flt * f, int p, int q) {
 	flt ret = ((f[q] + q*q) - (f[p] + p*p)) / (2.0*q - 2.0*p);
-	if isnan(ret) ret = INFINITY;
+	if (isnan(ret)) ret = INFINITY;
 	return ret;
 }
 
