@@ -11,6 +11,30 @@
  #define epsilon DBL_EPSILON
 #endif
 
+#define SIMD
+
+#ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
+	#ifdef __x86_64__    
+		#include <immintrin.h>
+		#ifdef DT32
+			#define kSSE32 4 //128-bit SSE handles 4 32-bit floats per instruction
+		#else
+			#define kSSE64 2 //128-bit SSE handles 2 64-bit floats per instruction
+		#endif
+		//#define myUseAVX
+		//#define kAVX32 8 //256-bit AVX handles 8 32-bit floats per instruction
+		//#define kAVX64 4 //256-bit AVX handles 4 64-bit floats per instruction
+	#else  
+		#ifdef DT32
+			#include "sse2neon.h"
+			#define kSSE32 4 //128-bit SSE handles 4 32-bit floats per instruction
+		#else
+			#undef SIMD
+		#endif
+		//#undef myUseAVX
+	#endif 
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <nifti2_io.h>
@@ -47,6 +71,185 @@
 //#ifdef TFCE //we now use in-built tfce function
 //	#include "tfce_pthread.h"
 //#endif
+
+#ifdef SIMD
+#ifdef DT32
+static void nifti_sqrt(flt *v, size_t n) {
+	flt * vin = v;
+	//#pragma omp parallel for
+	for (size_t i = 0; i <= (n-kSSE32); i+=kSSE32) {
+		__m128 v4 = _mm_loadu_ps(vin);
+		__m128 ma = _mm_sqrt_ps(v4);
+		_mm_storeu_ps(vin, ma); 
+		vin += kSSE32;
+	}
+	int tail = (n % kSSE32);
+	while (tail > 0) {
+		v[n-tail] = sqrt(v[n-tail]);
+		tail --;	
+	}
+} // nifti_sqrt()
+
+static void nifti_mul(flt *v, size_t n, flt slope1) {
+	flt * vin = v;
+	__m128 slope = _mm_set1_ps(slope1);
+	//#pragma omp parallel for
+	for (size_t i = 0; i <= (n-kSSE32); i+=kSSE32) {
+		__m128 v4 = _mm_loadu_ps(vin);
+		__m128 m = _mm_mul_ps(v4, slope);
+		_mm_storeu_ps(vin, m); 
+		vin += kSSE32;
+	}
+	int tail = (n % kSSE32);
+	while (tail > 0) {
+		v[n-tail] *= slope1;
+		tail --;
+	}
+} //nifti_mul()
+
+static void nifti_add(flt *v, int64_t n, flt intercept1) {
+//add, out = in + intercept
+	if (intercept1 == 0.0f) return;
+	flt * vin = v;
+	__m128 intercept = _mm_set1_ps(intercept1);
+	//#pragma omp parallel for
+	for (int64_t i = 0; i <= (n-kSSE32); i+=kSSE32) {
+		__m128 v4 = _mm_loadu_ps(vin);
+		__m128 ma = _mm_add_ps(v4, intercept);
+		_mm_storeu_ps(vin, ma); 
+		vin += kSSE32;
+	}
+	int tail = (n % kSSE32);
+	while (tail > 0) {
+		v[n-tail] = v[n-tail] + intercept1;
+		tail --;	
+	}
+} //nifti_add()
+
+static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
+//multiply+add, out = in * slope + intercept
+	if ((slope1 == 1.0f) && (intercept1 == 0.0f)) return;
+	flt * vin = v;
+	__m128 intercept = _mm_set1_ps(intercept1);
+	__m128 slope = _mm_set1_ps(slope1);
+	//#pragma omp parallel for
+	for (int64_t i = 0; i <= (n-kSSE32); i+=kSSE32) {
+		__m128 v4 = _mm_loadu_ps(vin);
+		__m128 m = _mm_mul_ps(v4, slope);
+		__m128 ma = _mm_add_ps(m, intercept);
+		_mm_storeu_ps(vin, ma); 
+		vin += kSSE32;
+	}
+	int tail = (n % kSSE32);
+	while (tail > 0) {
+		v[n-tail] = (v[n-tail] * slope1) + intercept1;
+		tail --;	
+	}
+} //nifti_fma()
+#else //if SIMD32 else SIMD64
+
+static void nifti_sqrt(flt *v, size_t n) {
+	flt * vin = v;
+	//#pragma omp parallel for
+	for (size_t i = 0; i <= (n-kSSE64); i+=kSSE64) {
+		__m128d v2 = _mm_loadu_pd(vin);
+		__m128d ma = _mm_sqrt_pd(v2);
+		_mm_storeu_pd(vin, ma); 
+		vin += kSSE64;
+	}
+	int tail = (n % kSSE64);
+	while (tail > 0) {
+		v[n-tail] = sqrt(v[n-tail]);
+		tail --;	
+	}
+} // nifti_sqrt()
+
+static void nifti_mul(flt *v, size_t n, flt slope1) {
+	flt * vin = v;
+	__m128d slope = _mm_set1_pd(slope1);
+	//#pragma omp parallel for
+	for (size_t i = 0; i <= (n-kSSE64); i+=kSSE64) {
+		__m128d v2 = _mm_loadu_pd(vin);
+		__m128d m = _mm_mul_pd(v2, slope);
+		_mm_storeu_pd(vin, m); 
+		vin += kSSE64;
+	}
+	int tail = (n % kSSE64);
+	while (tail > 0) {
+		v[n-tail] *= slope1;
+		tail --;
+	}
+} //nifti_mul()
+
+static void nifti_add(flt *v, int64_t n, flt intercept1) {
+//add, out = in + intercept
+	if (intercept1 == 0.0f) return;
+	flt * vin = v;
+	__m128d intercept = _mm_set1_pd(intercept1);
+	//#pragma omp parallel for
+	for (int64_t i = 0; i <= (n-kSSE64); i+=kSSE64) {
+		__m128d v2 = _mm_loadu_pd(vin);
+		__m128d ma = _mm_add_pd(v2, intercept);
+		_mm_storeu_pd(vin, ma); 
+		vin += kSSE64;
+	}
+	int tail = (n % kSSE64);
+	while (tail > 0) {
+		v[n-tail] = v[n-tail] + intercept1;
+		tail --;	
+	}
+} //nifti_add()
+
+
+static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
+//multiply+add, out = in * slope + intercept
+	if ((slope1 == 1.0f) && (intercept1 == 0.0f)) return;
+	flt * vin = v;
+	__m128d intercept = _mm_set1_pd(intercept1);
+	__m128d slope = _mm_set1_pd(slope1);
+	//#pragma omp parallel for
+	for (int64_t i = 0; i <= (n-kSSE64); i+=kSSE64) {
+		__m128d v2 = _mm_loadu_pd(vin);
+		__m128d m = _mm_mul_pd(v2, slope);
+		__m128d ma = _mm_add_pd(m, intercept);
+		_mm_storeu_pd(vin, ma); 
+		vin += kSSE64;
+	}
+	int tail = (n % kSSE64);
+	while (tail > 0) {
+		v[n-tail] = (v[n-tail] * slope1) + intercept1;
+		tail --;	
+	}
+} //nifti_fma()
+
+#endif //end SIMD64
+
+#else //if SIMD vectorized, else scalar
+
+static void nifti_sqrt(flt *v, size_t n) {
+	//#pragma omp parallel for
+	for (size_t i = 0; i < n; i++ )
+		v[i] = sqrt(v[i]);
+} //nifti_sqrt()
+
+static void nifti_mul(flt *v, size_t n, flt slope1) {
+	//#pragma omp parallel for
+	for (size_t i = 0; i < n; i++ )
+		v[i] *= slope1;
+} //nifti_mul()
+
+static void nifti_add(flt *v, size_t n, flt intercept1) {
+	//#pragma omp parallel for
+	for (size_t i = 0; i < n; i++ )
+		v[i] += intercept1;
+} //nifti_add()
+
+static void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
+	//#pragma omp parallel for
+	for (size_t i = 0; i < n; i++ )
+		v[i] = (v[i] * slope1) + intercept1;
+} //nifti_fma
+#endif //if vector SIMD else scalar
 
 static int show_helpx( void ) {
 	printf("Fatal: show_help shown by wrapper function\n");
@@ -632,8 +835,17 @@ static int nifti_rescale ( nifti_image * nim, double scale , double intercept) {
 		flt scl = scale;
 		flt inter = intercept;
 		flt * f32 = (flt *) nim->data;
-		for (size_t i = 0; i < nim->nvox; i++ )
-			f32[i] = (f32[i] * scl) + inter;
+		if (intercept == 0.0) {
+			if (scale == 1.0) return 0; //nothing to do
+			nifti_mul(f32, nim->nvox, scl);
+			return 0;
+		} else if (scale == 1.0) {
+			nifti_mul(f32, nim->nvox, intercept);
+			return 0;
+		}
+		nifti_fma(f32, nim->nvox, scl, inter);
+		//for (size_t i = 0; i < nim->nvox; i++ )
+		//	f32[i] = (f32[i] * scl) + inter;
 		return 0;
 	}
 	fprintf(stderr,"nifti_rescale: Unsupported datatype %d\n", nim->datatype); 
@@ -3664,15 +3876,13 @@ static int nifti_unary ( nifti_image * nim, enum eOp op) {
 			else
 				f32[i] = log(f32[i]);
 		}
-		//for (size_t i = 0; i < nim->nvox; i++ )
-		//	f32[i] = log(f32[i]);
 	} else if (op == floor1) {
-		for (size_t i = 0; i < nim->nvox; i++ )
+		for (size_t i = 0; i < nim->nvox; i++ ) 
 			f32[i] = floor(f32[i]);
 	} else if (op == round1) {
 		for (size_t i = 0; i < nim->nvox; i++ )
 			f32[i] = round(f32[i]);
-	} else if (op == ceil1) {
+	} else if (op == ceil1) { 
 		for (size_t i = 0; i < nim->nvox; i++ )
 			f32[i] = ceil(f32[i]);
 	} else if (op == trunc1) {
@@ -3700,9 +3910,8 @@ static int nifti_unary ( nifti_image * nim, enum eOp op) {
 		for (size_t i = 0; i < nim->nvox; i++ )
 			f32[i] = f32[i]*f32[i]; //<- pow(a,x) uses flt for x 
 	} else if (op == sqrt1) {
-		for (size_t i = 0; i < nim->nvox; i++ )
-			f32[i] = sqrt(f32[i]);
-	} else if (op == recip1) {
+		nifti_sqrt(f32, nim->nvox);
+	} else if (op == recip1) { //https://stackoverflow.com/questions/10606483/sse-reciprocal-if-not-zero
 		for (size_t i = 0; i < nim->nvox; i++ ) {
 			if (f32[i] == 0.0f) continue;
 				f32[i] = 1.0 / f32[i];
@@ -4236,7 +4445,7 @@ int main64(int argc, char * argv[]) {
 				fprintf(stderr,"Using %d threads\n", maxNumThreads);
 			} else {
 				omp_set_num_threads(nProcessors);
-				//printf("Using %d threads\n", nProcessors);
+				printf("Using %d threads\n", nProcessors);
 			}
 			#else
 			fprintf(stderr,"Warning: not compiled for OpenMP: '-p' ignored\n");
