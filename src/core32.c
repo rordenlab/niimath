@@ -589,7 +589,6 @@ static int nifti_smooth_gauss(nifti_image * nim, flt SigmammX, flt SigmammY, flt
 	for (int i = 2; i < 8; i++ )
 		nRow *= MAX(nim->dim[i],1);
 	#if defined(_OPENMP)
-	//printf(">>>%d\n", omp_get_num_threads());
 	if (omp_get_max_threads() > 1)
 		blurP(img, nim->nx, nRow, nim->dx, SigmammX);
 	else
@@ -636,10 +635,9 @@ static int nifti_smooth_gauss(nifti_image * nim, flt SigmammX, flt SigmammY, flt
 	//BLUR Z:
 	if ((SigmammZ <= 0.0) || (nim->nz < 2)) return 0; //all done!
 	nRow = nim->nx * nim->ny; //transpose XYZ to ZXY and blur Z columns with XY Rows
-	//#pragma omp parallel
-	//#pragma omp for
 	#pragma omp parallel for
 	for (int v = 0; v < nVol; v++ ) { //transpose each volume separately
+	    //printf("volume %d uses thread %d\n", v, omp_get_thread_num()); 
 		flt * img3D = (flt *)_mm_malloc(nvox3D*sizeof(flt), 64); //alloc for each volume to allow openmp
 		size_t vo = v * nvox3D; //volume offset
 		for (int z = 0; z < nz; z++ ) {

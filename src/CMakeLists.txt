@@ -18,11 +18,16 @@ if(NOT CMAKE_BUILD_TYPE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS  "Debug;Release;RelWithDebInfo;MinSizeRel")
 endif()
 
-
+#e.g.  cmake -DOPENMP_XCODE=ON ..
+option(OPENMP_XCODE "Build the static library" OFF)
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
     # using AppleClang
     add_definitions(-fno-caret-diagnostics)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
+    if (OPENMP_XCODE)
+        set(CMAKE_C_FLAGS "-I/usr/local/include -Xclang -fopenmp ${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/usr/local/lib -lomp")
+    endif()
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     # using GCC
     set(CMAKE_C_STANDARD 11)
