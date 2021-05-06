@@ -1237,7 +1237,7 @@ static int nifti_robust_range(nifti_image * nim, flt * pct2, flt * pct98, int ig
 		}
 		if ( f32[i] == 0.0 ) {
 			nZero++;
-			continue;
+			if (ignoreZeroVoxels) continue;
 		}
 		mn = fmin(f32[i],mn);
 		mx = fmax(f32[i],mx);
