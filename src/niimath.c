@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20201102"
+#define kMTHdate "v1.0.20210909"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
