@@ -3118,7 +3118,7 @@ static int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 							iv32[vx] = 1.0;
 						else if ((imgdir[vx] == 2)  && (val > mxY) && ((mxX > 0.0) || (mxZ > 0.0)) ) //anterior/posterior gradient
 							iv32[vx] = 1.0;
-						else if ((val > mxY)  && ((mxX > 0.0) || (mxY > 0.0)))//head/foot gradient
+						else if ((val > mxZ)  && ((mxX > 0.0) || (mxY > 0.0)))//head/foot gradient
 							iv32[vx] = 1.0;
 					}
 			nim->scl_inter = 0.0;
