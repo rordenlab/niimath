@@ -79,6 +79,7 @@ int show_help( void ) {
 	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
 	printf(" -round                   : round voxels to the nearest integer\n");
 	printf(" -sobel                   : fast edge detection\n");
+	printf(" -sobel_binary              : sobel creating binary edge\n");
 	printf(" -tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order\n");
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
@@ -100,6 +101,8 @@ int show_help( void ) {
 	printf(" -uthr  : use following number to upper-threshold current image (zero anything above the number)\n");
 	printf(" -uthrp : use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)\n");
 	printf(" -uthrP : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold above\n");
+	printf(" -clamp : use following percentage (0-100) of ROBUST RANGE to threshold current image (anything below set to this threshold)\n");
+	printf(" -uclamp: use following percentage (0-100) of ROBUST RANGE to threshold current image (anything above set to this threshold)\n");
 	printf(" -max   : take maximum of following input and current image\n");
 	printf(" -min   : take minimum of following input and current image\n");
 	printf(" -seed  : seed random number generator with following number\n");
@@ -108,6 +111,7 @@ int show_help( void ) {
 	printf(" -inm <mean> :  (-i i ip.c) intensity normalisation (per 3D volume mean)\n");
 	printf(" -ing <mean> :  (-I i ip.c) intensity normalisation, global 4D mean)\n");
 	printf(" -s <sigma> : create a gauss kernel of sigma mm and perform mean filtering\n");
+	printf(" -sv <sigma> : create a gauss kernel of sigma voxels and perform mean filtering\n");
 	printf("\n");
 	printf("Basic unary operations:\n");
 	printf(" -hdr   : report header and terminate ('niimath img.nii -hdr')\n");
@@ -222,7 +226,7 @@ int main(int argc, char * argv[]) {
 	if( ! strcmp(argv[ac], "-dt") ) {
 		if (! strcmp(argv[ac+1], "double") ) {
 			dtCalc = DT_FLOAT64;
-			//fprintf(stderr,"'-dt' error: Double caclulations not yet supported\n");
+			//fprintf(stderr,"'-dt' error: Double calculations not yet supported\n");
 			//return 1;
 		} else if (strcmp(argv[ac+1], "float") ) {
 			fprintf(stderr,"'-dt' error: only 'float' or 'double' calculations supported\n");

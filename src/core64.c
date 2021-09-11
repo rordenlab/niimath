@@ -577,9 +577,6 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
 	if (nim->datatype != DT_CALC)
 		return 1;
 	flt *img = (flt *)nim->data;
-	//int nVol = 1;
-	//for (int i = 4; i < 8; i++ )
-	//	nVol *= MAX(nim->dim[i],1);
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	if ((nvox3D * nVol) != nim->nvox)
@@ -674,6 +671,13 @@ DO_Z_BLUR:
 		_mm_free(img3D);
 	} //for each volume
 	return 0;
+}
+
+static int nifti_smooth_gauss_vox(nifti_image *nim, flt SigmaVox) {
+	flt SigmammX = SigmaVox * nim->dx;
+	flt SigmammY = SigmaVox * nim->dy;
+	flt SigmammZ = SigmaVox * nim->dz;
+	return nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ);
 }
 
 static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
@@ -1156,21 +1160,21 @@ fmod(-1.8, 2) = -1.8 : -1
 	return 0;
 }
 
-static int nifti_thr(nifti_image *nim, double v, int zeroBrightVoxels) {
+static int nifti_thr(nifti_image *nim, double v, int modifyBrightVoxels, float newIntensity) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype == DT_CALC) {
 		flt fv = v;
 		flt *f32 = (flt *)nim->data;
-		if (zeroBrightVoxels) {
+		if (modifyBrightVoxels) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				if (f32[i] > fv)
-					f32[i] = 0.0f;
+					f32[i] = newIntensity;
 
 		} else {
 			for (size_t i = 0; i < nim->nvox; i++)
 				if (f32[i] < fv)
-					f32[i] = 0.0f;
+					f32[i] = newIntensity;
 		}
 		return 0;
 	}
@@ -2206,6 +2210,8 @@ enum eOp { unknown,
 	uthr,
 	uthrp,
 	uthrP,
+	clamp,
+	uclamp,
 	max,
 	min,
 	power,
@@ -2213,6 +2219,7 @@ enum eOp { unknown,
 	inm,
 	ing,
 	smth,
+	smthvx,
 	exp1,
 	floor1,
 	round1,
@@ -2459,7 +2466,7 @@ static int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	}
 	flt *in32 = (flt *)nim->data;
 //detect if data is upper or lower triangle
-// The "YY" component should be brighter (stronlgy positive) than the off axis XZ
+// The "YY" component should be brighter (strongly positive) than the off axis XZ
 #define detectUpperOrLower
 #ifdef detectUpperOrLower
 	double sumV3 = 0.0;				//3rd volume, YY for lower, XZ for upper
@@ -2967,7 +2974,7 @@ static int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize,
 	return 0;
 }
 
-static int nifti_sobel(nifti_image *nim, int offc) {
+static int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 	//sobel is simply one kernel pass per dimension.
 	// this could be achieved with successive passes of "-kernel"
 	// here it is done in a single pass for cache efficiency
@@ -3009,6 +3016,12 @@ static int nifti_sobel(nifti_image *nim, int offc) {
 	for (int v = 0; v < nvol; v++) {
 		flt *iv32 = i32 + (v * vox3D);
 		flt *imgin = _mm_malloc(vox3D * sizeof(flt), 64); //input values prior to blur
+		//edge information:
+		flt mx = 0.0;
+		uint8_t *imgdir = _mm_malloc(vox3D * sizeof(uint8_t), 64); //image direction
+		if (isBinary)
+			memset(imgdir, 0, vox3D * sizeof(uint8_t));
+		
 		memcpy(imgin, iv32, vox3D * sizeof(flt));
 		int i = 0;
 		for (int z = 0; z < nim->nz; z++)
@@ -3059,11 +3072,65 @@ static int nifti_sobel(nifti_image *nim, int offc) {
 							continue; //wrapped anterior-posterior
 						gz += imgin[vx] * kz[k + numk + numk + numk];
 					} //for k
-					iv32[i] = sqrt(sqr(gx) + sqr(gy) + sqr(gz));
+					gx = sqr(gx);
+					gy = sqr(gy);
+					gz = sqr(gz);
+					iv32[i] = sqrt(gx + gy + gz);
+					if (isBinary) {
+						mx = MAX(mx, iv32[i]);
+						if ((gx > gy) && (gx > gz))
+							imgdir[i] = 1; //left/right gradient is strongest
+						else if (gy > gz)
+							imgdir[i] = 2; //anterior/posterior gradient is strongest
+						else
+							imgdir[i] = 3; //superior/inferior gradient is strongest (or tie)
+					}
 					i++;
 				} //for x
+		if (isBinary) {
+			//magnitude in range 0..1, zero voxels below threshold
+			float scale = 1.0;
+			if (mx > 0.0) 
+				scale = 1.0 / mx;
+			float thresh = 0.1;
+			for (int vx = 0; vx < vox3D; vx++) {
+				imgin[vx] = iv32[vx] * scale;
+				if (imgin[vx] < thresh) {
+					imgin[vx] = 0.0;
+					continue;
+				}
+			}
+			//zero output: we will not set border voxels
+			memset(iv32, 0, vox3D * sizeof(flt));
+			//
+			int nx = nim->nx;
+			int nxy = nx * nim->ny;
+			for (int z = 1; z < (nim->nz -1); z++)
+				for (int y = 1; y < (nim->ny - 1); y++)
+					for (size_t x = 1; x < (nim->nx - 1); x++) {
+						int vx = x + (y * nx) + (z * nxy);
+						float val = imgin[vx];
+						if (val == 0.0) continue;
+						float mxX = MAX(imgin[vx-1],imgin[vx+1]);
+						float mxY = MAX(imgin[vx-nx],imgin[vx+nx]);
+						float mxZ = MAX(imgin[vx-nxy],imgin[vx+nxy]);
+						if ((imgdir[vx] == 1) && (val > mxX) && ((mxY > 0.0) || (mxZ > 0.0)) ) //left/right gradient
+							iv32[vx] = 1.0;
+						else if ((imgdir[vx] == 2)  && (val > mxY) && ((mxX > 0.0) || (mxZ > 0.0)) ) //anterior/posterior gradient
+							iv32[vx] = 1.0;
+						else if ((val > mxY)  && ((mxX > 0.0) || (mxY > 0.0)))//head/foot gradient
+							iv32[vx] = 1.0;
+					}
+			nim->scl_inter = 0.0;
+			nim->scl_slope = 1.0;
+			nim->cal_min = 0.0;
+			nim->cal_max = 1.0;
+		} //if isBinary
+		_mm_free(imgdir);
+
+
 		_mm_free(imgin);
-	}
+	} //for each volume
 	_mm_free(kx);
 	_mm_free(ky);
 	_mm_free(kz);
@@ -4464,7 +4531,7 @@ static int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
 	// -thrP: use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold below
 	// -uthrp : use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)
 	// -uthrP : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold above
-	if ((v <= 0.0) || (v >= 100.0)) {
+	if ((v < 0.0) || (v > 100.0)) {
 		fprintf(stderr, "nifti_thrp: threshold should be between 0..100\n");
 		return 1;
 	}
@@ -4475,12 +4542,16 @@ static int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
 	if (nifti_robust_range(nim, &pct2, &pct98, ignoreZeroVoxels) != 0)
 		return 1;
 	flt thresh = pct2 + ((v / 100.0) * (pct98 - pct2));
-	int zeroBrightVoxels = 0;
-	if ((op == uthrp) || (op == uthrP))
-		zeroBrightVoxels = 1;
-	nifti_thr(nim, thresh, zeroBrightVoxels);
+	int modifyBrightVoxels = 0;
+	flt newIntensity = 0.0;
+	if ((op == clamp) || (op == uclamp))
+		newIntensity = thresh;
+	if ((op == uthrp) || (op == uthrP) || (op == uclamp))
+		modifyBrightVoxels = 1;
+	nifti_thr(nim, thresh, modifyBrightVoxels, newIntensity);
 	return 0;
 } //nifti_thrp()
+
 
 #ifdef DT32
 int main32(int argc, char *argv[]) {
@@ -4615,6 +4686,10 @@ int main64(int argc, char *argv[]) {
 			op = uthrp;
 		if (!strcmp(argv[ac], "-uthrP"))
 			op = uthrP;
+		if (!strcmp(argv[ac], "-clamp"))
+			op = clamp;
+		if (!strcmp(argv[ac], "-uclamp"))
+			op = uclamp;
 		if (!strcmp(argv[ac], "-max"))
 			op = max;
 		if (!strcmp(argv[ac], "-min"))
@@ -4635,6 +4710,8 @@ int main64(int argc, char *argv[]) {
 			op = ing;
 		if (!strcmp(argv[ac], "-s"))
 			op = smth;
+		if (!strcmp(argv[ac], "-sv"))
+			op = smthvx;
 		if (!strcmp(argv[ac], "-exp"))
 			op = exp1;
 		if (!strcmp(argv[ac], "-ceil"))
@@ -4858,8 +4935,10 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_subsamp2(nim, 0);
 		else if (!strcmp(argv[ac], "-subsamp2offc"))
 			ok = nifti_subsamp2(nim, 1);
+		else if (!strcmp(argv[ac], "-sobel_binary"))
+			ok = nifti_sobel(nim, 1, 1);
 		else if (!strcmp(argv[ac], "-sobel"))
-			ok = nifti_sobel(nim, 1);
+			ok = nifti_sobel(nim, 1, 0);
 		else if (!strcmp(argv[ac], "-demean"))
 			ok = nifti_demean(nim);
 		else if (!strcmp(argv[ac], "-detrend"))
@@ -5016,7 +5095,7 @@ int main64(int argc, char *argv[]) {
 			double v = strtod(argv[ac], &end);
 			//if (end == argv[ac]) {
 			if (strlen(argv[ac]) != (end - argv[ac])) { // "4d" will return numeric "4"
-				if ((op == power) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed)) {
+				if ((op == power) || (op == clamp) || (op == uclamp) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed)) {
 					fprintf(stderr, "Error: '%s' expects numeric value\n", argv[ac - 1]);
 					goto fail;
 				} else
@@ -5041,11 +5120,11 @@ int main64(int argc, char *argv[]) {
 				if (op == power)
 					ok = nifti_binary_power(nim, v);
 				if (op == thr)
-					ok = nifti_thr(nim, v, 0);
-				if ((op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP))
+					ok = nifti_thr(nim, v, 0, 0.0);
+				if ((op == clamp) || (op == uclamp) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP))
 					ok = nifti_thrp(nim, v, op);
 				if (op == uthr)
-					ok = nifti_thr(nim, v, 1);
+					ok = nifti_thr(nim, v, 1, 0.0);
 				if (op == max)
 					ok = nifti_max(nim, v, 0);
 				if (op == min)
@@ -5056,6 +5135,8 @@ int main64(int argc, char *argv[]) {
 					ok = nifti_ing(nim, v);
 				if (op == smth)
 					ok = nifti_smooth_gauss(nim, v, v, v);
+				if (op == smthvx)
+					ok = nifti_smooth_gauss_vox(nim, v);
 				if (op == seed) {
 					if ((v > 0) && (v < 1))
 						v *= RAND_MAX;
