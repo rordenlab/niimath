@@ -112,6 +112,8 @@ int show_help( void ) {
 	printf(" -ing <mean> :  (-I i ip.c) intensity normalisation, global 4D mean)\n");
 	printf(" -s <sigma> : create a gauss kernel of sigma mm and perform mean filtering\n");
 	printf(" -sv <sigma> : create a gauss kernel of sigma voxels and perform mean filtering\n");
+	printf(" -dog <sPos> <sNeg> : difference gauss kernel with positive and negative sigma mm\n");
+	printf(" -dog_edge <sPos> <sNeg> : edges based on difference gauss kernel with positive and negative sigma mm\n");
 	printf("\n");
 	printf("Basic unary operations:\n");
 	printf(" -hdr   : report header and terminate ('niimath img.nii -hdr')\n");

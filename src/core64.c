@@ -671,14 +671,98 @@ DO_Z_BLUR:
 		_mm_free(img3D);
 	} //for each volume
 	return 0;
-}
+} // nifti_smooth_gauss()
 
 static int nifti_smooth_gauss_vox(nifti_image *nim, flt SigmaVox) {
 	flt SigmammX = SigmaVox * nim->dx;
 	flt SigmammY = SigmaVox * nim->dy;
 	flt SigmammZ = SigmaVox * nim->dz;
 	return nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ);
-}
+} // nifti_smooth_gauss_vox()
+
+static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdge) {
+//Difference of Gaussians (DoG)
+//Laplacian of Gaussian
+// https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
+	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1) || (nim->datatype != DT_CALC))
+		return 1;
+	flt *inimg = (flt *)nim->data;
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	int64_t nvox4D = nvox3D * nVol;
+	flt *imgNeg = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	for (int64_t i = 0; i < nvox4D; i++)
+		imgNeg[i] = inimg[i];
+	int ret = nifti_smooth_gauss(nim, SigmammNeg, SigmammNeg, SigmammNeg);
+	if (ret != 0) {
+		return ret;
+		_mm_free(imgNeg);
+	}
+	for (int64_t i = 0; i < nvox4D; i++) {
+		flt tmp = inimg[i];
+		inimg[i] = imgNeg[i];
+		imgNeg[i] = tmp;
+	}
+	ret = nifti_smooth_gauss(nim, SigmammPos, SigmammPos, SigmammPos);
+	for (int64_t i = 0; i < nvox4D; i++)
+		inimg[i] -= imgNeg[i];
+	if (!isEdge) {
+		_mm_free(imgNeg);
+		return ret; //return continuous values
+	}
+	//we will define edges as voxels with zero crossings
+	for (int64_t i = 0; i < nvox4D; i++)
+		imgNeg[i] = 0.0;
+	int nx = nim->nx;
+	int nxy = nx * nim->ny;
+	int nxyz = nxy * nim->nz;
+	for (int v = 0; v < nVol; v++)
+		for (int z = 1; z < (nim->nz -1); z++)
+			for (int y = 1; y < (nim->ny - 1); y++)
+				for (size_t x = 1; x < (nim->nx - 1); x++) {
+						int64_t i = x + (y * nx) + (z * nxy) + (v * nxyz);
+						flt val = inimg[i];
+						if (val == 0.0) continue; //masked images will have a lot of zeros!
+						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
+						//check six neighbors that share a face
+						if (val * inimg[i-1] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i+1] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i-nx] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i+nx] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i-nxy] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i+nxy] < 0) { imgNeg[i] = 1.0; continue;}
+						//check 12 neighbors that share an edge
+						if (val * inimg[i-1-nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+1-nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-nx-nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+nx-nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-1-nx] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+1-nx] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-1+nx] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+1+nx] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-1+nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+1+nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-nx+nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i+nx+nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						//check 8 neighbors that share a corner
+						if (val * inimg[i-1-nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i+1-nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i-1+nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i+1+nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i-1-nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i+1-nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i-1+nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i+1+nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
+					}
+	for (int64_t i = 0; i < nvox4D; i++)
+		inimg[i] = imgNeg[i];
+	nim->scl_inter = 0.0;
+	nim->scl_slope = 1.0;
+	nim->cal_min = 0.0;
+	nim->cal_max = 1.0;
+	_mm_free(imgNeg);
+	return ret;
+} // nifti_dog()
 
 static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
@@ -752,7 +836,7 @@ static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image
 	}
 	//fprintf(stderr,"range %g..%g threshold %g bin %d\n", mn, mx, threshold, level);
 	return 0;
-}
+} // nifti_otsu()
 
 static int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt amount) {
 	//https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
@@ -3127,8 +3211,6 @@ static int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 			nim->cal_max = 1.0;
 		} //if isBinary
 		_mm_free(imgdir);
-
-
 		_mm_free(imgin);
 	} //for each volume
 	_mm_free(kx);
@@ -5058,6 +5140,18 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			int s = atoi(argv[ac]);
 			ok = nifti_grid(nim, v, s);
+		} else if (!strcmp(argv[ac], "-dog_edge")) {
+			ac++;
+			double pos = strtod(argv[ac], &end);
+			ac++;
+			double neg = strtod(argv[ac], &end);
+			ok = nifti_dog(nim, pos, neg, 1);
+		} else if (!strcmp(argv[ac], "-dog")) {
+			ac++;
+			double pos = strtod(argv[ac], &end);
+			ac++;
+			double neg = strtod(argv[ac], &end);
+			ok = nifti_dog(nim, pos, neg, 0);
 		} else if (!strcmp(argv[ac], "-tfce")) {
 			ac++;
 			double H = strtod(argv[ac], &end);
