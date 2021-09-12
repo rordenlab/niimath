@@ -113,7 +113,8 @@ int show_help( void ) {
 	printf(" -s <sigma> : create a gauss kernel of sigma mm and perform mean filtering\n");
 	printf(" -sv <sigma> : create a gauss kernel of sigma voxels and perform mean filtering\n");
 	printf(" -dog <sPos> <sNeg> : difference gauss kernel with positive and negative sigma mm\n");
-	printf(" -dog_edge <sPos> <sNeg> : edges based on difference gauss kernel with positive and negative sigma mm\n");
+	printf(" -dog1 <sPos> <sNeg> : single edge based on difference gauss kernel with positive and negative sigma mm\n");
+	printf(" -dog2 <sPos> <sNeg> : double edge based on difference gauss kernel with positive and negative sigma mm\n");
 	printf("\n");
 	printf("Basic unary operations:\n");
 	printf(" -hdr   : report header and terminate ('niimath img.nii -hdr')\n");

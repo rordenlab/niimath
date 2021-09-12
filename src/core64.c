@@ -722,6 +722,7 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 				for (size_t x = 1; x < (nim->nx - 1); x++) {
 						int64_t i = x + (y * nx) + (z * nxy) + (v * nxyz);
 						flt val = inimg[i];
+						if ((isEdge == 1) &&  (val <= 0.0)) continue; //one sided edge
 						if (val == 0.0) continue; //masked images will have a lot of zeros!
 						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
 						//check six neighbors that share a face
@@ -5140,12 +5141,18 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			int s = atoi(argv[ac]);
 			ok = nifti_grid(nim, v, s);
-		} else if (!strcmp(argv[ac], "-dog_edge")) {
+		} else if (!strcmp(argv[ac], "-dog1")) {
 			ac++;
 			double pos = strtod(argv[ac], &end);
 			ac++;
 			double neg = strtod(argv[ac], &end);
 			ok = nifti_dog(nim, pos, neg, 1);
+		} else if (!strcmp(argv[ac], "-dog2")) {
+			ac++;
+			double pos = strtod(argv[ac], &end);
+			ac++;
+			double neg = strtod(argv[ac], &end);
+			ok = nifti_dog(nim, pos, neg, 2);
 		} else if (!strcmp(argv[ac], "-dog")) {
 			ac++;
 			double pos = strtod(argv[ac], &end);
