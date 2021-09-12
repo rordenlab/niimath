@@ -576,6 +576,8 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
 		return 1;
 	if (nim->datatype != DT_CALC)
 		return 1;
+	if ((SigmammX == 0) && (SigmammY == 0) && (SigmammZ == 0))
+		return 0; //all done: no smoothing, e.g. small kernel for difference of Gaussian
 	flt *img = (flt *)nim->data;
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
@@ -686,6 +688,23 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 // https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1) || (nim->datatype != DT_CALC))
 		return 1;
+	//
+	flt SigmammPosX = SigmammPos;
+	flt SigmammPosY = SigmammPos;
+	flt SigmammPosZ = SigmammPos;
+	flt SigmammNegX = SigmammNeg;
+	flt SigmammNegY = SigmammNeg;
+	flt SigmammNegZ = SigmammNeg;
+	if (SigmammPos < 0) { //negative values for voxels, not mm
+		SigmammPosX = -SigmammPos  * nim->dx;
+		SigmammPosY = -SigmammPos  * nim->dy;
+		SigmammPosZ = -SigmammPos  * nim->dz;
+	}
+	if (SigmammNeg < 0) { //negative values for voxels, not mm
+		SigmammNegX = -SigmammNeg  * nim->dx;
+		SigmammNegY = -SigmammNeg  * nim->dy;
+		SigmammNegZ = -SigmammNeg  * nim->dz;
+	}
 	flt *inimg = (flt *)nim->data;
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
@@ -693,7 +712,7 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 	flt *imgNeg = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
 	for (int64_t i = 0; i < nvox4D; i++)
 		imgNeg[i] = inimg[i];
-	int ret = nifti_smooth_gauss(nim, SigmammNeg, SigmammNeg, SigmammNeg);
+	int ret = nifti_smooth_gauss(nim, SigmammNegX, SigmammNegY, SigmammNegZ);
 	if (ret != 0) {
 		return ret;
 		_mm_free(imgNeg);
@@ -703,7 +722,7 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 		inimg[i] = imgNeg[i];
 		imgNeg[i] = tmp;
 	}
-	ret = nifti_smooth_gauss(nim, SigmammPos, SigmammPos, SigmammPos);
+	ret = nifti_smooth_gauss(nim, SigmammPosX, SigmammPosY, SigmammPosZ);
 	for (int64_t i = 0; i < nvox4D; i++)
 		inimg[i] -= imgNeg[i];
 	if (!isEdge) {
