@@ -86,6 +86,9 @@ int show_help( void ) {
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
+	printf(" -dog <sPos> <sNeg> : difference gauss kernel with positive and negative sigma mm\n");
+	printf(" -dog1 <sPos> <sNeg> : single edge based on difference gauss kernel with positive and negative sigma mm\n");
+	printf(" -dog2 <sPos> <sNeg> : double edge based on difference gauss kernel with positive and negative sigma mm\n");
 	printf("\n");
 	printf("Binary operations:\n");
 	printf("  (some inputs can be either an image or a number)\n");
@@ -111,10 +114,6 @@ int show_help( void ) {
 	printf(" -inm <mean> :  (-i i ip.c) intensity normalisation (per 3D volume mean)\n");
 	printf(" -ing <mean> :  (-I i ip.c) intensity normalisation, global 4D mean)\n");
 	printf(" -s <sigma> : create a gauss kernel of sigma mm and perform mean filtering\n");
-	printf(" -sv <sigma> : create a gauss kernel of sigma voxels and perform mean filtering\n");
-	printf(" -dog <sPos> <sNeg> : difference gauss kernel with positive and negative sigma mm\n");
-	printf(" -dog1 <sPos> <sNeg> : single edge based on difference gauss kernel with positive and negative sigma mm\n");
-	printf(" -dog2 <sPos> <sNeg> : double edge based on difference gauss kernel with positive and negative sigma mm\n");
 	printf("\n");
 	printf("Basic unary operations:\n");
 	printf(" -hdr   : report header and terminate ('niimath img.nii -hdr')\n");
