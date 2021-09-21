@@ -266,12 +266,53 @@ static flt vx(flt *f, int p, int q) {
 	return ret;
 }
 
+inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz) {
+//transpose X and Y dimensions: rows <-> columns
+//Note: in future we could use SIMD to transpose values in tiles
+// https://stackoverflow.com/questions/16737298/what-is-the-fastest-way-to-transpose-a-matrix-in-c
+	int nx = *nxp;
+	int ny = *nyp;
+	size_t vi = 0; //volume offset
+	for (int z = 0; z < nz; z++) {
+		int zo = z * nx * ny;
+		for (int y = 0; y < ny; y++) {
+			int xo = 0;
+			for (int x = 0; x < nx; x++) {
+				img3Dout[zo + xo + y] = img3Din[vi += 1];
+				xo += ny;
+			}
+		}
+	}
+	*nxp = ny;
+	*nyp = nx;
+}
+
+inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, int *nzp) {
+//transpose X and Z dimensions: slices <-> columns
+	int nx = *nxp;
+	int nz = *nzp;
+	int nyz = ny * nz;
+	size_t vi = 0; //volume offset
+	for (int z = 0; z < nz; z++) {
+		for (int y = 0; y < ny; y++) {
+			int yo = y * nz;
+			int zo = 0;
+			for (int x = 0; x < nx; x++) {
+				img3Dout[z + yo + zo] = img3Din[vi += 1];
+				zo += nyz;
+			}
+		}
+	}
+	*nxp = nz;
+	*nzp = nx;
+}
+
 static void edt(flt *f, int n) {
 	int q, p, k;
 	flt s, dx;
-	flt *d = (flt *)_mm_malloc((n) * sizeof(flt), 64);
-	flt *z = (flt *)_mm_malloc((n) * sizeof(flt), 64);
-	int *v = (int *)_mm_malloc((n) * sizeof(int), 64);
+	flt *d = (flt *)_mm_malloc((n+2) * sizeof(flt), 64);
+	flt *z = (flt *)_mm_malloc((n+2) * sizeof(flt), 64);
+	int *v = (int *)_mm_malloc((n+2) * sizeof(int), 64);
 	/*# Find the lower envelope of a sequence of parabolas.
     #   f...source data (returns the Y of the parabola vertex at X)
     #   d...destination data (final distance values are written here)
@@ -353,9 +394,6 @@ static int nifti_edt(nifti_image *nim) {
 	if (nim->datatype != DT_CALC)
 		return 1;
 	flt *img = (flt *)nim->data;
-	//int nVol = 1;
-	//for (int i = 4; i < 8; i++ )
-	//	nVol *= MAX(nim->dim[i],1);
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	if ((nvox3D * nVol) != nim->nvox)
@@ -374,45 +412,20 @@ static int nifti_edt(nifti_image *nim) {
 	for (int i = 2; i < 8; i++)
 		nRow *= MAX(nim->dim[i], 1);
 	//EDT in left-right direction
-	for (int r = 0; r < nRow; r++) {
-		flt *imgRow = img + (r * nx);
-		edt1(imgRow, nx);
-	}
+	flt *imgRow = img;
+	for (int r = 0; r < nRow; r++)
+		edt1(imgRow += nx, nx);
 	//EDT in anterior-posterior direction
 	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
 	for (int v = 0; v < nVol; v++) { //transpose each volume separately
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
-		//transpose data
 		size_t vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			int zo = z * nx * ny;
-			for (int y = 0; y < ny; y++) {
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img3D[zo + xo + y] = img[vo];
-					vo += 1;
-					xo += ny;
-				}
-			}
-		}
-		//perform EDT for all rows
-		for (int r = 0; r < nRow; r++) {
-			flt *imgRow = img3D + (r * ny);
-			edt(imgRow, ny);
-		}
-		//transpose data back
-		vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			int zo = z * nx * ny;
-			for (int y = 0; y < ny; y++) {
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img[vo] = img3D[zo + xo + y];
-					vo += 1;
-					xo += ny;
-				}
-			}
-		}
+		transposeXY(&img[vo], img3D, &nx, &ny, nz);
+		//perform EDT for all "rows"
+		flt *imgRow = img3D;
+		for (int r = 0; r < nRow; r++)
+			edt(imgRow += nx, nx);
+		transposeXY(img3D, &img[vo], &nx, &ny, nz);
 		_mm_free(img3D);
 	} //for each volume
 	//EDT in head-foot direction
@@ -420,37 +433,13 @@ static int nifti_edt(nifti_image *nim) {
 #pragma omp parallel for
 	for (int v = 0; v < nVol; v++) { //transpose each volume separately
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
-		//transpose data
 		size_t vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			for (int y = 0; y < ny; y++) {
-				int yo = y * nz * nx;
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img3D[z + xo + yo] = img[vo];
-					vo += 1;
-					xo += nz;
-				}
-			}
-		}
+		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
 		//perform EDT for all "rows"
-		for (int r = 0; r < nRow; r++) {
-			flt *imgRow = img3D + (r * nz);
-			edt(imgRow, nz);
-		}
-		//transpose data back
-		vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			for (int y = 0; y < ny; y++) {
-				int yo = y * nz * nx;
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img[vo] = img3D[z + xo + yo];
-					vo += 1;
-					xo += nz;
-				} //x
-			} //y
-		} //z
+		flt *imgRow = img3D;
+		for (int r = 0; r < nRow; r++)
+			edt(imgRow += nx, nx);
+		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
 		_mm_free(img3D);
 	} //for each volume
 	return 0;
@@ -616,30 +605,9 @@ DO_Y_BLUR:
 	for (int v = 0; v < nVol; v++) { //transpose each volume separately
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
 		size_t vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			int zo = z * nx * ny;
-			for (int y = 0; y < ny; y++) {
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img3D[zo + xo + y] = img[vo];
-					vo += 1;
-					xo += ny;
-				}
-			}
-		}
+		transposeXY(&img[vo], img3D, &nx, &ny, nz);
 		blurS(img3D, nim->ny, nRow, nim->dy, SigmammY);
-		vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			int zo = z * nx * ny;
-			for (int y = 0; y < ny; y++) {
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img[vo] = img3D[zo + xo + y];
-					vo += 1;
-					xo += ny;
-				}
-			}
-		}
+		transposeXY(img3D, &img[vo], &nx, &ny, nz);
 		_mm_free(img3D);
 	} //for each volume
 DO_Z_BLUR:
@@ -652,30 +620,9 @@ DO_Z_BLUR:
 		//printf("volume %d uses thread %d\n", v, omp_get_thread_num());
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
 		size_t vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			for (int y = 0; y < ny; y++) {
-				int yo = y * nz * nx;
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img3D[z + xo + yo] = img[vo];
-					vo += 1;
-					xo += nz;
-				}
-			}
-		}
-		blurS(img3D, nz, nRow, nim->dz, SigmammZ);
-		vo = v * nvox3D; //volume offset
-		for (int z = 0; z < nz; z++) {
-			for (int y = 0; y < ny; y++) {
-				int yo = y * nz * nx;
-				int xo = 0;
-				for (int x = 0; x < nx; x++) {
-					img[vo] = img3D[z + xo + yo];
-					vo += 1;
-					xo += nz;
-				} //x
-			} //y
-		} //z
+		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
+		blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ);
+		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
 		_mm_free(img3D);
 	} //for each volume
 	return 0;
