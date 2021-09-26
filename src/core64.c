@@ -636,38 +636,50 @@ static int nifti_smooth_gauss_vox(nifti_image *nim, flt SigmaVox) {
 } // nifti_smooth_gauss_vox()
 
 static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdge) {
-//Difference of Gaussians (DoG)
-//Laplacian of Gaussian
+//Difference of Gaussians (DoG): difference ratio of 1.6 approximates a Laplacian of Gaussian
 // https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1) || (nim->datatype != DT_CALC))
 		return 1;
+	if (SigmammPos == SigmammNeg) {
+		fprintf(stderr, "Difference of Gaussian requires two different sigma values.\n");
+		return 1;
+	}
+	if ((SigmammPos < 0) || (SigmammNeg < 0)) {
+		fprintf(stderr, "Difference of Gaussian requires positive values of sigma.\n");
+		return 1;
+	}
+	flt sigmaMn = MIN(SigmammNeg, SigmammPos);
+	flt sigmaMx = MAX(SigmammNeg, SigmammPos);
+	//Optimization: use results from narrow blur (sigmaMn) as inputs for wide blur (sigmaMx)
+	//consider desired blurs of 2mm and 3.2mm, we can instead compute 2mm and 2.5mmm
+	//only about 10% faster for difference ratio of 2.0, but also removes one copy
+	//https://computergraphics.stackexchange.com/questions/256/is-doing-multiple-gaussian-blurs-the-same-as-doing-one-larger-blur
+	sigmaMx = sqrt((sigmaMx*sigmaMx) - (sigmaMn*sigmaMn));
 	flt *inimg = (flt *)nim->data;
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	int64_t nvox4D = nvox3D * nVol;
-	flt *imgNeg = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
-	for (int64_t i = 0; i < nvox4D; i++)
-		imgNeg[i] = inimg[i];
-	int ret = nifti_smooth_gauss(nim, SigmammNeg, SigmammNeg, SigmammNeg);
-	if (ret != 0) {
+	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn);
+	if (ret != 0)
 		return ret;
-		_mm_free(imgNeg);
-	}
-	for (int64_t i = 0; i < nvox4D; i++) {
-		flt tmp = inimg[i];
-		inimg[i] = imgNeg[i];
-		imgNeg[i] = tmp;
-	}
-	ret = nifti_smooth_gauss(nim, SigmammPos, SigmammPos, SigmammPos);
+	flt *imgMn = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
 	for (int64_t i = 0; i < nvox4D; i++)
-		inimg[i] -= imgNeg[i];
+		imgMn[i] = inimg[i];
+	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx);
+	if (SigmammPos > SigmammNeg) {
+		for (int64_t i = 0; i < nvox4D; i++)
+			inimg[i] = inimg[i] - imgMn[i];
+	} else {
+		for (int64_t i = 0; i < nvox4D; i++)
+			inimg[i] = imgMn[i] - inimg[i];
+	}
 	if (!isEdge) {
-		_mm_free(imgNeg);
+		_mm_free(imgMn);
 		return ret; //return continuous values
 	}
 	//we will define edges as voxels with zero crossings
 	for (int64_t i = 0; i < nvox4D; i++)
-		imgNeg[i] = 0.0;
+		imgMn[i] = 0.0;
 	int nx = nim->nx;
 	int nxy = nx * nim->ny;
 	int nxyz = nxy * nim->nz;
@@ -681,43 +693,44 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 						if (val == 0.0) continue; //masked images will have a lot of zeros!
 						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
 						//check six neighbors that share a face
-						if (val * inimg[i-1] < 0) { imgNeg[i] = 1.0; continue;}
-						if (val * inimg[i+1] < 0) { imgNeg[i] = 1.0; continue;}
-						if (val * inimg[i-nx] < 0) { imgNeg[i] = 1.0; continue;}
-						if (val * inimg[i+nx] < 0) { imgNeg[i] = 1.0; continue;}
-						if (val * inimg[i-nxy] < 0) { imgNeg[i] = 1.0; continue;}
-						if (val * inimg[i+nxy] < 0) { imgNeg[i] = 1.0; continue;}
+						if (val * inimg[i-1] < 0) { imgMn[i] = 1.0; continue;}
+						if (val * inimg[i+1] < 0) { imgMn[i] = 1.0; continue;}
+						if (val * inimg[i-nx] < 0) { imgMn[i] = 1.0; continue;}
+						if (val * inimg[i+nx] < 0) { imgMn[i] = 1.0; continue;}
+						if (val * inimg[i-nxy] < 0) { imgMn[i] = 1.0; continue;}
+						if (val * inimg[i+nxy] < 0) { imgMn[i] = 1.0; continue;}
+						if (isEdge == 1) continue; //dog1 is binary
 						//check 12 neighbors that share an edge
-						if (val * inimg[i-1-nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+1-nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i-nx-nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+nx-nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i-1-nx] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+1-nx] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i-1+nx] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+1+nx] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i-1+nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+1+nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i-nx+nxy] < 0) { imgNeg[i] = 0.5; continue;}
-						if (val * inimg[i+nx+nxy] < 0) { imgNeg[i] = 0.5; continue;}
+						if (val * inimg[i-1-nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+1-nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i-nx-nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+nx-nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i-1-nx] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+1-nx] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i-1+nx] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+1+nx] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i-1+nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+1+nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i-nx+nxy] < 0) { imgMn[i] = 0.5; continue;}
+						if (val * inimg[i+nx+nxy] < 0) { imgMn[i] = 0.5; continue;}
 						//check 8 neighbors that share a corner
-						if (val * inimg[i-1-nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i+1-nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i-1+nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i+1+nx-nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i-1-nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i+1-nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i-1+nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
-						if (val * inimg[i+1+nx+nxy] < 0) { imgNeg[i] = 0.25; continue;}
+						if (val * inimg[i-1-nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i+1-nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i-1+nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i+1+nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i-1-nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i+1-nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i-1+nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
+						if (val * inimg[i+1+nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
 					}
 	for (int64_t i = 0; i < nvox4D; i++)
-		inimg[i] = imgNeg[i];
+		inimg[i] = imgMn[i];
 	nim->scl_inter = 0.0;
 	nim->scl_slope = 1.0;
 	nim->cal_min = 0.0;
 	nim->cal_max = 1.0;
-	_mm_free(imgNeg);
-	return ret;
+	_mm_free(imgMn);
+	return ret;	
 } // nifti_dog()
 
 static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
