@@ -278,8 +278,9 @@ inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz
 		for (int y = 0; y < ny; y++) {
 			int xo = 0;
 			for (int x = 0; x < nx; x++) {
-				img3Dout[zo + xo + y] = img3Din[vi += 1];
+				img3Dout[zo + xo + y] = img3Din[vi];
 				xo += ny;
+				vi += 1;
 			}
 		}
 	}
@@ -298,8 +299,9 @@ inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, int *nzp
 			int yo = y * nz;
 			int zo = 0;
 			for (int x = 0; x < nx; x++) {
-				img3Dout[z + yo + zo] = img3Din[vi += 1];
+				img3Dout[z + yo + zo] = img3Din[vi];
 				zo += nyz;
+				vi += 1;
 			}
 		}
 	}
@@ -445,8 +447,17 @@ static int nifti_edt(nifti_image *nim) {
 	return 0;
 }
 
+//kernelWid influences width of kernel, use negative values for round, positive for ceil
+// kenrnelWid of 2.5 means the kernel will be (2 * ceil(2.5 * sigma))+1 voxels wide
+// kenrnelWid of -6.0 means the kernel will be (2 * round(6.0 * sigma))+1 voxels wide
+// 2.5 AFNI ceil(2.5) https://github.com/afni/afni/blob/25e77d564f2c67ff480fa99a7b8e48ec2d9a89fc/src/edt_blur.c#L1391
+// -6   SPM round(6) https://github.com/spm/spm12/blob/3085dac00ac804adb190a7e82c6ef11866c8af02/spm_smooth.m#L97
+// -6 FSL round(6) (estimated)
+// -3 opencv round(3) or round(4) depending on datatype https://github.com/opencv/opencv/blob/9c23f2f1a682faa9f0b2c2223a857c7d93ba65a6/modules/imgproc/src/smooth.cpp#L3782
+//bioimagesuite floor(1.5) https://github.com/bioimagesuiteweb/bisweb/blob/210d678c92fd404287fe5766136379ec94750eb2/js/utilities/bis_imagesmoothreslice.js#L133
+
 //Gaussian blur, both serial and parallel variants, https://github.com/neurolabusc/niiSmooth
-static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm) {
+static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid) {
 	//serial blur
 	//make kernels
 	if ((xmm == 0) || (nx < 2) || (ny < 1) || (Sigmamm <= 0.0))
@@ -455,7 +466,11 @@ static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm) {
 	flt sigma = (Sigmamm / xmm); //mm to vox
 	//round(6*sigma), ceil(4*sigma) seems spot on larger than fslmaths
 	//int cutoffvox = round(6*sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	int cutoffvox = ceil(4 * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
+	int cutoffvox;
+	if (kernelWid < 0)
+		cutoffvox = round(fabs(kernelWid) * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
+	else
+		cutoffvox = ceil(kernelWid * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
 	//printf(".Blur Cutoff (%g) %d\n", 4*sigma, cutoffvox);
 	//validated on SPM12's 1.5mm isotropic mask_ICV.nii (discrete jump in number of non-zero voxels)
 	//fslmaths mask -s 2.26 f6.nii //Blur Cutoff (6.02667) 7
@@ -505,14 +520,18 @@ static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm) {
 
 #if defined(_OPENMP)
 
-static void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm) {
+static void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid) {
 	//parallel blur
 	//make kernels
 	if ((xmm == 0) || (nx < 2) || (ny < 1) || (FWHMmm <= 0.0))
 		return;
 	//flt sigma = (FWHMmm/xmm)/sqrt(8*log(2));
 	flt sigma = (FWHMmm / xmm); //mm to vox
-	int cutoffvox = round(6 * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
+	int cutoffvox;
+	if (kernelWid < 0)
+		cutoffvox = round(fabs(kernelWid) * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
+	else
+		cutoffvox = ceil(kernelWid * sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
 	cutoffvox = MAX(cutoffvox, 1);
 	flt *k = (flt *)_mm_malloc((cutoffvox + 1) * sizeof(flt), 64); //FIR Gaussian
 	flt expd = 2 * sigma * sigma;
@@ -559,7 +578,7 @@ static void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm) {
 
 #endif
 
-static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ) {
+static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
 	//https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
@@ -589,11 +608,11 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
 		nRow *= MAX(nim->dim[i], 1);
 #if defined(_OPENMP)
 	if (omp_get_max_threads() > 1)
-		blurP(img, nim->nx, nRow, nim->dx, SigmammX);
+		blurP(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
 	else
-		blurS(img, nim->nx, nRow, nim->dx, SigmammX);
+		blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
 #else
-	blurS(img, nim->nx, nRow, nim->dx, SigmammX);
+	blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
 #endif
 //blurX(img, nim->nx, nRow, nim->dx, SigmammX);
 DO_Y_BLUR:
@@ -606,7 +625,7 @@ DO_Y_BLUR:
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
 		size_t vo = v * nvox3D; //volume offset
 		transposeXY(&img[vo], img3D, &nx, &ny, nz);
-		blurS(img3D, nim->ny, nRow, nim->dy, SigmammY);
+		blurS(img3D, nim->ny, nRow, nim->dy, SigmammY, kernelWid);
 		transposeXY(img3D, &img[vo], &nx, &ny, nz);
 		_mm_free(img3D);
 	} //for each volume
@@ -621,7 +640,7 @@ DO_Z_BLUR:
 		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
 		size_t vo = v * nvox3D; //volume offset
 		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
-		blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ);
+		blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ, kernelWid);
 		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
 		_mm_free(img3D);
 	} //for each volume
@@ -632,12 +651,13 @@ static int nifti_smooth_gauss_vox(nifti_image *nim, flt SigmaVox) {
 	flt SigmammX = SigmaVox * nim->dx;
 	flt SigmammY = SigmaVox * nim->dy;
 	flt SigmammZ = SigmaVox * nim->dz;
-	return nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ);
+	return nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ, -6.0);
 } // nifti_smooth_gauss_vox()
 
 static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdge) {
 //Difference of Gaussians (DoG): difference ratio of 1.6 approximates a Laplacian of Gaussian
 // https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
+	flt kKernelWid = 2.5; //ceil(2.5)
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1) || (nim->datatype != DT_CALC))
 		return 1;
 	if (SigmammPos == SigmammNeg) {
@@ -659,13 +679,13 @@ static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdg
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	int64_t nvox4D = nvox3D * nVol;
-	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn);
+	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn, kKernelWid);
 	if (ret != 0)
 		return ret;
 	flt *imgMn = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
 	for (int64_t i = 0; i < nvox4D; i++)
 		imgMn[i] = inimg[i];
-	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx);
+	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx, kKernelWid);
 	if (SigmammPos > SigmammNeg) {
 		for (int64_t i = 0; i < nvox4D; i++)
 			inimg[i] = inimg[i] - imgMn[i];
@@ -836,7 +856,7 @@ static int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt Sigma
 	flt *simg = (flt *)sdat;
 	for (int v = 0; v < nVol; v++) {
 		memcpy(simg, inimg, nim->nvox * sizeof(flt));
-		nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ);
+		nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ, 2.5); //2.5: a relatively narrow kernel for speed
 		for (int i = 0; i < nim->nvox; i++) {
 			//sharpened = original + (original - blurred) * amount
 			inimg[i] += (inimg[i] - simg[i]) * amount;
@@ -5200,7 +5220,7 @@ int main64(int argc, char *argv[]) {
 				if (op == ing)
 					ok = nifti_ing(nim, v);
 				if (op == smth)
-					ok = nifti_smooth_gauss(nim, v, v, v);
+					ok = nifti_smooth_gauss(nim, v, v, v, -6.0);
 				if (op == seed) {
 					if ((v > 0) && (v < 1))
 						v *= RAND_MAX;
