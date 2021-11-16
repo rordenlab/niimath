@@ -1,6 +1,5 @@
 #undef DT32
 //#define DT32 //<- This should be the ONLY difference between core32 and core64!
-
 #ifdef DT32
 #define flt float
 #define DT_CALC DT_FLOAT32
@@ -11,7 +10,9 @@
 #define epsilon DBL_EPSILON
 #endif
 
-#define SIMD
+#ifndef USING_WASM
+ #define SIMD
+#endif
 
 #ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
 #ifdef __x86_64__
@@ -36,7 +37,19 @@
 #endif
 
 #include <float.h> //FLT_EPSILON
-#include <nifti2_io.h>
+#include "core.h"
+#ifdef USING_TIMERS
+#include <time.h>
+#endif
+#ifdef USING_WASM
+  #define staticx
+  #include <nifti2_wasm.h>
+#else
+  #define staticx static
+  #include <nifti2_io.h>
+  #define bandpass
+  #define tensor_decomp //tensor_decomp support is optional
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef __aarch64__
@@ -50,9 +63,7 @@
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
-#include "core.h"
 
-#define bandpass
 #ifdef bandpass
 #include "bw.h"
 #endif
@@ -62,7 +73,6 @@
 #include "afni.h"
 #endif
 
-#define tensor_decomp //tensor_decomp support is optional
 #ifdef tensor_decomp
 #include "tensor.h"
 #endif
@@ -74,7 +84,7 @@
 
 #ifdef SIMD
 #ifdef DT32
-static void nifti_sqrt(flt *v, size_t n) {
+staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	//#pragma omp parallel for
 	for (size_t i = 0; i <= (n - kSSE32); i += kSSE32) {
@@ -90,7 +100,7 @@ static void nifti_sqrt(flt *v, size_t n) {
 	}
 } // nifti_sqrt()
 
-static void nifti_mul(flt *v, size_t n, flt slope1) {
+staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128 slope = _mm_set1_ps(slope1);
 	//#pragma omp parallel for
@@ -107,7 +117,7 @@ static void nifti_mul(flt *v, size_t n, flt slope1) {
 	}
 } //nifti_mul()
 
-static void nifti_add(flt *v, int64_t n, flt intercept1) {
+/*staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	//add, out = in + intercept
 	if (intercept1 == 0.0f)
 		return;
@@ -125,9 +135,9 @@ static void nifti_add(flt *v, int64_t n, flt intercept1) {
 		v[n - tail] = v[n - tail] + intercept1;
 		tail--;
 	}
-} //nifti_add()
+} //nifti_add()*/
 
-static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
+staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	//multiply+add, out = in * slope + intercept
 	if ((slope1 == 1.0f) && (intercept1 == 0.0f))
 		return;
@@ -150,7 +160,7 @@ static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 } //nifti_fma()
 #else //if SIMD32 else SIMD64
 
-static void nifti_sqrt(flt *v, size_t n) {
+staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	//#pragma omp parallel for
 	for (size_t i = 0; i <= (n - kSSE64); i += kSSE64) {
@@ -166,7 +176,7 @@ static void nifti_sqrt(flt *v, size_t n) {
 	}
 } // nifti_sqrt()
 
-static void nifti_mul(flt *v, size_t n, flt slope1) {
+staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128d slope = _mm_set1_pd(slope1);
 	//#pragma omp parallel for
@@ -183,7 +193,7 @@ static void nifti_mul(flt *v, size_t n, flt slope1) {
 	}
 } //nifti_mul()
 
-static void nifti_add(flt *v, int64_t n, flt intercept1) {
+/*staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	//add, out = in + intercept
 	if (intercept1 == 0.0f)
 		return;
@@ -201,9 +211,9 @@ static void nifti_add(flt *v, int64_t n, flt intercept1) {
 		v[n - tail] = v[n - tail] + intercept1;
 		tail--;
 	}
-} //nifti_add()
+} //nifti_add()*/
 
-static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
+staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	//multiply+add, out = in * slope + intercept
 	if ((slope1 == 1.0f) && (intercept1 == 0.0f))
 		return;
@@ -229,37 +239,37 @@ static void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 
 #else //if SIMD vectorized, else scalar
 
-static void nifti_sqrt(flt *v, size_t n) {
+staticx void nifti_sqrt(flt *v, size_t n) {
 	//#pragma omp parallel for
 	for (size_t i = 0; i < n; i++)
 		v[i] = sqrt(v[i]);
 } //nifti_sqrt()
 
-static void nifti_mul(flt *v, size_t n, flt slope1) {
+staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	//#pragma omp parallel for
 	for (size_t i = 0; i < n; i++)
 		v[i] *= slope1;
 } //nifti_mul()
 
-static void nifti_add(flt *v, size_t n, flt intercept1) {
+staticx void nifti_add(flt *v, size_t n, flt intercept1) {
 	//#pragma omp parallel for
 	for (size_t i = 0; i < n; i++)
 		v[i] += intercept1;
 } //nifti_add()
 
-static void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
+staticx void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
 	//#pragma omp parallel for
 	for (size_t i = 0; i < n; i++)
 		v[i] = (v[i] * slope1) + intercept1;
 } //nifti_fma
 #endif //if vector SIMD else scalar
 
-static int show_helpx(void) {
+staticx int show_helpx(void) {
 	printf("Fatal: show_help shown by wrapper function\n");
 	exit(1);
 }
 
-static flt vx(flt *f, int p, int q) {
+staticx flt vx(flt *f, int p, int q) {
 	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
 	if (isnan(ret))
 		ret = INFINITY;
@@ -309,7 +319,7 @@ inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, int *nzp
 	*nzp = nx;
 }
 
-static void edt(flt *f, int n) {
+staticx void edt(flt *f, int n) {
 	int q, p, k;
 	flt s, dx;
 	flt *d = (flt *)_mm_malloc((n+2) * sizeof(flt), 64);
@@ -363,7 +373,7 @@ static void edt(flt *f, int n) {
 	_mm_free(v);
 }
 
-static void edt1(flt *df, int n) { //first dimension is simple
+staticx void edt1(flt *df, int n) { //first dimension is simple
 	int q, prevX;
 	flt prevY, v;
 	prevX = 0;
@@ -389,7 +399,7 @@ static void edt1(flt *df, int n) { //first dimension is simple
 	}
 }
 
-static int nifti_edt(nifti_image *nim) {
+staticx int nifti_edt(nifti_image *nim) {
 	//https://github.com/neurolabusc/DistanceFields
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
@@ -457,7 +467,7 @@ static int nifti_edt(nifti_image *nim) {
 //bioimagesuite floor(1.5) https://github.com/bioimagesuiteweb/bisweb/blob/210d678c92fd404287fe5766136379ec94750eb2/js/utilities/bis_imagesmoothreslice.js#L133
 
 //Gaussian blur, both serial and parallel variants, https://github.com/neurolabusc/niiSmooth
-static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid) {
+staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid) {
 	//serial blur
 	//make kernels
 	if ((xmm == 0) || (nx < 2) || (ny < 1) || (Sigmamm <= 0.0))
@@ -520,7 +530,7 @@ static void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid)
 
 #if defined(_OPENMP)
 
-static void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid) {
+staticx void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid) {
 	//parallel blur
 	//make kernels
 	if ((xmm == 0) || (nx < 2) || (ny < 1) || (FWHMmm <= 0.0))
@@ -576,12 +586,15 @@ static void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid) 
 	_mm_free(kWeight);
 } //blurP
 
-#endif
+#endif // if OPENMP: blurP (parallel blur) is multi-threaded
 
-static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
+staticx int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
 	//https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
-	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+		fprintf(stderr, "Image size too small for Gaussian blur.\n");
 		return 1;
+	}
 	if (nim->datatype != DT_CALC)
 		return 1;
 	if ((SigmammX == 0) && (SigmammY == 0) && (SigmammZ == 0))
@@ -593,14 +606,13 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
 	if (SigmammZ < 0) //negative values for voxels, not mm
 		SigmammZ = -SigmammZ  * nim->dz;
 	flt *img = (flt *)nim->data;
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	if ((nvox3D * nVol) != nim->nvox)
 		return 1;
 	int nx = nim->nx;
 	int ny = nim->ny;
 	int nz = nim->nz;
-	if (SigmammX <= 0.0)
+	if ((SigmammX <= 0.0) || (nx < 2))
 		goto DO_Y_BLUR;
 	//BLUR X
 	int nRow = 1;
@@ -617,7 +629,7 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
 //blurX(img, nim->nx, nRow, nim->dx, SigmammX);
 DO_Y_BLUR:
 	//BLUR Y
-	if (SigmammY <= 0.0)
+	if ((SigmammY <= 0.0) || (ny < 2))
 		goto DO_Z_BLUR;
 	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
 #pragma omp parallel for
@@ -647,113 +659,34 @@ DO_Z_BLUR:
 	return 0;
 } // nifti_smooth_gauss()
 
-static int nifti_smooth_gauss_vox(nifti_image *nim, flt SigmaVox) {
-	flt SigmammX = SigmaVox * nim->dx;
-	flt SigmammY = SigmaVox * nim->dy;
-	flt SigmammZ = SigmaVox * nim->dz;
-	return nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ, -6.0);
-} // nifti_smooth_gauss_vox()
+staticx flt* padImg3D( flt *imgIn, int *nx, int *ny, int *nz) {
+//create an image with new first and last columns, rows, slices
+	int nxIn = (* nx);
+	int nxOut = (* nx) + 2;
+	int nyOut = (* ny) + 2;
+	int nzOut = (* nz) + 2;
+	int nvox3D = nxOut * nyOut * nzOut;
+	flt *imgOut= (flt *)_mm_malloc(nvox3D * sizeof(flt), 64);
+	memset(imgOut, 0, nvox3D * sizeof(flt)); //zero array
+	flt *imgOutP = imgOut;
+	flt *imgInP = imgIn;
+	imgOutP += 1;
+	for (int z = 0; z < nzOut; z++)
+		for (int y = 0; y < nyOut; y++) {
+			if ((z > 0) && (y > 0) && (z < (nzOut - 1)) && (y < (nyOut - 1))) {
+				memcpy(imgOutP, imgInP, nxIn * sizeof(flt)); //dest, src, count
+				imgInP += nxIn;
+			}
+			imgOutP += nxOut;
+		
+		}
+	* nx = nxOut;
+	* ny = nyOut;
+	* nz = nzOut;
+	return imgOut;
+}
 
-static int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int isEdge) {
-//Difference of Gaussians (DoG): difference ratio of 1.6 approximates a Laplacian of Gaussian
-// https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
-	flt kKernelWid = 2.5; //ceil(2.5)
-	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1) || (nim->datatype != DT_CALC))
-		return 1;
-	if (SigmammPos == SigmammNeg) {
-		fprintf(stderr, "Difference of Gaussian requires two different sigma values.\n");
-		return 1;
-	}
-	if ((SigmammPos < 0) || (SigmammNeg < 0)) {
-		fprintf(stderr, "Difference of Gaussian requires positive values of sigma.\n");
-		return 1;
-	}
-	flt sigmaMn = MIN(SigmammNeg, SigmammPos);
-	flt sigmaMx = MAX(SigmammNeg, SigmammPos);
-	//Optimization: use results from narrow blur (sigmaMn) as inputs for wide blur (sigmaMx)
-	//consider desired blurs of 2mm and 3.2mm, we can instead compute 2mm and 2.5mmm
-	//only about 10% faster for difference ratio of 2.0, but also removes one copy
-	//https://computergraphics.stackexchange.com/questions/256/is-doing-multiple-gaussian-blurs-the-same-as-doing-one-larger-blur
-	sigmaMx = sqrt((sigmaMx*sigmaMx) - (sigmaMn*sigmaMn));
-	flt *inimg = (flt *)nim->data;
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-	int nVol = nim->nvox / nvox3D;
-	int64_t nvox4D = nvox3D * nVol;
-	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn, kKernelWid);
-	if (ret != 0)
-		return ret;
-	flt *imgMn = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64); //alloc for each volume to allow openmp
-	for (int64_t i = 0; i < nvox4D; i++)
-		imgMn[i] = inimg[i];
-	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx, kKernelWid);
-	if (SigmammPos > SigmammNeg) {
-		for (int64_t i = 0; i < nvox4D; i++)
-			inimg[i] = inimg[i] - imgMn[i];
-	} else {
-		for (int64_t i = 0; i < nvox4D; i++)
-			inimg[i] = imgMn[i] - inimg[i];
-	}
-	if (!isEdge) {
-		_mm_free(imgMn);
-		return ret; //return continuous values
-	}
-	//we will define edges as voxels with zero crossings
-	for (int64_t i = 0; i < nvox4D; i++)
-		imgMn[i] = 0.0;
-	int nx = nim->nx;
-	int nxy = nx * nim->ny;
-	int nxyz = nxy * nim->nz;
-	for (int v = 0; v < nVol; v++)
-		for (int z = 1; z < (nim->nz -1); z++)
-			for (int y = 1; y < (nim->ny - 1); y++)
-				for (size_t x = 1; x < (nim->nx - 1); x++) {
-						int64_t i = x + (y * nx) + (z * nxy) + (v * nxyz);
-						flt val = inimg[i];
-						if ((isEdge == 1) &&  (val <= 0.0)) continue; //one sided edge
-						if (val == 0.0) continue; //masked images will have a lot of zeros!
-						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
-						//check six neighbors that share a face
-						if (val * inimg[i-1] < 0) { imgMn[i] = 1.0; continue;}
-						if (val * inimg[i+1] < 0) { imgMn[i] = 1.0; continue;}
-						if (val * inimg[i-nx] < 0) { imgMn[i] = 1.0; continue;}
-						if (val * inimg[i+nx] < 0) { imgMn[i] = 1.0; continue;}
-						if (val * inimg[i-nxy] < 0) { imgMn[i] = 1.0; continue;}
-						if (val * inimg[i+nxy] < 0) { imgMn[i] = 1.0; continue;}
-						if (isEdge == 1) continue; //dog1 is binary
-						//check 12 neighbors that share an edge
-						if (val * inimg[i-1-nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+1-nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i-nx-nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+nx-nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i-1-nx] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+1-nx] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i-1+nx] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+1+nx] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i-1+nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+1+nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i-nx+nxy] < 0) { imgMn[i] = 0.5; continue;}
-						if (val * inimg[i+nx+nxy] < 0) { imgMn[i] = 0.5; continue;}
-						//check 8 neighbors that share a corner
-						if (val * inimg[i-1-nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i+1-nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i-1+nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i+1+nx-nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i-1-nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i+1-nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i-1+nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
-						if (val * inimg[i+1+nx+nxy] < 0) { imgMn[i] = 0.25; continue;}
-					}
-	for (int64_t i = 0; i < nvox4D; i++)
-		inimg[i] = imgMn[i];
-	nim->scl_inter = 0.0;
-	nim->scl_slope = 1.0;
-	nim->cal_min = 0.0;
-	nim->cal_max = 1.0;
-	_mm_free(imgMn);
-	return ret;	
-} // nifti_dog()
-
-static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
+staticx int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -791,7 +724,7 @@ static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image
 	size_t total = 0;
 	for (int i = 0; i < nBins; i++)
 		total += hist[i];
-	int top = nBins - 1;
+	//int top = nBins - 1;
 	int level = 0;
 	double sumB = 0;
 	double wB = 0;
@@ -827,7 +760,7 @@ static int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image
 	return 0;
 } // nifti_otsu()
 
-static int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt amount) {
+staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt amount) {
 	//https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
@@ -873,7 +806,7 @@ static int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt Sigma
 	return 0;
 } //nifti_unsharp()
 
-static int nifti_crop(nifti_image *nim, int tmin, int tsize) {
+staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	if (tsize == 0) {
 		fprintf(stderr, "tsize must not be 0\n");
 		return 1;
@@ -926,7 +859,7 @@ static int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	return 0;
 }
 
-static int nifti_rescale(nifti_image *nim, double scale, double intercept) {
+staticx int nifti_rescale(nifti_image *nim, double scale, double intercept) {
 	//linear transform of data
 	if (nim->nvox < 1)
 		return 1;
@@ -952,7 +885,7 @@ static int nifti_rescale(nifti_image *nim, double scale, double intercept) {
 	return 1;
 }
 
-static int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int y, int z, double tfce_thresh) {
+staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int y, int z, double tfce_thresh) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -1006,8 +939,9 @@ static int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int y
 	flt *outimg = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //output image
 	int32_t *q = (int32_t *)_mm_malloc(nvox3D * sizeof(int32_t), 64); //queue with untested seed
 	uint8_t *vxs = (uint8_t *)_mm_malloc(nvox3D * sizeof(uint8_t), 64);
-	for (int i = 0; i < nvox3D; i++)
-		outimg[i] = 0.0;
+	memset(outimg, 0, nvox3D * sizeof(flt)); //zero array
+	//for (int i = 0; i < nvox3D; i++)
+	//	outimg[i] = 0.0;
 	int n_steps = (int)ceil(mx / dh);
 	//for (int step=0; step<n_steps; step++) {
 	for (int step = n_steps - 1; step >= 0; step--) {
@@ -1060,7 +994,7 @@ static int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int y
 	return 0;
 }
 
-static int nifti_tfce(nifti_image *nim, double H, double E, int c) {
+staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 	//https://www.fmrib.ox.ac.uk/datasets/techrep/tr08ss1/tr08ss1.pdf
 	if (nim->nvox < 1)
 		return 1;
@@ -1107,8 +1041,9 @@ static int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 		flt *outimg = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64);//output image
 		int32_t *q = (int32_t *)_mm_malloc(nvox3D * sizeof(int32_t), 64); //queue with untested seed
 		uint8_t *vxs = (uint8_t *)_mm_malloc(nvox3D * sizeof(uint8_t), 64);
-		for (int i = 0; i < nvox3D; i++)
-			outimg[i] = 0.0;
+		memset(outimg, 0, nvox3D * sizeof(flt)); //zero array
+		//for (int i = 0; i < nvox3D; i++)
+		//	outimg[i] = 0.0;
 		int n_steps = (int)ceil(mx / dh);
 		for (int step = 0; step < n_steps; step++) {
 			flt thresh = (step + 1) * dh;
@@ -1165,7 +1100,7 @@ static int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 	return 0;
 } //nifti_tfce()
 
-static int nifti_grid(nifti_image *nim, double v, int spacing) {
+staticx int nifti_grid(nifti_image *nim, double v, int spacing) {
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2))
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -1200,7 +1135,7 @@ static int nifti_grid(nifti_image *nim, double v, int spacing) {
 	return 0;
 }
 
-static int nifti_rem(nifti_image *nim, double v, int isFrac) {
+staticx int nifti_rem(nifti_image *nim, double v, int isFrac) {
 	//remainder (modulo) : fslmaths
 	/*fmod(0.45, 2) = 0.45 : 0
 fmod(0.9, 2) = 0.9 : 0
@@ -1233,7 +1168,7 @@ fmod(-1.8, 2) = -1.8 : -1
 	return 0;
 }
 
-static int nifti_thr(nifti_image *nim, double v, int modifyBrightVoxels, float newIntensity) {
+staticx int nifti_thr(nifti_image *nim, double v, int modifyBrightVoxels, float newIntensity) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype == DT_CALC) {
@@ -1255,7 +1190,7 @@ static int nifti_thr(nifti_image *nim, double v, int modifyBrightVoxels, float n
 	return 1;
 } // nifti_thr()
 
-static int nifti_max(nifti_image *nim, double v, int useMin) {
+staticx int nifti_max(nifti_image *nim, double v, int useMin) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype == DT_CALC) {
@@ -1275,7 +1210,7 @@ static int nifti_max(nifti_image *nim, double v, int useMin) {
 	return 1;
 } // nifti_max()
 
-static int nifti_inm(nifti_image *nim, double M) {
+staticx int nifti_inm(nifti_image *nim, double M) {
 	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;bf9d21d2.1610
 	//With '-inm <value>', every voxel in the input volume is multiplied by <value> / M
 	// where M is the mean across all voxels.
@@ -1320,7 +1255,7 @@ static int nifti_inm(nifti_image *nim, double M) {
 	return 0;
 } // nifti_inm()
 
-static int nifti_ing(nifti_image *nim, double M) {
+staticx int nifti_ing(nifti_image *nim, double M) {
 	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;bf9d21d2.1610
 	//With '-inm <value>', every voxel in the input volume is multiplied by <value> / M
 	// where M is the mean across all voxels.
@@ -1348,7 +1283,7 @@ static int nifti_ing(nifti_image *nim, double M) {
 	return 0;
 } //nifti_ing()
 
-static int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
+staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
 	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;31f309c1.1307
 	// robust range is essentially the 2nd and 98th percentiles
 	// "but ensuring that the majority of the intensity range is captured, even for binary images."
@@ -1467,22 +1402,13 @@ static int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignor
 	return 0;
 }
 
-enum eDimReduceOp { Tmean,
-					Tstd,
-					Tmax,
-					Tmaxn,
-					Tmin,
-					Tmedian,
-					Tperc,
-					Tar1 };
-
-static int compare(const void *a, const void *b) {
+staticx int compare(const void *a, const void *b) {
 	flt fa = *(const flt *)a;
 	flt fb = *(const flt *)b;
 	return (fa > fb) - (fa < fb);
 }
 
-static void dtrend(flt *xx, int npt, int pt0) {
+staticx void dtrend(flt *xx, int npt, int pt0) {
 	//linear detrend, first point is set to zero
 	// if pt0=0 then mean is zero, pt0=1 then first point is zero, if pt0=2 final point is zero
 	double t1, t3, t10, x0, x1;
@@ -1509,7 +1435,7 @@ static void dtrend(flt *xx, int npt, int pt0) {
 		xx[ii] -= (f0 + f1 * ii);
 }
 
-static int nifti_detrend_linear(nifti_image *nim) {
+staticx int nifti_detrend_linear(nifti_image *nim) {
 	if (nim->datatype != DT_CALC)
 		return 1;
 	size_t nvox3D = nim->nx * nim->ny * MAX(1, nim->nz);
@@ -1587,7 +1513,7 @@ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.*/
-static int butterworth_filter(flt *img, int nvox3D, int nvol, double fs, double highcut, double lowcut) {
+staticx int butterworth_filter(flt *img, int nvox3D, int nvol, double fs, double highcut, double lowcut) {
 	//sample rate, low cut and high cut are all in Hz
 	//this attempts to emulate performance of https://www.mathworks.com/matlabcentral/fileexchange/32261-filterm
 	//  specifically, prior to the forward and reverse pass the coefficients are estimated by a forward and reverse pass
@@ -1673,7 +1599,7 @@ static int butterworth_filter(flt *img, int nvox3D, int nvol, double fs, double 
 	return 0;
 }
 
-static int nifti_bandpass(nifti_image *nim, double hp_hz, double lp_hz, double TRsec) {
+staticx int nifti_bandpass(nifti_image *nim, double hp_hz, double lp_hz, double TRsec) {
 	if (nim->datatype != DT_CALC)
 		return 1;
 	size_t nvox3D = nim->nx * nim->ny * MAX(1, nim->nz);
@@ -1699,7 +1625,7 @@ static int nifti_bandpass(nifti_image *nim, double hp_hz, double lp_hz, double T
 //#define DEBUG_ENABLED
 #ifdef DEBUG_ENABLED
 
-static int xyzt2txyz(nifti_image *nim) {
+staticx int xyzt2txyz(nifti_image *nim) {
 	size_t nxyz = nim->nx * nim->ny * nim->nz;
 	size_t nt = nim->nt;
 	if ((nim->nvox < 1) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nt < 2))
@@ -1721,7 +1647,7 @@ static int xyzt2txyz(nifti_image *nim) {
 	return 0;
 }
 
-static int txyz2xyzt(nifti_image *nim) {
+staticx int txyz2xyzt(nifti_image *nim) {
 	size_t nxyz = nim->nx * nim->ny * nim->nz;
 	size_t nt = nim->nt;
 	if ((nim->nvox < 1) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nt < 2))
@@ -1743,7 +1669,7 @@ static int txyz2xyzt(nifti_image *nim) {
 	return 0;
 }
 
-static int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
+staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
 	//Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
 	//5.0.7 highpass temporal filter removes the mean component https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1
 	// http://www.fast.u-psud.fr/ezyfit/html/ezfit.html
@@ -1906,7 +1832,7 @@ static int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int de
 
 #else
 
-static int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
+staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
 	//Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
 	//5.0.7 highpass temporal filter removes the mean component https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1
 	// http://www.fast.u-psud.fr/ezyfit/html/ezfit.html
@@ -2077,7 +2003,7 @@ static int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int de
 
 #endif
 
-static int nifti_demean(nifti_image *nim) {
+staticx int nifti_demean(nifti_image *nim) {
 	if (nim->datatype != DT_CALC)
 		return 1;
 	size_t nvox3D = nim->nx * nim->ny * MAX(1, nim->nz);
@@ -2103,7 +2029,7 @@ static int nifti_demean(nifti_image *nim) {
 	return 0;
 }
 
-static int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, int percentage) {
+staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, int percentage) {
 	//e.g. nifti_dim_reduce(nim, Tmean, 4) reduces 4th dimension, saving mean
 	int nReduce = nim->dim[dim];
 	if ((nReduce <= 1) || (dim < 1) || (dim > 4))
@@ -2269,75 +2195,7 @@ static int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, int
 	return 0;
 } //Tar1
 
-enum eOp { unknown,
-	add,
-	sub,
-	mul,
-	divX,
-	rem,
-	mod,
-	mas,
-	thr,
-	thrp,
-	thrP,
-	uthr,
-	uthrp,
-	uthrP,
-	clamp,
-	uclamp,
-	max,
-	min,
-	power,
-	seed,
-	inm,
-	ing,
-	smth,
-	exp1,
-	floor1,
-	round1,
-	trunc1,
-	ceil1,
-	log1,
-	sin1,
-	cos1,
-	tan1,
-	asin1,
-	acos1,
-	atan1,
-	sqr1,
-	sqrt1,
-	recip1,
-	abs1,
-	bin1,
-	binv1,
-	edge1,
-	index1,
-	nan1,
-	nanm1,
-	rand1,
-	randn1,
-	range1,
-	rank1,
-	ranknorm1,
-	pval1,
-	pval01,
-	cpval1,
-	ztop1,
-	ptoz1,
-	dilMk,
-	dilDk,
-	dilFk,
-	dilallk,
-	erok,
-	eroFk,
-	fmediank,
-	fmeank,
-	fmeanuk,
-	subsamp2,
-	subsamp2offc
-};
-
-static int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
+staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	sigmamm = fabs(sigmamm);
 	if (sigmamm == 0.0)
 		return NULL;
@@ -2427,7 +2285,7 @@ static int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	return kernel;
 } //make_kernel_gauss()
 
-static flt calmax(nifti_image *nim) {
+staticx flt calmax(nifti_image *nim) {
 	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
 		return 0.0;
 	flt *in32 = (flt *)nim->data;
@@ -2437,7 +2295,7 @@ static flt calmax(nifti_image *nim) {
 	return mx;
 }
 
-static flt calmin(nifti_image *nim) {
+staticx flt calmin(nifti_image *nim) {
 	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
 		return 0.0;
 	flt *in32 = (flt *)nim->data;
@@ -2447,7 +2305,7 @@ static flt calmin(nifti_image *nim) {
 	return mn;
 }
 
-static int nifti_tensor_2(nifti_image *nim, int lower2upper) {
+staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	int nvox3D = nim->dim[1] * nim->dim[2] * nim->dim[3];
 	if ((nim->datatype != DT_CALC) || (nvox3D < 1))
 		return 1;
@@ -2510,7 +2368,7 @@ static int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	return 0;
 }
 
-static int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
+staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 // MD= (Dxx+Dyy+Dzz)/3
 //https://github.com/ANTsX/ANTs/wiki/Importing-diffusion-tensor-data-from-other-software
 // dtifit produces upper-triangular order: xx xy xz yy yz zz
@@ -2694,7 +2552,7 @@ static int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 #endif
 } //nifti_tensor_decomp()
 
-static void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol) {
+staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol) {
 	int nVox3D = nim->dim[1] * nim->dim[2] * nim->dim[3];
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
@@ -2739,7 +2597,7 @@ static void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol)
 	_mm_free(inf32);
 } //kernel3D_dilall()
 
-static int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int vol) {
+staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int vol) {
 	int nVox3D = nim->dim[1] * nim->dim[2] * nim->dim[3];
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
@@ -2890,7 +2748,7 @@ static int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int
 				} //for x
 			} //for y
 		} //for z
-	} else if (op == fmeank) {
+	} else if (op == fmeank) { //Mean filtering, kernel weighted (conventionally used with gauss kernel) //u22a
 		flt *kwt = (flt *)_mm_malloc(nkernel * sizeof(flt), 64);
 		for (int k = 0; k < nkernel; k++)
 			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
@@ -2920,7 +2778,49 @@ static int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int
 			} //for y
 		} //for z
 		_mm_free(kwt);
-	} else if (op == fmeanuk) {
+	} else if (op == fmeanzerok) { //Mean filtering, kernel weighted (negative and positive samples sume to zero: laplacian kernel) //u22a
+		flt *kwt = (flt *)_mm_malloc(nkernel * sizeof(flt), 64);
+		for (int k = 0; k < nkernel; k++)
+			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
+		for (int z = 0; z < nim->nz; z++) {
+			int i = (z * nxy) - 1; //offset
+			for (int y = 0; y < nim->ny; y++) {
+				for (int x = 0; x < nim->nx; x++) {
+					i++;
+					flt sumPos = 0.0f;
+					flt wtPos = 0.0f;
+					flt sumNeg = 0.0f;
+					flt wtNeg = 0.0f;
+					for (int k = 0; k < nkernel; k++) {
+						int vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D))
+							continue;
+						//next handle edge cases
+						int dx = x + kernel[k + nkernel];
+						if ((dx < 0) || (dx >= nim->nx))
+							continue; //wrapped left-right
+						int dy = y + kernel[k + nkernel + nkernel];
+						if ((dy < 0) || (dy >= nim->ny))
+							continue; //wrapped anterior-posterior
+						if (kwt[k] > 0.0) {
+							sumPos += (inf32[vx] * kwt[k]);
+							wtPos += kwt[k];
+						} else {
+							sumNeg += (inf32[vx] * kwt[k]);
+							wtNeg += -kwt[k];
+						}
+					} //for k
+					flt val = 0.0;
+					if (wtPos > 0.0)
+						val += sumPos / wtPos;
+					if (wtNeg > 0.0)
+						val += sumNeg / wtNeg;
+					f32[i] = val;
+				} //for x
+			} //for y
+		} //for z
+		_mm_free(kwt);
+	} else if (op == fmeanuk) { //Mean filtering, kernel weighted, un-normalized (gives edge effects)
 		flt *kwt = (flt *)_mm_malloc(nkernel * sizeof(flt), 64);
 		for (int k = 0; k < nkernel; k++)
 			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
@@ -2985,7 +2885,7 @@ static int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int
 	return 0;
 } //kernel3D
 
-static int nifti_kernel(nifti_image *nim, enum eOp op, int *kernel, int nkernel) {
+staticx int nifti_kernel(nifti_image *nim, enum eOp op, int *kernel, int nkernel) {
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -3004,7 +2904,193 @@ static int nifti_kernel(nifti_image *nim, enum eOp op, int *kernel, int nkernel)
 	return 0;
 }
 
-static int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize, int zmin, int zsize, int tmin, int tsize) {
+staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
+	//https://homepages.inf.ed.ac.uk/rbf/HIPR2/zeros.htm
+	// implements: A better technique is to consider points on both sides of the threshold boundary, and choose the one with the lowest absolute magnitude of the Laplacian, which will hopefully be closest to the zero crossing.
+	//we will define edges as voxels with zero crossings
+	// orient refers to slice direction: 1=x=Sagittal, 2=y=Coronal, 3=z=Axial, else 3D 
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	int64_t nvox4D = nvox3D * nVol;
+	flt *inimg = (flt *)nim->data;
+	#pragma omp parallel for
+	for (int v = 0; v < nVol; v++) {
+		int nx = nim->nx;
+		int ny = nim->ny;
+		int nz = nim->nz;
+		flt * img = padImg3D(inimg, &nx, &ny, &nz);
+		memset(inimg, 0, nvox4D * sizeof(flt)); //zero array
+		int xi = 1;
+		int yj = nx;
+		int zk = nx * ny;
+		//orient: only look for edges in 2D, ignore on dimesion
+		if (orient == 1) xi = yj;
+		if (orient == 2) yj = 1;
+		if (orient == 3) zk = 1;
+		int nxy = nx * ny;
+		for (int z = 1; z < (nz -1); z++)
+			for (int y = 1; y < (ny - 1); y++)
+				for (size_t x = 1; x < (nx - 1); x++) {
+						int64_t i = x + (y * nx) + (z * nxy);
+						flt val = img[i];
+						flt ival = -val;
+						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
+						//check six neighbors that share a face
+						if ((val > 0.0) && ((img[i-xi] <= ival) || (img[i+xi] <= ival) 
+							|| (img[i-yj] <= ival) || (img[i+yj] <= ival) 
+							|| (img[i-zk] <= ival) || (img[i+zk] <= ival) ))
+								inimg[0] = 1.0;
+						if ((val < 0.0) && ((img[i-xi] > ival) || (img[i+xi] > ival) 
+							|| (img[i-yj] > ival) || (img[i+yj] > ival) 
+							|| (img[i-zk] > ival) || (img[i+zk] > ival) ))
+								inimg[0] = 1.0;
+						inimg ++;
+					}
+		_mm_free(img);
+	}
+	nim->scl_inter = 0.0;
+	nim->scl_slope = 1.0;
+	nim->cal_min = 0.0;
+	nim->cal_max = 1.0;
+	return 0;
+} //nifti_zero_crossing
+
+#ifdef USING_TIMERS
+double clockMsec() { //return milliseconds since midnight
+	struct timespec _t;
+	clock_gettime(CLOCK_MONOTONIC, &_t);
+	return _t.tv_sec*1000.0 + (_t.tv_nsec/1.0e6);
+}
+
+long timediff(double startTimeMsec, double endTimeMsec) {
+	return round(endTimeMsec - startTimeMsec);
+}
+#endif
+
+staticx int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int orient) {
+//Difference of Gaussians (DoG): difference ratio of 1.6 approximates a Laplacian of Gaussian
+// https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
+	flt kKernelWid = 2.5; //ceil(2.5)
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	if ((nvox3D < 3) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+		fprintf(stderr, "Image dimensions too small for Difference of Gaussian.\n");
+		return 1;
+	}
+	if (SigmammPos == SigmammNeg) {
+		fprintf(stderr, "Difference of Gaussian requires two different sigma values.\n");
+		return 1;
+	}
+	if ((SigmammPos < 0) || (SigmammNeg < 0)) {
+		fprintf(stderr, "Difference of Gaussian requires positive values of sigma.\n");
+		return 1;
+	}
+	#ifdef USING_TIMERS
+	double startTime = clockMsec();
+	#endif
+	flt sigmaMn = MIN(SigmammNeg, SigmammPos);
+	flt sigmaMx = MAX(SigmammNeg, SigmammPos);
+	//Optimization: use results from narrow blur (sigmaMn) as inputs for wide blur (sigmaMx)
+	//consider desired blurs of 2mm and 3.2mm, we can instead compute 2mm and 2.5mmm
+	//only about 10% faster for difference ratio of 2.0, but also removes one copy
+	//https://computergraphics.stackexchange.com/questions/256/is-doing-multiple-gaussian-blurs-the-same-as-doing-one-larger-blur
+	sigmaMx = sqrt((sigmaMx*sigmaMx) - (sigmaMn*sigmaMn));
+	flt *inimg = (flt *)nim->data;
+	int nVol = nim->nvox / nvox3D;
+	int64_t nvox4D = nvox3D * nVol;
+	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn, kKernelWid);
+	if (ret != 0) {
+		fprintf(stderr, "Gaussian smooth failed.\n");
+		return ret;
+	}
+	flt *imgMn = (flt *)_mm_malloc(nvox4D * sizeof(flt), 64);
+	for (int64_t i = 0; i < nvox4D; i++)
+		imgMn[i] = inimg[i];
+	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx, kKernelWid);
+	if (SigmammPos > SigmammNeg) {
+		for (int64_t i = 0; i < nvox4D; i++)
+			inimg[i] = inimg[i] - imgMn[i];
+	} else {
+		for (int64_t i = 0; i < nvox4D; i++)
+			inimg[i] = imgMn[i] - inimg[i];
+	}
+	_mm_free(imgMn);
+	if (orient >= 0)
+		ret = nifti_zero_crossing(nim, orient);
+	#ifdef USING_TIMERS
+	printf("DoG time: %ld ms\n", timediff(startTime, clockMsec()));
+	#endif	
+	return ret;
+} // nifti_dog()
+
+/*
+staticx int nifti_dogNew(nifti_image *nim, flt Sigmamm, flt SigmammNeg, int isEdge) {
+//Only one Gaussian blur - faster in theory, but slower in practice (kernel reads out of cache, kernel must be adjusted for edges)
+	#ifdef USING_TIMERS
+	double startTime = clockMsec();
+	#endif
+	flt kKernelWid = 2.5; //ceil(2.5)
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	if ((nvox3D < 3) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+		fprintf(stderr, "Image dimensions too small for Difference of Gaussian.\n");
+		return 1;
+	}
+	int ret = nifti_smooth_gauss(nim, Sigmamm, Sigmamm, Sigmamm, kKernelWid);
+	if (ret != 0) {
+		fprintf(stderr, "Gaussian smooth failed.\n");
+		return ret;
+	}
+	int nkernel = 0; //number of voxels in kernel
+	int *kernel = NULL;
+	kernel = make_kernel(nim, &nkernel, 3, 3, 3);
+	//https://en.wikipedia.org/wiki/Discrete_Laplace_operator
+	//27 point stencil
+	// [2 3 2; 3 6 3; 2 3 2];
+	// [3 6 3; 6 -88 6; 3 6 3];
+	// [2 3 2; 3 6 3; 2 3 2];
+	int kernelWeight = floor(INT_MAX / 88.0);
+	int i = nkernel + nkernel + nkernel;
+	//slice below
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	//current slice
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = 88 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	//slice above
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -6 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	kernel[i] = -3 * kernelWeight; i++;
+	kernel[i] = -2 * kernelWeight; i++;
+	enum eOp op = fmeanzerok; //u22
+	ret = nifti_kernel(nim, op, kernel, nkernel);
+	_mm_free(kernel);
+	if (isEdge)
+		ret = nifti_zero_crossing(nim, 0);
+	#ifdef USING_TIMERS
+	printf("DoG time: %ld ms\n", timediff(startTime, clockMsec()));
+	#endif	
+	return ret;
+}*/
+
+staticx int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize, int zmin, int zsize, int tmin, int tsize) {
 	// "fslmaths LAS -roi 3 32 0 40 0 40 0 5 f "
 	int nt = nim->nvox / (nim->nx * nim->ny * nim->nz);
 	if ((nim->nvox < 1) || (nt < 1))
@@ -3046,7 +3132,7 @@ static int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize,
 	return 0;
 }
 
-static int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
+staticx int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 	//sobel is simply one kernel pass per dimension.
 	// this could be achieved with successive passes of "-kernel"
 	// here it is done in a single pass for cache efficiency
@@ -3207,7 +3293,7 @@ static int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 	return 0;
 } //nifti_sobel()
 
-static int nifti_subsamp2(nifti_image *nim, int offc) {
+staticx int nifti_subsamp2(nifti_image *nim, int offc) {
 	//naive downsampling: this is provided purely to mimic the behavior of fslmaths
 	// see https://nbviewer.jupyter.org/urls/dl.dropbox.com/s/s0nw827nc4kcnaa/Aliasing.ipynb
 	// no anti-aliasing filter https://en.wikipedia.org/wiki/Image_scaling
@@ -3337,9 +3423,11 @@ static int nifti_subsamp2(nifti_image *nim, int offc) {
 	nim->dx *= 2;
 	nim->dy *= 2;
 	nim->dz *= 2;
+	#ifndef USING_WASM
 	nim->pixdim[1] *= 2;
 	nim->pixdim[2] *= 2;
 	nim->pixdim[3] *= 2;
+	#endif
 	//adjust origin
 	mat44 m = xform(nim);
 	vec4 vx = setVec4(0, 0, 0);
@@ -3384,7 +3472,7 @@ static int nifti_subsamp2(nifti_image *nim, int offc) {
 	return 0;
 }
 
-static int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_method) {
+staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_method) {
 	//see AFNI's 3dresample
 	//better than fslmaths: fslmaths can not resample 4D data
 	// time 3dresample -dxyz 4.8 4.8 4.8 -rmode Linear -prefix afni.nii -input rest.nii
@@ -3506,9 +3594,11 @@ static int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_met
 	nim->dx /= zx;
 	nim->dy /= zy;
 	nim->dz /= zz;
+	#ifndef USING_WASM
 	nim->pixdim[1] /= zx;
 	nim->pixdim[2] /= zy;
 	nim->pixdim[3] /= zz;
+	#endif
 	//adjust origin - again, just like fslmaths
 	mat44 m = xform(nim);
 	m.m[0][0] /= zx;
@@ -3530,561 +3620,32 @@ static int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_met
 	return 0;
 }
 
-static int essentiallyEqual(float a, float b) {
+staticx int essentiallyEqual(float a, float b) {
 	if (isnan(a) && isnan(b))
 		return 1; //surprisingly, with C nan != nan
 	return fabs(a - b) <= ((fabs(a) > fabs(b) ? fabs(b) : fabs(a)) * epsilon);
 }
 
-static void nifti_compare(nifti_image *nim, char *fin) {
-	if (nim->nvox < 1)
-		exit(1);
-	if (nim->datatype != DT_CALC) {
-		fprintf(stderr, "nifti_compare: Unsupported datatype %d\n", nim->datatype);
-		exit(1);
-	}
-	nifti_image *nim2 = nifti_image_read2(fin, 1);
-	if (!nim2) {
-		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", fin);
-		exit(2);
-	}
-	if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
-		fprintf(stderr, "** Attempted to process images of different sizes %" PRId64 "x%" PRId64 "x%" PRId64 "vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
-		nifti_image_free(nim2);
-		exit(1);
-	}
-	if (nim->nvox != nim2->nvox) {
-		fprintf(stderr, " Number of volumes differ\n");
-		nifti_image_free(nim2);
-		exit(1);
-	}
-	if (max_displacement_mm(nim, nim2) > 0.5) { //fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
-		fprintf(stderr, "WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
-		fprintf(stderr, " Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
-	}
-	in_hdr ihdr = set_input_hdr(nim2);
-	if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
-		nifti_image_free(nim2);
-		exit(1);
-	}
-	flt *img = (flt *)nim->data;
-	flt *img2 = (flt *)nim2->data;
-	size_t differentVox = nim->nvox;
-	double sum = 0.0;
-	double sum2 = 0.0;
-	double maxDiff = 0.0;
-	size_t nNotNan = 0;
-	size_t nDifferent = 0;
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (!essentiallyEqual(img[i], img2[i])) {
-			if (fabs(img[i] - img2[i]) > maxDiff) {
-				differentVox = i;
-				maxDiff = fabs(img[i] - img2[i]);
-			}
-			nDifferent++;
-		}
-		if (isnan(img[i]) || isnan(img[i]))
-			continue;
-		nNotNan++;
-		sum += img[i];
-		sum2 += img2[i];
-	}
-	if (differentVox >= nim->nvox) {
-		//fprintf(stderr,"Images essentially equal\n"); */
-		nifti_image_free(nim2);
-		exit(0);
-	}
-	//second pass - one pass correlation is inaccurate or slow
-	nNotNan = MAX(1, nNotNan);
-	flt mn = INFINITY; //do not set to item 1, in case it is nan
-	flt mx = -INFINITY;
-	flt sd = 0.0;
-	flt ave = sum / nNotNan;
-	flt mn2 = INFINITY;
-	flt mx2 = -INFINITY;
-	flt sd2 = 0.0;
-	flt ave2 = sum2 / nNotNan;
-	//for i := 0 to (n - 1) do
-	// sd := sd + sqr(y[i] - mn);
-	//sd := sqrt(sd / (n - 1));
-	double sumDx = 0.0;
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i]) || isnan(img[i]))
-			continue;
-		mn = MIN(mn, img[i]);
-		mx = MAX(mx, img[i]);
-		sd += sqr(img[i] - ave);
-		mn2 = MIN(mn2, img2[i]);
-		mx2 = MAX(mx2, img2[i]);
-		sd2 += sqr(img2[i] - ave2);
-		sumDx += (img[i] - ave) * (img2[i] - ave2);
-	}
-	double r = 0.0;
-	nNotNan = MAX(2, nNotNan);
-	if (nim->nvox < 2) {
-		sd = 0.0;
-		sd2 = 0.0;
-	} else {
-		sd = sqrt(sd / (nNotNan - 1));
-		//if (sd != 0.0) sd = 1.0/sd;
-		sd2 = sqrt(sd2 / (nNotNan - 1));
-		//if (sd2 != 0.0) sd2 = 1.0/sd2;
-		if ((sd * sd2) != 0.0)
-			r = sumDx / (sd * sd2 * (nNotNan - 1));
-		//r = r / (nim->nvox - 1);
-	}
-	r = MIN(r, 1.0);
-	r = MAX(r, -1.0);
-	fprintf(stderr, "Images Differ: Correlation r = %g, identical voxels %d%%\n", r, (int)floor(100.0 * (1.0 - (double)nDifferent / (double)nim->nvox)));
-	if (nNotNan < nim->nvox) {
-		fprintf(stderr, "  %" PRId64 " voxels have a NaN in at least one image.\n", nim->nvox - nNotNan);
-		fprintf(stderr, "  Descriptives consider voxels that are numeric in both images.\n");
-	}
-	fprintf(stderr, "  Most different voxel %g vs %g (difference %g)\n", img[differentVox], img2[differentVox], maxDiff);
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-	int nVol = nim->nvox / nvox3D;
-	size_t vx[4];
-	vx[3] = differentVox / nvox3D;
-	vx[2] = (differentVox / (nim->nx * nim->ny)) % nim->nz;
-	vx[1] = (differentVox / nim->nx) % nim->ny;
-	vx[0] = differentVox % nim->nx;
-	fprintf(stderr, "  Most different voxel location %zux%zux%zu volume %zu\n", vx[0], vx[1], vx[2], vx[3]);
-	fprintf(stderr, "Image 1 Descriptives\n");
-	fprintf(stderr, " Range: %g..%g Mean %g StDev %g\n", mn, mx, ave, sd);
-	fprintf(stderr, "Image 2 Descriptives\n");
-	fprintf(stderr, " Range: %g..%g Mean %g StDev %g\n", mn2, mx2, ave2, sd2);
-	//V1 comparison - EXIT_SUCCESS if all vectors are parallel (for DWI up vector [1 0 0] has same direction as down [-1 0 0])
-	if (nVol != 3) {
-		nifti_image_free(nim2);
-		exit(1);
-	}
-	int allParallel = 1;
-	//niimath ft_V1 -compare nt_V1
-	for (size_t i = 0; i < nvox3D; i++) {
-		//check angle of two vectors... assume unit vectors
-		flt v[3]; //vector, image 1
-		v[0] = img[i];
-		v[1] = img[i + nvox3D];
-		v[2] = img[i + nvox3D + nvox3D];
-		flt v2[3]; //vector, image 2
-		v2[0] = img2[i];
-		v2[1] = img2[i + nvox3D];
-		v2[2] = img2[i + nvox3D + nvox3D];
-		flt x[3]; //cross product
-		x[0] = (v[1] * v2[2]) - (v[2] * v2[1]);
-		x[1] = (v[2] * v2[0]) - (v[0] * v2[2]);
-		x[2] = (v[0] * v2[1]) - (v[1] * v2[0]);
-		flt len = sqrt((x[0] * x[0]) + (x[1] * x[1]) + (x[2] * x[2]));
-		if (len > 0.01) {
-			allParallel = 0;
-			//fprintf(stderr,"[%g %g %g] vs [%g %g %g]\n", v[0],v[1], v[2], v2[0], v2[1], v2[2]);
-			break;
-		}
-	}
-	if (allParallel) {
-		fprintf(stderr, "Despite polarity differences, all vectors are parallel.\n");
-		nifti_image_free(nim2);
-		exit(0);
-	}
-	nifti_image_free(nim2);
-	exit(1);
-} //nifti_compare()
-
-static int nifti_binary_power(nifti_image *nim, double v) {
+staticx int nifti_binary_power(nifti_image *nim, double v) {
 	//clone operations from ANTS ImageMath: power
 	//https://manpages.debian.org/jessie/ants/ImageMath.1.en.html
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype != DT_CALC)
 		return 1;
-	flt fv = v;
+	//flt fv = v;
 	flt *f32 = (flt *)nim->data;
 	for (size_t i = 0; i < nim->nvox; i++)
 		f32[i] = pow(f32[i], v);
 	return 0;
 }
 
-static int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
-	if (nim->nvox < 1)
-		return 1;
-	if (nim->datatype != DT_CALC) {
-		fprintf(stderr, "nifti_binary: Unsupported datatype %d\n", nim->datatype);
-		return 1;
-	}
-	nifti_image *nim2 = nifti_image_read2(fin, 1);
-	if (!nim2) {
-		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", fin);
-		return 2;
-	}
-	if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
-		fprintf(stderr, "** Attempted to process images of different sizes %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
-		nifti_image_free(nim2);
-		return 1;
-	}
-	if (max_displacement_mm(nim, nim2) > 0.5) { //fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
-		fprintf(stderr, "WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
-		fprintf(stderr, " Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
-	}
-	in_hdr ihdr = set_input_hdr(nim2);
-	if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
-		nifti_image_free(nim2);
-		return 1;
-	}
-	flt *imga = (flt *)nim->data;
-	flt *imgb = (flt *)nim2->data;
-	int nvox3D = nim->nx * nim->ny * nim->nz;
-	int nvola = nim->nvox / nvox3D;
-	int nvolb = nim2->nvox / nvox3D;
-	int rem0 = 0;
-	int swap4D = 0; //if 1: input nim was 3D, but nim2 is 4D: output will be 4D
-	if ((nvolb > 1) && (nim->nvox != nim2->nvox) && ((op == uthr) || (op == thr))) {
-		//"niimath 3D -uthr 4D out" only uses 1st volume of 4D, only one volume out
-		nvolb = 1; //fslmaths
-		printf("threshold operation expects 3D mask\n"); //fslmaths makes not modification to image
-		if (op == uthr) //strictly for fslmaths compatibility - makes no sense
-			for (size_t i = 0; i < nim->nvox; i++)
-				imga[i] = 0;
-		nifti_image_free(nim2);
-		return 0;
-	} else if (nim->nvox != nim2->nvox) {
-		//situation where one input is 3D and the other is 4D
-		if ((nvola != 1) && ((nvolb != 1))) {
-			fprintf(stderr, "nifti_binary: both images must have the same number of volumes, or one must have a single volume (%d and %d)\n", nvola, nvolb);
-			nifti_image_free(nim2);
-			return 1;
-		}
-		if (nvola == 1) {
-			imgb = (flt *)nim->data;
-			imga = (flt *)nim2->data;
-			swap4D = 1;
-			nvolb = nim->nvox / nvox3D;
-			nvola = nim2->nvox / nvox3D;
-		}
-	} //make it so imga/novla >= imgb/nvolb
-	for (int v = 0; v < nvola; v++) { //
-		int va = v * nvox3D; //start of volume for image A
-		int vb = (v % nvolb) * nvox3D; //start of volume for image B
-		if (op == add) {
-			for (int i = 0; i < nvox3D; i++)
-				imga[va + i] += imgb[vb + i];
-		} else if (op == sub) {
-			if (swap4D) {
-				for (int i = 0; i < nvox3D; i++) {
-					imga[va + i] = imgb[vb + i] - imga[va + i];
-					//printf(">>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], x, imga[va+i]);
-				}
-			} else {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("[%d]/[%d] %g/%g\n", va+i, vb+i, imga[va+i], imga[vb+i]);
-					imga[va + i] = imga[va + i] - imgb[vb + i];
-				}
-			}
-		} else if (op == mul) {
-			for (int i = 0; i < nvox3D; i++)
-				imga[va + i] *= imgb[vb + i];
-		} else if (op == max) {
-			for (int i = 0; i < nvox3D; i++)
-				imga[va + i] = MAX(imga[va + i], imgb[vb + i]);
-		} else if (op == min) {
-			for (int i = 0; i < nvox3D; i++)
-				imga[va + i] = MIN(imga[va + i], imgb[vb + i]);
-		} else if (op == thr) {
-			//thr  : use following number to threshold current image (zero anything below the number)
-			for (int i = 0; i < nvox3D; i++)
-				if (imga[va + i] < imgb[vb + i])
-					imga[va + i] = 0;
-		} else if (op == uthr) {
-			//uthr : use following number to upper-threshold current image (zero anything above the number)
-			for (int i = 0; i < nvox3D; i++)
-				if (imga[va + i] > imgb[vb + i])
-					imga[va + i] = 0;
-
-		} else if (op == mas) {
-			if (swap4D) {
-				for (int i = 0; i < nvox3D; i++) {
-					if (imga[va + i] > 0)
-						imga[va + i] = imgb[vb + i];
-					else
-						imga[va + i] = 0;
-				}
-			} else {
-				for (int i = 0; i < nvox3D; i++)
-					if (imgb[vb + i] <= 0)
-						imga[va + i] = 0;
-			}
-		} else if (op == divX) {
-			if (swap4D) {
-				for (int i = 0; i < nvox3D; i++) {
-					//flt x = imga[va+i];
-					if (imga[va + i] != 0.0f)
-						imga[va + i] = imgb[vb + i] / imga[va + i];
-					//printf(">>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], x, imga[va+i]);
-				}
-			} else {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("[%d]/[%d] %g/%g\n", va+i, vb+i, imga[va+i], imga[vb+i]);
-					if (imgb[vb + i] == 0.0f)
-						imga[va + i] = 0.0f;
-					else
-						imga[va + i] = imga[va + i] / imgb[vb + i];
-				}
-			}
-		} else if (op == mod) { //afni mod function, divide by zero yields 0 (unlike Matlab, see remtest.m)
-			//fractional remainder:
-			if (swap4D) {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("!>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], imga[va+i], fmod(trunc(imgb[vb+i]), trunc(imga[va+i]))  );
-					if (imga[va + i] != 0.0f)
-						imga[va + i] = fmod(imgb[vb + i], imga[va + i]);
-					else {
-						rem0 = 1;
-						imga[va + i] = 0; //imgb[vb+i];
-					}
-				}
-			} else {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("?>[%d]/[%d] %g/%g = %g : %g\n", va+i, vb+i, imga[va+i], imgb[vb+i], fmod(imga[va+i], imgb[vb+i]), fmod(trunc(imga[va+i]), trunc(imgb[vb+i])) );
-					if (imgb[vb + i] != 0.0f)
-						//imga[va+i] = round(fmod(imga[va+i], imgb[vb+i]));
-						imga[va + i] = fmod(imga[va + i], imgb[vb + i]);
-					else {
-						rem0 = 1;
-						imga[va + i] = 0;
-					}
-				}
-			}
-		} else if (op == rem) { //fmod _rem
-			//fractional remainder:
-			if (swap4D) {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("!>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], imga[va+i], fmod(trunc(imgb[vb+i]), trunc(imga[va+i]))  );
-					if (trunc(imga[va + i]) != 0.0f)
-						imga[va + i] = fmod(trunc(imgb[vb + i]), trunc(imga[va + i]));
-					else {
-						rem0 = 1;
-						imga[va + i] = imgb[vb + i];
-					}
-				}
-			} else {
-				for (int i = 0; i < nvox3D; i++) {
-					//printf("?>[%d]/[%d] %g/%g = %g : %g\n", va+i, vb+i, imga[va+i], imgb[vb+i], fmod(imga[va+i], imgb[vb+i]), fmod(trunc(imga[va+i]), trunc(imgb[vb+i])) );
-					if (trunc(imgb[vb + i]) != 0.0f)
-						//imga[va+i] = round(fmod(imga[va+i], imgb[vb+i]));
-						imga[va + i] = fmod(trunc(imga[va + i]), trunc(imgb[vb + i]));
-					else
-						rem0 = 1;
-				}
-			}
-		} else {
-			fprintf(stderr, "nifti_binary: unsupported operation %d\n", op);
-			nifti_image_free(nim2);
-			return 1;
-		}
-	}
-	if (swap4D) { //if 1: input nim was 3D, but nim2 is 4D: output will be 4D
-		nim->nvox = nim2->nvox;
-		nim->ndim = nim2->ndim;
-		nim->nt = nim2->nt;
-		nim->nu = nim2->nu;
-		nim->nv = nim2->nv;
-		nim->nw = nim2->nw;
-		for (int i = 4; i < 8; i++) {
-			nim->dim[i] = nim2->dim[i];
-			nim->pixdim[i] = nim2->pixdim[i];
-		}
-		nim->dt = nim2->dt;
-		nim->du = nim2->du;
-		nim->dv = nim2->dv;
-		nim->dw = nim2->dw;
-		free(nim->data);
-		nim->data = nim2->data;
-		nim2->data = NULL;
-	}
-	nifti_image_free(nim2);
-	if (rem0) {
-		fprintf(stderr, "Warning -rem image included zeros (fslmaths exception)\n");
-		return 0;
-	}
-	return 0;
-} // nifti_binary()
-
 struct sortIdx {
 	flt val;
 	int idx;
 };
 
-static int nifti_roc(nifti_image *nim, double fpThresh, const char *foutfile, const char *fnoise, const char *ftruth) {
-	if (nim->datatype != DT_CALC)
-		return 1;
-	//(nim, thresh, argv[outfile], fnoise, argv[truth]);
-	//fslmaths appears to ignore voxels on edge of image, and will crash with small images:
-	// error: sort(): given object has non-finite elements
-	//therefore, there is a margin ("border") around the volume
-	int border = 5; //in voxels
-	int mindim = border + border + 1; //e.g. minimum size has one voxel surrounded by border on each side
-	if ((nim->nx < mindim) || (nim->ny < mindim) || (nim->nz < mindim)) {
-		fprintf(stderr, "volume too small for ROC analyses\n");
-		return 1;
-	}
-	if (nim->nvox > (nim->nx * nim->ny * nim->nz)) {
-		fprintf(stderr, "ROC input should be 3D image (not 4D)\n"); //fslmaths seg faults
-		return 1;
-	}
-	if ((fpThresh <= 0.0) || (fpThresh >= 1.0)) {
-		fprintf(stderr, "ROC  false-positive threshold should be between 0 and 1, not '%g'\n", fpThresh);
-		return 1;
-	}
-	nifti_image *nimTrue = nifti_image_read2(ftruth, 1);
-	if (!nimTrue) {
-		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", ftruth);
-		exit(2);
-	}
-	if ((nim->nx != nimTrue->nx) || (nim->ny != nimTrue->ny) || (nim->nz != nimTrue->nz)) {
-		fprintf(stderr, "** Truth image is the wrong size %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nimTrue->nx, nimTrue->ny, nimTrue->nz);
-		nifti_image_free(nimTrue);
-		exit(1);
-	}
-	if (nimTrue->nvox > (nimTrue->nx * nimTrue->ny * nimTrue->nz)) {
-		fprintf(stderr, "ROC truth should be 3D image (not 4D)\n"); //fslmaths seg faults
-		return 1;
-	}
-	nifti_image *nimNoise = NULL;
-	//count number of tests
-	//If the truth image contains negative voxels these get excluded from all calculations
-	int nTest = 0;
-	int nTrue = 0;
-	size_t i = 0;
-	flt *imgTrue = (flt *)nimTrue->data;
-	flt *imgObs = (flt *)nim->data;
-	for (int z = 0; z < nim->nz; z++)
-		for (int y = 0; y < nim->ny; y++)
-			for (int x = 0; x < nim->nx; x++) {
-				if ((imgTrue[i] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border))) {
-					nTest++;
-					if (imgTrue[i] > 0)
-						nTrue++;
-				}
-				i++;
-			}
-	if (nTest < 1) {
-		fprintf(stderr, "** All truth voxels inside border are negative\n");
-		exit(1);
-	}
-	//printf("%d %d = %d\n", nTrue, nFalse, nTest);
-	if (nTest == nTrue)
-		fprintf(stderr, "Warning: All truth voxels inside border are the same (all true or all false)\n");
-	struct sortIdx *k = (struct sortIdx *)_mm_malloc(nTest * sizeof(struct sortIdx), 64);
-	//load the data
-	nTest = 0;
-	i = 0;
-	for (int z = 0; z < nim->nz; z++)
-		for (int y = 0; y < nim->ny; y++)
-			for (int x = 0; x < nim->nx; x++) {
-				if ((imgTrue[i] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border))) {
-					k[nTest].val = imgObs[i];
-					k[nTest].idx = imgTrue[i] > 0;
-					nTest++;
-				}
-				i++;
-			}
-	qsort(k, nTest, sizeof(struct sortIdx), compare);
-	//for (int v = 0; v < nvol; v++ )
-	//	f32[ k[v].idx ] = v + 1;
-	//printf("%d tests, intensity range %g..%g\n", nTest, k[0].val, k[nTest-1].val);
-	FILE *txt = fopen(foutfile, "w+");
-	flt threshold = k[nTest - 1].val; //maximum observed intensity
-	int bins = 1000; //step size: how often are results reported
-	flt step = (threshold - k[0].val) / bins; //[max-min]/bins
-	int fp = 0;
-	int tp = 0;
-	if (fnoise != NULL) {
-		nimNoise = nifti_image_read2(fnoise, 1);
-		if ((nim->nx != nimNoise->nx) || (nim->ny != nimNoise->ny) || (nim->nz != nimNoise->nz)) {
-			fprintf(stderr, "** Noise image is the wrong size %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nimNoise->nx, nimNoise->ny, nimNoise->nz);
-			nifti_image_free(nimTrue);
-			nifti_image_free(nimNoise);
-			exit(1);
-		}
-		//Matlab script roc.m generates samples you can process with fslmaths.\
-		// The fslmaths text file includes two additional columns of output not described by the help documentation
-		// Appears to find maximum signal in each noise volume, regardless of whether it is a hit or false alarm.
-		int nvox3D = nim->dim[1] * nim->dim[2] * nim->dim[3];
-		int nvol = nimNoise->nvox / nvox3D;
-		if (nvol < 10)
-			fprintf(stderr, "Warning: Noise images should include many volumes for estimating familywise error/\n");
-		flt *imgNoise = (flt *)nimNoise->data;
-		flt *mxVox = (flt *)_mm_malloc(nvol * sizeof(flt), 64);
-		for (int v = 0; v < nvol; v++) { //for each volume
-			mxVox[v] = -INFINITY;
-			size_t vo = v * nvox3D;
-			size_t vi = 0;
-			for (int z = 0; z < nim->nz; z++)
-				for (int y = 0; y < nim->ny; y++)
-					for (int x = 0; x < nim->nx; x++) {
-						if ((imgTrue[vi] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border)))
-							mxVox[v] = MAX(mxVox[v], imgNoise[vo + vi]);
-						vi++;
-					}
-		} //for each volume
-		nifti_image_free(nimNoise);
-		qsort(mxVox, nvol, sizeof(flt), compare);
-		int idx = nTest - 1;
-		flt mxNoise = mxVox[nvol - 1];
-		while ((idx >= 1) && (k[idx].val > mxNoise)) {
-			tp++;
-			idx--;
-			if ((k[idx].val != k[idx - 1].val) && (k[idx].val <= threshold)) {
-				fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
-				threshold = threshold - step; //delay next report
-			}
-		} //more significant than any noise...
-		int fpThreshInt = round(fpThresh * nvol); //stop when number of false positives exceed this
-		for (int i = nvol - 1; i >= 1; i--) {
-			fp++; //false alarm
-			while ((idx >= 1) && (k[idx].val >= mxVox[i])) {
-				tp++;
-				idx--;
-				if ((k[idx].val != k[idx - 1].val) && (k[idx].val <= threshold)) {
-					fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
-					threshold = threshold - step; //delay next report
-				}
-			} //at least as significant as current noise
-			if ((fp > fpThreshInt) || ((k[i].val != k[i - 1].val) && (k[i].val <= threshold))) {
-				//printf("%g %g %g\n", (double)fp/(double)nFalse, (double)tp/(double)nTrue, threshold);
-				fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
-				threshold = threshold - step; //delay next report
-			}
-			if (fp > fpThreshInt)
-				break;
-		} //inspect all tests...
-		_mm_free(mxVox);
-		exit(1);
-
-	} else { //if noise image else infer FP/TP from input image
-		int nFalse = nTest - nTrue;
-		int fpThreshInt = ceil(fpThresh * nFalse); //stop when number of false positives exceed this
-
-		for (int i = nTest - 1; i >= 1; i--) {
-			if (k[i].idx == 0)
-				fp++; //false alarm
-			else
-				tp++; //hit
-			if ((fp > fpThreshInt) || ((k[i].val != k[i - 1].val) && (k[i].val <= threshold))) {
-				//printf("%g %g %g\n", (double)fp/(double)nFalse, (double)tp/(double)nTrue, threshold);
-				fprintf(txt, "%g %g %g\n", (double)fp / (double)nFalse, (double)tp / (double)nTrue, threshold);
-				threshold = threshold - step; //delay next report
-			}
-			if (fp > fpThreshInt)
-				break;
-		} //inspect all tests...
-	} //if noise else...
-	fclose(txt);
-	_mm_free(k);
-	nifti_image_free(nimTrue);
-	return 0;
-}
-
-static int nifti_fillh(nifti_image *nim, int is26) {
+staticx int nifti_fillh(nifti_image *nim, int is26) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -4190,7 +3751,7 @@ static int nifti_fillh(nifti_image *nim, int is26) {
 	return 0;
 }
 
-static void rand_test() {
+staticx void rand_test() {
 	//https://www.phoronix.com/scan.php?page=news_item&px=Linux-RdRand-Sanity-Check
 	int r0 = rand();
 	for (int i = 0; i < 7; i++)
@@ -4199,7 +3760,7 @@ static void rand_test() {
 	fprintf(stderr, "RDRAND gives funky output: update firmware\n");
 }
 
-static int nifti_unary(nifti_image *nim, enum eOp op) {
+staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 	if (nim->nvox < 1)
 		return 1;
 	if (nim->datatype != DT_CALC) {
@@ -4596,7 +4157,7 @@ static int nifti_unary(nifti_image *nim, enum eOp op) {
 	return 0;
 } //nifti_unary()
 
-static int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
+staticx int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
 	// -thrp: use following percentage (0-100) of ROBUST RANGE to threshold current image (zero anything below the number)
 	// -thrP: use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold below
 	// -uthrp : use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)
@@ -4622,6 +4183,536 @@ static int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
 	return 0;
 } //nifti_thrp()
 
+#ifndef USING_WASM
+staticx int nifti_roc(nifti_image *nim, double fpThresh, const char *foutfile, const char *fnoise, const char *ftruth) {
+	if (nim->datatype != DT_CALC)
+		return 1;
+	//(nim, thresh, argv[outfile], fnoise, argv[truth]);
+	//fslmaths appears to ignore voxels on edge of image, and will crash with small images:
+	// error: sort(): given object has non-finite elements
+	//therefore, there is a margin ("border") around the volume
+	int border = 5; //in voxels
+	int mindim = border + border + 1; //e.g. minimum size has one voxel surrounded by border on each side
+	if ((nim->nx < mindim) || (nim->ny < mindim) || (nim->nz < mindim)) {
+		fprintf(stderr, "volume too small for ROC analyses\n");
+		return 1;
+	}
+	if (nim->nvox > (nim->nx * nim->ny * nim->nz)) {
+		fprintf(stderr, "ROC input should be 3D image (not 4D)\n"); //fslmaths seg faults
+		return 1;
+	}
+	if ((fpThresh <= 0.0) || (fpThresh >= 1.0)) {
+		fprintf(stderr, "ROC  false-positive threshold should be between 0 and 1, not '%g'\n", fpThresh);
+		return 1;
+	}
+	nifti_image *nimTrue = nifti_image_read2(ftruth, 1);
+	if (!nimTrue) {
+		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", ftruth);
+		exit(2);
+	}
+	if ((nim->nx != nimTrue->nx) || (nim->ny != nimTrue->ny) || (nim->nz != nimTrue->nz)) {
+		fprintf(stderr, "** Truth image is the wrong size %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nimTrue->nx, nimTrue->ny, nimTrue->nz);
+		nifti_image_free(nimTrue);
+		exit(1);
+	}
+	if (nimTrue->nvox > (nimTrue->nx * nimTrue->ny * nimTrue->nz)) {
+		fprintf(stderr, "ROC truth should be 3D image (not 4D)\n"); //fslmaths seg faults
+		return 1;
+	}
+	nifti_image *nimNoise = NULL;
+	//count number of tests
+	//If the truth image contains negative voxels these get excluded from all calculations
+	int nTest = 0;
+	int nTrue = 0;
+	size_t i = 0;
+	flt *imgTrue = (flt *)nimTrue->data;
+	flt *imgObs = (flt *)nim->data;
+	for (int z = 0; z < nim->nz; z++)
+		for (int y = 0; y < nim->ny; y++)
+			for (int x = 0; x < nim->nx; x++) {
+				if ((imgTrue[i] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border))) {
+					nTest++;
+					if (imgTrue[i] > 0)
+						nTrue++;
+				}
+				i++;
+			}
+	if (nTest < 1) {
+		fprintf(stderr, "** All truth voxels inside border are negative\n");
+		exit(1);
+	}
+	//printf("%d %d = %d\n", nTrue, nFalse, nTest);
+	if (nTest == nTrue)
+		fprintf(stderr, "Warning: All truth voxels inside border are the same (all true or all false)\n");
+	struct sortIdx *k = (struct sortIdx *)_mm_malloc(nTest * sizeof(struct sortIdx), 64);
+	//load the data
+	nTest = 0;
+	i = 0;
+	for (int z = 0; z < nim->nz; z++)
+		for (int y = 0; y < nim->ny; y++)
+			for (int x = 0; x < nim->nx; x++) {
+				if ((imgTrue[i] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border))) {
+					k[nTest].val = imgObs[i];
+					k[nTest].idx = imgTrue[i] > 0;
+					nTest++;
+				}
+				i++;
+			}
+	qsort(k, nTest, sizeof(struct sortIdx), compare);
+	//for (int v = 0; v < nvol; v++ )
+	//	f32[ k[v].idx ] = v + 1;
+	//printf("%d tests, intensity range %g..%g\n", nTest, k[0].val, k[nTest-1].val);
+	FILE *txt = fopen(foutfile, "w+");
+	flt threshold = k[nTest - 1].val; //maximum observed intensity
+	int bins = 1000; //step size: how often are results reported
+	flt step = (threshold - k[0].val) / bins; //[max-min]/bins
+	int fp = 0;
+	int tp = 0;
+	if (fnoise != NULL) {
+		nimNoise = nifti_image_read2(fnoise, 1);
+		if ((nim->nx != nimNoise->nx) || (nim->ny != nimNoise->ny) || (nim->nz != nimNoise->nz)) {
+			fprintf(stderr, "** Noise image is the wrong size %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nimNoise->nx, nimNoise->ny, nimNoise->nz);
+			nifti_image_free(nimTrue);
+			nifti_image_free(nimNoise);
+			exit(1);
+		}
+		//Matlab script roc.m generates samples you can process with fslmaths.\
+		// The fslmaths text file includes two additional columns of output not described by the help documentation
+		// Appears to find maximum signal in each noise volume, regardless of whether it is a hit or false alarm.
+		int nvox3D = nim->dim[1] * nim->dim[2] * nim->dim[3];
+		int nvol = nimNoise->nvox / nvox3D;
+		if (nvol < 10)
+			fprintf(stderr, "Warning: Noise images should include many volumes for estimating familywise error/\n");
+		flt *imgNoise = (flt *)nimNoise->data;
+		flt *mxVox = (flt *)_mm_malloc(nvol * sizeof(flt), 64);
+		for (int v = 0; v < nvol; v++) { //for each volume
+			mxVox[v] = -INFINITY;
+			size_t vo = v * nvox3D;
+			size_t vi = 0;
+			for (int z = 0; z < nim->nz; z++)
+				for (int y = 0; y < nim->ny; y++)
+					for (int x = 0; x < nim->nx; x++) {
+						if ((imgTrue[vi] >= 0) && (x >= border) && (y >= border) && (z >= border) && (x < (nim->nx - border)) && (y < (nim->ny - border)) && (z < (nim->nz - border)))
+							mxVox[v] = MAX(mxVox[v], imgNoise[vo + vi]);
+						vi++;
+					}
+		} //for each volume
+		nifti_image_free(nimNoise);
+		qsort(mxVox, nvol, sizeof(flt), compare);
+		int idx = nTest - 1;
+		flt mxNoise = mxVox[nvol - 1];
+		while ((idx >= 1) && (k[idx].val > mxNoise)) {
+			tp++;
+			idx--;
+			if ((k[idx].val != k[idx - 1].val) && (k[idx].val <= threshold)) {
+				fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
+				threshold = threshold - step; //delay next report
+			}
+		} //more significant than any noise...
+		int fpThreshInt = round(fpThresh * nvol); //stop when number of false positives exceed this
+		for (int i = nvol - 1; i >= 1; i--) {
+			fp++; //false alarm
+			while ((idx >= 1) && (k[idx].val >= mxVox[i])) {
+				tp++;
+				idx--;
+				if ((k[idx].val != k[idx - 1].val) && (k[idx].val <= threshold)) {
+					fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
+					threshold = threshold - step; //delay next report
+				}
+			} //at least as significant as current noise
+			if ((fp > fpThreshInt) || ((k[i].val != k[i - 1].val) && (k[i].val <= threshold))) {
+				//printf("%g %g %g\n", (double)fp/(double)nFalse, (double)tp/(double)nTrue, threshold);
+				fprintf(txt, "%g %g %g\n", (double)fp / (double)nvol, (double)tp / (double)nTrue, threshold);
+				threshold = threshold - step; //delay next report
+			}
+			if (fp > fpThreshInt)
+				break;
+		} //inspect all tests...
+		_mm_free(mxVox);
+		exit(1);
+
+	} else { //if noise image else infer FP/TP from input image
+		int nFalse = nTest - nTrue;
+		int fpThreshInt = ceil(fpThresh * nFalse); //stop when number of false positives exceed this
+
+		for (int i = nTest - 1; i >= 1; i--) {
+			if (k[i].idx == 0)
+				fp++; //false alarm
+			else
+				tp++; //hit
+			if ((fp > fpThreshInt) || ((k[i].val != k[i - 1].val) && (k[i].val <= threshold))) {
+				//printf("%g %g %g\n", (double)fp/(double)nFalse, (double)tp/(double)nTrue, threshold);
+				fprintf(txt, "%g %g %g\n", (double)fp / (double)nFalse, (double)tp / (double)nTrue, threshold);
+				threshold = threshold - step; //delay next report
+			}
+			if (fp > fpThreshInt)
+				break;
+		} //inspect all tests...
+	} //if noise else...
+	fclose(txt);
+	_mm_free(k);
+	nifti_image_free(nimTrue);
+	return 0;
+}
+
+
+staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
+	if (nim->nvox < 1)
+		return 1;
+	if (nim->datatype != DT_CALC) {
+		fprintf(stderr, "nifti_binary: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	nifti_image *nim2 = nifti_image_read2(fin, 1);
+	if (!nim2) {
+		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", fin);
+		return 2;
+	}
+	if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
+		fprintf(stderr, "** Attempted to process images of different sizes %" PRId64 "x%" PRId64 "x%" PRId64 " vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+		nifti_image_free(nim2);
+		return 1;
+	}
+	if (max_displacement_mm(nim, nim2) > 0.5) { //fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
+		fprintf(stderr, "WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
+		fprintf(stderr, " Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
+	}
+	in_hdr ihdr = set_input_hdr(nim2);
+	if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
+		nifti_image_free(nim2);
+		return 1;
+	}
+	flt *imga = (flt *)nim->data;
+	flt *imgb = (flt *)nim2->data;
+	int nvox3D = nim->nx * nim->ny * nim->nz;
+	int nvola = nim->nvox / nvox3D;
+	int nvolb = nim2->nvox / nvox3D;
+	int rem0 = 0;
+	int swap4D = 0; //if 1: input nim was 3D, but nim2 is 4D: output will be 4D
+	if ((nvolb > 1) && (nim->nvox != nim2->nvox) && ((op == uthr) || (op == thr))) {
+		//"niimath 3D -uthr 4D out" only uses 1st volume of 4D, only one volume out
+		nvolb = 1; //fslmaths
+		printf("threshold operation expects 3D mask\n"); //fslmaths makes not modification to image
+		if (op == uthr) //strictly for fslmaths compatibility - makes no sense
+			for (size_t i = 0; i < nim->nvox; i++)
+				imga[i] = 0;
+		nifti_image_free(nim2);
+		return 0;
+	} else if (nim->nvox != nim2->nvox) {
+		//situation where one input is 3D and the other is 4D
+		if ((nvola != 1) && ((nvolb != 1))) {
+			fprintf(stderr, "nifti_binary: both images must have the same number of volumes, or one must have a single volume (%d and %d)\n", nvola, nvolb);
+			nifti_image_free(nim2);
+			return 1;
+		}
+		if (nvola == 1) {
+			imgb = (flt *)nim->data;
+			imga = (flt *)nim2->data;
+			swap4D = 1;
+			nvolb = nim->nvox / nvox3D;
+			nvola = nim2->nvox / nvox3D;
+		}
+	} //make it so imga/novla >= imgb/nvolb
+	for (int v = 0; v < nvola; v++) { //
+		int va = v * nvox3D; //start of volume for image A
+		int vb = (v % nvolb) * nvox3D; //start of volume for image B
+		if (op == add) {
+			for (int i = 0; i < nvox3D; i++)
+				imga[va + i] += imgb[vb + i];
+		} else if (op == sub) {
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++) {
+					imga[va + i] = imgb[vb + i] - imga[va + i];
+					//printf(">>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], x, imga[va+i]);
+				}
+			} else {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("[%d]/[%d] %g/%g\n", va+i, vb+i, imga[va+i], imga[vb+i]);
+					imga[va + i] = imga[va + i] - imgb[vb + i];
+				}
+			}
+		} else if (op == mul) {
+			for (int i = 0; i < nvox3D; i++)
+				imga[va + i] *= imgb[vb + i];
+		} else if (op == max) {
+			for (int i = 0; i < nvox3D; i++)
+				imga[va + i] = MAX(imga[va + i], imgb[vb + i]);
+		} else if (op == min) {
+			for (int i = 0; i < nvox3D; i++)
+				imga[va + i] = MIN(imga[va + i], imgb[vb + i]);
+		} else if (op == thr) {
+			//thr  : use following number to threshold current image (zero anything below the number)
+			for (int i = 0; i < nvox3D; i++)
+				if (imga[va + i] < imgb[vb + i])
+					imga[va + i] = 0;
+		} else if (op == uthr) {
+			//uthr : use following number to upper-threshold current image (zero anything above the number)
+			for (int i = 0; i < nvox3D; i++)
+				if (imga[va + i] > imgb[vb + i])
+					imga[va + i] = 0;
+
+		} else if (op == mas) {
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++) {
+					if (imga[va + i] > 0)
+						imga[va + i] = imgb[vb + i];
+					else
+						imga[va + i] = 0;
+				}
+			} else {
+				for (int i = 0; i < nvox3D; i++)
+					if (imgb[vb + i] <= 0)
+						imga[va + i] = 0;
+			}
+		} else if (op == divX) {
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++) {
+					//flt x = imga[va+i];
+					if (imga[va + i] != 0.0f)
+						imga[va + i] = imgb[vb + i] / imga[va + i];
+					//printf(">>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], x, imga[va+i]);
+				}
+			} else {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("[%d]/[%d] %g/%g\n", va+i, vb+i, imga[va+i], imga[vb+i]);
+					if (imgb[vb + i] == 0.0f)
+						imga[va + i] = 0.0f;
+					else
+						imga[va + i] = imga[va + i] / imgb[vb + i];
+				}
+			}
+		} else if (op == mod) { //afni mod function, divide by zero yields 0 (unlike Matlab, see remtest.m)
+			//fractional remainder:
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("!>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], imga[va+i], fmod(trunc(imgb[vb+i]), trunc(imga[va+i]))  );
+					if (imga[va + i] != 0.0f)
+						imga[va + i] = fmod(imgb[vb + i], imga[va + i]);
+					else {
+						rem0 = 1;
+						imga[va + i] = 0; //imgb[vb+i];
+					}
+				}
+			} else {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("?>[%d]/[%d] %g/%g = %g : %g\n", va+i, vb+i, imga[va+i], imgb[vb+i], fmod(imga[va+i], imgb[vb+i]), fmod(trunc(imga[va+i]), trunc(imgb[vb+i])) );
+					if (imgb[vb + i] != 0.0f)
+						//imga[va+i] = round(fmod(imga[va+i], imgb[vb+i]));
+						imga[va + i] = fmod(imga[va + i], imgb[vb + i]);
+					else {
+						rem0 = 1;
+						imga[va + i] = 0;
+					}
+				}
+			}
+		} else if (op == rem) { //fmod _rem
+			//fractional remainder:
+			if (swap4D) {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("!>[%d]/[%d] %g/%g = %g\n",vb+i, va+i, imgb[vb+i], imga[va+i], fmod(trunc(imgb[vb+i]), trunc(imga[va+i]))  );
+					if (trunc(imga[va + i]) != 0.0f)
+						imga[va + i] = fmod(trunc(imgb[vb + i]), trunc(imga[va + i]));
+					else {
+						rem0 = 1;
+						imga[va + i] = imgb[vb + i];
+					}
+				}
+			} else {
+				for (int i = 0; i < nvox3D; i++) {
+					//printf("?>[%d]/[%d] %g/%g = %g : %g\n", va+i, vb+i, imga[va+i], imgb[vb+i], fmod(imga[va+i], imgb[vb+i]), fmod(trunc(imga[va+i]), trunc(imgb[vb+i])) );
+					if (trunc(imgb[vb + i]) != 0.0f)
+						//imga[va+i] = round(fmod(imga[va+i], imgb[vb+i]));
+						imga[va + i] = fmod(trunc(imga[va + i]), trunc(imgb[vb + i]));
+					else
+						rem0 = 1;
+				}
+			}
+		} else {
+			fprintf(stderr, "nifti_binary: unsupported operation %d\n", op);
+			nifti_image_free(nim2);
+			return 1;
+		}
+	}
+	if (swap4D) { //if 1: input nim was 3D, but nim2 is 4D: output will be 4D
+		nim->nvox = nim2->nvox;
+		nim->ndim = nim2->ndim;
+		nim->nt = nim2->nt;
+		nim->nu = nim2->nu;
+		nim->nv = nim2->nv;
+		nim->nw = nim2->nw;
+		for (int i = 4; i < 8; i++) {
+			nim->dim[i] = nim2->dim[i];
+			nim->pixdim[i] = nim2->pixdim[i];
+		}
+		nim->dt = nim2->dt;
+		nim->du = nim2->du;
+		nim->dv = nim2->dv;
+		nim->dw = nim2->dw;
+		free(nim->data);
+		nim->data = nim2->data;
+		nim2->data = NULL;
+	}
+	nifti_image_free(nim2);
+	if (rem0) {
+		fprintf(stderr, "Warning -rem image included zeros (fslmaths exception)\n");
+		return 0;
+	}
+	return 0;
+} // nifti_binary()
+
+staticx void nifti_compare(nifti_image *nim, char *fin) {
+	if (nim->nvox < 1)
+		exit(1);
+	if (nim->datatype != DT_CALC) {
+		fprintf(stderr, "nifti_compare: Unsupported datatype %d\n", nim->datatype);
+		exit(1);
+	}
+	nifti_image *nim2 = nifti_image_read2(fin, 1);
+	if (!nim2) {
+		fprintf(stderr, "** failed to read NIfTI image from '%s'\n", fin);
+		exit(2);
+	}
+	if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
+		fprintf(stderr, "** Attempted to process images of different sizes %" PRId64 "x%" PRId64 "x%" PRId64 "vs %" PRId64 "x%" PRId64 "x%" PRId64 "\n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+		nifti_image_free(nim2);
+		exit(1);
+	}
+	if (nim->nvox != nim2->nvox) {
+		fprintf(stderr, " Number of volumes differ\n");
+		nifti_image_free(nim2);
+		exit(1);
+	}
+	if (max_displacement_mm(nim, nim2) > 0.5) { //fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
+		fprintf(stderr, "WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
+		fprintf(stderr, " Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
+	}
+	in_hdr ihdr = set_input_hdr(nim2);
+	if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
+		nifti_image_free(nim2);
+		exit(1);
+	}
+	flt *img = (flt *)nim->data;
+	flt *img2 = (flt *)nim2->data;
+	size_t differentVox = nim->nvox;
+	double sum = 0.0;
+	double sum2 = 0.0;
+	double maxDiff = 0.0;
+	size_t nNotNan = 0;
+	size_t nDifferent = 0;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (!essentiallyEqual(img[i], img2[i])) {
+			if (fabs(img[i] - img2[i]) > maxDiff) {
+				differentVox = i;
+				maxDiff = fabs(img[i] - img2[i]);
+			}
+			nDifferent++;
+		}
+		if (isnan(img[i]) || isnan(img[i]))
+			continue;
+		nNotNan++;
+		sum += img[i];
+		sum2 += img2[i];
+	}
+	if (differentVox >= nim->nvox) {
+		//fprintf(stderr,"Images essentially equal\n"); */
+		nifti_image_free(nim2);
+		exit(0);
+	}
+	//second pass - one pass correlation is inaccurate or slow
+	nNotNan = MAX(1, nNotNan);
+	flt mn = INFINITY; //do not set to item 1, in case it is nan
+	flt mx = -INFINITY;
+	flt sd = 0.0;
+	flt ave = sum / nNotNan;
+	flt mn2 = INFINITY;
+	flt mx2 = -INFINITY;
+	flt sd2 = 0.0;
+	flt ave2 = sum2 / nNotNan;
+	//for i := 0 to (n - 1) do
+	// sd := sd + sqr(y[i] - mn);
+	//sd := sqrt(sd / (n - 1));
+	double sumDx = 0.0;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (isnan(img[i]) || isnan(img[i]))
+			continue;
+		mn = MIN(mn, img[i]);
+		mx = MAX(mx, img[i]);
+		sd += sqr(img[i] - ave);
+		mn2 = MIN(mn2, img2[i]);
+		mx2 = MAX(mx2, img2[i]);
+		sd2 += sqr(img2[i] - ave2);
+		sumDx += (img[i] - ave) * (img2[i] - ave2);
+	}
+	double r = 0.0;
+	nNotNan = MAX(2, nNotNan);
+	if (nim->nvox < 2) {
+		sd = 0.0;
+		sd2 = 0.0;
+	} else {
+		sd = sqrt(sd / (nNotNan - 1));
+		//if (sd != 0.0) sd = 1.0/sd;
+		sd2 = sqrt(sd2 / (nNotNan - 1));
+		//if (sd2 != 0.0) sd2 = 1.0/sd2;
+		if ((sd * sd2) != 0.0)
+			r = sumDx / (sd * sd2 * (nNotNan - 1));
+		//r = r / (nim->nvox - 1);
+	}
+	r = MIN(r, 1.0);
+	r = MAX(r, -1.0);
+	fprintf(stderr, "Images Differ: Correlation r = %g, identical voxels %d%%\n", r, (int)floor(100.0 * (1.0 - (double)nDifferent / (double)nim->nvox)));
+	if (nNotNan < nim->nvox) {
+		fprintf(stderr, "  %" PRId64 " voxels have a NaN in at least one image.\n", nim->nvox - nNotNan);
+		fprintf(stderr, "  Descriptives consider voxels that are numeric in both images.\n");
+	}
+	fprintf(stderr, "  Most different voxel %g vs %g (difference %g)\n", img[differentVox], img2[differentVox], maxDiff);
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	size_t vx[4];
+	vx[3] = differentVox / nvox3D;
+	vx[2] = (differentVox / (nim->nx * nim->ny)) % nim->nz;
+	vx[1] = (differentVox / nim->nx) % nim->ny;
+	vx[0] = differentVox % nim->nx;
+	fprintf(stderr, "  Most different voxel location %zux%zux%zu volume %zu\n", vx[0], vx[1], vx[2], vx[3]);
+	fprintf(stderr, "Image 1 Descriptives\n");
+	fprintf(stderr, " Range: %g..%g Mean %g StDev %g\n", mn, mx, ave, sd);
+	fprintf(stderr, "Image 2 Descriptives\n");
+	fprintf(stderr, " Range: %g..%g Mean %g StDev %g\n", mn2, mx2, ave2, sd2);
+	//V1 comparison - EXIT_SUCCESS if all vectors are parallel (for DWI up vector [1 0 0] has same direction as down [-1 0 0])
+	if (nVol != 3) {
+		nifti_image_free(nim2);
+		exit(1);
+	}
+	int allParallel = 1;
+	//niimath ft_V1 -compare nt_V1
+	for (size_t i = 0; i < nvox3D; i++) {
+		//check angle of two vectors... assume unit vectors
+		flt v[3]; //vector, image 1
+		v[0] = img[i];
+		v[1] = img[i + nvox3D];
+		v[2] = img[i + nvox3D + nvox3D];
+		flt v2[3]; //vector, image 2
+		v2[0] = img2[i];
+		v2[1] = img2[i + nvox3D];
+		v2[2] = img2[i + nvox3D + nvox3D];
+		flt x[3]; //cross product
+		x[0] = (v[1] * v2[2]) - (v[2] * v2[1]);
+		x[1] = (v[2] * v2[0]) - (v[0] * v2[2]);
+		x[2] = (v[0] * v2[1]) - (v[1] * v2[0]);
+		flt len = sqrt((x[0] * x[0]) + (x[1] * x[1]) + (x[2] * x[2]));
+		if (len > 0.01) {
+			allParallel = 0;
+			//fprintf(stderr,"[%g %g %g] vs [%g %g %g]\n", v[0],v[1], v[2], v2[0], v2[1], v2[2]);
+			break;
+		}
+	}
+	if (allParallel) {
+		fprintf(stderr, "Despite polarity differences, all vectors are parallel.\n");
+		nifti_image_free(nim2);
+		exit(0);
+	}
+	nifti_image_free(nim2);
+	exit(1);
+} //nifti_compare()
 
 #ifdef DT32
 int main32(int argc, char *argv[]) {
@@ -5126,24 +5217,18 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			int s = atoi(argv[ac]);
 			ok = nifti_grid(nim, v, s);
-		} else if (!strcmp(argv[ac], "-dog1")) {
+		//} else if (!strcmp(argv[ac], "-dog")) {
+		} else if (strstr(argv[ac], "-dog")) {
+			int orient = 0;
+			if (strstr(argv[ac], "-dogx")) orient = 1;
+			if (strstr(argv[ac], "-dogy")) orient = 2;
+			if (strstr(argv[ac], "-dogz")) orient = 3;
+			if (strstr(argv[ac], "-dogr")) orient = -1;
 			ac++;
 			double pos = strtod(argv[ac], &end);
 			ac++;
 			double neg = strtod(argv[ac], &end);
-			ok = nifti_dog(nim, pos, neg, 1);
-		} else if (!strcmp(argv[ac], "-dog2")) {
-			ac++;
-			double pos = strtod(argv[ac], &end);
-			ac++;
-			double neg = strtod(argv[ac], &end);
-			ok = nifti_dog(nim, pos, neg, 2);
-		} else if (!strcmp(argv[ac], "-dog")) {
-			ac++;
-			double pos = strtod(argv[ac], &end);
-			ac++;
-			double neg = strtod(argv[ac], &end);
-			ok = nifti_dog(nim, pos, neg, 0);
+			ok = nifti_dog(nim, pos, neg, orient);
 		} else if (!strcmp(argv[ac], "-tfce")) {
 			ac++;
 			double H = strtod(argv[ac], &end);
@@ -5250,3 +5335,5 @@ fail:
 		_mm_free(kernel);
 	return 1;
 } //main()
+
+#endif // #ifndef USING_WASM

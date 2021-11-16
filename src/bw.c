@@ -651,11 +651,10 @@ int butter_design(int order, double fl, double fh, double ** a, double ** b, dou
 
 void Filt(double *X, int nX, double *a, double *b, int order, double *Z) {
 	double Xi, Yi;
-	int j, R;
 	for (int i = 0; i < (nX); i++) {
 		Xi = X[i];                       // Get signal
 		Yi = b[0] * Xi + Z[0];           // Filtered value
-		for (j = 1; j < order; j++)    // Update conditions
+		for (int j = 1; j < order; j++)    // Update conditions
 			Z[j - 1] = b[j] * Xi + Z[j] - a[j] * Yi;
 		Z[order - 1] = b[order] * Xi - a[order] * Yi;
 		X[i] = Yi;                      // Write to output
@@ -664,13 +663,10 @@ void Filt(double *X, int nX, double *a, double *b, int order, double *Z) {
 
 void FiltRev(double *X, int nX, double *a, double *b, int order, double *Z) {
 	double Xi, Yi;
-	int j, R;
-	//i = nX -1;
-	//while (i >= 0) {
 	for (int i = (nX -1); i >= 0; i--) {
 		Xi = X[i];                       // Get signal
 		Yi = b[0] * Xi + Z[0];           // Filtered value
-		for (j = 1; j < order; j++)    // Update conditions
+		for (int j = 1; j < order; j++)    // Update conditions
 			Z[j - 1] = b[j] * Xi + Z[j] - a[j] * Yi;
 		Z[order - 1] = b[order] * Xi - a[order] * Yi;
 		X[i] = Yi;                      // Write to output
