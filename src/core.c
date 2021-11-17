@@ -57,7 +57,7 @@ int nifti_save(nifti_image *nim, const char *postfix) {
 	//nim->dim[4] = 1;
 	int isGz = 0;
 	int isNifti2 = 0;
-	if ((value == NULL) || strstr(value, nii2Key))
+	if ((value != NULL) && strstr(value, nii2Key))
 		isNifti2 = 1; //NIFTI2_GZ, NIFTI2_PAIR_GZ, NIFTI_GZ, NIFTI_PAIR_GZ
 #ifdef HAVE_ZLIB // if compression is requested, make sure of suffix
 	if ((value == NULL) || strstr(value, gzKey))
@@ -66,7 +66,6 @@ int nifti_save(nifti_image *nim, const char *postfix) {
 	if ((value != NULL) && strstr(value, pairKey)) {
 		strcat(hname, exthdr);
 		strcat(iname, extimg);
-		//nim->nifti_type =
 		if (isNifti2)
 			nim->nifti_type = NIFTI_FTYPE_NIFTI2_2;
 		else
@@ -141,7 +140,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 	memset(&blank_string[0], 0, sizeof(blank_string));
 	memcpy(nim->descrip, blank_string, 79);
 	nim->descrip[79] = '\0';
-	strcat(nim->descrip, "6.0.1"); //target fslmaths version
+	strcat(nim->descrip, "6.0.5"); //target fslmaths version
 	memcpy(nim->aux_file, blank_string, 23);
 	nim->aux_file[23] = '\0';
 	memcpy(nim->intent_name, blank_string, 15);

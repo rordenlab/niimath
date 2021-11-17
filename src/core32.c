@@ -2934,7 +2934,7 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 						int64_t i = x + (y * nx) + (z * nxy);
 						flt val = img[i];
 						flt ival = -val;
-						//logic: pos*neg = neg; pos*pos=pos; neg*neg=neg
+						//logic: opposite polarities cause negative sign: pos*neg = neg; pos*pos=pos; neg*neg=pos
 						//check six neighbors that share a face
 						if ((val > 0.0) && ((img[i-xi] <= ival) || (img[i+xi] <= ival) 
 							|| (img[i-yj] <= ival) || (img[i+yj] <= ival) 

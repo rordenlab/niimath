@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20211111"
+#define kMTHdate "v1.0.20211117"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -85,12 +85,13 @@ int show_help( void ) {
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
-	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");
 	printf(" -dogx <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices\n");
 	printf(" -dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices\n");
 	printf(" -dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices\n");
+	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
+	printf(" filename.nii             : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image\n");
 	printf("\n");
 	printf("Binary operations:\n");
 	printf("  (some inputs can be either an image or a number)\n");
@@ -118,7 +119,6 @@ int show_help( void ) {
 	printf(" -s <sigma> : create a gauss kernel of sigma mm and perform mean filtering\n");
 	printf("\n");
 	printf("Basic unary operations:\n");
-	printf(" -hdr   : report header and terminate ('niimath img.nii -hdr')\n");
 	printf(" -exp   : exponential\n");
 	printf(" -log   : natural logarithm\n");
 	printf(" -sin   : sine function\n");

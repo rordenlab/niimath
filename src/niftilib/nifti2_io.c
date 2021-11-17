@@ -7730,16 +7730,14 @@ void nifti_set_iname_offset(nifti_image *nim, int nifti_ver)
    } else if( nifti_ver == 2 ) {
       hsize = sizeof(nifti_2_header);
    }
-
    switch( nim->nifti_type ){
-
      default:  /* writing into 2 files */
        /* we only write files with 0 offset in the 2 file format */
        nim->iname_offset = 0 ;
      break ;
-
      /* NIFTI-1 single binary file - always update */
      case NIFTI_FTYPE_NIFTI1_1:
+     case NIFTI_FTYPE_NIFTI2_1:
        offset = nifti_extension_size(nim) + hsize + 4;
        /* be sure offset is aligned to a 16 byte boundary */
        if ( ( offset % 16 ) != 0 )  offset = ((offset + 0xf) & ~0xf);
