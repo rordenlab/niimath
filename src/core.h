@@ -135,6 +135,7 @@ vec4 setVec4(float x, float y, float z);
 vec4 nifti_vect44mat44_mul(vec4 v, mat44 m );
 mat44 xform(nifti_image * nim);
 int neg_determ(nifti_image * nim);
+int nii_otsu(int* H, int nBin, int mode);
 float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
 float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2);
 in_hdr set_input_hdr(nifti_image * nim);

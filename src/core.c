@@ -16,6 +16,97 @@
 #define M_PI 3.14159265358979323846264338327
 #endif
 
+int nii_otsu(int* H, int nBin, int mode) {
+//H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
+//nBin: number of bins in histogram, e.g. 256 for H[0..255]
+//mode: threshold 
+	double Sum = 0.0;
+	for (int v = 0; v < nBin; v++)
+		Sum = Sum + H[v];
+	if (Sum <= 0)
+		return 0;
+	double P[nBin][nBin], S[nBin][nBin];
+	P[0][0] = H[0];
+	S[0][0] = H[0];
+	for (int v = 1; v < nBin; v++) {
+		double Prob = H[v]/Sum;
+		P[0][v] = P[0][v-1]+Prob;
+		S[0][v] = S[0][v-1]+(v+1)*Prob;
+	}
+	for (int u = 1; u < nBin; u++) {
+		for (int v = u; v < nBin; v++) {
+			P[u][v] = P[0][v]-P[0][u-1];
+			S[u][v] = S[0][v]-S[0][u-1];
+		}
+	}
+	//result is eq 29 from Liao
+	for (int u = 0; u < nBin; u++) {
+		for (int v = u; v < nBin; v++) {
+			if (P[u][v] != 0) //avoid divide by zero errors...
+				P[u][v] = sqr(S[u][v]) / P[u][v];
+		}
+	}
+	int thresh = 0;
+	if ((mode == 1) || (mode == 5)) {
+		int lo = (int)(0.25*nBin);
+		int mi = (int)(0.50*nBin);
+		int hi = (int)(0.75*nBin);
+		//double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
+		double max = P[0][lo] + P[lo+1][mi] + P[mi+1][hi] + P[hi+1][255];
+		for (int l = 0; l < (nBin-3); l++) {
+			for (int m = l + 1; m < (nBin-2); m++) {
+				for (int h = m + 1; h < (nBin-1); h++) {
+					//double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
+					double v = P[0][l] + P[l+1][m] + P[m+1][h] + P[h+1][255];
+					if (v > max) {
+						lo = l;
+						mi = m;
+						hi = h;
+						max = v;
+					} //new max
+				}//for h -> hi
+			} //for m -> mi
+		} //for l -> low
+		//printf(">>>>%d %d %d\n", lo, mi, hi);
+		if (mode == 1)
+			thresh = hi;
+		else
+			thresh = lo;
+	} else if ((mode == 2) || (mode == 4)) {
+		int lo = (int)(0.33*nBin);
+		int hi = (int)(0.67*nBin);
+		double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
+		for (int l = 0; l < (nBin-2); l++) {
+			for (int h = l + 1; h < (nBin-1); h++) {
+				double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
+				if (v > max) {
+					lo = l;
+					hi = h;
+					max = v;
+				} //new max
+			}//for h -> hi
+		} //for l -> low
+		//printf(">>>>%d %d\n", lo, hi);
+		if (mode == 1)
+			thresh = hi;
+		else
+			thresh = lo;
+	} else {
+		thresh = (int)(0.25*nBin); //nBin / 2;
+		double max = P[0][thresh]+P[thresh+1][nBin-1];
+		//exhaustively search
+		for (int i = 0; i < (nBin-1); i++) {
+			double v = P[0][i]+P[i+1][nBin-1];
+			if (v > max) {
+				thresh = i;
+				max = v;
+			}//new max
+		}
+	}
+	//printf(">>>>%d\n", thresh);	
+	return thresh;
+}
+
 int nifti_save(nifti_image *nim, const char *postfix) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */
 	char exthdr[5] = ".hdr";

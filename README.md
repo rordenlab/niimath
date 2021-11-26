@@ -74,7 +74,7 @@ This project includes the `--compare` argument that allows you to directly the r
 ```
 Images Differ: Correlation r = 1, identical voxels 73%
  Most different voxel -69.3133 vs -69.3133 (difference 1.52588e-05)
- Most different voxel locatoin 43x17x49 volume 39
+ Most different voxel location 43x17x49 volume 39
 Image 1 Descriptives
  Range: -472.393..491.385 Mean -0.00121971 StDev 6.8898
 Image 2 Descriptives

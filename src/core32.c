@@ -276,7 +276,7 @@ staticx flt vx(flt *f, int p, int q) {
 	return ret;
 }
 
-inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz) {
+staticx inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz) {
 //transpose X and Y dimensions: rows <-> columns
 //Note: in future we could use SIMD to transpose values in tiles
 // https://stackoverflow.com/questions/16737298/what-is-the-fastest-way-to-transpose-a-matrix-in-c
@@ -298,7 +298,7 @@ inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz
 	*nyp = nx;
 }
 
-inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, int *nzp) {
+staticx inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, int *nzp) {
 //transpose X and Z dimensions: slices <-> columns
 	int nx = *nxp;
 	int nz = *nzp;
@@ -659,6 +659,125 @@ DO_Z_BLUR:
 	return 0;
 } // nifti_smooth_gauss()
 
+staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
+	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;31f309c1.1307
+	// robust range is essentially the 2nd and 98th percentiles
+	// "but ensuring that the majority of the intensity range is captured, even for binary images."
+	// fsl uses 1000 bins, also limits for volumes less than 100 voxels taylor.hanayik@ndcn.ox.ac.uk 20190107
+	//fslstats trick -r
+	// 0.000000 1129.141968
+	//niimath >fslstats trick -R
+	// 0.000000 2734.000000
+	*pct2 = 0.0;
+	*pct98 = 1.0;
+	if (nim->nvox < 1)
+		return 1;
+	if (nim->datatype != DT_CALC)
+		return 1;
+	flt *f32 = (flt *)nim->data;
+	flt mn = INFINITY;
+	flt mx = -INFINITY;
+	size_t nZero = 0;
+	size_t nNan = 0;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (isnan(f32[i])) {
+			nNan++;
+			continue;
+		}
+		if (f32[i] == 0.0) {
+			nZero++;
+			if (ignoreZeroVoxels)
+				continue;
+		}
+		mn = fmin(f32[i], mn);
+		mx = fmax(f32[i], mx);
+	}
+	if ((nZero > 0) && (mn > 0.0) && (!ignoreZeroVoxels))
+		mn = 0.0;
+	if (mn > mx)
+		return 0; //all NaN
+	if (mn == mx) {
+		*pct2 = mn;
+		*pct98 = mx;
+
+		return 0;
+	}
+	if (!ignoreZeroVoxels)
+		nZero = 0;
+	nZero += nNan;
+	size_t n2pct = round((nim->nvox - nZero) * 0.02);
+	if ((n2pct < 1) || (mn == mx) || ((nim->nvox - nZero) < 100)) { //T Hanayik mentioned issue with very small volumes
+		*pct2 = mn;
+		*pct98 = mx;
+		return 0;
+	}
+#define nBins 1001
+	flt scl = (nBins - 1) / (mx - mn);
+	int hist[nBins];
+	for (int i = 0; i < nBins; i++)
+		hist[i] = 0;
+	if (ignoreZeroVoxels) {
+		for (int i = 0; i < nim->nvox; i++) {
+			if (isnan(f32[i]))
+				continue;
+			if (f32[i] == 0.0)
+				continue;
+			hist[(int)round((f32[i] - mn) * scl)]++;
+		}
+	} else {
+		for (int i = 0; i < nim->nvox; i++) {
+			if (isnan(f32[i]))
+				continue;
+			hist[(int)round((f32[i] - mn) * scl)]++;
+		}
+	}
+	size_t n = 0;
+	size_t lo = 0;
+	while (n < n2pct) {
+		n += hist[lo];
+		//if (lo < 10)
+		//	printf("%zu %zu %zu %d\n",lo, n, n2pct, ignoreZeroVoxels);
+		lo++;
+	}
+	lo--; //remove final increment
+	n = 0;
+	int hi = nBins;
+	while (n < n2pct) {
+		hi--;
+		n += hist[hi];
+	}
+	/*if ((lo+1) < hi) {
+		size_t nGray = 0;
+		for (int i = lo+1; i < hi; i++ ) {
+			nGray += hist[i];
+			//printf("%d %d\n", i, hist[i]);
+		}
+		float fracGray = (float)nGray/(float)(nim->nvox - nZero);
+		printf("histogram[%d..%d] = %zu %g\n", lo, hi, nGray, fracGray);
+	}*/
+	if (lo == hi) { //MAJORITY are not black or white
+		int ok = -1;
+		while (ok != 0) {
+			if (lo > 0) {
+				lo--;
+				if (hist[lo] > 0)
+					ok = 0;
+			}
+			if ((ok != 0) && (hi < (nBins - 1))) {
+				hi++;
+				if (hist[hi] > 0)
+					ok = 0;
+			}
+			if ((lo == 0) && (hi == (nBins - 1)))
+				ok = 0;
+		} //while not ok
+	}//if lo == hi
+	*pct2 = (lo) / scl + mn;
+	*pct98 = (hi) / scl + mn;
+	//printf("full range %g..%g (voxels 0 or NaN =%zu)  robust range %g..%g\n", mn, mx, nZero, *pct2, *pct98);
+	return 0;
+}
+
 staticx flt* padImg3D( flt *imgIn, int *nx, int *ny, int *nz) {
 //create an image with new first and last columns, rows, slices
 	int nxIn = (* nx);
@@ -686,78 +805,121 @@ staticx flt* padImg3D( flt *imgIn, int *nx, int *ny, int *nz) {
 	return imgOut;
 }
 
-staticx int nifti_otsu(nifti_image *nim, int ignoreZeroVoxels) { //binarize image using Otsu's method
-	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
-		return 1;
-	if (nim->datatype != DT_CALC)
+staticx int nifti_binarize(nifti_image *nim, flt threshold) { //binarize image using Otsu's method
+	if (nim->nvox < 1)
 		return 1;
 	flt *inimg = (flt *)nim->data;
-	flt mn = INFINITY; //better that inimg[0] in case NaN
-	flt mx = -INFINITY;
 	for (int i = 0; i < nim->nvox; i++) {
-		mn = MIN(mn, inimg[i]);
-		mx = MAX(mx, inimg[i]);
+		if (isnan(inimg[i]))
+			continue;
+		inimg[i] = (inimg[i] < threshold) ? 0.0 : 1.0;
 	}
-	if (mn >= mx)
-		return 0; //no variability
-#define nBins 1001
-	flt scl = (nBins - 1) / (mx - mn);
-	int hist[nBins];
-	for (int i = 0; i < nBins; i++)
-		hist[i] = 0;
-	if (ignoreZeroVoxels) {
-		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(inimg[i]))
-				continue;
-			if (inimg[i] == 0.0)
-				continue;
-			hist[(int)round((inimg[i] - mn) * scl)]++;
-		}
-	} else {
-		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(inimg[i]))
-				continue;
-			hist[(int)round((inimg[i] - mn) * scl)]++;
-		}
-	}
-	//https://en.wikipedia.org/wiki/Otsu%27s_method
-	size_t total = 0;
-	for (int i = 0; i < nBins; i++)
-		total += hist[i];
-	//int top = nBins - 1;
-	int level = 0;
-	double sumB = 0;
-	double wB = 0;
-	double maximum = 0.0;
-	double sum1 = 0.0;
-	for (int i = 0; i < nBins; i++)
-		sum1 += (i * hist[i]);
-	for (int ii = 0; ii < nBins; ii++) {
-		double wF = total - wB;
-		if ((wB > 0) && (wF > 0)) {
-			double mF = (sum1 - sumB) / wF;
-			double val = wB * wF * ((sumB / wB) - mF) * ((sumB / wB) - mF);
-			if (val >= maximum) {
-				level = ii;
-				maximum = val;
-			}
-		}
-		wB = wB + hist[ii];
-		sumB = sumB + (ii - 1) * hist[ii];
-	}
-	double threshold = (level / scl) + mn;
-	if (ignoreZeroVoxels) {
-		for (int i = 0; i < nim->nvox; i++) {
-			if (inimg[i] == 0.0)
-				continue;
-			inimg[i] = (inimg[i] < threshold) ? 0.0 : 1.0;
-		}
-	} else {
-		for (int i = 0; i < nim->nvox; i++)
-			inimg[i] = (inimg[i] < threshold) ? 0.0 : 1.0;
-	}
-	//fprintf(stderr,"range %g..%g threshold %g bin %d\n", mn, mx, threshold, level);
+	nim->scl_inter = 0.0;
+	nim->scl_slope = 1.0;
+	nim->cal_min = 0.0;
+	nim->cal_max = 1.0;
 	return 0;
+}
+
+staticx int nifti_zero_below(nifti_image *nim, flt threshold) { //set dark voxels to zero
+	if (nim->nvox < 1)
+		return 1;
+	flt *inimg = (flt *)nim->data;
+	for (int i = 0; i < nim->nvox; i++) {
+		if ((isnan(inimg[i])) || (inimg[i] >= threshold))
+			continue;
+		inimg[i] = 0.0;
+	}
+	return 0;
+}
+
+staticx int nifti_zero_below_dilate(nifti_image *nim, flt threshold) { 
+//set dark voxels to zero ONLY if surrounded by other dark voxels
+// this 'feathers' the edges of bright objects, capturing partial volumes
+	if (nim->nvox < 1)
+		return 1;
+	if ((nim->nx < 3) || (nim->ny < 3) || (nim->nz < 3)) 
+		return nifti_zero_below(nim, threshold);
+	flt *inimg = (flt *)nim->data;
+	uint8_t *vxs = (uint8_t *)_mm_malloc(nim->nvox * sizeof(uint8_t), 64);
+	memset(vxs, 0, nim->nvox * sizeof(uint8_t));
+	for (int i = 0; i < nim->nvox; i++) {
+		if ((isnan(inimg[i])) || (inimg[i] >= threshold))
+			vxs[i] = 1;
+	}
+	size_t nx = nim->nx;
+	size_t nxy = nx * nim->ny;
+	size_t nvox3D = nxy * MAX(nim->nz, 1);
+	size_t nVol = nim->nvox / nvox3D;
+	for (int v = 0; v < nVol; v++) {
+		uint8_t *vxs2 = (uint8_t *)_mm_malloc(nvox3D * sizeof(uint8_t), 64);
+		uint8_t *tmp = vxs + (v * nvox3D);
+		memcpy(vxs2, tmp, nvox3D * sizeof(uint8_t)); //dest,src,bytes
+		size_t iv = (v * nvox3D);
+		for (int z = 1; z < (nim->nz - 1); z++) {
+			for (int y = 1; y < (nim->ny - 1); y++) {
+				size_t iyz = + (z * nxy) + (y * nim->nx);
+				for (int x = 1; x < (nx - 1); x++) {
+					size_t vx = iyz + x;
+					if (vxs[vx + iv] == 1) continue;
+					if ((vxs2[vx -1] == 1) || (vxs2[vx + 1] == 1)
+						|| (vxs2[vx - nx] == 1) || (vxs2[vx + nx] == 1)
+						|| (vxs2[vx - nxy] == 1) || (vxs2[vx + nxy] == 1))
+							vxs[vx] = 1;
+				} //x
+			} //y
+		} //z
+	} //v
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (vxs[i] == 0)
+			inimg[i] = 0.0;
+	}
+	_mm_free(vxs);
+	return 0;
+}
+
+staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize image using Otsu's method
+//mode is 1..5
+	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
+		return 1;
+	//Create histogram of intensity frequency
+	// hist[0..kOtsuBins-1]: each bin is number of pixels with this intensity
+	flt mn, mx;
+
+	if (nifti_robust_range(nim, &mn, &mx, 0) != 0)
+		return 1;
+	if (mn >= mx)
+		return 1; //no variability
+	#define kOtsuBins 256
+	flt *inimg = (flt *)nim->data;
+	flt scl = (kOtsuBins - 1) / (mx - mn);
+	//create histogram
+	int hist[kOtsuBins];
+	for (int i = 0; i < kOtsuBins; i++)
+		hist[i] = 0;
+	for (int i = 0; i < nim->nvox; i++) {
+		if (isnan(inimg[i]))
+			continue;
+		int idx = (int)round((inimg[i] - mn) * scl);
+		idx = MIN(idx, kOtsuBins - 1);
+		idx = MAX(idx, 0);
+		hist[idx]++;
+	}
+	//attenuate influence of zero intensity: zero bin clamped to most frequent non-zero bin
+	// 	int idx0 = (int)round((0.0 - mn) * scl);
+	// 	int mostFrequentNot0 = 0;
+	// 	for (int i = 0; i < kOtsuBins; i++) {
+	// 		if (i == idx0) continue;
+	// 		if (hist[i] > mostFrequentNot0) mostFrequentNot0 = hist[i];
+	// 	}
+	// 	hist[idx0] = MIN(hist[idx0], mostFrequentNot0);
+	//compute Otsu
+	int thresh = nii_otsu(hist, kOtsuBins, mode);
+	flt threshold = (thresh / scl) + mn;
+	//printf("range %g..%g Otsu threshold %g\n", mn, mx, threshold);
+	if (makeBinary)
+		return nifti_binarize(nim, threshold);
+	return nifti_zero_below_dilate(nim, threshold);
 } // nifti_otsu()
 
 staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt amount) {
@@ -1282,125 +1444,6 @@ staticx int nifti_ing(nifti_image *nim, double M) {
 		f32[i] *= scale;
 	return 0;
 } //nifti_ing()
-
-staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
-	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;31f309c1.1307
-	// robust range is essentially the 2nd and 98th percentiles
-	// "but ensuring that the majority of the intensity range is captured, even for binary images."
-	// fsl uses 1000 bins, also limits for volumes less than 100 voxels taylor.hanayik@ndcn.ox.ac.uk 20190107
-	//fslstats trick -r
-	// 0.000000 1129.141968
-	//niimath >fslstats trick -R
-	// 0.000000 2734.000000
-	*pct2 = 0.0;
-	*pct98 = 1.0;
-	if (nim->nvox < 1)
-		return 1;
-	if (nim->datatype != DT_CALC)
-		return 1;
-	flt *f32 = (flt *)nim->data;
-	flt mn = INFINITY;
-	flt mx = -INFINITY;
-	size_t nZero = 0;
-	size_t nNan = 0;
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (isnan(f32[i])) {
-			nNan++;
-			continue;
-		}
-		if (f32[i] == 0.0) {
-			nZero++;
-			if (ignoreZeroVoxels)
-				continue;
-		}
-		mn = fmin(f32[i], mn);
-		mx = fmax(f32[i], mx);
-	}
-	if ((nZero > 0) && (mn > 0.0) && (!ignoreZeroVoxels))
-		mn = 0.0;
-	if (mn > mx)
-		return 0; //all NaN
-	if (mn == mx) {
-		*pct2 = mn;
-		*pct98 = mx;
-
-		return 0;
-	}
-	if (!ignoreZeroVoxels)
-		nZero = 0;
-	nZero += nNan;
-	size_t n2pct = round((nim->nvox - nZero) * 0.02);
-	if ((n2pct < 1) || (mn == mx) || ((nim->nvox - nZero) < 100)) { //T Hanayik mentioned issue with very small volumes
-		*pct2 = mn;
-		*pct98 = mx;
-		return 0;
-	}
-#define nBins 1001
-	flt scl = (nBins - 1) / (mx - mn);
-	int hist[nBins];
-	for (int i = 0; i < nBins; i++)
-		hist[i] = 0;
-	if (ignoreZeroVoxels) {
-		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(f32[i]))
-				continue;
-			if (f32[i] == 0.0)
-				continue;
-			hist[(int)round((f32[i] - mn) * scl)]++;
-		}
-	} else {
-		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(f32[i]))
-				continue;
-			hist[(int)round((f32[i] - mn) * scl)]++;
-		}
-	}
-	size_t n = 0;
-	size_t lo = 0;
-	while (n < n2pct) {
-		n += hist[lo];
-		//if (lo < 10)
-		//	printf("%zu %zu %zu %d\n",lo, n, n2pct, ignoreZeroVoxels);
-		lo++;
-	}
-	lo--; //remove final increment
-	n = 0;
-	int hi = nBins;
-	while (n < n2pct) {
-		hi--;
-		n += hist[hi];
-	}
-	/*if ((lo+1) < hi) {
-		size_t nGray = 0;
-		for (int i = lo+1; i < hi; i++ ) {
-			nGray += hist[i];
-			//printf("%d %d\n", i, hist[i]);
-		}
-		float fracGray = (float)nGray/(float)(nim->nvox - nZero);
-		printf("histogram[%d..%d] = %zu %g\n", lo, hi, nGray, fracGray);
-	}*/
-	if (lo == hi) { //MAJORITY are not black or white
-		int ok = -1;
-		while (ok != 0) {
-			if (lo > 0) {
-				lo--;
-				if (hist[lo] > 0)
-					ok = 0;
-			}
-			if ((ok != 0) && (hi < (nBins - 1))) {
-				hi++;
-				if (hist[hi] > 0)
-					ok = 0;
-			}
-			if ((lo == 0) && (hi == (nBins - 1)))
-				ok = 0;
-		} //while not ok
-	}//if lo == hi
-	*pct2 = (lo) / scl + mn;
-	*pct98 = (hi) / scl + mn;
-	printf("full range %g..%g (voxels 0 or NaN =%zu)  robust range %g..%g\n", mn, mx, nZero, *pct2, *pct98);
-	return 0;
-}
 
 staticx int compare(const void *a, const void *b) {
 	flt fa = *(const flt *)a;
@@ -5086,11 +5129,15 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			double amount = strtod(argv[ac], &end);
 			nifti_unsharp(nim, sigma, sigma, sigma, amount);
-		} else if (!strcmp(argv[ac], "-otsu"))
-			ok = nifti_otsu(nim, 0);
-		else if (!strcmp(argv[ac], "-otsu0"))
-			ok = nifti_otsu(nim, 1);
-		else if (!strcmp(argv[ac], "-subsamp2"))
+		} else if (strstr(argv[ac], "-otsu")) {
+			ac ++;
+			int mode = atoi(argv[ac]);
+			ok = nifti_otsu(nim, mode, 1);
+		} else if (strstr(argv[ac], "-dehaze")) {
+			ac ++;
+			int mode = atoi(argv[ac]);
+			ok = nifti_otsu(nim, mode, 0);
+		} else if (!strcmp(argv[ac], "-subsamp2"))
 			ok = nifti_subsamp2(nim, 0);
 		else if (!strcmp(argv[ac], "-subsamp2offc"))
 			ok = nifti_subsamp2(nim, 1);

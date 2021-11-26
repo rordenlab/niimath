@@ -69,8 +69,10 @@ int show_help( void ) {
 	printf(" -detrend                 : remove linear trend (and mean) from input\n");
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
-	printf(" -floor                    : round voxels downwards to the nearest integer\n");
+	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
+	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels))\n");
+	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
 	#if defined(_OPENMP)
 	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
 	#else
@@ -79,7 +81,7 @@ int show_help( void ) {
 	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
 	printf(" -round                   : round voxels to the nearest integer\n");
 	printf(" -sobel                   : fast edge detection\n");
-	printf(" -sobel_binary              : sobel creating binary edge\n");
+	printf(" -sobel_binary            : sobel creating binary edge\n");
 	printf(" -tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order\n");
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
