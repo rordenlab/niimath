@@ -5,13 +5,13 @@
 It is said that `imitation is the sincerest form of flattery`. This project emulates the popular [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) tool. fslmaths is advertized as a `general image calculator` and is not only one of the foundational tools for FSL's brain imaging pipelines (such as [FEAT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FEAT)), but has also been widely adopted by many tools. This popularity suggests that it fulfills an important niche. While scientists are often encouraged to discover novel solutions, it sometimes seems that replication is undervalued. Here are some specific reasons for creating this tool:
 
 1. While fslmaths is provided for without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects.
-2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. 
+2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. n.b. Subsequently, we helped update [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) that allows recent FSL releases to use this library,  improving the speed for all FSL tools.
 3. Minimal dependencies allow easy distribution, compilation and development. For example, it can be compiled for MacOS, Linux and Windows (fsl can not target Windows).
 4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)). 
 5. Most programs are developed organically, with new features added as need arises. Cloning an existing tool provides a full specification, which can lead to optimization. niimath uses explicit single and double precision pipelines that allow the compiler to better use advanced instructions (every x86_64 CPU provides SSE, but high level code has trouble optimizing these routines). The result is that modern compilers are able to create operations that are limited by memory bandwidth, obviating the need for [hand tuning](https://github.com/neurolabusc/simd) the code. 
- 6. Developing a robust regression testing dataset has allowed us to discover a few edge cases where fslmaths provides anomalous or unexpected answers (see below). Therefore, this can benefit the popular tool that is being cloned. 
- 7. While the code is completely reverse engineered, the FSL team has been gracious to allow us to copy their error messages and help information. This allows true plug in compatibility. They have also provided pseudo code for poorly documented routines. This will allow the community to better understand the actual algorithms.
- 8. This project provides an open-source foundation to introduce new features that fill gaps with the current FSL tools (e.g. unsharp, sobel, resize functions). For future releases, Bob Cox has graciously provided permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools that provide performance unavailable within [FSL](https://neurostars.org/t/bandpass-filtering-different-outputs-from-fsl-and-nipype-custom-function/824). Including them in this project ensures they work in a familiar manner to other FSL tools (and leverage the same environment variables).
+6. Developing a robust regression testing dataset has allowed us to discover a few edge cases where fslmaths provides anomalous or unexpected answers (see below). Therefore, this can benefit the popular tool that is being cloned. 
+7. While the code is completely reverse engineered, the FSL team has been gracious to allow us to copy their error messages and help information. This allows true plug in compatibility. They have also provided pseudo code for poorly documented routines. This will allow the community to better understand the actual algorithms.
+8. This project provides an open-source foundation to introduce new features that fill gaps with the current FSL tools (e.g. unsharp, sobel, resize functions). For future releases, Bob Cox has graciously provided permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools that provide performance unavailable within [FSL](https://neurostars.org/t/bandpass-filtering-different-outputs-from-fsl-and-nipype-custom-function/824). Including them in this project ensures they work in a familiar manner to other FSL tools (and leverage the same environment variables).
  
 The Reason to use fslmaths instead of niimath:
 
@@ -50,20 +50,30 @@ cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c 
 ## Usage
 
 niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-maths-commands/), so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. There are a couple of things to advanced features:
+
  - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export NIFTI_GZ` or `export NIFTI` from the command line or profile to select between compressed (smaller) or uncompressed (faster) results. Windows users can use `set` instead of `export`.
- - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded output.output.
+ - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded compresson.
  - niimath has has a few features not provided by fslmaths: 
- - -resize <X> <Y> <Z> <m> : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)
- - -crop <tmin> <tsize> : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range
- - -sobel : fast edge detection
- - -demean : remove average signal across volumes (requires 4D input). Note that `niimath in -demean out` generates equivalent output to `niimath in -Tmean -mul -1 -add in out` but is faster and uses substantially less memory. 
- - -unsharp <sigma> <amount> : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount)
- - -tensor_2lower : convert FSL style upper triangle image to NIfTI standard lower triangle order.
- - -tensor_2upper : convert NIfTI standard lower triangle image to FSL style upper triangle order.
- - -tensor_decomp_lower : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)
- - -tensor_decomp_lower : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)
- - -bptfm <hp_sigma> <lp_sigma> : Same as bptf but does not remove mean (emulates fslmaths < [5.0.7](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1)). Useful for [pipelines](https://github.com/Washington-University/HCPpipelines/blob/master/TaskfMRIAnalysis/scripts/TaskfMRILevel1.sh) that expect [mean component](https://research.cchmc.org/c-mind-db/py-doc/html/_modules/cmind/pipeline/cmind_fMRI_preprocess2.html).
- - --compare <ref> : report if image matches, terminates without saving new image
+  - `-resize` <X> <Y> <Z> <m> : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)
+  - `-crop` <tmin> <tsize> : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range
+  - `-sobel` : fast edge detection
+  - `-demean` : remove average signal across volumes (requires 4D input). Note that `niimath in -demean out` generates equivalent output to `niimath in -Tmean -mul -1 -add in out` but is faster and uses substantially less memory. 
+  -  `-otsu` <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels))
+  - `-dehaze` <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)
+  - `-unsharp` <sigma> <amount> : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount)
+  - `-tensor_2lower` : convert FSL style upper triangle image to NIfTI standard lower triangle order.
+  - `-tensor_2upper` : convert NIfTI standard lower triangle image to FSL style upper triangle order.
+  - `-tensor_decomp_lower` : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)
+  - `-tensor_decomp_lower` : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)
+  - `-bptfm` <hp_sigma> <lp_sigma> : Same as bptf but does not remove mean (emulates fslmaths < [5.0.7](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/WhatsNew#anchor1)). Useful for [pipelines](https://github.com/Washington-University/HCPpipelines/blob/master/TaskfMRIAnalysis/scripts/TaskfMRILevel1.sh) that expect [mean component](https://research.cchmc.org/c-mind-db/py-doc/html/_modules/cmind/pipeline/cmind_fMRI_preprocess2.html).
+  -  `-trunc`                   : truncates the decimal value from floating point value and returns integer value
+  - `-unsharp`  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))
+  - `-dog` <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)
+  - `-dogr` <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)
+  - `-dogx` <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices
+  - `-dogy` <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices
+  - `-dogz` <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices
+  - --compare <ref> : report if image matches, terminates without saving new image
 
 ## Identical Versus Equivalent Results
 
