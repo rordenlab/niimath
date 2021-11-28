@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20211117"
+#define kMTHdate "v1.0.20211128"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -73,6 +73,9 @@ int show_help( void ) {
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels))\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
+	printf(" -c2h                     : reverse h2c transform.\n");
+	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
+
 	#if defined(_OPENMP)
 	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
 	#else

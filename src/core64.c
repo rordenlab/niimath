@@ -821,10 +821,39 @@ staticx int nifti_binarize(nifti_image *nim, flt threshold) { //binarize image u
 	return 0;
 }
 
-staticx int nifti_zero_below(nifti_image *nim, flt threshold) { //set dark voxels to zero
+staticx flt brightest_voxel(nifti_image *nim) {
+	if (nim->nvox < 1)
+		return 0.0;
+	flt *img = (flt *)nim->data;
+	flt mx = -INFINITY; //in case 1st voxel is NaN
+	for (int i = 0; i < nim->nvox; i++) {
+		if (isnan(img[i])) continue;
+		mx = MAX(mx, img[i]);
+	}
+	return mx;
+}
+
+staticx flt darkest_voxel(nifti_image *nim) {
+	if (nim->nvox < 1)
+		return 0.0;
+	flt *img = (flt *)nim->data;
+	flt mn = INFINITY; //in case 1st voxel is NaN
+	for (int i = 0; i < nim->nvox; i++) {
+		if (isnan(img[i])) continue;
+		mn = MIN(mn, img[i]);
+	}
+	return mn;
+}
+
+staticx int nifti_mask_below(nifti_image *nim, flt threshold, int isZeroFill) { 
+//if isZeroFill set dark voxels to zero
+//else set dark voxels to darkest
 	if (nim->nvox < 1)
 		return 1;
 	flt *inimg = (flt *)nim->data;
+	flt fill = 0.0;
+	if (!isZeroFill)
+		fill = darkest_voxel(nim);
 	for (int i = 0; i < nim->nvox; i++) {
 		if ((isnan(inimg[i])) || (inimg[i] >= threshold))
 			continue;
@@ -833,13 +862,14 @@ staticx int nifti_zero_below(nifti_image *nim, flt threshold) { //set dark voxel
 	return 0;
 }
 
-staticx int nifti_zero_below_dilate(nifti_image *nim, flt threshold) { 
-//set dark voxels to zero ONLY if surrounded by other dark voxels
+staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroFill) { 
+//mask dark voxels to zero ONLY if surrounded by other dark voxels
 // this 'feathers' the edges of bright objects, capturing partial volumes
+// isZeroFill determines if masked voxels are set to zero or the global darkest value
 	if (nim->nvox < 1)
 		return 1;
 	if ((nim->nx < 3) || (nim->ny < 3) || (nim->nz < 3)) 
-		return nifti_zero_below(nim, threshold);
+		return nifti_mask_below(nim, threshold, isZeroFill);
 	flt *inimg = (flt *)nim->data;
 	uint8_t *vxs = (uint8_t *)_mm_malloc(nim->nvox * sizeof(uint8_t), 64);
 	memset(vxs, 0, nim->nvox * sizeof(uint8_t));
@@ -870,16 +900,84 @@ staticx int nifti_zero_below_dilate(nifti_image *nim, flt threshold) {
 			} //y
 		} //z
 	} //v
+	flt fill = 0.0;
+	if (!isZeroFill)
+		fill = darkest_voxel(nim);
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (vxs[i] == 0)
-			inimg[i] = 0.0;
+			inimg[i] = fill;
 	}
 	_mm_free(vxs);
 	return 0;
 }
 
+staticx int nifti_c2h(nifti_image *nim) {
+//c2h: Cormack to Hounsfield
+//  https://github.com/neurolabusc/Clinical/blob/master/clinical_c2h.m
+	flt kUninterestingDarkUnits = 900.0; //e.g. -1000..-100
+	flt kInterestingMidUnits = 200.0; //e.g. unenhanced CT: -100..+100
+	flt kScaleRatio = 10;
+	flt kMax = kInterestingMidUnits * (kScaleRatio+1);
+	if (nim->nvox < 1)
+		return 1;
+	flt mn = darkest_voxel(nim);
+	if (mn < 0.0) {
+		fprintf(stderr, "Negative brightnesses impossible in the Cormack scale.\n");
+		return 1;
+	}
+	flt *img = (flt *)nim->data;
+	for (int i = 0; i < nim->nvox; i++) {
+		if (isnan(img[i]))
+			continue;
+		flt boost = img[i] - kUninterestingDarkUnits;
+		boost = MAX(boost, 0.0);
+		boost = MIN(boost, kInterestingMidUnits * kScaleRatio);
+		boost = boost * ((kScaleRatio - 1.0) / kScaleRatio);
+		img[i] = img[i] - boost - 1024.0;
+	}
+	return 0;
+} // nifti_c2h()
+
+staticx int nifti_h2c(nifti_image *nim) {
+//h2c: Hounsfield to Cormack
+//  https://github.com/neurolabusc/Clinical/blob/master/clinical_h2c.m
+	flt kUninterestingDarkUnits = 900.0; //e.g. -1000..-100
+	flt kInterestingMidUnits = 200.0; //e.g. unenhanced CT: -100..+100
+	flt kMin = -1024.0; //some GE scanners place artificial rim around air
+	flt kScaleRatio = 10;
+	if (nim->nvox < 1)
+		return 1;
+	flt mn = darkest_voxel(nim);
+	flt mx = brightest_voxel(nim);
+	if ((mx < 100) || (mn > -500)) {
+		fprintf(stderr, "Image not in Hounsfield units: Intensity range %g..%g\n", mn, mx);
+		return 1;
+	}
+	flt *img = (flt *)nim->data;
+	if (mn < kMin) {//some GE scanners place artificial rim around air
+		for (int i = 0; i < nim->nvox; i++) {
+			if ((isnan(img[i])) || (img[i] >= kMin))
+				continue;
+			img[i] = kMin;
+		}
+		mn = kMin;
+	}
+	for (int i = 0; i < nim->nvox; i++) {
+		if (isnan(img[i]))
+			continue;
+		img[i] -= mn; //translate so min value is 0
+		flt boost = img[i] - kUninterestingDarkUnits;
+		boost = MAX(boost, 0.0);
+		boost = MIN(boost, kInterestingMidUnits);
+		boost = boost * (kScaleRatio - 1.0);
+		img[i] += boost;
+	}
+	return 0;
+}  // nifti_h2c()
+
 staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize image using Otsu's method
-//mode is 1..5
+//mode is 1..5 corresponding to 3/4, 2/3, 1/2 1/3 and 1/4 compartments made dark
+//makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
 	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
 		return 1;
 	//Create histogram of intensity frequency
@@ -917,9 +1015,9 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize 
 	int thresh = nii_otsu(hist, kOtsuBins, mode);
 	flt threshold = (thresh / scl) + mn;
 	//printf("range %g..%g Otsu threshold %g\n", mn, mx, threshold);
-	if (makeBinary)
+	if (makeBinary == 1)
 		return nifti_binarize(nim, threshold);
-	return nifti_zero_below_dilate(nim, threshold);
+	return nifti_mask_below_dilate(nim, threshold, (makeBinary == 0));
 } // nifti_otsu()
 
 staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt amount) {
@@ -5136,8 +5234,15 @@ int main64(int argc, char *argv[]) {
 		} else if (strstr(argv[ac], "-dehaze")) {
 			ac ++;
 			int mode = atoi(argv[ac]);
-			ok = nifti_otsu(nim, mode, 0);
-		} else if (!strcmp(argv[ac], "-subsamp2"))
+			int zeroFill = 0;
+			if (mode < 0) zeroFill = -1;
+			mode = abs(mode);
+			ok = nifti_otsu(nim, mode, zeroFill);
+		} else if (!strcmp(argv[ac], "-h2c"))
+			ok = nifti_h2c(nim);
+		else if (!strcmp(argv[ac], "-c2h"))
+			ok = nifti_c2h(nim);
+		else if (!strcmp(argv[ac], "-subsamp2"))
 			ok = nifti_subsamp2(nim, 0);
 		else if (!strcmp(argv[ac], "-subsamp2offc"))
 			ok = nifti_subsamp2(nim, 1);
