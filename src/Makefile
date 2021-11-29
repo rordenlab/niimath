@@ -3,7 +3,7 @@ CNAME=gcc
 #linker flags
 LFLAGS=-lm -lz
 #c flags
-CFLAGS=-O3 -DHAVE_ZLIB
+CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX
 # Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
 #CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
 

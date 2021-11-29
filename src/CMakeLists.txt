@@ -18,6 +18,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS  "Debug;Release;RelWithDebInfo;MinSizeRel")
 endif()
 
+#emulate fslmaths behavior, add pigz support
+option(FSLSTYLE "FSL behavior, pigz support" ON)
+if(FSLSTYLE)
+   ADD_DEFINITIONS(-DFSLSTYLE)
+   ADD_DEFINITIONS(-DREJECT_COMPLEX)
+   ADD_DEFINITIONS(-DPIGZ)
+endif()
+
 #e.g.  cmake -DOPENMP_XCODE=ON ..
 option(OPENMP_XCODE "Build the static library" OFF)
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")

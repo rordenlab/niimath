@@ -137,6 +137,19 @@ int nifti_save(nifti_image *nim, const char *postfix) {
 	char pairKey[5] = "PAIR";
 	char *value;
 	value = getenv(key);
+	//n* has precedence, resolve conflicts between ->dim[*] and ->n*
+	nim->dim[1] = nim->nx; //e.g. crop, subsamp2offc
+	nim->dim[2] = nim->ny; //e.g. subsamp2offc
+	nim->dim[3] = nim->nz; //e.g. subsamp2offc
+	nim->dim[4] = nim->nt; //e.g. 4D -> 3D operations like mean
+	nim->dim[5] = nim->nu;
+	nim->dim[6] = nim->nv;
+	nim->dim[7] = nim->nw;
+	//d* has precedence, resolve conflicts between ->pixdim[*] and d*
+	nim->pixdim[1] = nim->dx;
+	nim->pixdim[2] = nim->dy;
+	nim->pixdim[3] = nim->dz;
+	nim->pixdim[4] = nim->dt;
 	//set dime[0]
 	int maxDim = 1;
 	for (int i = 2; i < 8; i++)
@@ -223,7 +236,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 	// fslmaths in -add 0 out -odt input
 	nifti_image *nim = nifti_image_read(hname, read_data);
 	if (nim == NULL)
-		exit(11);
+		exit(134);
 	nim->cal_min = 0.0;
 	nim->cal_max = 0.0;
 	//nim->descrip = '';

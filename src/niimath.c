@@ -64,16 +64,17 @@ int show_help( void ) {
 	printf("New operations: (not in fslmaths)\n");
 	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
 	printf(" -bptfm  <hp> <lp>        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+	printf(" -c2h                     : reverse h2c transform\n");
 	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
+	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
 	printf(" -detrend                 : remove linear trend (and mean) from input\n");
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels))\n");
-	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
-	printf(" -c2h                     : reverse h2c transform.\n");
+	printf(" -power <exponent>        : raise the current image by following exponent\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 
 	#if defined(_OPENMP)

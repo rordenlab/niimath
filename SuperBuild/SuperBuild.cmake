@@ -12,6 +12,14 @@ else()
     set(git_protocol "https")
 endif()
 
+#emulate fslmaths behavior, add pigz support
+option(FSLSTYLE "FSL behavior, pigz support" ON)
+if(FSLSTYLE)
+   ADD_DEFINITIONS(-DFSLSTYLE)
+   ADD_DEFINITIONS(-DREJECT_COMPLEX)
+   ADD_DEFINITIONS(-DPIGZ)
+endif()
+
 # Basic CMake build settings
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING
