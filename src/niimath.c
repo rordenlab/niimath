@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20211128"
+#define kMTHdate "v1.0.20211204"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -63,7 +63,8 @@ int show_help( void ) {
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
 	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
-	printf(" -bptfm  <hp> <lp>        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+	printf(" -bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+	printf(" -bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) \n");
 	printf(" -c2h                     : reverse h2c transform\n");
 	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");

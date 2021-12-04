@@ -147,6 +147,9 @@ CLIST	* createFilter(int srcXsize, int dstXsize, int filterMethod);
 double qginv( double p );
 double qg( double x );
 
+//#define printfx(...) printf(__VA_ARGS__)
+#define printfx(...) fprintf(stderr, __VA_ARGS__)
+
 #ifndef MAX //from Christian Gaser's TFCE example
 #define MAX(A,B) ((A) > (B) ? (A) : (B))
 #endif

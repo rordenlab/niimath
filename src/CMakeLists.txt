@@ -81,6 +81,7 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     tensor.c
+    bwlabel.c
     bw.c
     core32.c
     core64.c

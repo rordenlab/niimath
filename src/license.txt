@@ -1,6 +1,3 @@
-As Kernighan and Plauger (ISBN-10: 0070342075, p115) noted "Floating point numbers are like piles of sand; every time you move one you lose a little sand and pick up a little dirt. " This software is designed to generate results that are negligibly different from fslmaths. Due to differences in rounding orders, orders of instructions, etc. the results may sometimes differ by a tiny amount. These tools use 32-bit and 64-bit floating point values, with accuracy that is typically far beyond that of our imaging data (where we use 12 or 16-bit analogue to digital conversion and where our signal-to-noise is low). Therefore, the computational accuracy will typically be more than sufficient for our purposes.
-  http://www.freshsources.com/page1/page7/files/Sand-1.pdf
-
 
 The following files are from different authors and have their own licenses
 
@@ -11,8 +8,14 @@ niftilib (updated to support NIfTI 2) and znzlib are public domain
 zlib is optional and includes a simple license
  https://www.zlib.net/zlib_license.html
 
-The project can optionally be compiled with the accelerated CloudFlare zlib. Be aware that one file uses the GPL (crc32-pclmul_asm)
+The project can optionally be compiled with the accelerated CloudFlare zlib. This is fully compatible with the BSD license.
  https://github.com/cloudflare/zlib
+
+The project can optionally be compiled to support the Butterworth filter (bw.c). The Recursive digital filter functions are provided under LGPL from Exstrom Laboratories.
+ http://www.exstrom.com/journal/sigproc/
+ https://www.gnu.org/licenses/lgpl-3.0.en.html
+
+The bwlabel.c file is Jesper Andersson's connected component labeling, which he has provided under the BSD 2-Clause license.
 
 On January 7, 2020 Matthew Webster said that direct copies of the fslmaths text and error messages were permitted and are not copyrighted. This allows users to have a common interface and error detection routines.
 

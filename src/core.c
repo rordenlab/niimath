@@ -610,14 +610,14 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		}
 		free(dat);
 	} //if (dt == DT_UINT16)
-	fprintf(stderr, "nifti_image_change_datatype: Unsupported datatype %d -> %d\n", idt, dt);
+	printfx("nifti_image_change_datatype: Unsupported datatype %d -> %d\n", idt, dt);
 	return ok;
 } //nifti_image_change_datatype()
 
 int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 	nifti_image *nim2 = nifti_image_read(fin, 1);
 	if (!nim2) {
-		fprintf(stderr, "make_kernel_file: failed to read NIfTI image '%s'\n", fin);
+		printfx("make_kernel_file: failed to read NIfTI image '%s'\n", fin);
 		return NULL;
 	}
 	int x = nim2->nx;
@@ -718,7 +718,7 @@ int *make_kernel(nifti_image *nim, int *nkernel, int x, int y, int z) {
 	y = MAX(1, y);
 	z = MAX(1, z);
 	if (((x % 2) == 0) || ((y % 2) == 0) || ((z % 2) == 0))
-		fprintf(stderr, "Off-center kernel due to even dimensions.\n");
+		printfx("Off-center kernel due to even dimensions.\n");
 	int n = x * y * z;
 	*nkernel = n;
 	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
