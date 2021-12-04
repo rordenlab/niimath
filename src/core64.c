@@ -10,8 +10,16 @@
 #define epsilon DBL_EPSILON
 #endif
 
-#ifndef USING_WASM
+#ifdef USING_WASM
+	void xmemcpy ( void * destination, const void * source, size_t num ) {
+		uint8_t * s = (uint8_t*) source;
+		uint8_t * d = (uint8_t*) destination;
+		for (size_t i = 0; i < num; i++)
+			d[i] = s[i];
+	}
+#else
  #define SIMD
+ #define xmemcpy memcpy
 #endif
 
 #ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
@@ -120,7 +128,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	}
 } //nifti_mul()
 
-/*staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
+staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	//add, out = in + intercept
 	if (intercept1 == 0.0f)
 		return;
@@ -138,7 +146,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 		v[n - tail] = v[n - tail] + intercept1;
 		tail--;
 	}
-} //nifti_add()*/
+} //nifti_add()
 
 staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	//multiply+add, out = in * slope + intercept
@@ -196,7 +204,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	}
 } //nifti_mul()
 
-/*staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
+staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	//add, out = in + intercept
 	if (intercept1 == 0.0f)
 		return;
@@ -214,7 +222,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 		v[n - tail] = v[n - tail] + intercept1;
 		tail--;
 	}
-} //nifti_add()*/
+} //nifti_add()
 
 staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	//multiply+add, out = in * slope + intercept
@@ -374,7 +382,7 @@ staticx void edt(flt *f, int n) {
 	_mm_free(d);
 	_mm_free(z);
 	_mm_free(v);
-}
+} //edt()
 
 staticx void edt1(flt *df, int n) { //first dimension is simple
 	int q, prevX;
@@ -400,7 +408,7 @@ staticx void edt1(flt *df, int n) { //first dimension is simple
 		} else
 			df[q] = v;
 	}
-}
+} //edt1()
 
 staticx int nifti_edt(nifti_image *nim) {
 	//https://github.com/neurolabusc/DistanceFields
@@ -459,7 +467,7 @@ staticx int nifti_edt(nifti_image *nim) {
 		_mm_free(img3D);
 	} //for each volume
 	return 0;
-}
+} //nifti_edt()
 
 //kernelWid influences width of kernel, use negative values for round, positive for ceil
 // kenrnelWid of 2.5 means the kernel will be (2 * ceil(2.5 * sigma))+1 voxels wide
@@ -515,7 +523,7 @@ staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid
 	flt *tmp = _mm_malloc(nx * sizeof(flt), 64); //input values prior to blur
 	for (int y = 0; y < ny; y++) {
 		//printf("-+ %d:%d\n", y, ny);
-		memcpy(tmp, img, nx * sizeof(flt));
+		xmemcpy(tmp, img, nx * sizeof(flt));
 		for (int x = 0; x < nx; x++) {
 			flt sum = 0;
 			for (int i = kStart[x]; i <= kEnd[x]; i++)
@@ -530,7 +538,7 @@ staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid
 	_mm_free(kStart);
 	_mm_free(kEnd);
 	_mm_free(kWeight);
-}
+} //blurS()
 
 #if defined(_OPENMP)
 
@@ -574,7 +582,7 @@ staticx void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid)
 		flt *tmp = _mm_malloc(nx * sizeof(flt), 64); //input values prior to blur
 		flt *imgx = img;
 		imgx += (nx * y);
-		memcpy(tmp, imgx, nx * sizeof(flt));
+		xmemcpy(tmp, imgx, nx * sizeof(flt));
 		for (int x = 0; x < nx; x++) {
 			flt sum = 0;
 			for (int i = kStart[x]; i <= kEnd[x]; i++)
@@ -798,7 +806,7 @@ staticx flt* padImg3D( flt *imgIn, int *nx, int *ny, int *nz) {
 	for (int z = 0; z < nzOut; z++)
 		for (int y = 0; y < nyOut; y++) {
 			if ((z > 0) && (y > 0) && (z < (nzOut - 1)) && (y < (nyOut - 1))) {
-				memcpy(imgOutP, imgInP, nxIn * sizeof(flt)); //dest, src, count
+				xmemcpy(imgOutP, imgInP, nxIn * sizeof(flt)); //dest, src, count
 				imgInP += nxIn;
 			}
 			imgOutP += nxOut;
@@ -889,7 +897,7 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 	for (int v = 0; v < nVol; v++) {
 		uint8_t *vxs2 = (uint8_t *)_mm_malloc(nvox3D * sizeof(uint8_t), 64);
 		uint8_t *tmp = vxs + (v * nvox3D);
-		memcpy(vxs2, tmp, nvox3D * sizeof(uint8_t)); //dest,src,bytes
+		xmemcpy(vxs2, tmp, nvox3D * sizeof(uint8_t)); //dest,src,bytes
 		size_t iv = (v * nvox3D);
 		for (int z = 1; z < (nim->nz - 1); z++) {
 			for (int y = 1; y < (nim->ny - 1); y++) {
@@ -1053,7 +1061,7 @@ staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt Sigm
 	nim->data = sdat;
 	flt *simg = (flt *)sdat;
 	for (int v = 0; v < nVol; v++) {
-		memcpy(simg, inimg, nim->nvox * sizeof(flt));
+		xmemcpy(simg, inimg, nim->nvox * sizeof(flt));
 		nifti_smooth_gauss(nim, SigmammX, SigmammY, SigmammZ, 2.5); //2.5: a relatively narrow kernel for speed
 		for (int i = 0; i < nim->nvox; i++) {
 			//sharpened = original + (original - blurred) * amount
@@ -1106,7 +1114,7 @@ staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	void *dat = (void *)calloc(1, nim->nvox * sizeof(flt));
 	flt *imgOut = (flt *)dat;
 	imgIn += tminVol * nvox3D;
-	memcpy(imgOut, imgIn, nim->nvox * sizeof(flt));
+	xmemcpy(imgOut, imgIn, nim->nvox * sizeof(flt));
 	free(nim->data);
 	nim->data = dat;
 	if (nvolOut == 1)
@@ -1137,7 +1145,7 @@ staticx int nifti_rescale(nifti_image *nim, double scale, double intercept) {
 			nifti_mul(f32, nim->nvox, scl);
 			return 0;
 		} else if (scale == 1.0) {
-			nifti_mul(f32, nim->nvox, intercept);
+			nifti_add(f32, nim->nvox, intercept);
 			return 0;
 		}
 		nifti_fma(f32, nim->nvox, scl, inter);
@@ -1779,7 +1787,7 @@ staticx int xyzt2txyz(nifti_image *nim) {
 		return 1;
 	flt *img = (flt *)nim->data;
 	flt *inimg = (flt *)_mm_malloc(nxyz * nt * sizeof(flt), 64); //alloc for each volume to allow openmp
-	memcpy(inimg, img, nim->nvox * sizeof(flt));
+	xmemcpy(inimg, img, nim->nvox * sizeof(flt));
 	size_t i = 0;
 #pragma omp parallel for
 	for (size_t x = 0; x < nxyz; x++) {
@@ -1801,7 +1809,7 @@ staticx int txyz2xyzt(nifti_image *nim) {
 		return 1;
 	flt *img = (flt *)nim->data;
 	flt *inimg = (flt *)_mm_malloc(nxyz * nt * sizeof(flt), 64); //alloc for each volume to allow openmp
-	memcpy(inimg, img, nim->nvox * sizeof(flt));
+	xmemcpy(inimg, img, nim->nvox * sizeof(flt));
 	size_t i = 0;
 #pragma omp parallel for
 	for (size_t x = 0; x < nxyz; x++) {
@@ -1913,7 +1921,7 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 		//read input data
 		flt *imgIn = (flt *)_mm_malloc((nvol) * sizeof(flt), 64);
 		flt *imgOut = img + (i * nvol);
-		memcpy(imgIn, imgOut, nvol * sizeof(flt));
+		xmemcpy(imgIn, imgOut, nvol * sizeof(flt));
 		if (hp_sigma > 0) {
 			double sumOut = 0.0;
 			for (int v = 0; v < nvol; v++) { //each volume
@@ -1947,7 +1955,7 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 			// fslmaths /Users/chris/src/rest -bptf 45 5 fbp
 			//  r=1.0 identical voxels 73% max difference 0.000488281
 			if (hp_sigma > 0)
-				memcpy(imgIn, imgOut, nvol * sizeof(flt));
+				xmemcpy(imgIn, imgOut, nvol * sizeof(flt));
 			for (int v = 0; v < nvol; v++) { //each volume
 				double sum = 0.0;
 				for (int k = lpStart[v]; k <= lpEnd[v]; k++) //for each index in kernel
@@ -2112,7 +2120,7 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 			// fslmaths /Users/chris/src/rest -bptf 45 5 fbp
 			//  r=1.0 identical voxels 73% max difference 0.000488281
 			if (hp_sigma > 0)
-				memcpy(imgIn, imgOut, nvol * sizeof(flt));
+				xmemcpy(imgIn, imgOut, nvol * sizeof(flt));
 			for (int v = 0; v < nvol; v++) { //each volume
 				double sum = 0.0;
 				for (int k = lpStart[v]; k <= lpEnd[v]; k++) //for each index in kernel
@@ -2482,9 +2490,9 @@ staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	flt *tmp = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64);
 	flt *v3 = in32 + (2 * nvox3D);
 	flt *v4 = in32 + (3 * nvox3D);
-	memcpy(tmp, v4, nvox3D * sizeof(flt));
-	memcpy(v4, v3, nvox3D * sizeof(flt));
-	memcpy(v3, tmp, nvox3D * sizeof(flt));
+	xmemcpy(tmp, v4, nvox3D * sizeof(flt));
+	xmemcpy(v4, v3, nvox3D * sizeof(flt));
+	xmemcpy(v3, tmp, nvox3D * sizeof(flt));
 	_mm_free(tmp);
 	if (lower2upper) {
 		//FSL uses non-standard upper triangle
@@ -2611,12 +2619,12 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	nifti_save(nim, "_V1");
 	//save V2
 	outv = out32 + (nvox3D * 6);
-	//memcpy(fa32, outv, 3*nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nifti_save(nim, "_V2");
 	//save V3
 	outv = out32 + (nvox3D * 9);
-	//memcpy(fa32, outv, 3*nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nifti_save(nim, "_V3");
 	//release 4D memory
@@ -2631,25 +2639,25 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	//nim->dim[4] = 1;
 	//save L1
 	outv = out32;
-	//memcpy(fa32, outv, nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
 	nifti_save(nim, "_L1");
 	//save L2
 	outv = out32 + (nvox3D * 1);
-	//memcpy(fa32, outv, nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
 	nifti_save(nim, "_L2");
 	//save L3
 	outv = out32 + (nvox3D * 2);
-	//memcpy(fa32, outv, nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
 	nifti_save(nim, "_L3");
 	//save MD
 	outv = out32 + (nvox3D * 13);
-	//memcpy(fa32, outv, nvox3D*sizeof(flt));
+	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_min = calmin(nim);
 	nim->cal_max = calmax(nim);
@@ -2693,7 +2701,7 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	nifti_save(nim, "_MO");
 	//save FA
 	outv = out32 + (nvox3D * 12);
-	memcpy(fa32, outv, nvox3D * sizeof(flt));
+	xmemcpy(fa32, outv, nvox3D * sizeof(flt));
 	nim->cal_min = 0;
 	nim->cal_max = 1;
 	nifti_save(nim, "_FA");
@@ -2712,7 +2720,7 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
 	flt *inf32 = (flt *)_mm_malloc(nVox3D * sizeof(flt), 64);
-	memcpy(inf32, f32, nVox3D * sizeof(flt));
+	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 	int nxy = nim->nx * nim->ny;
 	size_t nZero = 1;
 	while (nZero > 0) {
@@ -2746,7 +2754,7 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 				} //for x
 			} //for y
 		} //for z
-		memcpy(inf32, f32, nVox3D * sizeof(flt));
+		xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 		//printf("n=0: %zu\n", nZero);
 	} //nZero > 0
 	_mm_free(inf32);
@@ -2757,7 +2765,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
 	flt *inf32 = (flt *)_mm_malloc(nVox3D * sizeof(flt), 64);
-	memcpy(inf32, f32, nVox3D * sizeof(flt));
+	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 	int nxy = nim->nx * nim->ny;
 	if (op == fmediank) {
 		flt *vxls = (flt *)_mm_malloc((nkernel) * sizeof(flt), 64);
@@ -3335,7 +3343,7 @@ staticx int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
 		if (isBinary)
 			memset(imgdir, 0, vox3D * sizeof(uint8_t));
 		
-		memcpy(imgin, iv32, vox3D * sizeof(flt));
+		xmemcpy(imgin, iv32, vox3D * sizeof(flt));
 		int i = 0;
 		for (int z = 0; z < nim->nz; z++)
 			for (int y = 0; y < nim->ny; y++)
@@ -3653,7 +3661,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 		//reduce in X: half the width: 1/2 input file size
 		flt *imgx = _mm_malloc(nx * nim->ny * nim->nz * sizeof(flt), 64); //input values prior to blur
 		if (nx == nim->nx) //no change in x dimension
-			memcpy(imgx, iv32, nx * nim->ny * nim->nz * sizeof(flt));
+			xmemcpy(imgx, iv32, nx * nim->ny * nim->nz * sizeof(flt));
 		else {
 			CLIST *contrib = createFilter(nim->nx, nx, interp_method);
 			size_t i = 0;
@@ -3673,7 +3681,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 		//reduce in Y: half the height: 1/4 input size
 		flt *imgy = _mm_malloc(nx * ny * nim->nz * sizeof(flt), 64); //input values prior to blur
 		if (ny == nim->ny) //no change in y dimension
-			memcpy(imgy, imgx, nx * ny * nim->nz * sizeof(flt));
+			xmemcpy(imgy, imgx, nx * ny * nim->nz * sizeof(flt));
 		else {
 			CLIST *contrib = createFilter(nim->ny, ny, interp_method);
 			flt *iny = _mm_malloc(nim->ny * sizeof(flt), 64); //input values prior to resize
@@ -3705,7 +3713,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 		//reduce in Z
 		flt *ov32 = o32 + (v * nvox3D);
 		if (nz == nim->nz) //no change in x dimension
-			memcpy(ov32, imgy, nx * ny * nz * sizeof(flt));
+			xmemcpy(ov32, imgy, nx * ny * nz * sizeof(flt));
 		else {
 			CLIST *contrib = createFilter(nim->nz, nz, interp_method);
 			flt *inz = _mm_malloc(nim->nz * sizeof(flt), 64); //input values prior to resize
@@ -3848,7 +3856,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		uint8_t *vxv = vx;
 		vxv += (v * nvox3D);
 		uint8_t *vxs = (uint8_t *)_mm_malloc(nim->nvox * sizeof(uint8_t), 64);
-		memcpy(vxs, vxv, nvox3D * sizeof(uint8_t)); //dst, src
+		xmemcpy(vxs, vxv, nvox3D * sizeof(uint8_t)); //dst, src
 		int32_t *q = (int32_t *)_mm_malloc(nvox3D * sizeof(int32_t), 64); //queue with untested seed
 		int qlo = 0;
 		int qhi = -1; //ints always signed in C!
@@ -4006,7 +4014,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				flt *inp = (flt *)_mm_malloc(nxy * sizeof(flt), 64);
 				flt *o32 = (flt *)f32;
 				o32 += v * nxy;
-				memcpy(inp, o32, nxy * sizeof(flt)); //dst, src
+				xmemcpy(inp, o32, nxy * sizeof(flt)); //dst, src
 				for (int y = 1; (y < (nim->ny - 1)); y++) {
 					size_t yo = y * nim->nx;
 					for (int x = 1; (x < (nim->nx - 1)); x++) {
@@ -4030,7 +4038,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			flt *inp = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64);
 			flt *o32 = (flt *)f32;
 			o32 += v * nvox3D;
-			memcpy(inp, o32, nvox3D * sizeof(flt)); //dst, src
+			xmemcpy(inp, o32, nvox3D * sizeof(flt)); //dst, src
 			for (int z = 1; (z < (nim->nz - 1)); z++) {
 				size_t zo = z * nxy;
 				for (int y = 1; (y < (nim->ny - 1)); y++) {
