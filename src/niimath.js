@@ -114,7 +114,7 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     let nvox = nx * ny * nz * nt; 
     let ptr = walloc(nvox * bpv)
     memory.record_malloc(ptr, nvox * bpv)
-    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox)
+    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
     cimg.set(img8)
     //run WASM
     startTime = new Date()
