@@ -6224,6 +6224,11 @@ char* parseStrToArgcArgvInsitu( char *str, const int argc_MAX, int *argc, char* 
 	return str;
 };
 
+float clampf(float d, float min, float max) {
+  float t = d < min ? min : d;
+  return t > max ? max : t;
+}
+
 __attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
 	int nvox = nx * ny * nz * MAX(nt, 1);
 	if (nvox < 1) return 101;
@@ -6259,7 +6264,7 @@ __attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int 
 		nim.data = img32;
 		int ret = mainWASM(&nim, argc, argv);
 		for (int i = 0; i < nvox; ++i)
-			img16[i] = img32[i];//img32[i]; //truncated
+			img16[i] = clampf(img32[i], -32768.0, 32767.0);//img32[i];
 		_mm_free(img32);
 		return ret;
 	}
@@ -6271,7 +6276,7 @@ __attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int 
 		nim.data = img32;
 		int ret = mainWASM(&nim, argc, argv);
 		for (int i = 0; i < nvox; ++i)
-			img8[i] = img32[i]; //truncated
+			img8[i] = clampf(img32[i], 0.0, 255.0); //img32[i]; 
 		_mm_free(img32);
 		return ret;
 	}
