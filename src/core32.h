@@ -6,7 +6,6 @@ extern "C" {
 #endif
 
 	int main32(int argc, char * argv[]);
-
 #ifdef  __cplusplus
 }
 #endif
