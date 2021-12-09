@@ -2,6 +2,8 @@
 // npm install nifti-reader-js
 //Compile funcx.wasm
 // emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
+// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
+
 //Test on image
 // node niimath.js T1.nii -sqr sT1.nii
 
@@ -114,8 +116,18 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     let nvox = nx * ny * nz * nt; 
     let ptr = walloc(nvox * bpv)
     memory.record_malloc(ptr, nvox * bpv)
-    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
-    cimg.set(img8)
+    const isSharedMem = true
+    let cimg
+    if (isSharedMem) {
+        //https://stackoverflow.com/questions/54112373/how-to-cast-an-arraybuffer-to-a-sharedarraybuffer-in-javascript
+        cimg = new Uint8Array(new SharedArrayBuffer(instance.exports.memory.buffer, ptr, nvox * bpv))
+        //cimg.set(img8) // <- does not work???
+        for (let i = 0; i < nvox * bpv; ++i)
+            cimg[i] = img8[i]
+    } else {
+        cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
+        cimg.set(img8)
+    }
     //run WASM
     startTime = new Date()
     let ok = niimath(ptr, datatype, nx, ny, nz, nt, dx, dy, dz, dt, cptr)
@@ -131,7 +143,7 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     wfree(cptr)
     memory.record_free(ptr)
     wfree(ptr)
-  return
+    return
 }
 
 async function main() {
