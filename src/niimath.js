@@ -1,14 +1,15 @@
 //Install dependencies
 // npm install nifti-reader-js
 //Compile funcx.wasm
-// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
 // emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
-
 //Test on image
 // node niimath.js T1.nii -sqr sT1.nii
+//Note: since we renew the ArrayBuffer we do not need to pre-allocate worst case TOTAL_MEMORY:
+// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
 
 const fs = require('fs')
 const nifti = require('nifti-reader-js')
+const pako = require('pako')
 let instance = null
 
 let granule_size = 8
@@ -60,7 +61,7 @@ class HeapVerifier {
 }
 
 class LinearMemory {
-    constructor({initial = 2048, maximum = 2048}) {
+    constructor({initial = 256, maximum = 2048}) {
     //https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/Memory
     //shared is problematic if pointer moved (e.g. pointer not handle)
         //this.memory = new WebAssembly.Memory({ initial, maximum, shared: true })
@@ -116,18 +117,8 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     let nvox = nx * ny * nz * nt; 
     let ptr = walloc(nvox * bpv)
     memory.record_malloc(ptr, nvox * bpv)
-    const isSharedMem = true
-    let cimg
-    if (isSharedMem) {
-        //https://stackoverflow.com/questions/54112373/how-to-cast-an-arraybuffer-to-a-sharedarraybuffer-in-javascript
-        cimg = new Uint8Array(new SharedArrayBuffer(instance.exports.memory.buffer, ptr, nvox * bpv))
-        //cimg.set(img8) // <- does not work???
-        for (let i = 0; i < nvox * bpv; ++i)
-            cimg[i] = img8[i]
-    } else {
-        cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
-        cimg.set(img8)
-    }
+    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
+    cimg.set(img8)
     //run WASM
     startTime = new Date()
     let ok = niimath(ptr, datatype, nx, ny, nz, nt, dx, dy, dz, dt, cptr)
@@ -136,6 +127,10 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
         return
     }
     console.log("'", cmd, "' required ", Math.round((new Date()) - startTime), "ms")
+    //Problem: JavaScript will generate "detached ArrayBuffer" error if malloc requires memory growth
+    //Unintuitive Solution: renew cimg pointer
+    // https://depth-first.com/articles/2019/10/16/compiling-c-to-webassembly-and-running-it-without-emscripten/
+    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
     //copy WASM image data to JavaScript image data
     img8.set(cimg)
     //free WASM memory
@@ -150,7 +145,7 @@ async function main() {
     // Load the wasm into a buffer.
     const buf = fs.readFileSync('./funcx.wasm')
     let mod = new WebAssembly.Module(buf)
-    let memory = new LinearMemory({ initial: 2048, maximum: 2048 })
+    let memory = new LinearMemory({ initial: 256, maximum: 2048 })
     let instance = new WebAssembly.Instance(mod, { env: memory.env() })
     //check inputs
     var argv = process.argv.slice(2)
@@ -199,17 +194,14 @@ async function main() {
     //get file extension
     var re = /(?:\.([^.]+))?$/
     let ext = re.exec(ofnm)[1]
-    if  ((ext !== undefined) && (ext.toLowerCase() === "gz")) {
-        console.log('gz output not (yet) supported. See https://github.com/rii-mango/NIFTI-Reader-JS/issues/4')
-        return
-    }
-    if ((ext === undefined) || (ext.toLowerCase() !== "nii"))
-        ofnm += '.nii'
     var ohdr = new Uint8Array(data,0,hdr.vox_offset)
-    //var odata = new Uint8Array(ohdr.length + img8.length)
     var odata = new Uint8Array(ohdr.length + img8.length)
     odata.set(ohdr)
     odata.set(img8, ohdr.length)
+    if  ((ext !== undefined) && (ext.toLowerCase() === "gz"))
+        odata = pako.deflate(odata, {gzip: true})
+    else if ((ext === undefined) || (ext.toLowerCase() !== "nii"))
+        ofnm += '.nii'
     fs.writeFile(ofnm, Buffer.from(odata), "binary", function(err) {
         if(err) {
             console.log(err)

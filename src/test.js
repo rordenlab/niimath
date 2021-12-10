@@ -1,3 +1,6 @@
+//demo
+// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js; node test.js
+//n.b. since we "renew" the ArrayBuffer we do not need to pre-allocate worst case total memory
 // emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js; node test.js
 
 const fs = require('fs')
@@ -52,10 +55,7 @@ class HeapVerifier {
 }
 
 class LinearMemory {
-    constructor({initial = 2048, maximum = 2048}) {
-    //https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/Memory
-    //shared is problematic if pointer moved (e.g. pointer not handle)
-        //this.memory = new WebAssembly.Memory({ initial, maximum, shared: true })
+    constructor({initial = 256, maximum = 2048}) {
         this.memory = new WebAssembly.Memory({ initial, maximum})
         this.verifier = new HeapVerifier(maximum * 65536)
     }
@@ -113,7 +113,7 @@ function niimath_shim(instance, memory, cmd, datatype) {
   console.log("")
   console.log(`dims: ${nx}x${ny}x${nz}x${nt} nbyper: ${bpv}`)
   console.log("input ", jsimg[0],",", jsimg[1],",", jsimg[2],",", jsimg[3],",", jsimg[4],",", jsimg[5],"...")
-    let cimg = null
+  let cimg = null
   if (datatype == 2)
     cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox)
   else if (datatype == 4)
@@ -137,6 +137,16 @@ function niimath_shim(instance, memory, cmd, datatype) {
     console.log(" -> '", cmd, " generated a fatal error: ", ok)
     return
   }
+  //Problem: JavaScript will generate "detached ArrayBuffer" error if malloc requires memory growth
+  //Unintuitive Solution: renew cimg pointer
+  // https://depth-first.com/articles/2019/10/16/compiling-c-to-webassembly-and-running-it-without-emscripten/
+  if (datatype == 2)
+    cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox)
+  else if (datatype == 4)
+    cimg = new Int16Array(instance.exports.memory.buffer, ptr, nvox)
+  else if (datatype == 16)
+    cimg = new Float32Array(instance.exports.memory.buffer, ptr, nvox)
+  //report success!
   console.log("  ", Math.round((new Date()) - startTime) + "ms -> '", cmd, "' -> output ", cimg[0],",", cimg[1],",", cimg[2],",", cimg[3],",", cimg[4],",", cimg[5],"...")
   // Copy data out to JavaScript.
   // jsimg.set(cimg)
@@ -154,7 +164,6 @@ async function main() {
   let mod = new WebAssembly.Module(buf)
   let memory = new LinearMemory({ initial: 2048, maximum: 2048 })
   let instance = new WebAssembly.Instance(mod, { env: memory.env() })
-  niimath_shim(instance, memory, "-dog 2 3", 16)
   niimath_shim(instance, memory, "-dehaze 3 -dog 2 3", 16)
   niimath_shim(instance, memory, "-mul 7", 4)
   niimath_shim(instance, memory, "-add 3 -mul 2", 2)
