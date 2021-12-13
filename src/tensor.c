@@ -1,5 +1,6 @@
 #include "math.h"
 #include "tensor.h"
+#include "print.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -1202,7 +1203,7 @@ void symeig_3( double *a , double *e , int dovec )
      static int nerr=0 ;
      {
      if( ++nerr < 4 )
-       fprintf(stderr,"** ERROR in symeig_3: discrim=%g numer=%g\n",qq,rr) ;
+       printfx("** ERROR in symeig_3: discrim=%g numer=%g\n",qq,rr) ;
      }
      qs = qq = rr = 0.0 ;
    } else {

@@ -1,4 +1,5 @@
 #include "core.h"
+#include "print.h"
 #define _USE_MATH_DEFINES //microsoft compiler
 #include <float.h>		  //FLT_EPSILON
 #include <limits.h>

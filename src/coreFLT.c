@@ -12,6 +12,7 @@
 
 //#include <float.h>
 #include "core.h"
+#include "print.h"
 #ifdef USING_TIMERS
 	#include <time.h>
 #endif
@@ -264,13 +265,6 @@ staticx void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
 } //nifti_fma
 #endif //if vector SIMD else scalar
 
-staticx flt vx(flt *f, int p, int q) {
-	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
-	if (isnan(ret))
-		ret = INFINITY;
-	return ret;
-}
-
 staticx inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz) {
 //transpose X and Y dimensions: rows <-> columns
 //Note: in future we could use SIMD to transpose values in tiles
@@ -314,9 +308,19 @@ staticx inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, 
 	*nzp = nx;
 }
 
-staticx void edt(flt *f, int n) {
-	int q, p, k;
-	flt s, dx;
+staticx flt vx(flt *f, int p, int q) {
+	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
+	if (isnan(ret))
+		ret = INFINITY;
+	return ret;
+}
+
+staticx void edt(flt *f, int n, flt delta) {
+	if ((delta != 1) && (delta != 0.0)) {
+		flt delta2 = 1.0 / (delta * delta);
+		for(int q = 0 ; q < n ; q++)
+			f[q] *= delta2;
+	}
 	flt *d = (flt *)_mm_malloc((n+2) * sizeof(flt), 64);
 	flt *z = (flt *)_mm_malloc((n+2) * sizeof(flt), 64);
 	int *v = (int *)_mm_malloc((n+2) * sizeof(int), 64);
@@ -329,17 +333,17 @@ staticx void edt(flt *f, int n) {
     #   n...number of pixels in "f" to process
     # Always add the first pixel to the enveloping set since it is
     # obviously lower than all parabolas processed so far.*/
-	k = 0;
+	int k = 0;
 	v[0] = 0;
 	z[0] = -INFINITY;
 	z[1] = INFINITY;
-	for (q = 1; q < n; q++) {
+	for (int q = 1; q < n; q++) {
 		/* If the new parabola is lower than the right-most parabola in
         # the envelope, remove it from the envelope. To make this
         # determination, find the X coordinate of the intersection (s)
         # between the parabolas with vertices at (q,f[q]) and (p,f[p]).*/
-		p = v[k];
-		s = vx(f, p, q);
+		int p = v[k];
+		flt s = vx(f, p, q);
 		//while (s <= z[k]) {
 		while ((s <= z[k]) && (k > 0)) {
 			k = k - 1;
@@ -355,26 +359,30 @@ staticx void edt(flt *f, int n) {
 	/*# Go back through the parabolas in the envelope and evaluate them
     # in order to populate the distance values at each X coordinate.*/
 	k = 0;
-	for (q = 0; q < n; q++) {
+	for (int q = 0; q < n; q++) {
 		while (z[k + 1] < q)
 			k = k + 1;
-		dx = (q - v[k]);
+		flt dx = (q - v[k]);
 		d[q] = dx * dx + f[v[k]];
 	}
-	for (q = 0; q < n; q++)
+	if ((delta != 1) && (delta != 0.0)) {
+		flt delta2 = delta * delta;
+		for(int q = 0 ; q < n ; q++)
+			d[q] *= delta2;
+	}
+	for (int q = 0; q < n; q++)
 		f[q] = d[q];
 	_mm_free(d);
 	_mm_free(z);
 	_mm_free(v);
 } //edt()
 
-staticx void edt1(flt *df, int n) { //first dimension is simple
-	int q, prevX;
+staticx void edt1(flt *df, int n, flt delta) { //first dimension is simple
 	flt prevY, v;
-	prevX = 0;
+	int prevX = 0;
 	prevY = INFINITY;
 	//forward
-	for (q = 0; q < n; q++) {
+	for (int q = 0; q < n; q++) {
 		if (df[q] == 0) {
 			prevX = q;
 			prevY = 0;
@@ -384,13 +392,18 @@ staticx void edt1(flt *df, int n) { //first dimension is simple
 	//reverse
 	prevX = n;
 	prevY = INFINITY;
-	for (q = (n - 1); q >= 0; q--) {
+	for (int q = (n - 1); q >= 0; q--) {
 		v = sqr(q - prevX) + prevY;
 		if (df[q] < v) {
 			prevX = q;
 			prevY = df[q];
 		} else
 			df[q] = v;
+	}
+	if( delta != 1 ){
+		flt delta2 = delta * delta;
+		for(int q = 0 ; q < n ; q++)
+			df[q] *= delta2;
 	}
 } //edt1()
 
@@ -408,6 +421,12 @@ staticx int nifti_edt(nifti_image *nim) {
 	int nx = nim->nx;
 	int ny = nim->ny;
 	int nz = nim->nz;
+	flt dx = fabs(nim->dx);
+	flt dy = fabs(nim->dy);
+	flt dz = fabs(nim->dz);
+	if (dx == 0.0) dx = 1.0;
+	if (dy == 0.0) dy = 1.0;
+	if (dz == 0.0) dz = 1.0;
 	flt threshold = 0.0;
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] > threshold)
@@ -415,14 +434,15 @@ staticx int nifti_edt(nifti_image *nim) {
 		else
 			img[i] = 0;
 	}
-	size_t nRow = nim->nx;
-	nRow *= MAX(nim->ny, 1);
+	size_t nRow = MAX(nim->ny, 1);
 	nRow *= MAX(nim->nz, 1);
 	nRow *= MAX(nVol, 1);
 	//EDT in left-right direction
-	flt *imgRow = img;
-	for (int r = 0; r < nRow; r++)
-		edt1(imgRow += nx, nx);
+	flt *imgRow = (flt *)nim->data;
+	for (int r = 0; r < nRow; r++) {
+		edt1(imgRow, nx, dx);
+		imgRow += nx;
+	}
 	//EDT in anterior-posterior direction
 	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
 	for (int v = 0; v < nVol; v++) { //transpose each volume separately
@@ -431,8 +451,10 @@ staticx int nifti_edt(nifti_image *nim) {
 		transposeXY(&img[vo], img3D, &nx, &ny, nz);
 		//perform EDT for all "rows"
 		flt *imgRow = img3D;
-		for (int r = 0; r < nRow; r++)
-			edt(imgRow += nx, nx);
+		for (int r = 0; r < nRow; r++) {
+			edt(imgRow, nx, dy);
+			imgRow += nx;
+		}
 		transposeXY(img3D, &img[vo], &nx, &ny, nz);
 		_mm_free(img3D);
 	} //for each volume
@@ -445,11 +467,14 @@ staticx int nifti_edt(nifti_image *nim) {
 		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
 		//perform EDT for all "rows"
 		flt *imgRow = img3D;
-		for (int r = 0; r < nRow; r++)
-			edt(imgRow += nx, nx);
+		for (int r = 0; r < nRow; r++) {
+			edt(imgRow, nx, dz);
+			imgRow += nx;
+		}
 		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
 		_mm_free(img3D);
 	} //for each volume
+	nifti_sqrt(img, nim->nvox);
 	return 0;
 } //nifti_edt()
 
@@ -3907,6 +3932,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 	return 0;
 }
 
+#ifndef USING_R
 staticx void rand_test() {
 	//https://www.phoronix.com/scan.php?page=news_item&px=Linux-RdRand-Sanity-Check
 	int r0 = rand();
@@ -3915,6 +3941,7 @@ staticx void rand_test() {
 			return;
 	printfx("RDRAND gives funky output: update firmware\n");
 }
+#endif
 
 staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 	if (nim->nvox < 1)
@@ -4086,42 +4113,52 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			else
 				f32[i] = 0.0;
 	} else if (op == rand1) {
-		rand_test();
-		flt scl = (1.0 / RAND_MAX);
-		for (size_t i = 0; i < nim->nvox; i++)
-			f32[i] += rand() * scl;
+		#ifdef USING_R
+			for (size_t i = 0; i < nim->nvox; i++ )
+				f32[i] += (flt) unif_rand();
+		#else
+			rand_test();
+			flt scl = (1.0 / RAND_MAX);
+			for (size_t i = 0; i < nim->nvox; i++)
+				f32[i] += rand() * scl;
+		#endif
 	} else if (op == randn1) {
-		rand_test();
-		//https://en.wikipedia.org/wiki/Box–Muller_transform
-		//for SIMD see https://github.com/miloyip/normaldist-benchmark
-		static const flt sigma = 1.0f;
-		static const flt mu = 0.0;
-		//static const flt epsilon = FLT_EPSILON;
-		static const flt two_pi = 2.0 * 3.14159265358979323846;
-		static const flt scl = (1.0 / RAND_MAX);
-		//fill pairs
-		for (size_t i = 0; i < (nim->nvox - 1); i += 2) {
-			flt u1, u2;
-			do {
-				u1 = rand() * scl;
-				u2 = rand() * scl;
-			} while (u1 <= epsilon);
-			flt su1 = sqrt(-2.0 * log(u1));
-			flt z0 = su1 * cos(two_pi * u2);
-			flt z1 = su1 * sin(two_pi * u2);
-			f32[i] += z0 * sigma + mu;
-			f32[i + 1] += z1 * sigma + mu;
-		}
-		//if odd, fill final voxel
-		if (nim->nvox % 2 != 0) {
-			flt u1, u2;
-			do {
-				u1 = rand() * scl;
-				u2 = rand() * scl;
-			} while (u1 <= epsilon);
-			flt z0 = sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
-			f32[nim->nvox - 1] += z0 * sigma + mu;
-		}
+		#ifdef USING_R
+			for (size_t i = 0; i < nim->nvox; i++ )
+				f32[i] += (flt) norm_rand();
+		#else
+			rand_test();
+			//https://en.wikipedia.org/wiki/Box–Muller_transform
+			//for SIMD see https://github.com/miloyip/normaldist-benchmark
+			static const flt sigma = 1.0f;
+			static const flt mu = 0.0;
+			//static const flt epsilon = FLT_EPSILON;
+			static const flt two_pi = 2.0 * 3.14159265358979323846;
+			static const flt scl = (1.0 / RAND_MAX);
+			//fill pairs
+			for (size_t i = 0; i < (nim->nvox - 1); i += 2) {
+				flt u1, u2;
+				do {
+					u1 = rand() * scl;
+					u2 = rand() * scl;
+				} while (u1 <= epsilon);
+				flt su1 = sqrt(-2.0 * log(u1));
+				flt z0 = su1 * cos(two_pi * u2);
+				flt z1 = su1 * sin(two_pi * u2);
+				f32[i] += z0 * sigma + mu;
+				f32[i + 1] += z1 * sigma + mu;
+			}
+			//if odd, fill final voxel
+			if (nim->nvox % 2 != 0) {
+				flt u1, u2;
+				do {
+					u1 = rand() * scl;
+					u2 = rand() * scl;
+				} while (u1 <= epsilon);
+				flt z0 = sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
+				f32[nim->nvox - 1] += z0 * sigma + mu;
+			}
+		#endif
 	} else if (op == range1) {
 		flt mn = f32[0];
 		flt mx = mn;
@@ -5071,10 +5108,10 @@ int main64X(int argc, char *argv[]) {
 			op = recip1;
 		if (!strcmp(argv[ac], "-abs"))
 			op = abs1;
-		if (!strcmp(argv[ac], "-bin"))
-			op = bin1;
 		if (!strcmp(argv[ac], "-binv"))
 			op = binv1;
+		else if (!strcmp(argv[ac], "-bin"))
+			op = bin1;
 		if (!strcmp(argv[ac], "-edge"))
 			op = edge1;
 		if (!strcmp(argv[ac], "-index"))
@@ -5437,8 +5474,6 @@ int main64X(int argc, char *argv[]) {
 		}
 		if ((op >= dilMk) && (op <= fmeanuk))
 			ok = nifti_kernel(nim, op, kernel, nkernel);
-		if ((op >= exp1) && (op <= ptoz1))
-			nifti_unary(nim, op);
 		if ((op >= add) && (op < exp1)) { //binary operations
 			ac++;
 			double v = strtod(argv[ac], &end);
@@ -5760,10 +5795,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			op = fmeank;
 		if (!strcmp(argv[ac], "-fmeanu"))
 			op = fmeanuk;
-
-		if ((op >= exp1) && (op <= ptoz1))
-			nifti_unary(nim, op);
-			
 		if (!strcmp(argv[ac], "-p")) {
 			ac++;
 #if defined(_OPENMP)

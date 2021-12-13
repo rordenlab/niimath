@@ -3698,10 +3698,8 @@ char * nifti_findhdrname(const char* fname)
    char  extzip[4]   = ".gz";
    int   efirst = 1;    /* init to .nii extension */
    int   eisupper = 0;  /* init to lowercase extensions */
-
    /**- check input file(s) for sanity */
    if( !nifti_validfilename(fname) ) return NULL;
-
    basename = nifti_makebasename(fname);
    if( !basename ) return NULL;   /* only on string alloc failure */
 
@@ -3751,7 +3749,8 @@ char * nifti_findhdrname(const char* fname)
    #ifdef FSLSTYLE
    if (nifti_fileexists(hdrname)) {
       free(basename);
-      char *gzname =nifti_strdup(hdrname);
+      char *gzname = (char *)calloc(sizeof(char),strlen(hdrname)+8);
+      strcpy(gzname, hdrname);
       strcat(gzname,extzip);
       if (nifti_fileexists(gzname)) {
          fprintf(stderr,"Image Exception : Multiple possible filenames detected for basename (*.nii, *.nii.gz): %s\n", basename);
@@ -5299,14 +5298,14 @@ nifti_1_header * nifti_read_n1_hdr(const char * hname, int *swapped, int check)
    hfile = nifti_findhdrname(hname);
    if( hfile == NULL ){
       if( g_opts.debug > 0 )
-         LNI_FERR(fname,"failed to find header file for", hname);
+         LNI_FERR(fname,"failed to find N1 header file for", hname);
       return NULL;
    } else if( g_opts.debug > 1 )
       fprintf(stderr,"-d %s: found header filename '%s'\n",fname,hfile);
 
    fp = znzopen( hfile, "rb", nifti_is_gzfile(hfile) );
    if( znz_isnull(fp) ){
-      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open header file",hfile);
+      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open N1 header file",hfile);
       free(hfile);
       return NULL;
    }
@@ -5400,7 +5399,7 @@ nifti_2_header * nifti_read_n2_hdr(const char * hname, int * swapped,
    hfile = nifti_findhdrname(hname);
    if( hfile == NULL ){
       if( g_opts.debug > 0 )
-         LNI_FERR(fname,"failed to find header file for", hname);
+         LNI_FERR(fname,"failed to find N2 header file for", hname);
       return NULL;
    } else if( g_opts.debug > 1 )
       fprintf(stderr,"-d %s: found N2 header filename '%s'\n",fname,hfile);
@@ -5742,7 +5741,7 @@ void * nifti_read_header( const char *hname, int *nver, int check )
    hfile = nifti_findhdrname(hname);
    if( hfile == NULL ){
       if(g_opts.debug > 0)
-         LNI_FERR(fname,"failed to find header file for", hname);
+         LNI_FERR(fname,"failed to find any header file for", hname);
       return NULL;  /* check return */
    } else if( g_opts.debug > 2 )
       fprintf(stderr,"-d %s: found header filename '%s'\n",fname,hfile);
@@ -5753,7 +5752,7 @@ void * nifti_read_header( const char *hname, int *nver, int check )
    /**- open file, separate reading of header, extensions and data */
    fp = znzopen(hfile, "rb", nifti_is_gzfile(hfile));
    if( znz_isnull(fp) ){
-      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open header file",hfile);
+      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open any header file",hfile);
       free(hfile);
       return NULL;
    }
@@ -5896,7 +5895,7 @@ nifti_image *nifti_image_read( const char *hname , int read_data )
    /**- open file, separate reading of header, extensions and data */
    fp = znzopen(hfile, "rb", nifti_is_gzfile(hfile));
    if( znz_isnull(fp) ){
-      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open header file",hfile);
+      if( g_opts.debug > 0 ) LNI_FERR(fname,"failed to open a header file",hfile);
       free(hfile);
       return NULL;
    }

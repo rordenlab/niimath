@@ -606,7 +606,6 @@ int butter_design(int order, double fl, double fh, double ** a, double ** b, dou
 		af = dcof_bwlp(order, fh);
 		gain = sf_bwlp(order, fh);
 		bi = ccof_bwlp(order);
-		//printf(">>>>%g\n", fh);
 		nA = order + 1;	
 	} else
 		return 0;
@@ -637,7 +636,6 @@ int butter_design(int order, double fl, double fh, double ** a, double ** b, dou
 	    double * ba = (double *)_mm_malloc(nM * sizeof(double), 64);
 	for (int i = 0; i < nM; i++) {
 		ba[i] = (*b)[i+1]-((*a)[i+1] * (*b)[0]);
-		//printf("%g\n", IC[i]);	
 	}
 	* IC = (double *)_mm_malloc(nM * sizeof(double), 64);
 	for (int i = 0; i < nM; i++) {

@@ -150,13 +150,6 @@ CLIST * createFilter(int srcXsize, int dstXsize, int filterMethod);
 double qginv( double p );
 double qg( double x );
 
-#ifdef USING_WASM
-//#define printfx(...) printf(__VA_ARGS__)
-#define printfx(...)
-#else
-#define printfx(...) fprintf(stderr, __VA_ARGS__)
-#endif
-
 #ifndef MAX //from Christian Gaser's TFCE example
 #define MAX(A,B) ((A) > (B) ? (A) : (B))
 #endif

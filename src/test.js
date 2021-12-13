@@ -1,7 +1,6 @@
 //demo
 // emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js; node test.js
 //n.b. since we "renew" the ArrayBuffer we do not need to pre-allocate worst case total memory
-// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js; node test.js
 
 const fs = require('fs')
 let instance = null
@@ -162,7 +161,7 @@ async function main() {
   // Load the wasm into a buffer.
   const buf = fs.readFileSync('./funcx.wasm')
   let mod = new WebAssembly.Module(buf)
-  let memory = new LinearMemory({ initial: 2048, maximum: 2048 })
+  let memory = new LinearMemory({ initial: 256, maximum: 2048 })
   let instance = new WebAssembly.Instance(mod, { env: memory.env() })
   niimath_shim(instance, memory, "-dehaze 3 -dog 2 3", 16)
   niimath_shim(instance, memory, "-mul 7", 4)

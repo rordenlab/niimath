@@ -6,7 +6,7 @@ niimath can be compiled to [WebAssembly (WASM)](https://webassembly.org) so that
 
 The niimath.js project provides a similar command line operation to fslmaths. It uses [NIFTI-Reader-JS](https://github.com/rii-mango/NIFTI-Reader-JS) to load NIfTI images from disk.
 
- 1. Compile C to WASM: `emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js`
+ 1. Compile C to WASM: `emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js`
  3. Run the JavaScript example: `node test.js`
 
 This project does not load or save images from disk. It simply generates fake images and processes them. It reports the time for each operation:
