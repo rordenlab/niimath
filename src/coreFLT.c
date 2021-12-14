@@ -4038,12 +4038,13 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		#else
 		flt mn = -8.29;
 		#endif
+		flt mx = 13.0;
 		size_t nClamp = 0;
 		for (size_t i = 0; i < nim->nvox; i++) {
-			if (f32[i] < mn) nClamp++;
+			if ((f32[i] < mn) || (f32[i] >= mx)) nClamp++;
 			f32[i] = qg(MAX(f32[i], mn));
 		}
-		if (nClamp > 0) printfx("ztop clamped %zu extremely negative z-scores\n", nClamp);
+		if (nClamp > 0) printfx("ztop clamped %zu extreme z-scores\n", nClamp);
 	} else if (op == ptoz1) {
 		//given p, return x such that Q(x)=p, for 0 < p < 1
 		// #ifdef DT32
