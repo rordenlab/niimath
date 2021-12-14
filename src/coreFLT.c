@@ -4033,8 +4033,17 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		} //nvol > 1
 		#endif //WASM does not like qsort
 	} else if (op == ztop1) {
-		for (size_t i = 0; i < nim->nvox; i++)
-			f32[i] = qg(f32[i]);
+		#ifdef DT32 //issue8
+		flt mn = -5.41;
+		#else
+		flt mn = -8.29;
+		#endif
+		size_t nClamp = 0;
+		for (size_t i = 0; i < nim->nvox; i++) {
+			if (f32[i] < mn) nClamp++;
+			f32[i] = qg(MAX(f32[i], mn));
+		}
+		if (nClamp > 0) printfx("ztop clamped %zu extremely negative z-scores\n", nClamp);
 	} else if (op == ptoz1) {
 		//given p, return x such that Q(x)=p, for 0 < p < 1
 		// #ifdef DT32
