@@ -263,6 +263,12 @@ staticx void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
 } //nifti_fma
 #endif //if vector SIMD else scalar
 
+staticx void * aligned_calloc(size_t size) {
+	uint8_t *dat= (uint8_t *)_mm_malloc(size, 64);
+	memset(dat, 0, size);
+	return (void *) dat;
+}
+
 staticx inline void transposeXY( flt *img3Din, flt *img3Dout, int *nxp, int *nyp, int nz) {
 //transpose X and Y dimensions: rows <-> columns
 //Note: in future we could use SIMD to transpose values in tiles
@@ -1117,7 +1123,8 @@ staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	int nvolOut = tFinalVol - tminVol + 1;
 	flt *imgIn = (flt *)nim->data;
 	nim->nvox = nvox3D * nvolOut;
-	void *dat = (void *)calloc(1, nim->nvox * sizeof(flt));
+	//void *dat = (void *)calloc(1, nim->nvox * sizeof(flt));
+	void *dat = (void *)aligned_calloc(nim->nvox * sizeof(flt));
 	flt *imgOut = (flt *)dat;
 	imgIn += tminVol * nvox3D;
 	xmemcpy(imgOut, imgIn, nim->nvox * sizeof(flt));
@@ -1136,7 +1143,6 @@ staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	#endif
 	return 0;
 }
-
 
 staticx void nifti_add2(flt *v, size_t n, flt intercept1) {
 	//#pragma omp parallel for
@@ -2022,7 +2028,8 @@ staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, in
 		dims[0] = 3; //reduce 4D to 3D
 	size_t nvox = dims[1] * dims[2] * dims[3] * dims[4];
 	flt *i32 = (flt *)nim->data;
-	void *dat = (void *)calloc(1, nim->nvox * sizeof(flt));
+	//void *dat = (void *)calloc(1, nim->nvox * sizeof(flt));
+	void *dat = (void *)aligned_calloc(nim->nvox * sizeof(flt));
 	flt *o32 = (flt *)dat;
 	int collapseStep; //e.g. if we collapse 4th dimension, we will collapse across voxels separated by X*Y*Z
 	if (dim == 1)
@@ -2465,7 +2472,8 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	nim->cal_max = calmax(nim);
 	nifti_save(nim, "_MD");
 	//single volume data
-	void *dat = (void *)calloc(1, nvox3D * sizeof(flt));
+	//void *dat = (void *)calloc(1, nvox3D * sizeof(flt));
+	void *dat = (void *)aligned_calloc(nvox3D * sizeof(flt));
 	nim->data = dat;
 	flt *fa32 = (flt *)dat;
 	//save MO
@@ -3283,7 +3291,8 @@ staticx int nifti_subsamp2(nifti_image *nim, int offc) {
 		return 0;
 	int nvox3D = nx * ny * nz;
 	flt *i32 = (flt *)nim->data;
-	void *dat = (void *)calloc(1, nvox3D * nvol * sizeof(flt));
+	//void *dat = (void *)calloc(1, nvox3D * nvol * sizeof(flt));
+	void *dat = (void *)aligned_calloc(nvox3D * nvol * sizeof(flt));
 	flt *o32 = (flt *)dat;
 	int x_flip = 0;
 	if (!neg_determ(nim))
@@ -3459,7 +3468,8 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 		return 0;
 	int nvox3D = nx * ny * nz;
 	flt *i32 = (flt *)nim->data;
-	void *dat = (void *)calloc(1, nvox3D * nvol * sizeof(flt));
+	//void *dat = (void *)calloc(1, nvox3D * nvol * sizeof(flt));
+	void *dat = (void *)aligned_calloc(nvox3D * nvol * sizeof(flt));
 	flt *o32 = (flt *)dat;
 #pragma omp parallel for
 	for (int v = 0; v < nvol; v++) {
@@ -4065,8 +4075,6 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			printfx("permutation tests require 4D datasets.\n");
 			return 1;
 		}
-		//void *dat = (void *)calloc(1, nvox3D * sizeof(flt));
-		//flt *o32 = (flt *)dat;
 		flt *o32= (flt *)_mm_malloc(nvox3D * sizeof(flt), 64);
 		memset(o32, 0, nvox3D * sizeof(flt)); //zero array
 #pragma omp parallel for

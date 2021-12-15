@@ -49,12 +49,12 @@ cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c 
 
 ## Usage
 
-niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-maths-commands/), so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. There are a couple of things to advanced features:
+niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-maths-commands/), so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. You can also modify your environment variables to unleash advanced features:
 
  - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export NIFTI_GZ` or `export NIFTI` from the command line or profile to select between compressed (smaller) or uncompressed (faster) results. Windows users can use `set` instead of `export`.
  - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded compresson.
 
-niimath has has a few features not provided by fslmaths: 
+niimath has a few features not provided by fslmaths: 
 
  - bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)
  - bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)
@@ -118,6 +118,7 @@ Some operations do generate known meaningfully different results. These are list
 10. Be aware that fslmaths takes account of whether the image has a negative determinant or not (flipping the first dimension). However, fslstats does not do this, so fslstats coordinates are often misleading. For example, consider an image in RAS orientation, where the command `fslstats tfRAS -x` will give coordinates that are incompatible with fslmath's `tfceS` function. niimath attempts to emulate the behavior of fslmaths for the relevant functions (-index -roi, -tfceS). 
 11. Neither `-subsamp2` nor `-subsamp2offc` handle anti-aliasing. Be aware that `-subsamp2offc` can exhibit odd edge effects. The problem is simple to describe, for slices in the middle of a volume, and output slice is weighted 50% with the center slice, and 25% for the slice below and the slice above. This makes sense. However, bottom slices (as well as first rows, first columns, last rows, last columns, last slices) the filter weights 75% on the central slice and just 25% on the slice above it. Signal from this 2nd slice is heavily diluted. A better mixture would be 66% edge slice and 33% 2nd slice. This latter solution is used by niimath.
 12. fslmaths 6.0.0..6.0.3 were unable to process files where the string ".nii" appears in a folder name. For example, consider the folder "test.niim", the command `fslmaths ~/test.niim/RAS -add 0 tst` will [generate an exception](https://github.com/FCP-INDI/C-PAC/issues/976). niimath will recognize that this is a folder name and not a file extension and work correctly. niimath helped detect this anomaly and it is an example of how a clone can help provide feedback to the developers of the original project.
+13. The fslmaths function [`-ztop`](https://github.com/rordenlab/niimath/issues/8) fails to clamp extreme values.
 
 Finally, it is possible that there are some edge cases where niimath fails to replicate fslmath. This is new software, and many of the operations applied by fslmaths are undocumented. If users detect any problems, they are encouraged to generate a Github issue to report the error.
 
