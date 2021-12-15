@@ -2,6 +2,7 @@
 #include <math.h>
 #include <nifti2_io.h>
 #include "core.h"
+#include "print.h"
 #ifdef __aarch64__
   #include "arm_malloc.h"
 #else

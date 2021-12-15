@@ -1,15 +1,43 @@
 #include "core.h"
+#include "print.h"
 #define _USE_MATH_DEFINES //microsoft compiler
 #include <float.h>		  //FLT_EPSILON
 #include <limits.h>
 #include <math.h>
-#include <nifti2_io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef __aarch64__
-#include "arm_malloc.h"
+	#include "arm_malloc.h"
 #else
-#include <immintrin.h>
+	#include <immintrin.h>
+#endif
+
+#ifdef USING_WASM
+#define WASM_EXPORT(name) \
+  __attribute__((export_name(#name))) \
+  name
+
+// Pull these in from walloc.c.
+                          
+void* WASM_EXPORT(walloc)(size_t size) {
+  return xmalloc(size);
+}
+
+void WASM_EXPORT(wfree)(void* ptr) {
+  xfree(ptr);
+}
+
+	void xmemcpy ( void * destination, const void * source, size_t num ) {
+		uint8_t * s = (uint8_t*) source;
+		uint8_t * d = (uint8_t*) destination;
+		for (size_t i = 0; i < num; i++)
+			d[i] = s[i];
+	}
+	#define staticx
+	#include <nifti2_wasm.h>
+#else
+	#define xmemcpy memcpy
+	#include <nifti2_io.h>
 #endif
 
 #ifndef M_PI
@@ -107,6 +135,7 @@ int nii_otsu(int* H, int nBin, int mode) {
 	return thresh;
 }
 
+#ifndef USING_WASM
 int nifti_save(nifti_image *nim, const char *postfix) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */
 	char exthdr[5] = ".hdr";
@@ -251,7 +280,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 	nim->intent_name[15] = '\0';
 	return nim;
 }
-
+#endif //not USING_WASM
 vec4 setVec4(float x, float y, float z) {
 	vec4 v = {{x, y, z, 1}};
 	return v;
@@ -275,6 +304,7 @@ float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2) {
 	return sqrt(sqr(pos.v[0] - pos2.v[0]));
 }
 
+#ifndef USING_WASM
 float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	//examines each corner of two NIfTI images and returns the max difference in vertex location
 	// used to detect if two volumes are aligned
@@ -290,6 +320,7 @@ float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	mx = MAX(mx, vertexDisplacement(0, 0, nim->nz - 1, m, m2));
 	return mx;
 }
+#endif
 
 in_hdr set_input_hdr(nifti_image *nim) {
 	//remember input datatype, slope and intercept in case user saves back to this
@@ -300,6 +331,7 @@ in_hdr set_input_hdr(nifti_image *nim) {
 	return ihdr;
 }
 
+#ifndef USING_WASM
 int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	//returns -1 on failure, 0 if okay
 	if (nim->datatype == dt)
@@ -664,6 +696,7 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 	nifti_image_free(nim2);
 	return kernel;
 } //make_kernel_file()
+#endif //not USING_WASM
 
 int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 	// sphere of radius <size> mm centered on target voxel

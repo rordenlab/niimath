@@ -17,9 +17,11 @@ extern "C" {
 #include <limits.h>
 
 
-#ifdef __EMSCRIPTEN__
- #define _mm_malloc(size, alignment) malloc(size)
- #define _mm_free(ptr) free(ptr)
+#ifdef USING_WASM
+void *xmalloc(size_t size);
+void xfree(void *p);
+ #define _mm_malloc(size, alignment) xmalloc(size)
+ #define _mm_free(ptr) xfree(ptr)
 #endif
 
 //CORE32 and CORE64 handle Float32 and Float64 operations, CORE handles shared code 
@@ -126,29 +128,27 @@ typedef struct {                   /** x4 vector struct **/
     float v[4] ;
 } vec4 ;
 
-#ifndef USING_WASM
+#ifdef USING_WASM
+void xmemcpy ( void * destination, const void * source, size_t num );
+#else
 int nifti_save(nifti_image * nim, const char *postfix);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);
+mat44 xform(nifti_image * nim);
+int nifti_image_change_datatype ( nifti_image * nim, int dt , in_hdr * ihdr);
+float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
 #endif
 vec4 setVec4(float x, float y, float z);
 vec4 nifti_vect44mat44_mul(vec4 v, mat44 m );
-mat44 xform(nifti_image * nim);
 int neg_determ(nifti_image * nim);
 int nii_otsu(int* H, int nBin, int mode);
-float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
 float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2);
 in_hdr set_input_hdr(nifti_image * nim);
-int nifti_image_change_datatype ( nifti_image * nim, int dt , in_hdr * ihdr);
 int * make_kernel(nifti_image * nim, int * nkernel, int x, int y, int z);
 int * make_kernel_sphere(nifti_image * nim, int * nkernel, double mm);
-//CLIST	* createFilter(int srcXsize, int dstXsize, double (*filterf)(), double fwidth);
-CLIST	* createFilter(int srcXsize, int dstXsize, int filterMethod);
+CLIST * createFilter(int srcXsize, int dstXsize, int filterMethod);
 double qginv( double p );
 double qg( double x );
-
-//#define printfx(...) printf(__VA_ARGS__)
-#define printfx(...) fprintf(stderr, __VA_ARGS__)
 
 #ifndef MAX //from Christian Gaser's TFCE example
 #define MAX(A,B) ((A) > (B) ? (A) : (B))
