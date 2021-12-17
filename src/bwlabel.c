@@ -39,7 +39,7 @@
  ***************************************************************/
 
 void fill_tratab(uint32_t  *tt,     /* Translation table */
-                 uint32_t  ttn,     /* Size of translation table */
+                 /*uint32_t  ttn,*/     /* Size of translation table */
                  uint32_t  *nabo,   /* Set of neighbours */
                  uint32_t  nr_set)  /* Number of neighbours in nabo */
 {
@@ -83,8 +83,8 @@ uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
                                   uint32_t  sl,      /* slice */
                                   size_t        dim[3],  /* dimensions of il */
                                   uint32_t  conn,    /* Connectivity criterion */
-                                  uint32_t  *tt,     /* Translation table */
-                                  uint32_t  ttn)     /* Size of translation table */
+                                  uint32_t  *tt)     /* Translation table */
+//                                  uint32_t  ttn)     /* Size of translation table */
 {
    uint32_t l=0;
    uint32_t nabo[9];
@@ -113,7 +113,7 @@ uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
 
    if (nr_set) 
    {
-      fill_tratab(tt,ttn,nabo,nr_set);
+      fill_tratab(tt,/*ttn,*/nabo,nr_set);
       return(nabo[0]);
    }
    else {return(0);}
@@ -164,7 +164,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
             nr_set = 0;
             if (bw[idx(r,c,sl,dim)])
             {
-               nabo[0] = check_previous_slice(il,r,c,sl,dim,conn,*tt,ttn);
+               nabo[0] = check_previous_slice(il,r,c,sl,dim,conn,*tt /*,ttn*/);
                if (nabo[0]) {nr_set += 1;}
                /*
                   For six(surface)-connectivity
@@ -198,7 +198,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
                if (nr_set)
                {
                   il[idx(r,c,sl,dim)] = nabo[0];
-                  fill_tratab(*tt,ttn,nabo,nr_set);
+                  fill_tratab(*tt,/*ttn,*/nabo,nr_set);
                }
                else
                {
@@ -298,6 +298,10 @@ int bwlabel(nifti_image *nim, int conn) {
   uint32_t  *tt = NULL;
   uint32_t ttn = do_initial_labelling(bw,dim,conn,il,&tt);
   double nl = translate_labels(il,dim,tt,ttn,l);
+  nim->cal_min = 0;
+  nim->cal_max = nl;
+  nim->scl_inter = 0.0;
+  nim->scl_slope = 1.0;
   _mm_free(il);
   _mm_free(tt);
   if (nim->datatype == DT_FLOAT32) {

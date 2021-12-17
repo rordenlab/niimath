@@ -942,7 +942,7 @@ staticx int nifti_c2h(nifti_image *nim) {
 	flt kUninterestingDarkUnits = 900.0; //e.g. -1000..-100
 	flt kInterestingMidUnits = 200.0; //e.g. unenhanced CT: -100..+100
 	flt kScaleRatio = 10;
-	flt kMax = kInterestingMidUnits * (kScaleRatio+1);
+	//flt kMax = kInterestingMidUnits * (kScaleRatio+1);
 	if (nim->nvox < 1)
 		return 1;
 	flt mn = darkest_voxel(nim);
@@ -1008,7 +1008,6 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize 
 	//Create histogram of intensity frequency
 	// hist[0..kOtsuBins-1]: each bin is number of pixels with this intensity
 	flt mn, mx;
-
 	if (nifti_robust_range(nim, &mn, &mx, 0) != 0)
 		return 1;
 	if (mn >= mx)
@@ -1144,31 +1143,29 @@ staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 	return 0;
 }
 
-staticx void nifti_add2(flt *v, size_t n, flt intercept1) {
+/*staticx void nifti_add2(flt *v, size_t n, flt intercept1) {
 	//#pragma omp parallel for
 	for (size_t i = 0; i < n; i++)
 		v[i] += intercept1;
-} //nifti_add()
+} //nifti_add()*/
 
 staticx int nifti_rescale(nifti_image *nim, double scale, double intercept) {
 	//linear transform of data
 	if (nim->nvox < 1)
 		return 1;
-	flt scl = scale;
-	flt inter = intercept;
 	flt *f32 = (flt *)nim->data;
 	if (intercept == 0.0) {
 		if (scale == 1.0)
 			return 0; //nothing to do
-		nifti_mul(f32, nim->nvox, scl);
+		nifti_mul(f32, nim->nvox, scale);
 		return 0;
 	} else if (scale == 1.0) {
 		nifti_add(f32, nim->nvox, intercept);
 		return 0;
 	}
-	nifti_fma(f32, nim->nvox, scl, inter);
+	nifti_fma(f32, nim->nvox, scale, intercept);
 	//for (size_t i = 0; i < nim->nvox; i++ )
-	//	f32[i] = (f32[i] * scl) + inter;
+	//	f32[i] = (f32[i] * scl) + intercept;
 	return 0;
 }
 
@@ -2394,7 +2391,7 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 			in6[v] = in32[iv];
 			iv += nvox3D;
 		}
-		EIG_tsfunc(0.0, 0.0, 0, in6, 0.0, 0.0, NULL, 0, out14, isUpperTriangle);
+		EIG_tsfunc(0, in6, out14, isUpperTriangle);
 		size_t ov = i;
 		for (int v = 0; v < 14; v++) {
 			out32[ov] = out14[v];
@@ -3108,7 +3105,7 @@ staticx int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize
 	return 0;
 }
 
-staticx int nifti_sobel(nifti_image *nim, int offc, int isBinary) {
+staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 	//sobel is simply one kernel pass per dimension.
 	// this could be achieved with successive passes of "-kernel"
 	// here it is done in a single pass for cache efficiency
@@ -5124,9 +5121,9 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 		else if (!strcmp(argv[ac], "-c2h"))
 			ok = nifti_c2h(nim);
 		else if (!strcmp(argv[ac], "-sobel_binary"))
-			ok = nifti_sobel(nim, 1, 1);
+			ok = nifti_sobel(nim, 1);
 		else if (!strcmp(argv[ac], "-sobel"))
-			ok = nifti_sobel(nim, 1, 0);
+			ok = nifti_sobel(nim, 0);
 		else if (!strcmp(argv[ac], "-demean"))
 			ok = nifti_demean(nim);
 		else if (!strcmp(argv[ac], "-detrend"))
@@ -5433,7 +5430,52 @@ float clampf(float d, float min, float max) {
 	return t > max ? max : t;
 }
 
-__attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
+staticx int nifti_unscale(nifti_image *nim, double scale, double intercept) {
+	//invert linear transform of data
+	if ((nim->nvox < 1) || (scale == 0.0))
+		return 1;
+	flt *f32 = (flt *)nim->data;
+	if (intercept == 0.0) {
+		if (scale == 1.0)
+			return 0; //nothing to do
+		nifti_mul(f32, nim->nvox, 1.0 / scale);
+		return 0;
+	} else if (scale == 1.0) {
+		nifti_add(f32, nim->nvox, - intercept);
+		return 0;
+	}
+	flt scl = 1.0 / scale;
+	for (size_t i = 0; i < nim->nvox; i++ )
+		f32[i] = (f32[i] - intercept ) * scl;
+	return 0;
+}
+
+int mainWASM2(nifti_image *nim, int argc, char *argv[], float *vars) {
+	nim->scl_slope = vars[0];
+	nim->scl_inter = vars[1];
+	nim->cal_min = vars[2];
+	nim->cal_max = vars[3];
+	if (nim->scl_slope != 0.0)
+		nifti_rescale(nim, nim->scl_slope, nim->scl_inter);
+	int ret = mainWASM(nim, argc, argv);
+	if (nim->scl_slope == 0.0) //bogus vars*, do not rescale, do not waste time calculating robust range
+		return ret;
+	nifti_unscale(nim, nim->scl_slope, nim->scl_inter);
+	flt mn, mx;
+	nifti_robust_range(nim, &mn, &mx, 0);
+	vars[0] = nim->scl_slope;
+	vars[1] = nim->scl_inter;
+	vars[2] = mn;
+	vars[3] = mx;
+	return ret;
+}
+
+//niimathx extends 'niimath' call to have float vars that may be changed by computations
+//vars[0] = scl_slope
+//vars[1] = scl_inter
+//vars[2] = cal_min
+//vars[3] = cal_max
+__attribute__((used)) int niimathx (void *img, float *vars, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
 	int nvox = nx * ny * nz * MAX(nt, 1);
 	if (nvox < 1) return 101;
 	#define argc_MAX 128
@@ -5459,14 +5501,14 @@ __attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int 
 	nim.cal_min = 0.0;
 	nim.datatype = DT_FLOAT;
 	if (datatype == DT_FLOAT) 
-		return mainWASM(&nim, argc, argv);//niimath_core(&nim, cmdstr);
+		return mainWASM2(&nim, argc, argv, vars);//niimath_core(&nim, cmdstr);
 	if (datatype == DT_SIGNED_SHORT) {
 		int16_t *img16 = (int16_t *)img;
 		float *img32 = (float *) _mm_malloc(nvox * sizeof(float), 64);
 		for (int i = 0; i < nvox; ++i)
 			img32[i] = img16[i];
 		nim.data = img32;
-		int ret = mainWASM(&nim, argc, argv);
+		int ret = mainWASM2(&nim, argc, argv, vars);
 		for (int i = 0; i < nvox; ++i)
 			img16[i] = clampf(img32[i], -32768.0, 32767.0);//img32[i];
 		_mm_free(img32);
@@ -5478,12 +5520,17 @@ __attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int 
 		for (int i = 0; i < nvox; ++i)
 			img32[i] = img8[i];
 		nim.data = img32;
-		int ret = mainWASM(&nim, argc, argv);
+		int ret = mainWASM2(&nim, argc, argv, vars);
 		for (int i = 0; i < nvox; ++i)
 			img8[i] = clampf(img32[i], 0.0, 255.0); //img32[i]; 
 		_mm_free(img32);
 		return ret;
 	}
 	return 88;
+}
+
+__attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
+	float vars[] = {0.0, 0.0, 0.0, 0.0};
+	return niimathx (img, &vars[0], datatype, nx, ny, nz, nt, dx, dy, dz, dt, cmdstr);
 }
 #endif //WASM code
