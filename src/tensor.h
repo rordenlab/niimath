@@ -5,10 +5,9 @@
 extern "C" {
 #endif
 
-void EIG_tsfunc( double tzero, double tdelta ,
+void EIG_tsfunc(
                           int npts, float ts[],
-                          double ts_mean, double ts_slope,
-                          void * ud, int nbriks, float * val, int isUpperTriangle );
+                          float * val, int isUpperTriangle );
 
 #ifdef  __cplusplus
 }

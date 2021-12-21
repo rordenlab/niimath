@@ -1692,10 +1692,9 @@ void symeig_double( int n , double *a , double *e ) {
 /* Author: Daniel Glen, 15 Nov 2004 */
 //https://github.com/afni/afni/blob/b6a9f7a21c1f3231ff09efbd861f8975ad48e525/src/3dDTeig.c
 //  Components developed at the US National Institutes of Health (after 15 Jan 2001) are not copyrighted.
-void EIG_tsfunc( double tzero, double tdelta ,
+void EIG_tsfunc(
                           int npts, float ts[],
-                          double ts_mean, double ts_slope,
-                          void * ud, int nbriks, float * val, int isUpperTriangle )
+                          float * val, int isUpperTriangle )
 {
   #define SMALLNUMBER 1E-4
   int i,j;

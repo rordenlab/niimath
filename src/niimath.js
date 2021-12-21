@@ -4,8 +4,6 @@
 // emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
 //Test on image
 // node niimath.js T1.nii -sqr sT1.nii
-//Note: since we renew the ArrayBuffer we do not need to pre-allocate worst case TOTAL_MEMORY:
-// emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s TOTAL_MEMORY=268435456 -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js
 
 const fs = require('fs')
 const nifti = require('nifti-reader-js')
@@ -94,7 +92,7 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
       console.log('Only dataypes 2,4,16 supported')
       return
     }
-    let {niimath, walloc, wfree} = instance.exports
+    let {niimathx, niimath, walloc, wfree} = instance.exports
     let nx = hdr.dims[1] //number of columns
     let ny = hdr.dims[2] //number of rows
     let nz = hdr.dims[3] //number of slices
@@ -103,7 +101,7 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     let dy = hdr.pixDims[2] //space between rows
     let dz = hdr.pixDims[3] //space between slices
     let dt = hdr.pixDims[4] //time between volumes
-    let bpv = Math.floor(hdr.numBitsPerVoxel/8) 
+    let bpv = Math.floor(hdr.numBitsPerVoxel/8)
     console.log(`dims: ${nx}x${ny}x${nz}x${nt} nbyper: ${bpv}`)
     //allocate WASM null-terminated command string
     let cptr = walloc(cmd.length + 1)
@@ -113,20 +111,34 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
         cmdstr[i] = cmd.charCodeAt(i)
     let cstr = new Uint8Array(instance.exports.memory.buffer, cptr, cmd.length + 1)
     cstr.set(cmdstr)
+    //allocate WASM float variables:
+    let fptr = walloc(4 * 4) //4 = sizeof(float)
+    memory.record_malloc(fptr, 4 * 4)
+    fvars = new Float32Array(instance.exports.memory.buffer, fptr, 4)
+    fvars[0] = hdr.scl_slope
+    fvars[1] = hdr.scl_inter
+    fvars[2] = hdr.cal_min
+    fvars[3] = hdr.cal_max
     //allocate WASM image data
-    let nvox = nx * ny * nz * nt; 
+    let nvox = nx * ny * nz * nt
     let ptr = walloc(nvox * bpv)
     memory.record_malloc(ptr, nvox * bpv)
     cimg = new Uint8Array(instance.exports.memory.buffer, ptr, nvox * bpv)
     cimg.set(img8)
     //run WASM
     startTime = new Date()
-    let ok = niimath(ptr, datatype, nx, ny, nz, nt, dx, dy, dz, dt, cptr)
+    //let ok = niimath(ptr, datatype, nx, ny, nz, nt, dx, dy, dz, dt, cptr)
+    let ok = niimathx(ptr, fptr, datatype, nx, ny, nz, nt, dx, dy, dz, dt, cptr)
     if (ok != 0) {
         console.log(" -> '", cmd, " generated a fatal error: ", ok)
         return
     }
     console.log("'", cmd, "' required ", Math.round((new Date()) - startTime), "ms")
+    //renew fvars
+    fvars = new Float32Array(instance.exports.memory.buffer, fptr, 4)
+    vars = new Float32Array(4)
+    vars.set(fvars)
+    console.log("slope", vars[0], "intercept", vars[1], "cal_min", vars[2], "cal_max", vars[3])
     //Problem: JavaScript will generate "detached ArrayBuffer" error if malloc requires memory growth
     //Unintuitive Solution: renew cimg pointer
     // https://depth-first.com/articles/2019/10/16/compiling-c-to-webassembly-and-running-it-without-emscripten/
@@ -134,6 +146,8 @@ function niimath_shim(instance, memory, hdr, img8, cmd) {
     //copy WASM image data to JavaScript image data
     img8.set(cimg)
     //free WASM memory
+    memory.record_free(fptr)
+    wfree(fptr)
     memory.record_free(cptr)
     wfree(cptr)
     memory.record_free(ptr)
