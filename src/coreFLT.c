@@ -8,6 +8,12 @@
 #define epsilon DBL_EPSILON
 #endif
 
+#ifdef _MSC_VER
+	#ifdef _M_X64
+		#define __x86_64__
+	#endif
+#endif
+
 //#include <float.h>
 #include "core.h"
 #include "print.h"

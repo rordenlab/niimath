@@ -53,7 +53,14 @@ int nii_otsu(int* H, int nBin, int mode) {
 		Sum = Sum + H[v];
 	if (Sum <= 0)
 		return 0;
+	#ifdef _MSC_VER
+	#define kBin 2048
+	if (nBin > kBin) return 0;
+	double P[kBin][kBin];
+	double S[kBin][kBin];
+	#else
 	double P[nBin][nBin], S[nBin][nBin];
+	#endif
 	P[0][0] = H[0];
 	S[0][0] = H[0];
 	for (int v = 1; v < nBin; v++) {

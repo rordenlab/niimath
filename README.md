@@ -44,7 +44,7 @@ Advanced users may want to run `CF=1 OMP=1 make -j` to make a version that uses 
 For Windows, the compilation will look like this (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
 
 ```
-cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
+cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c bwlabel.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
 ```
 
 ## Usage
