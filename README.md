@@ -47,6 +47,17 @@ For Windows, the compilation will look like this (here without the `-DHAVE_ZLIB`
 cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c bwlabel.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
 ```
 
+Simply running `make` in the `src` folder should compile niimath on Linux. This should work regardless of if you use the Clang/LLVM or gcc compiler. However, the resulting executable will only work with specific versions of Linux. If you want to make a universal Linux release you can use [holy-build-box](https://github.com/FooBarWidget/holy-build-box). Be aware that this uses an old version of the gcc compiler (4.8.5), so the resulting performance may not be optimized for your system.
+
+```
+cd ~/holy-build-box
+git clone https://github.com/rordenlab/niimath
+#start docker
+sudo docker run --mount src="$(pwd)",target=/test_container,type=bind -t -i --rm ghcr.io/foobarwidget/holy-build-box-x64 bash
+cd ./test_container/niimath/src
+make -j
+```
+
 ## Usage
 
 niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-maths-commands/), so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. You can also modify your environment variables to unleash advanced features:
