@@ -7,6 +7,10 @@ CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX
 # Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
 #CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
 
+ifeq ($(CXX),g++)
+	CFLAGS += -std=gnu99
+endif
+
 #run "OMP=1 make -j" for both OpenMP and CloudFlare
 ifeq "$(OMP)" "1"
 	CNAME= gcc-9
