@@ -24,7 +24,7 @@ You can get niimath using three methods:
  - (Recommended) Download latest compiled release from [Github release web page](https://github.com/rordenlab/niimath/releases).
  - (Recommended) You can also download from the command line for Linux, MacOS and Windows:
   * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_lnx.zip`
-  * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_mac.zip`
+  * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_universal.pkg`
   * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_win.zip`
  - (Developers) Download the source code from [GitHub](https://github.com/rordenlab/niimath), the next section describes how to build the software.
 
