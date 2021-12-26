@@ -30,7 +30,7 @@ before_build:
 
     cd c:\projects\niimath\build
 
-    cmake -Wno-dev -G "Visual Studio 14 2015 Win64" -DBATCH_VERSION=ON -DUSE_OPENJPEG=ON -DUSE_JPEGLS=true ..\
+    cmake -Wno-dev -G "Visual Studio 14 2015 Win64" ..\
 
 build:
   project: c:\projects\niimath\build\niimath.sln
