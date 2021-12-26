@@ -3,6 +3,12 @@ language: cpp
 git:
   depth: 1
 
+# safelist
+branches:
+  only:
+  - master
+  - development
+
 matrix:
   include:
     - os: linux
