@@ -1,0 +1,47 @@
+language: cpp
+
+git:
+  depth: 1
+
+# safelist
+branches:
+  only:
+  - master
+  - development
+
+matrix:
+  include:
+    - os: linux
+      dist: trusty
+      addons:
+        apt:
+          sources:
+            - ubuntu-toolchain-r-test
+          packages:
+            - g++-5 # support c++14
+      env:
+         - MATRIX_EVAL="CC=gcc-5 && CXX=g++-5"
+         - TARGET=lnx
+    - os: osx
+      osx_image: xcode8.3 # Tracvis default: OS X 10.12.6 and Xcode 8.3.3
+      env: TARGET=mac
+
+before_install:
+  - eval "${MATRIX_EVAL}"
+
+script:
+  - mkdir build && cd build && cmake -DZLIB_IMPLEMENTATION=Cloudflare .. && make && cd -
+  - export PATH=$PWD/build/bin:$PATH
+
+before_deploy:
+  - zip -j niimath_${TARGET}.zip build/bin/* #compress
+  - sleep 300 # make sure appveyor deployment is done, thus proper release name is set
+
+deploy:
+  provider: releases
+  api_key: "GITHUB OAUTH TOKEN"
+  file_glob: true
+  file: niimath*.zip
+  skip_cleanup: true
+  on:
+    tags: true
