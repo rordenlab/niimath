@@ -52,6 +52,9 @@
   #include <immintrin.h>
 #endif
 
+#ifndef M_PI //not defined by older gcc unless compiled with `-std=gnu99`:
+  #define M_PI 3.14159265358979323846
+#endif
 
 /**********************************************************************
   binomial_mult - multiplies a series of binomials together and returns
