@@ -1,9 +1,18 @@
-version: build-{build}
+environment:
+  matrix:
+    - job_name: win
+      appveyor_build_worker_image: Visual Studio 2019
 
-image:
-  - Visual Studio 2019
-  - Ubuntu
-  - macos
+    - job_name: linux
+      appveyor_build_worker_image: Ubuntu
+
+    - job_name: mac
+      appveyor_build_worker_image: macos
+
+matrix:
+  fast_finish: true
+
+version: build-{build}
 
 configuration: Release
 
@@ -27,7 +36,7 @@ for:
   -
     matrix:
       only:
-        - image: Visual Studio 2019
+        - job_name: win
 
     build_script:
       - cmake -Wno-dev -B build
@@ -40,7 +49,7 @@ for:
   -
     matrix:
       only:
-        - image: Ubuntu
+        - job_name: linux
 
     build_script:
       - export CC=gcc-8 CXX=g++-8
@@ -54,7 +63,7 @@ for:
   -
     matrix:
       only:
-        - image: macos
+        - job_name: mac
 
     build_script:
       - sudo xcode-select -s /Applications/Xcode-10.3.app
