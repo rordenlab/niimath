@@ -1,0 +1,79 @@
+version: build-{build}
+
+image:
+  - Visual Studio 2019
+  - Ubuntu
+  - macos
+
+configuration: Release
+
+platform: x64
+
+clone_depth: 1
+
+init:
+  - ps: >-
+      $env:DATE = $(Get-Date -Format d-MMM-yyyy)
+
+      $githash = $env:APPVEYOR_REPO_COMMIT.Substring(0, 7)
+
+      $gittag = if ($env:APPVEYOR_REPO_TAG -eq $True) {"_$($env:APPVEYOR_REPO_TAG_NAME)"} else {""}
+
+      Update-AppveyorBuild -Version "$($env:DATE)_g${githash}${gittag}"
+
+      $env:RELEASE_VERSION = $(Get-Date -Format d-MMMM-yyyy)
+
+for:
+  -
+    matrix:
+      only:
+        - image: Visual Studio 2019
+
+    build_script:
+      - cmake -Wno-dev -B build
+      - cmake --build build --config %configuration%
+
+    after_build:
+      - 7z a niimath_win.zip .\build\bin\* >$null
+      - appveyor PushArtifact niimath_win.zip
+
+  -
+    matrix:
+      only:
+        - image: Ubuntu
+
+    build_script:
+      - export CC=gcc-8 CXX=g++-8
+      - cmake -Wno-dev -B build
+      - cmake --build build
+
+    after_build:
+      - 7z a niimath_lnx.zip ./build/bin/* &>/dev/null
+      - appveyor PushArtifact niimath_lnx.zip
+
+  -
+    matrix:
+      only:
+        - image: macos
+
+    build_script:
+      - sudo xcode-select -s /Applications/Xcode-10.3.app
+      - cmake -Wno-dev -B build
+      - cmake --build build
+
+    after_build:
+      - 7z a niimath_macos.zip ./build/bin/* &>/dev/null
+      - appveyor PushArtifact niimath_macos.zip
+
+deploy:
+  - provider: GitHub
+    tag: $(APPVEYOR_REPO_TAG_NAME)
+    release: version $(RELEASE_VERSION) ($(APPVEYOR_REPO_TAG_NAME))
+    description: ""
+    auth_token:
+      secure: hz/FloIhbQHhqmi2KhuKhO59uahHgTnx2tpnpTGSQetrZ5A9o/l6n1dY1a7DKAAc
+    artifact: /niimath_.*\.zip/
+    draft: false
+    prerelease: false
+    on:
+      APPVEYOR_REPO_TAG: true
