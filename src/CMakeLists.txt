@@ -29,9 +29,9 @@ endif()
 # Add NII2MESH support
 ADD_DEFINITIONS(-DNII2MESH)
 
-#e.g.  cmake -DOPENMP_XCODE=ON ..
-option(OPENMP_XCODE "Build the static library" OFF)
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
+    #e.g.  cmake -DOPENMP_XCODE=ON ..
+    option(OPENMP_XCODE "Build with OpenMP support" OFF)
     # using AppleClang
     add_definitions(-fno-caret-diagnostics)
     if (OPENMP_XCODE)

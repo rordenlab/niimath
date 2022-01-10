@@ -29,7 +29,10 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 option(USE_STATIC_RUNTIME "Use static runtime" ON)
-option(OPENMP_XCODE "Build the static library" OFF)
+
+if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
+    option(OPENMP_XCODE "Build with OpenMP support" OFF)
+endif()
 
 include(ExternalProject)
 
