@@ -3649,7 +3649,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		_mm_free(vx);
 		return 1;
 	}
-	//set up kernel to search for neighbors. Since we already included sides, we do not worry about A<->P and L<->R wrap
+	//set up kernel to search for neighbors.
 	int numk = 6;
 	if (is26)
 		numk = 26;
@@ -3659,6 +3659,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		for (int z = -1; z <= 1; z++)
 			for (int y = -1; y <= 1; y++)
 				for (int x = -1; x <= 1; x++) {
+					if ((x == 0) && (y == 0) && (z == 0)) continue;
 					k[j] = x + (y * nim->nx) + (z * nim->nx * nim->ny);
 					j++;
 				} //for x

@@ -121,7 +121,6 @@ int nii_otsu(int* H, int nBin, int mode) {
 				} //new max
 			}//for h -> hi
 		} //for l -> low
-		//printf(">>>>%d %d\n", lo, hi);
 		if (mode == 1)
 			thresh = hi;
 		else
@@ -138,7 +137,6 @@ int nii_otsu(int* H, int nBin, int mode) {
 			}//new max
 		}
 	}
-	//printf(">>>>%d\n", thresh);	
 	return thresh;
 }
 
@@ -359,6 +357,8 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	int idt = nim->datatype; //input datatype
 	double *f64 = (double *)nim->data;
 	float *f32 = (float *)nim->data;
+	uint64_t *u64 = (uint64_t *)nim->data;
+	int64_t *i64 = (int64_t *)nim->data;
 	uint32_t *u32 = (uint32_t *)nim->data;
 	int32_t *i32 = (int32_t *)nim->data;
 	uint16_t *u16 = (uint16_t *)nim->data;
@@ -374,6 +374,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o64[i] = (u32[i] * scl) + inter;
+			ok = 0;
+		}
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o64[i] = (u64[i] * scl) + inter;
+			ok = 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o64[i] = (i64[i] * scl) + inter;
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
@@ -417,6 +427,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		float *o32 = (float *)nim->data;
 		nim->datatype = DT_FLOAT32;
 		nim->nbyper = 4;
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (u64[i] * scl) + inter;
+			return 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (i64[i] * scl) + inter;
+			return 0;
+		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (u32[i] * scl) + inter;

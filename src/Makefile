@@ -19,7 +19,6 @@ ifeq "$(OMP)" "1"
 	#gcc-9 --print-file-name=libgomp.a
 	#LFLAGS+= /usr/local/Cellar/gcc/9.2.0_3/lib/gcc/9/gcc/x86_64-apple-darwin18/9.2.0/../../../libgomp.a
 	LFLAGS+= -static-libgcc -static-libstdc++ -L.
-
 endif
 
 all:

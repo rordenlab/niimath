@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20211212"
+#define kMTHdate "v1.0.20220116"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -74,7 +74,7 @@ int show_help( void ) {
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
-	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels))\n");
+	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");
 	printf(" -power <exponent>        : raise the current image by following exponent\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 
@@ -91,7 +91,7 @@ int show_help( void ) {
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
-	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical for amount (scl))\n");
+	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical)\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");
 	printf(" -dogx <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices\n");

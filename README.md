@@ -51,12 +51,12 @@ cl  /Feniimath niimath.c core.c tensor.c core32.c core64.c bwlabel.c niftilib/ni
 Simply running `make` in the `src` folder should compile niimath on Linux. This should work regardless of if you use the Clang/LLVM or gcc compiler. However, the resulting executable will only work with specific versions of Linux. If you want to make a universal Linux release you can use [holy-build-box](https://github.com/FooBarWidget/holy-build-box). Be aware that this uses an old version of the gcc compiler (4.8.5), so the resulting performance may not be optimized for your system.
 
 ```
-cd ~/holy-build-box
 git clone https://github.com/rordenlab/niimath
-#start docker
-sudo docker run --mount src="$(pwd)",target=/test_container,type=bind -t -i --rm ghcr.io/foobarwidget/holy-build-box-x64 bash
-cd ./test_container/niimath/src
-make -j
+sudo docker run -t -i --rm  -v `pwd`:/io ghcr.io/foobarwidget/holy-build-box-x64 /hbb_exe/activate-exec bash
+cd /io/niimath/src
+make
+exit
+sudo chown $(whoami) ./niimath/src/niimath
 ```
 
 ## Usage
