@@ -1006,7 +1006,7 @@ staticx int nifti_h2c(nifti_image *nim) {
 	return 0;
 } // nifti_h2c()
 
-staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize image using Otsu's method
+staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *midThresh, flt *brightThresh) { //binarize image using Otsu's method
 //mode is 1..5 corresponding to 3/4, 2/3, 1/2 1/3 and 1/4 compartments made dark
 //makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
 	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
@@ -1033,18 +1033,23 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize 
 		idx = MAX(idx, 0);
 		hist[idx]++;
 	}
-	//attenuate influence of zero intensity: zero bin clamped to most frequent non-zero bin
-	// 	int idx0 = (int)round((0.0 - mn) * scl);
-	// 	int mostFrequentNot0 = 0;
-	// 	for (int i = 0; i < kOtsuBins; i++) {
-	// 		if (i == idx0) continue;
-	// 		if (hist[i] > mostFrequentNot0) mostFrequentNot0 = hist[i];
-	// 	}
-	// 	hist[idx0] = MIN(hist[idx0], mostFrequentNot0);
-	//compute Otsu
-	int thresh = nii_otsu(hist, kOtsuBins, mode);
-	flt threshold = (thresh / scl) + mn;
-	//printf("range %g..%g Otsu threshold %g\n", mn, mx, threshold);
+	//estimate Otsu
+	//int thresh = nii_otsu(hist, kOtsuBins, mode);
+	int dark, mid, bright;
+	int thresh = nii_otsu(hist, kOtsuBins, mode, &dark, &mid, &bright);
+	*darkThresh = (dark / scl) + mn;
+	*midThresh = (mid / scl) + mn;
+	*brightThresh = (bright / scl) + mn;
+	return (thresh / scl) + mn;
+}
+
+staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize image using Otsu's method
+//mode is 1..5 corresponding to 3/4, 2/3, 1/2 1/3 and 1/4 compartments made dark
+//makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
+	flt darkThresh, midThresh, brightThresh;
+	flt threshold = otsu_thresholds(nim, mode, &darkThresh, &midThresh, &brightThresh);
+	printf("%g %g %g\n", darkThresh, midThresh, brightThresh);
+	//apply otsu
 	if (makeBinary == 1)
 		return nifti_binarize(nim, threshold);
 	return nifti_mask_below_dilate(nim, threshold, (makeBinary == 0));
@@ -5117,11 +5122,32 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			if (mode < 0) zeroFill = -1;
 			mode = abs(mode);
 			ok = nifti_otsu(nim, mode, zeroFill);
+		} else if (strstr(argv[ac], "-mesh")) {
+			flt darkThresh, midThresh, brightThresh;
+			flt *f32 = (flt *)nim->data;
+			flt mx = -INFINITY;
+			for (size_t i = 0; i < nim->nvox; i++) {
+				if (isnan(f32[i]))
+					continue;
+				mx = fmax(f32[i], mx);
+			}
+			otsu_thresholds(nim, 5, &darkThresh, &midThresh, &brightThresh);
+			ac ++;
+			ok = nifti_mesh(nim, darkThresh, midThresh, brightThresh, mx, ac, argc+1, argv);
+			nifti_image_free(nim);
+			exit(ok);
 		#ifdef bwlabelx
 		} else if (strstr(argv[ac], "-bwlabel")) {
 			ac ++;
 			int conn = atoi(argv[ac]);
-			ok = bwlabel(nim, conn);
+			#ifdef DT32
+			size_t dim[3] = {nim->nx, nim->ny, nim->nz};
+			flt *img = (flt *)nim->data;
+			ok = bwlabel(img, conn, dim, false, false);
+			#else
+			printfx("'-dt double' does not support bwlabel\n" );
+			ok = EXIT_FAILURE;
+			#endif
 		#endif
 		} else if (!strcmp(argv[ac], "-h2c"))
 			ok = nifti_h2c(nim);

@@ -97,6 +97,7 @@ niimath has a few features not provided by fslmaths:
  - dogx <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices
  - dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices
  - dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices
+ - mesh                    : see separate section below
  - `--compare` <ref>       : report if images are identical, terminates without saving new image\n");
  - filename.nii            : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
 
@@ -156,9 +157,25 @@ Here are the same testson a desktop computer with twelve cores (24 threads, Ryze
 |  niimath rest -demean out (same output as above)       | 2.6x (2.6x)   | 3.0x (10.8x)  |
 | fslmaths rest -bptf 77 8.68 out : 887 (1019)           | 2.6x (2.5x)   | 23x (23.0x)   |
 
+## Converting voxelwise images to a triangulated mesh
+
+niimath can convert NIfTI images to meshes, suitable for viewing in Surfice, blender, SUMA, FreeSurfer and other tools. The features are based on [nii2mesh](https://github.com/neurolabusc/nii2mesh) and the features are almost identical. However, the order of arguments is different to match the expectations of fslmaths/niimath. So the call `nii2mesh -r 1 bet.nii.gz r100.ply` becomes `niimath bet.nii.gz -mesh -r 1 r100.ply`. As described on the nii2mesh page, you can create independent meshes for each area in an atlas using the command:
+
+```
+niimath D99_atlas_v2.0_right.nii.gz -mesh -p 0 -s 10 -a D99_v2.0_labels_semicolon.txt ./gii/D99s10roi.gii
+```
+Both programs allow you to explicitly set the isolevel using the `-i` value, so `-i 128` we render a surface for voxels brighter than 128. One minor difference between the programs is that niimath allows you also request `dark`, `medium` and `bright` using the `-i d`, `-i m` and `-i b` commands respectively. These use Otsu's method, and typically identify pleasing values. Also, if the user does not specify an isolevel be aware that nii2mesh chooses the middle brightness (the midpoint between the darkest and brightest value) while niimath uses the medium Otsu threshold. The latter is more robust to outliers. Here are examples illustrating this usage:
+
+```
+niimath bet.nii.gz -mesh -i 128 Isolevel128.gii
+niimath bet.nii.gz -mesh -i d darkIsolevel.gii
+niimath bet.nii.gz -mesh -i m medIsolevel.gii
+niimath bet.nii.gz -mesh -i b brightIsolevel.gii
+```
+
 ## License
 
-niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. The Butterworth Filter Coefficients in `bw.c` are from [Exstrom Labs](http://www.exstrom.com/journal/sigproc/) and the authors provided permission for it to be included in this project under the [LGPL](https://www.gnu.org/licenses/lgpl-3.0.en.html), the file provides additional details. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation.
+niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020-2022. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. The Butterworth Filter Coefficients in `bw.c` are from [Exstrom Labs](http://www.exstrom.com/journal/sigproc/) and the authors provided permission for it to be included in this project under the [LGPL](https://www.gnu.org/licenses/lgpl-3.0.en.html), the file provides additional details. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation. The PolygoniseCube function comes from Cory Bloyd's public domain [Marching Cubes example](http://paulbourke.net/geometry/polygonise/) program described here. The bwlabel.cpp file was written by Jesper Andersson, who has explicitly allowed this to be shared using the BSD 2-Clause license. The [high performance](https://github.com/gaspardpetit/base64) base64.cpp was written by Jouni Malinen and is distributed under the BSD license. The mesh simplification was written by [Sven Forstmann](https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification) and distributed under the MIT license. It was ported from C++ to C by Chris Rorden.  The [radixsort.c](https://github.com/bitshifter/radixsort) was written by Cameron Hart (2014) using the zlib license.
 
 ## Links
 

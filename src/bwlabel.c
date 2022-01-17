@@ -1,13 +1,13 @@
 #include <stdlib.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <math.h>
-#include <nifti2_io.h>
-#include "core.h"
-#include "print.h"
-#ifdef __aarch64__
-  #include "arm_malloc.h"
-#else
-  #include <immintrin.h>
-#endif
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+
+#define printfx(...) fprintf(stderr, __VA_ARGS__)
 
 //Jesper Andersson has acknowledged that this port of spm_bwlabel.c may be released using the BSD 2-Clause license
 
@@ -26,23 +26,32 @@
  ** (which is a routine in the image processing toolbox) and
  ** takes as input a binary image and (optionally) a connectednes
  ** criterion (6, 18 or 26, in 2D 6 will correspond to 4 and 18
- ** and 26 to 8). It will output an image/volume where each 
+ ** and 26 to 8). It will output an image/volume where each
  ** connected component will have a unique label.
  **
  ** The implementation is not recursive (i.e. will no crash for
  ** large connected components) and is loosely based on
  ** Thurfjell et al. 1992, A new three-dimensional connected
  ** components labeling algorithm with simultaneous object
- ** feature extraction capability. CVGIP: Graphical Models 
+ ** feature extraction capability. CVGIP: Graphical Models
  ** and Image Processing 54(4):357-364.
  **
  ***************************************************************/
 
-void fill_tratab(uint32_t  *tt,     /* Translation table */
-                 /*uint32_t  ttn,*/     /* Size of translation table */
-                 uint32_t  *nabo,   /* Set of neighbours */
-                 uint32_t  nr_set)  /* Number of neighbours in nabo */
-{
+#ifndef MAX
+#define MAX(A,B) ((A) > (B) ? (A) : (B))
+#endif
+
+#ifndef MIN
+#define MIN(A,B) ((A) > (B) ? (B) : (A))
+#endif
+
+void fill_tratab(uint32_t  *tt, uint32_t  *nabo, uint32_t  nr_set)  {
+/*
+*tt   Translation table
+*nabo   Set of neighbours
+nr_set   Number of neighbours in nabo
+*/
    int           i = 0, j = 0, cntr = 0;
    uint32_t  tn[9];
    uint32_t  ltn = UINT_MAX;
@@ -55,11 +64,11 @@ void fill_tratab(uint32_t  *tt,     /* Translation table */
    {
       j = nabo[i];
       cntr=0;
-      while (tt[j-1] != j) 
+      while (tt[j-1] != j)
       {
          j = tt[j-1];
          cntr++;
-         if (cntr>100) {printf("\nOoh no!!"); break;}
+         if (cntr>100) {printfx("\nOoh no!!"); break;}
       }
       tn[i] = j;
       ltn = MIN(ltn,j);
@@ -91,7 +100,6 @@ uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
    uint32_t nr_set = 0;
 
    if (!sl) return(0);
-  
    if (conn >= 6)
    {
       if ((l = il[idx(r,c,sl-1,dim)])) {nabo[nr_set++] = l;}
@@ -111,7 +119,7 @@ uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
       if ((r < dim[0]-1) && (c < dim[1]-1)) {if ((l = il[idx(r+1,c+1,sl-1,dim)])) {nabo[nr_set++] = l;}}
    }
 
-   if (nr_set) 
+   if (nr_set)
    {
       fill_tratab(tt,/*ttn,*/nabo,nr_set);
       return(nabo[0]);
@@ -123,17 +131,17 @@ void * mxRealloc(void *oldArray, size_t oldBytes, size_t newBytes) {
    // https://octave.org/doxygen/3.8/df/d4e/mex_8cc_source.html
    //reallocate memory, preserve previous bytes
    if (newBytes <= 0) {
-      _mm_free(oldArray);
+      free(oldArray);
       return NULL;
    }
-   void *newArray = (void *)_mm_malloc(newBytes, 64);
+   void *newArray = (void *)malloc(newBytes);
    memset(newArray, 0, newBytes);
    if (oldBytes > 0) {
      //void * memcpy ( void * destination, const void * source, size_t num );
      oldBytes = MIN(oldBytes, newBytes);
      //void * memcpy ( void * destination, const void * source, size_t num );
      memcpy(newArray, oldArray, oldBytes);
-     _mm_free(oldArray);
+     free(oldArray);
    }
    return newArray;
 }
@@ -153,7 +161,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
    uint32_t  l = 0;
    int32_t       sl, r, c;
    uint32_t  ttn = 1000;
-   *tt = (uint32_t *)_mm_malloc(ttn * sizeof(uint32_t), 64);
+   *tt = (uint32_t *)malloc(ttn * sizeof(uint32_t));
    memset(*tt, 0, ttn * sizeof(uint32_t));
    for (sl=0; sl<dim[2]; sl++)
    {
@@ -203,7 +211,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
                else
                {
                   il[idx(r,c,sl,dim)] = label;
-                  if (label >= ttn) {ttn += 1000; *tt = mxRealloc(*tt, (ttn - 1000)*sizeof(uint32_t), ttn*sizeof(uint32_t));}
+                  if (label >= ttn) {ttn += 1000; *tt = (uint32_t*)mxRealloc(*tt, (ttn - 1000)*sizeof(uint32_t), ttn*sizeof(uint32_t));}
                   (*tt)[label-1] = label;
                   label++;
                }
@@ -225,94 +233,177 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
       }
       (*tt)[i] = j+1;
    }
- 
-   
    return(label-1);
 }
 
 /* translate_labels */
 
-double translate_labels(uint32_t  *il,     /* Map of initial labels. */
+int translate_labels(uint32_t  *il,     /* Map of initial labels. */
                         size_t        dim[3],  /* Dimensions of il. */
                         uint32_t  *tt,     /* Translation table. */
                         uint32_t  ttn,     /* Size of translation table. */
-                        double        *l)      /* Final map of labels. */
+                        uint32_t        *l)      /* Final map of labels. */
 {
    int            n=0;
    int            i=0;
-   uint32_t   ml=0;
-   double         cl = 0.0;
+   int   ml=0;
+   int         cl = 0;
    n = dim[0]*dim[1]*dim[2];
    for (i=0; i<ttn; i++) {ml = MAX(ml,tt[i]);}
-   double *fl = (double *)_mm_malloc(ml * sizeof(double), 64); 
-   memset(fl, 0, ml * sizeof(double));
+   uint32_t *fl = (uint32_t *)malloc(ml * sizeof(uint32_t));
+   memset(fl, 0, ml * sizeof(uint32_t));
    for (i=0; i<n; i++)
    {
       if (il[i])
       {
-         if (!fl[tt[il[i]-1]-1]) 
+         if (!fl[tt[il[i]-1]-1])
          {
-            cl += 1.0; 
+            cl += 1;
             fl[tt[il[i]-1]-1] = cl;
          }
          l[i] = fl[tt[il[i]-1]-1];
       }
    }
-   _mm_free(fl);
+   free(fl);
    return(cl);
 }
 
+void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
+  //aka nifti_fillh
+  //all given binary image, interior 0 voxels set to 1
+  int nx = dim[0];
+  int ny = dim[1];
+  int nz = dim[2];
+  if ((nx < 3) || (ny < 3) || (nz < 3) || (nLabels < 1))
+    return;
+  int nvox = dim[0] * dim[1] * dim[2];
+  //uint8_t *vxv = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  //memset(vxv, 0, nvox * sizeof(uint8_t));
+  //set up kernel to search for neighbors. Since we already included sides, we do not worry about A<->P and L<->R wrap
+  int numk = 6;
+  if (is26)
+    numk = 26;
+  int32_t *k = (int32_t *)malloc(numk * sizeof(int32_t)); //queue with untested seed
+  if (is26) {
+    int j = 0;
+    for (int z = -1; z <= 1; z++)
+      for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+          if ((x == 0) && (y == 0) && (z == 0)) continue;
+          k[j] = x + (y * nx) + (z * nx * ny);
+          j++;
+        } //for x
+  } else { //if 26 neighbors else 6..
+    k[0] = nx * ny; //up
+    k[1] = -k[0]; //down
+    k[2] = nx; //anterior
+    k[3] = -k[2]; //posterior
+    k[4] = 1; //left
+    k[5] = -1;
+  }
+  //https://en.wikipedia.org/wiki/Flood_fill
+  int32_t *q = (int32_t *)malloc(nvox * sizeof(int32_t)); //queue with untested seed
+  uint8_t *vxs = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  for (int label = 1; label <= nLabels; label++) {
+    for (size_t i = 0; i < nvox; i++)
+      vxs[i] = (imgBin[i] == label);
+    int qlo = 0;
+    int qhi = -1; //ints always signed in C!
+    //load edges
+    size_t i = 0;
+    for (int z = 0; z < nz; z++) {
+      int zedge = 0;
+      if ((z == 0) || (z == (nz - 1)))
+        zedge = 1;
+      for (int y = 0; y < ny; y++) {
+        int yedge = 0;
+        if ((y == 0) || (y == (ny - 1)))
+          yedge = 1;
+        for (int x = 0; x < nx; x++) {
+          if ((vxs[i] == 0) && (zedge || yedge || (x == 0) || (x == (nx - 1)))) { //found new seed
+            vxs[i] = 1; //do not find again
+            qhi++;
+            q[qhi] = i;
+          } // new seed
+          i++;
+        } //for x
+      } //y
+    } //z
+    //printf("seeds %d kernel %d\n", qhi+1, numk);
+    //run a 'first in, first out' queue
+    while (qhi >= qlo) {
+      //retire one seed, add 0..6 new ones (fillh) or 0..26 new ones (fillh26)
+      for (int j = 0; j < numk; j++) {
+        int jj = q[qlo] + k[j];
+        if ((jj < 0) || (jj >= nvox))
+          continue;
+        if (vxs[jj] != 0)
+          continue;
+        //add new seed;
+        vxs[jj] = 1;
+        qhi++;
+        q[qhi] = jj;
+      }
+      qlo++;
+    } //while qhi >= qlo: continue until all seeds tested
+    for (size_t i = 0; i < nvox; i++) {
+      if (vxs[i] == 0)
+        imgBin[i] = label; //hidden internal voxel not found from the fill
+    }
+  }
+  //for (size_t i = 0; i < nvox; i++)
+  //  imgBin[i] = (vxs[i] == 0); //hidden internal voxel not found from the fill
+  free(vxs);
+  free(q);
+  free(k);
+}
 
-int bwlabel(nifti_image *nim, int conn) {
+int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubbles) {
   if ((conn!=6) && (conn!=18) && (conn!=26)) {
      printfx("bwlabel: conn must be 6, 18 or 26.\n");
-     return 11;
+     return 0;
   }
-  if ((nim->ndim < 2) || (nim->ndim > 3)) {
+  if ((dim[0] < 2) || (dim[1] < 2) || (dim[2] < 1)) {
     printfx("bwlabel: img must be 2 or 3-dimensional\n");
-    return 33;
+    return 0;
   }
-  size_t dim[3];
-  dim[0]=nim->nx;
-  dim[1]=nim->ny;
-  dim[2]=nim->nz;
-  size_t nvox = nim->nx*nim->ny*nim->nz;
-  double *l = (double *)_mm_malloc(nvox * sizeof(double), 64); //output image
-  memset(l, 0, nvox * sizeof(double));
-  uint32_t *il = (uint32_t *)_mm_malloc(nvox * sizeof(uint32_t), 64);
+  size_t nvox = dim[0] * dim[1] * dim[2];
+  uint32_t *l = (uint32_t *)malloc(nvox * sizeof(uint32_t)); //output image
+  memset(l, 0, nvox * sizeof(uint32_t));
+  uint32_t *il = (uint32_t *)malloc(nvox * sizeof(uint32_t));
   memset(il, 0, nvox * sizeof(uint32_t));
-  uint8_t *bw = (uint8_t *)_mm_malloc(nvox * sizeof(uint8_t), 64);
+  uint8_t *bw = (uint8_t *)malloc(nvox * sizeof(uint8_t));
   memset(bw, 0, nvox * sizeof(uint8_t));
-  if (nim->datatype == DT_FLOAT32) {
-    float *img = (float *)nim->data;
-    for (size_t i = 0; i < nvox; i++)
-      if (img[i] != 0.0) bw[i] = 1;
-  } else if (nim->datatype == DT_FLOAT64) {
-    double *img = (double *)nim->data;
-    for (size_t i = 0; i < nvox; i++)
-      if (img[i] != 0.0) bw[i] = 1;
-  } else {
-    printfx("bwlabel: Unsupported datatype %d\n", nim->datatype);
-    return 22;
-  }
+  for (size_t i = 0; i < nvox; i++)
+    if (img[i] != 0.0) bw[i] = 1;
   uint32_t  *tt = NULL;
   uint32_t ttn = do_initial_labelling(bw,dim,conn,il,&tt);
-  double nl = translate_labels(il,dim,tt,ttn,l);
-  nim->cal_min = 0;
-  nim->cal_max = nl;
-  nim->scl_inter = 0.0;
-  nim->scl_slope = 1.0;
-  _mm_free(il);
-  _mm_free(tt);
-  if (nim->datatype == DT_FLOAT32) {
-    float *img = (float *)nim->data;
-    for (size_t i = 0; i < nvox; i++)
-      img[i] = l[i];
-  } else if (nim->datatype == DT_FLOAT32) {
-    double *img = (double *)nim->data;
-    for (size_t i = 0; i < nvox; i++)
-      img[i] = l[i];
-  }
-  _mm_free(l);
-  return(EXIT_SUCCESS);
+  free(bw);
+  int nl = translate_labels(il,dim,tt,ttn,l);
+  free(il);
+  free(tt);
+  if ((nl > 0) && (onlyLargest)){
+    int mxL = 0;
+    int mxN = 0;
+    for (int j = 1; j <= nl; j++) {
+      int n = 0;
+      for (int i = 0; i < nvox; i++)
+        if (l[i] == j)
+          n++;
+      if (n > mxN) {
+        mxN = n;
+        mxL = j;
+      }
+    } //for j: each label
+    for (int i = 0; i < nvox; i++)
+      l[i] = (l[i] == mxL);
+    nl = 1;
+  } //if labels found
+  if (fillBubbles)
+      fillh(l, dim, 1, nl);
+  for (size_t i = 0; i < nvox; i++)
+    img[i] = l[i];
+  free(l);
+  return nl;
 }
+

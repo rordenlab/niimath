@@ -2,15 +2,20 @@
 #define EX_BWLABEL_H
 
 #ifdef  __cplusplus
-extern "C" {
+//extern "C" {
 #endif
 
-#include <nifti2_io.h>
+#include <stdbool.h>
 
-int bwlabel(nifti_image *nim, int conn);
+int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubbles);
+//if 
+// onlyLargest = 0: return image where voxel intensity is cluster number
+// onlyLargest = 1: return image where voxels of largest cluster is 1, all other voxels 0
+// onlyLargest = 2: return image where voxels of and inside largest cluster is 1, all other voxels 0
 
-//int butter_design(int order, double fl, double fh, double ** a, double ** b, double ** IC);
-//void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
+#ifdef  __cplusplus
+//}
+#endif
 
-#endif // EX_BUTTER_H
+#endif // EX_BWLABEL_H
