@@ -3,3 +3,5 @@
 /bin/
 /src/niimath
 niimath
+/dist
+/node_modules

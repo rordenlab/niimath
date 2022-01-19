@@ -1,10 +1,22 @@
 {
-  "name": "niimath",
+  "name": "niimath-js",
   "version": "2022.1.154114",
   "description": "niimath - a clone of fslmaths",
-  "main": "index.js",
+  "files": ["dist"],
+  "main": "./dist/niimath-js.umd.js",
+  "module": "./dist/niimath-js.es.js",
+  "exports": {
+	  ".": {
+		  "import": "./dist/niimath-js.es.js",
+		  "require": "./dist/niimath-js.umd.js"
+	  }
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "update-version": "npm version $(date \"+%Y.%m.%H%M%S\")",
+    "build-wasm": "cd src && emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o process-image.wasm --no-entry && cd ..",
+    "build": "[ -d dist ] || mkdir dist && npm run build-wasm && npx vite build",
+    "pub": "npm publish --access public"
   },
   "repository": {
     "type": "git",
@@ -21,5 +33,9 @@
   "bugs": {
     "url": "https://github.com/hanayik/niimath/issues"
   },
-  "homepage": "https://github.com/hanayik/niimath#readme"
+  "homepage": "https://github.com/hanayik/niimath#readme",
+  "devDependencies": {
+    "esbuild": "^0.14.11",
+    "vite": "^2.7.13"
+  }
 }
