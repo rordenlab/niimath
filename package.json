@@ -1,0 +1,25 @@
+{
+  "name": "niimath",
+  "version": "2022.1.154114",
+  "description": "niimath - a clone of fslmaths",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hanayik/niimath.git"
+  },
+  "keywords": [
+    "niimath",
+    "fslmaths",
+    "nii",
+    "nifti"
+  ],
+  "author": "Chris Rorden",
+  "license": "BSD-2-Clause",
+  "bugs": {
+    "url": "https://github.com/hanayik/niimath/issues"
+  },
+  "homepage": "https://github.com/hanayik/niimath#readme"
+}
