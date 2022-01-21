@@ -269,6 +269,30 @@ staticx void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
 } //nifti_fma
 #endif //if vector SIMD else scalar
 
+#define MY_LITTLE_ENDIAN (((union { unsigned x; unsigned char c; }){1}).c)
+#ifdef DT32
+staticx bool isnanx(flt f) { //isnan disabled by gcc -Ofast and -ffinite-math-only
+//4byte IEEE: msb[31] = signbit, bits[23-30] exponent, bits[0..22] mantissa
+//exponent of all 1s =   Infinity, NAN or Indeterminate
+	uint32_t i = *(long *)&f;
+	#ifdef MY_LITTLE_ENDIAN
+		return ((i&0x7f800000)==0x7f800000)&&(i&0x007fffff);
+	#else
+		return ((i&0x0000807f)==0x0000807f)&&(i&0xffff7f00);
+	#endif
+}
+#else
+
+staticx bool isnanx(double d) {
+	const uint64_t u = *(uint64_t*)&d;
+	#ifdef MY_LITTLE_ENDIAN
+	return (u&0x7FF0000000000000ULL) == 0x7FF0000000000000ULL && (u&0xFFFFFFFFFFFFFULL);
+	#else
+	return isnan(d); //TODO: detect double NaN on big endian
+	#endif
+}
+#endif
+
 staticx void * aligned_calloc(size_t size) {
 	uint8_t *dat= (uint8_t *)_mm_malloc(size, 64);
 	memset(dat, 0, size);
@@ -320,7 +344,7 @@ staticx inline void transposeXZ( flt *img3Din, flt *img3Dout, int *nxp, int ny, 
 
 staticx flt vx(flt *f, int p, int q) {
 	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
-	if (isnan(ret))
+	if (isnanx(ret))
 		ret = INFINITY;
 	return ret;
 }
@@ -711,7 +735,7 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 	size_t nZero = 0;
 	size_t nNan = 0;
 	for (size_t i = 0; i < nim->nvox; i++) {
-		if (isnan(f32[i])) {
+		if (isnanx(f32[i])) {
 			nNan++;
 			continue;
 		}
@@ -749,7 +773,7 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 		hist[i] = 0;
 	if (ignoreZeroVoxels) {
 		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(f32[i]))
+			if (isnanx(f32[i]))
 				continue;
 			if (f32[i] == 0.0)
 				continue;
@@ -757,7 +781,7 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 		}
 	} else {
 		for (int i = 0; i < nim->nvox; i++) {
-			if (isnan(f32[i]))
+			if (isnanx(f32[i]))
 				continue;
 			hist[(int)round((f32[i] - mn) * scl)]++;
 		}
@@ -777,15 +801,6 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 		hi--;
 		n += hist[hi];
 	}
-	/*if ((lo+1) < hi) {
-		size_t nGray = 0;
-		for (int i = lo+1; i < hi; i++ ) {
-			nGray += hist[i];
-			//printf("%d %d\n", i, hist[i]);
-		}
-		float fracGray = (float)nGray/(float)(nim->nvox - nZero);
-		printf("histogram[%d..%d] = %zu %g\n", lo, hi, nGray, fracGray);
-	}*/
 	if (lo == hi) { //MAJORITY are not black or white
 		int ok = -1;
 		while (ok != 0) {
@@ -841,7 +856,7 @@ staticx int nifti_binarize(nifti_image *nim, flt threshold) { //binarize image u
 		return 1;
 	flt *inimg = (flt *)nim->data;
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(inimg[i]))
+		if (isnanx(inimg[i]))
 			continue;
 		inimg[i] = (inimg[i] < threshold) ? 0.0 : 1.0;
 	}
@@ -858,7 +873,7 @@ staticx flt brightest_voxel(nifti_image *nim) {
 	flt *img = (flt *)nim->data;
 	flt mx = -INFINITY; //in case 1st voxel is NaN
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i])) continue;
+		if (isnanx(img[i])) continue;
 		mx = MAX(mx, img[i]);
 	}
 	return mx;
@@ -870,7 +885,7 @@ staticx flt darkest_voxel(nifti_image *nim) {
 	flt *img = (flt *)nim->data;
 	flt mn = INFINITY; //in case 1st voxel is NaN
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i])) continue;
+		if (isnanx(img[i])) continue;
 		mn = MIN(mn, img[i]);
 	}
 	return mn;
@@ -886,7 +901,7 @@ staticx int nifti_mask_below(nifti_image *nim, flt threshold, int isZeroFill) {
 	if (!isZeroFill)
 		fill = darkest_voxel(nim);
 	for (int i = 0; i < nim->nvox; i++) {
-		if ((isnan(inimg[i])) || (inimg[i] >= threshold))
+		if ((isnanx(inimg[i])) || (inimg[i] >= threshold))
 			continue;
 		inimg[i] = 0.0;
 	}
@@ -905,7 +920,7 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 	uint8_t *vxs = (uint8_t *)_mm_malloc(nim->nvox * sizeof(uint8_t), 64);
 	memset(vxs, 0, nim->nvox * sizeof(uint8_t));
 	for (int i = 0; i < nim->nvox; i++) {
-		if ((isnan(inimg[i])) || (inimg[i] >= threshold))
+		if ((isnanx(inimg[i])) || (inimg[i] >= threshold))
 			vxs[i] = 1;
 	}
 	size_t nx = nim->nx;
@@ -958,7 +973,7 @@ staticx int nifti_c2h(nifti_image *nim) {
 	}
 	flt *img = (flt *)nim->data;
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i]))
+		if (isnanx(img[i]))
 			continue;
 		flt boost = img[i] - kUninterestingDarkUnits;
 		boost = MAX(boost, 0.0);
@@ -987,14 +1002,14 @@ staticx int nifti_h2c(nifti_image *nim) {
 	flt *img = (flt *)nim->data;
 	if (mn < kMin) {//some GE scanners place artificial rim around air
 		for (int i = 0; i < nim->nvox; i++) {
-			if ((isnan(img[i])) || (img[i] >= kMin))
+			if ((isnanx(img[i])) || (img[i] >= kMin))
 				continue;
 			img[i] = kMin;
 		}
 		mn = kMin;
 	}
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i]))
+		if (isnanx(img[i]))
 			continue;
 		img[i] -= mn; //translate so min value is 0
 		flt boost = img[i] - kUninterestingDarkUnits;
@@ -1026,7 +1041,7 @@ staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *mi
 	for (int i = 0; i < kOtsuBins; i++)
 		hist[i] = 0;
 	for (int i = 0; i < nim->nvox; i++) {
-		if (isnan(inimg[i]))
+		if (isnanx(inimg[i]))
 			continue;
 		int idx = (int)round((inimg[i] - mn) * scl);
 		idx = MIN(idx, kOtsuBins - 1);
@@ -3605,7 +3620,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 #endif //WASM does not support changing sform/qform
 
 staticx int essentiallyEqual(float a, float b) {
-	if (isnan(a) && isnan(b))
+	if (isnanx(a) && isnanx(b))
 		return 1; //surprisingly, with C nan != nan
 	return fabs(a - b) <= ((fabs(a) > fabs(b) ? fabs(b) : fabs(a)) * epsilon);
 } // essentiallyEqual()
@@ -3908,11 +3923,11 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		#endif
 	} else if (op == nan1) {
 		for (size_t i = 0; i < nim->nvox; i++)
-			if (isnan(f32[i]))
+			if (isnanx(f32[i]))
 				f32[i] = 0.0;
 	} else if (op == nanm1) {
 		for (size_t i = 0; i < nim->nvox; i++)
-			if (isnan(f32[i]))
+			if (isnanx(f32[i]))
 				f32[i] = 1.0;
 			else
 				f32[i] = 0.0;
@@ -4623,7 +4638,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin) {
 			}
 			nDifferent++;
 		}
-		if (isnan(img[i]) || isnan(img[i]))
+		if (isnanx(img[i]) || isnanx(img2[i]))
 			continue;
 		nNotNan++;
 		sum += img[i];
@@ -4649,7 +4664,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin) {
 	//sd := sqrt(sd / (n - 1));
 	double sumDx = 0.0;
 	for (size_t i = 0; i < nim->nvox; i++) {
-		if (isnan(img[i]) || isnan(img[i]))
+		if (isnanx(img[i]) || isnanx(img2[i]))
 			continue;
 		mn = MIN(mn, img[i]);
 		mx = MAX(mx, img[i]);
@@ -5127,7 +5142,7 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			flt *f32 = (flt *)nim->data;
 			flt mx = -INFINITY;
 			for (size_t i = 0; i < nim->nvox; i++) {
-				if (isnan(f32[i]))
+				if (isnanx(f32[i]))
 					continue;
 				mx = fmax(f32[i], mx);
 			}
