@@ -1037,7 +1037,8 @@ staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *mi
 	flt *inimg = (flt *)nim->data;
 	flt scl = (kOtsuBins - 1) / (mx - mn);
 	//create histogram
-	int hist[kOtsuBins];
+	//int hist[kOtsuBins]; //<- we have to use malloc for MSVC (C90, not C99)
+	int *hist = (int*) malloc(kOtsuBins * sizeof(int));
 	for (int i = 0; i < kOtsuBins; i++)
 		hist[i] = 0;
 	for (int i = 0; i < nim->nvox; i++) {
@@ -1049,9 +1050,9 @@ staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *mi
 		hist[idx]++;
 	}
 	//estimate Otsu
-	//int thresh = nii_otsu(hist, kOtsuBins, mode);
 	int dark, mid, bright;
 	int thresh = nii_otsu(hist, kOtsuBins, mode, &dark, &mid, &bright);
+	free(hist);
 	*darkThresh = (dark / scl) + mn;
 	*midThresh = (mid / scl) + mn;
 	*brightThresh = (bright / scl) + mn;
