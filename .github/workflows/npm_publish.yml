@@ -8,8 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v1
       - uses: mymindstorm/setup-emsdk@v11
-      - run: cd src
-      - run: emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o process-image.wasm --no-entry
+      - run: cd src && emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o process-image.wasm --no-entry
   publish:
     runs-on: ubuntu-latest
     steps:
