@@ -1,21 +1,20 @@
 {
-  "name": "niimath-js",
-  "version": "2022.1.154114",
+  "name": "@niivue/niimath-js",
+  "version": "0.0.1643710827823",
   "description": "niimath - a clone of fslmaths",
   "files": [
     "src"
   ],
   "main": "./src/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "update-version": "npm version $(date \"+%Y.%m.%H%M%S\")",
+    "update-version": "node version.js",
     "build-wasm": "cd src && emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o process-image.wasm --no-entry && cd ..",
-    "build": "mkdir -p dist/ && npm run build-wasm",
-    "pub": "npm publish --access public"
+    "build": "npm run build-wasm",
+    "pub": "npm run update-version && npm publish --access public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hanayik/niimath.git"
+    "url": "git+https://github.com/rordenlab/niimath.git"
   },
   "keywords": [
     "niimath",
@@ -23,14 +22,11 @@
     "nii",
     "nifti"
   ],
-  "author": "Chris Rorden",
+  "author": "Chris Rorden, Taylor Hanayik, Chris Drake",
   "license": "BSD-2-Clause",
   "bugs": {
-    "url": "https://github.com/hanayik/niimath/issues"
+    "url": "https://github.com/rordenlab/niimath/issues"
   },
-  "homepage": "https://github.com/hanayik/niimath#readme",
-  "devDependencies": {
-    "esbuild": "^0.14.11",
-    "vite": "^2.7.13"
-  }
+  "homepage": "https://github.com/rordenlab/niimath#readme",
+  "devDependencies": {}
 }
