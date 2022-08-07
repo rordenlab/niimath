@@ -5,11 +5,11 @@ if(NOT GIT_FOUND)
 endif()
 
 # Use git protocol or not
-option(USE_GIT_PROTOCOL "If behind a firewall turn this off to use http instead." ON)
+option(USE_GIT_PROTOCOL "If behind a firewall turn this off to use https instead." OFF)
 if(USE_GIT_PROTOCOL)
-    set(git_protocol "git")
+    set(git_protocol "git@github.com:")
 else()
-    set(git_protocol "https")
+    set(git_protocol "https://github.com/")
 endif()
 
 #emulate fslmaths behavior, add pigz support
