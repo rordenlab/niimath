@@ -4,10 +4,10 @@ environment:
       appveyor_build_worker_image: Visual Studio 2019
 
     - job_name: linux
-      appveyor_build_worker_image: Ubuntu
+      appveyor_build_worker_image: Ubuntu2004
 
     - job_name: mac
-      appveyor_build_worker_image: macos
+      appveyor_build_worker_image: macos-catalina
 
 matrix:
   fast_finish: true
@@ -66,7 +66,7 @@ for:
         - job_name: mac
 
     build_script:
-      - sudo xcode-select -s /Applications/Xcode-10.3.app
+      - sudo xcode-select -s /Applications/Xcode-11.3.1.app
       - cmake -Wno-dev -B build
       - cmake --build build
 
