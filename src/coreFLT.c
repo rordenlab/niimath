@@ -2912,17 +2912,19 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	int64_t nvox4D = nvox3D * nVol;
-	flt *inimg = (flt *)nim->data;
+	flt *inimg4D = (flt *)nim->data;
 	#pragma omp parallel for
 	for (int v = 0; v < nVol; v++) {
+		flt *inimg = inimg4D + (v * nvox3D);
 		int nx = nim->nx;
 		int ny = nim->ny;
 		int nz = nim->nz;
 		flt * img = padImg3D(inimg, &nx, &ny, &nz);
-		memset(inimg, 0, nvox4D * sizeof(flt)); //zero array
+		memset(inimg, 0, nvox3D * sizeof(flt)); //zero array
 		int xi = 1;
 		int yj = nx;
 		int zk = nx * ny;
+		int64_t nxyz = nx * ny * nz;
 		//orient: only look for edges in 2D, ignore on dimesion
 		if (orient == 1) xi = yj;
 		if (orient == 2) yj = 1;
@@ -2932,6 +2934,8 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 			for (int y = 1; y < (ny - 1); y++)
 				for (size_t x = 1; x < (nx - 1); x++) {
 						int64_t i = x + (y * nx) + (z * nxy);
+						if ( ((i - zk) < 0) || ((i + zk) >= nxyz))
+							continue;
 						flt val = img[i];
 						flt ival = -val;
 						//logic: opposite polarities cause negative sign: pos*neg = neg; pos*pos=pos; neg*neg=pos
