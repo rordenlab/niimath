@@ -5,11 +5,11 @@ if(NOT GIT_FOUND)
 endif()
 
 # Use git protocol or not
-option(USE_GIT_PROTOCOL "If behind a firewall turn this off to use http instead." ON)
+option(USE_GIT_PROTOCOL "If behind a firewall turn this off to use https instead." OFF)
 if(USE_GIT_PROTOCOL)
-    set(git_protocol "git")
+    set(git_protocol "ssh://git@")
 else()
-    set(git_protocol "https")
+    set(git_protocol "https://")
 endif()
 
 #emulate fslmaths behavior, add pigz support
@@ -29,7 +29,10 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 option(USE_STATIC_RUNTIME "Use static runtime" ON)
-option(OPENMP_XCODE "Build the static library" OFF)
+
+if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
+    option(OPENMP_XCODE "Build with OpenMP support" OFF)
+endif()
 
 include(ExternalProject)
 

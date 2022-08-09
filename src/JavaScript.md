@@ -9,6 +9,9 @@ The niimath.js project provides a similar command line operation to fslmaths. It
  1. Compile C to WASM: `emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -I. core32.c nifti2_wasm.c core.c walloc.c -o funcx.js`
  3. Run the JavaScript example: `node test.js`
 
+**The development branch requires additional files:**
+**emcc -O2 -s ALLOW_MEMORY_GROWTH -s MAXIMUM_MEMORY=4GB -s WASM=1 -DUSING_WASM -DNII2MESH -I. core32.c nifti2_wasm.c core.c meshify.c MarchingCubes.c  walloc.c base64.c bwlabel.c quadric.c radixsort.c -o funcx.js**
+
 This project does not load or save images from disk. It simply generates fake images and processes them. It reports the time for each operation:
 
 ```

@@ -26,9 +26,12 @@ if(FSLSTYLE)
    ADD_DEFINITIONS(-DPIGZ)
 endif()
 
-#e.g.  cmake -DOPENMP_XCODE=ON ..
-option(OPENMP_XCODE "Build the static library" OFF)
+# Add NII2MESH support
+ADD_DEFINITIONS(-DNII2MESH)
+
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
+    #e.g.  cmake -DOPENMP_XCODE=ON ..
+    option(OPENMP_XCODE "Build with OpenMP support" OFF)
     # using AppleClang
     add_definitions(-fno-caret-diagnostics)
     if (OPENMP_XCODE)
@@ -87,7 +90,12 @@ set(NIIMATH_SRCS
     core64.c
     niftilib/nifti2_io.c
     znzlib/znzlib.c
-    )
+    meshify.c
+    MarchingCubes.c
+    quadric.c
+    base64.c
+    radixsort.c
+)
 
 include_directories(niftilib)
 include_directories(znzlib)

@@ -3,7 +3,7 @@ CNAME=gcc
 #linker flags
 LFLAGS=-lm -lz
 #c flags
-CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX
+CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH
 # Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
 #CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
 
@@ -19,9 +19,8 @@ ifeq "$(OMP)" "1"
 	#gcc-9 --print-file-name=libgomp.a
 	#LFLAGS+= /usr/local/Cellar/gcc/9.2.0_3/lib/gcc/9/gcc/x86_64-apple-darwin18/9.2.0/../../../libgomp.a
 	LFLAGS+= -static-libgcc -static-libstdc++ -L.
-
 endif
 
 all:
-	$(CNAME) $(CFLAGS) -o niimath niimath.c  bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
+	$(CNAME) $(CFLAGS) -o niimath niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
 	

@@ -3581,14 +3581,19 @@ int nifti_is_gzfile(const char* fname)
 {
   /* return true if the filename ends with .gz */
   if (fname == NULL) { return 0; }
-#ifdef HAVE_ZLIB
   { /* just so len doesn't generate compile warning */
      int len;
      len = (int)strlen(fname);
      if (len < 3) return 0;  /* so we don't search before the name */
-     if (fileext_compare(fname + strlen(fname) - 3,".gz")==0) { return 1; }
+     if (fileext_compare(fname + strlen(fname) - 3,".gz")==0) { 
+	   #ifdef HAVE_ZLIB
+	   return 1;
+	   #else
+		fprintf(stderr,"** nifti_is_gzfile: recompile for compressed data '%s'\n", fname);
+	   #endif
+
+	 }
   }
-#endif
   return 0;
 }
 
@@ -5883,8 +5888,12 @@ nifti_image *nifti_image_read( const char *hname , int read_data )
    /**- determine filename to use for header */
    hfile = nifti_findhdrname(hname);
    if( hfile == NULL ){
-      if(g_opts.debug > 0)
-         LNI_FERR(fname,"failed to find header file for", hname);
+      if(g_opts.debug > 0) {
+		#ifndef HAVE_ZLIB
+        nifti_is_gzfile(hname); //provide meaningful warning for existing .gz
+		#endif
+	    LNI_FERR(fname,"failed to find header file for", hname);
+      }
       return NULL;  /* check return */
    } else if( g_opts.debug > 1 )
       fprintf(stderr,"-d %s: found header filename '%s'\n",fname,hfile);

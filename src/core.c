@@ -1,11 +1,18 @@
+#include <stdbool.h>
 #include "core.h"
 #include "print.h"
 #define _USE_MATH_DEFINES //microsoft compiler
-#include <float.h>		  //FLT_EPSILON
+#include <float.h> //FLT_EPSILON
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
+#define USE_MESH
+#ifdef USE_MESH
+	#include "meshify.h"
+	#include "quadric.h"
+#endif
 #ifdef __aarch64__
 	#include "arm_malloc.h"
 #else
@@ -44,10 +51,123 @@ void WASM_EXPORT(wfree)(void* ptr) {
 #define M_PI 3.14159265358979323846264338327
 #endif
 
-int nii_otsu(int* H, int nBin, int mode) {
+#ifdef _MSC_VER //MSVC conforms to C90 not C99: not variable length arrays
+//We can use this MSVC-compatible Mangled array for gcc and ClangLLVM
+//However, the readability suffers. Lets hope a future MSVC supports C99.
+int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
-//mode: threshold 
+//mode: segment and levels 1: 3/4, 2: 2/3 3: 1/2, 4: 1/3, 5: 1/4
+//dark/bright/high: set to threshold
+	int thresh = 0;
+	*dark = 0;
+	*mid = 0;
+	*bright = 0;
+	double Sum = 0.0;
+	for (int v = 0; v < nBin; v++)
+		Sum = Sum + H[v];
+	if (Sum <= 0)
+		return 0;
+	double *P = (double*) malloc(nBin * nBin * sizeof(double));
+	double *S = (double*) malloc(nBin * nBin * sizeof(double));
+	P[0] = H[0];
+	S[0] = H[0];
+	for (int v = 1; v < nBin; v++) {
+		double Prob = H[v]/Sum;
+		P[v] = P[v-1]+Prob;
+		S[v] = S[v-1]+(v+1)*Prob;
+	}
+	for (int u = 1; u < nBin; u++) {
+		for (int v = u; v < nBin; v++) {
+			P[(u*nBin)+v] = P[v]-P[u-1];
+			S[(u*nBin)+v] = S[v]-S[u-1];
+		}
+	}
+	//result is eq 29 from Liao
+	for (int u = 0; u < nBin; u++) {
+		for (int v = u; v < nBin; v++) {
+			if (P[(u*nBin)+v] != 0) //avoid divide by zero errors...
+				P[(u*nBin)+v] = (S[(u*nBin)+v]*S[(u*nBin)+v]) / P[(u*nBin)+v];
+		}
+	}
+	if ((mode == 1) || (mode == 5)) {
+		int lo = (int)(0.25*nBin);
+		int mi = (int)(0.50*nBin);
+		int hi = (int)(0.75*nBin);
+		//double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
+		double max = P[lo] + P[((lo+1)*nBin)+mi] + P[((mi+1)*nBin)+hi] + P[((hi+1)*nBin)+255];
+		for (int l = 0; l < (nBin-3); l++) {
+			for (int m = l + 1; m < (nBin-2); m++) {
+				for (int h = m + 1; h < (nBin-1); h++) {
+					//double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
+					double v = P[l] + P[((l+1)*nBin)+m] + P[((m+1)*nBin)+h] + P[((h+1)*nBin)+255];
+					if (v > max) {
+						lo = l;
+						mi = m;
+						hi = h;
+						max = v;
+					} //new max
+				}//for h -> hi
+			} //for m -> mi
+		} //for l -> low
+		if (mode == 1)
+			thresh = hi;
+		else
+			thresh = lo;
+		*dark = lo;
+		*mid = mi;
+		*bright = hi;
+	} else if ((mode == 2) || (mode == 4)) {
+		int lo = (int)(0.33*nBin);
+		int hi = (int)(0.67*nBin);
+		double max = P[lo] + P[((lo+1)*nBin)+hi] + P[((hi+1)*nBin)+nBin-1];
+		for (int l = 0; l < (nBin-2); l++) {
+			for (int h = l + 1; h < (nBin-1); h++) {
+				double v = P[l]+P[((l+1)*nBin)+h]+P[((h+1)*nBin)+nBin-1];
+				if (v > max) {
+					lo = l;
+					hi = h;
+					max = v;
+				} //new max
+			}//for h -> hi
+		} //for l -> low
+		if (mode == 1)
+			thresh = hi;
+		else
+			thresh = lo;
+		*dark = lo;
+		*mid = thresh;
+		*bright = hi;
+	} else { //two levels:
+		thresh = (int)(0.25*nBin); //nBin / 2;
+		double max = P[thresh]+P[((thresh+1)*nBin)+nBin-1];
+		//exhaustively search
+		for (int i = 0; i < (nBin-1); i++) {
+			double v = P[i]+P[((i+1)*nBin)+nBin-1];
+			if (v > max) {
+				thresh = i;
+				max = v;
+			}//new max
+		}
+		*dark = thresh;
+		*mid = thresh;
+		*bright = thresh;
+	}
+	free(P);
+	free(S);
+	return thresh;
+}
+
+
+#else
+int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
+//H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
+//nBin: number of bins in histogram, e.g. 256 for H[0..255]
+//mode: segment and levels 1: 3/4, 2: 2/3 3: 1/2, 4: 1/3, 5: 1/4
+//dark/bright/high: set to threshold
+	*dark = 0;
+	*mid = 0;
+	*bright = 0;
 	double Sum = 0.0;
 	for (int v = 0; v < nBin; v++)
 		Sum = Sum + H[v];
@@ -107,6 +227,9 @@ int nii_otsu(int* H, int nBin, int mode) {
 			thresh = hi;
 		else
 			thresh = lo;
+		*dark = lo;
+		*mid = mi;
+		*bright = hi;
 	} else if ((mode == 2) || (mode == 4)) {
 		int lo = (int)(0.33*nBin);
 		int hi = (int)(0.67*nBin);
@@ -121,12 +244,14 @@ int nii_otsu(int* H, int nBin, int mode) {
 				} //new max
 			}//for h -> hi
 		} //for l -> low
-		//printf(">>>>%d %d\n", lo, hi);
 		if (mode == 1)
 			thresh = hi;
 		else
 			thresh = lo;
-	} else {
+		*dark = lo;
+		*mid = thresh;
+		*bright = hi;
+	} else { //two levels:
 		thresh = (int)(0.25*nBin); //nBin / 2;
 		double max = P[0][thresh]+P[thresh+1][nBin-1];
 		//exhaustively search
@@ -137,10 +262,13 @@ int nii_otsu(int* H, int nBin, int mode) {
 				max = v;
 			}//new max
 		}
+		*dark = thresh;
+		*mid = thresh;
+		*bright = thresh;
 	}
-	//printf(">>>>%d\n", thresh);	
 	return thresh;
 }
+#endif
 
 #ifndef USING_WASM
 int nifti_save(nifti_image *nim, const char *postfix) {
@@ -359,6 +487,8 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	int idt = nim->datatype; //input datatype
 	double *f64 = (double *)nim->data;
 	float *f32 = (float *)nim->data;
+	uint64_t *u64 = (uint64_t *)nim->data;
+	int64_t *i64 = (int64_t *)nim->data;
 	uint32_t *u32 = (uint32_t *)nim->data;
 	int32_t *i32 = (int32_t *)nim->data;
 	uint16_t *u16 = (uint16_t *)nim->data;
@@ -374,6 +504,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o64[i] = (u32[i] * scl) + inter;
+			ok = 0;
+		}
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o64[i] = (u64[i] * scl) + inter;
+			ok = 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o64[i] = (i64[i] * scl) + inter;
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
@@ -417,6 +557,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		float *o32 = (float *)nim->data;
 		nim->datatype = DT_FLOAT32;
 		nim->nbyper = 4;
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (u64[i] * scl) + inter;
+			return 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (i64[i] * scl) + inter;
+			return 0;
+		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (u32[i] * scl) + inter;
@@ -750,6 +900,202 @@ int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 				i++;
 			}
 	return kernel;
+}
+
+#ifdef USE_MESH
+int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, float reduceFraction, int preSmooth, bool onlyLargest, bool fillBubbles, int postSmooth, bool verbose, char * outnm, int quality) {
+	vec3d *pts = NULL;
+	vec3i *tris = NULL;
+	int ntri, npt;
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("'-dt double' does not support mesh\n" );
+		return EXIT_FAILURE;
+	}
+	size_t dim[3] = {nim->nx, nim->ny, nim->nz};
+	if (meshify(img, dim, originalMC, isolevel, &tris, &pts, &ntri, &npt, preSmooth, onlyLargest, fillBubbles, verbose) != EXIT_SUCCESS)
+		return EXIT_FAILURE;
+	#ifndef USING_WASM //TO DO: WASM must apply transform
+	float srow_x[4] = {nim->sto_xyz.m[0][0], nim->sto_xyz.m[0][1], nim->sto_xyz.m[0][2], nim->sto_xyz.m[0][3]} ;
+	float srow_y[4] = {nim->sto_xyz.m[1][0], nim->sto_xyz.m[1][1], nim->sto_xyz.m[1][2], nim->sto_xyz.m[1][3]} ;
+	float srow_z[4] = {nim->sto_xyz.m[2][0], nim->sto_xyz.m[2][1], nim->sto_xyz.m[2][2], nim->sto_xyz.m[2][3]} ;
+	apply_sform(tris, pts, ntri, npt, srow_x, srow_y, srow_z);
+	#endif
+	double startTime = clockMsec();
+	if (postSmooth > 0) {
+		laplacian_smoothHC(pts, tris, npt, ntri, 0.1, 0.5, postSmooth, true);
+		if (verbose)
+			printfx("post-smooth: %ld ms\n", timediff(startTime, clockMsec()));
+		startTime = clockMsec();
+	}
+	if ((reduceFraction < 1.0) || (quality > 1)) { //lossless for high quality
+		double agressiveness = 7.0; //7 = default for Simplify.h
+		if (quality == 0) //fast
+			agressiveness = 8.0;
+		if (quality == 2) //best
+			agressiveness = 5.0;
+		int startVert = npt;
+		int startTri = ntri;
+		int target_count = round((float)ntri * reduceFraction);
+		quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, agressiveness, verbose, (quality > 1));
+		if (verbose)
+			printfx("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
+		startTime = clockMsec();
+	}
+	save_mesh(outnm, tris, pts, ntri, npt, (quality > 0));
+	if (verbose)
+		printfx("save to disk: %ld ms\n", timediff(startTime, clockMsec()));
+	free(tris);
+	free(pts);
+	return EXIT_SUCCESS;
+}
+#endif
+
+int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brightThresh, float imgMax, int arg, int argc, char *argv[]) {
+	#ifdef USE_MESH
+	#define mxStr 1024
+	float isolevel = midThresh;
+	float reduceFraction = 0.25;
+	int preSmooth = true;
+	bool onlyLargest = true;
+	bool fillBubbles = false;
+	int postSmooth = 0;
+	int originalMC = 0;
+	int quality = 1;
+	bool verbose = false;
+	char atlasFilename[mxStr] = "";
+	for (int i=arg;i<argc;i++) {
+		if (strcmp(argv[i],"-a") == 0)
+			strcpy(atlasFilename, argv[i+1]);
+		if (strcmp(argv[i],"-b") == 0)
+			fillBubbles = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-i") == 0) {
+			if (strlen(argv[i+1]) < 1) continue;
+			if (toupper(argv[i+1][0]) == 'D')
+				isolevel = darkThresh;
+			else if (toupper(argv[i+1][0]) == 'M')
+				isolevel = midThresh;
+			else if (toupper(argv[i+1][0]) == 'B')
+				isolevel = brightThresh;
+			else
+				isolevel = atof(argv[i+1]);
+		}
+		if (strcmp(argv[i],"-l") == 0)
+			onlyLargest = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-o") == 0)
+			originalMC = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-p") == 0)
+			preSmooth = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-q") == 0)
+			quality = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-s") == 0)
+			postSmooth = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-r") == 0)
+			reduceFraction = atof(argv[i+1]);
+		if (strcmp(argv[i],"-v") == 0)
+			verbose = atoi(argv[i+1]);
+	}
+	if (verbose)
+		printfx("bubbles=%d isolevel=%g preSmooth=%d quality=%d smooth=%d reduction=%g verbose=%d\n", 
+			fillBubbles, isolevel, preSmooth, quality, postSmooth, reduceFraction, verbose);
+	if (strlen(atlasFilename) > 0) {
+		int nLabel = trunc(imgMax);
+		int nvox = (nim->nx * nim->ny * nim->nz);
+		float * img = (float *)nim->data;
+		onlyLargest = false;
+		if (imgMax < 1.0) {
+			printfx("intensity range not consistent with an indexed atlas (maximum intensity %g)\n", imgMax);
+			exit(EXIT_FAILURE);
+		}
+		char basenm[mxStr], ext[mxStr] = "";
+		#define kLabelStrLen 32
+		typedef struct  {
+			char str[kLabelStrLen];
+		} tstr;
+		tstr *atlasLabels = (tstr *) malloc((nLabel+1) * sizeof(tstr));
+		//We need to use a struct to support MSVC C90, with gcc and clang:
+		//  char atlasLabels[nLabel+1][kLabelStrLen];
+		for (int i = 0; i <= nLabel; i++)
+			snprintf (atlasLabels[i].str, kLabelStrLen-1, "%d", i);
+		if (strcmp("1", atlasFilename) != 0) {
+			FILE *fp = fopen(atlasFilename,"rt");
+			if (fp == NULL) {
+				printfx("Unable to find atlas names '%s'\n", atlasFilename);
+			} else {
+				char str[mxStr], s[mxStr];
+				while(fgets(str, mxStr, fp)) {
+					strncpy(s, strtok(str,";"), mxStr);
+					int i = atoi(s);
+					if ((i < 0) || (i > nLabel)) continue;
+					strncpy(s, strtok(NULL,";"), mxStr);
+					int len = snprintf (atlasLabels[i].str, kLabelStrLen-1, "%s.k%d", s, i);
+					if (len < 0) exit(EXIT_FAILURE);
+					//remove illegal characters, e.g. 'PACo/Pir' -> 'PACo-Pir'
+					if (len < 1) continue;
+					for (int j = 0; j < len; j++)
+						if ((atlasLabels[i].str[j] < 1) || (atlasLabels[i].str[j] == ' ') || (atlasLabels[i].str[j] == ',') || (atlasLabels[i].str[j] == '/') || (atlasLabels[i].str[j] == '\\') || (atlasLabels[i].str[j] == '%') || (atlasLabels[i].str[j] == '*') || (atlasLabels[i].str[j] == 9) || (atlasLabels[i].str[j] == 10) || (atlasLabels[i].str[j] == 11) || (atlasLabels[i].str[j] == 13))
+							atlasLabels[i].str[j] = '-';
+				}
+				fclose(fp);
+			}
+		}
+		//next, parse name and extension for output files
+		strcpy(basenm, argv[argc-1]);
+		strip_ext(basenm); // ~/file.nii -> ~/file
+		if (strlen(argv[argc-1]) > strlen(basenm))
+			strcpy(ext, argv[argc-1] + strlen(basenm));
+		#if defined(_OPENMP) //compile with 'OMP=1 make -j'
+			int maxNumThreads = omp_get_max_threads();
+			printfx("Using %d threads\n", maxNumThreads);
+			omp_set_num_threads(maxNumThreads);
+		#endif
+		int partial_OK, nOK;
+		#pragma omp parallel private(partial_OK) shared(nOK)
+		{
+			partial_OK = 0;
+			nOK = 0;
+			#pragma omp for
+			for (int i = 1; i <= nLabel; i++) {
+				printfx("%d/%d\n", i, nLabel);
+				float * imgbinary = (float *) malloc(nvox*sizeof(float));
+				int n1 = 0;
+				float lo = i - 0.5;
+				float hi = i + 0.5;
+				for (int j = 0; j < nvox; j++) {
+					int n = 0;
+					if ((img[j] > lo) && (img[j] < hi))
+						n = 1;
+					imgbinary[j] = n;
+					n1 += n;
+				}
+				if (n1 == 0) {
+					printfx("Skipping %d: no voxels with this intensity\n", i);
+					continue;
+				}
+				char outnm[mxStr];
+				if (snprintf(outnm,sizeof(outnm),"%s%s%s", basenm, atlasLabels[i].str, ext) < 0) exit(EXIT_FAILURE);
+				int reti = nii2mesh(imgbinary, nim, originalMC, 0.5, reduceFraction, preSmooth, onlyLargest, fillBubbles, postSmooth, verbose, outnm, quality);
+				if (reti == EXIT_SUCCESS)
+					partial_OK ++;
+				free(imgbinary);
+			} //for nLabel
+			#pragma omp critical
+			{
+				nOK += partial_OK;
+			}
+		}
+		free(atlasLabels);
+		printfx("Converted %d regions of interest\n", nOK);
+		if (nOK == 0)
+			return EXIT_FAILURE;
+		return EXIT_SUCCESS;
+	} else {
+		float * img = (float *)nim->data;
+		return nii2mesh (img, nim, originalMC, isolevel, reduceFraction, preSmooth,onlyLargest, fillBubbles, postSmooth, verbose, argv[argc-1], quality);
+	}
+	#else
+		printfx("Not compiled for meshify");
+		return EXIT_FAILURE;
+	#endif
 }
 
 int *make_kernel(nifti_image *nim, int *nkernel, int x, int y, int z) {
