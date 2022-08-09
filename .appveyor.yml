@@ -80,7 +80,7 @@ deploy:
     release: version $(RELEASE_VERSION) ($(APPVEYOR_REPO_TAG_NAME))
     description: ""
     auth_token:
-      secure: hz/FloIhbQHhqmi2KhuKhO59uahHgTnx2tpnpTGSQetrZ5A9o/l6n1dY1a7DKAAc
+      secure: 90KUxJbQyRfqQ6N6EOMy4ZVqSt8/bdEpenZBIFSRCyagmvQlGfyN0yKKkeknmtPg
     artifact: /niimath_.*\.zip/
     draft: false
     prerelease: false
