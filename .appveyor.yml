@@ -66,12 +66,15 @@ for:
         - job_name: mac
 
     build_script:
-      - sudo xcode-select -s /Applications/Xcode-11.3.1.app
-      - cmake -Wno-dev -B build
-      - cmake --build build
+      - sudo xcode-select -s /Applications/Xcode-12.3.app
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -B build/x86_64
+      - cmake --build build/x86_64
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -B build/arm64
+      - cmake --build build/arm64
 
     after_build:
-      - 7z a niimath_macos.zip ./build/bin/* &>/dev/null
+      - lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
+      - zip -j niimath_macos.zip ./build/niimath &>/dev/null
       - appveyor PushArtifact niimath_macos.zip
 
 deploy:
