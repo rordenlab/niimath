@@ -40,7 +40,7 @@ set(DEPENDENCIES)
 
 set(DEP_INSTALL_DIR ${CMAKE_BINARY_DIR})
 set(ZLIB_IMPLEMENTATION "Cloudflare" CACHE STRING "Choose zlib implementation.")
-set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Cloudflare;System;Custom")
+set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Cloudflare;Miniz;System;Custom")
 if(${ZLIB_IMPLEMENTATION} STREQUAL "Cloudflare")
     message("-- Build with Cloudflare zlib: ON")
     include(${CMAKE_SOURCE_DIR}/SuperBuild/External-CLOUDFLARE-ZLIB.cmake)
