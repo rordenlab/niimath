@@ -1,0 +1,1 @@
+cl /Feniimath niimath.c core.c tensor.c bwlabel.c bw.c core32.c core64.c meshify.c MarchingCubes.c quadric.c base64.c radixsort.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DNII2MESH
