@@ -387,7 +387,7 @@ void laplacian_smoothHC(vec3d *verts, vec3i *tris, int nvert, int ntri, double a
 		triangles[i].v[2] = tris[i].z;
 	}
 	int nref = 0;
-	struct TRef* refs = (struct TRef*) malloc(ntri * 6 * sizeof(struct TRef)); //overprovision initially *ntri * 3, allow room for growth
+	struct TRef* refs = (struct TRef*) malloc(ntri * 9 * sizeof(struct TRef)); //overprovision initially *ntri * 3, allow room for growth
 	int ntriOK = ntri;
 	int vertex_count = nvert;
 	update_mesh(0, triangles, vertices, refs, &nref, &ntriOK, &vertex_count);

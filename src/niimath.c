@@ -73,6 +73,7 @@ int show_help( void ) {
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
+	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('nii2mesh bet -mesh -i d mesh.gii')\n");
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");
 	printf(" -power <exponent>        : raise the current image by following exponent\n");
