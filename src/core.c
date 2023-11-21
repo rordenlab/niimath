@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#define USE_MESH
+#ifndef USING_WASM
+	#define USE_MESH
+#endif
 #ifdef USE_MESH
 	#include "meshify.h"
 	#include "quadric.h"
@@ -17,6 +19,10 @@
 	#include "arm_malloc.h"
 #else
 	#include <immintrin.h>
+#endif
+#ifndef _mm_malloc
+  #define _mm_malloc(size, alignment) malloc(size)
+  #define _mm_free(ptr) free(ptr)
 #endif
 
 #ifdef USING_WASM
@@ -503,7 +509,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		double *o64 = (double *)dat;
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o64[i] = (u32[i] * scl) + inter;
+				o64[i] = (f32[i] * scl) + inter; //<<<<<<<<>>>>
 			ok = 0;
 		}
 		if (idt == DT_UINT64) {
@@ -1193,19 +1199,12 @@ static double Mitchell_filter(double t) {
 	return (0.0);
 }
 
-static double filter(double t) {
-	/* f(t) = 2|t|^3 - 3|t|^2 + 1, -1 <= t <= 1 */
-	if (t < 0.0)
-		t = -t;
-	if (t < 1.0)
-		return ((2.0 * t - 3.0) * t * t + 1.0);
-	return (0.0);
-}
-
 CLIST *createFilter(int srcXsize, int dstXsize, int filterMethod) {
-	//CLIST	* createFilter(int srcXsize, int dstXsize, double (*filterf)(), double fwidth) {
-	double (*filterf)() = filter;
-	double fwidth;
+	//Schumacher's resampler in Graphics Gems 3, for improvements see
+	//see https://github.com/richgel999/imageresampler/blob/master/resampler.cpp
+	// method 1 is the default: linear
+	double (*filterf)(double t) = triangle_filter;
+	double fwidth = triangle_support;
 	if (filterMethod == 0) {
 		filterf = box_filter;
 		fwidth = box_support;
@@ -1218,9 +1217,6 @@ CLIST *createFilter(int srcXsize, int dstXsize, int filterMethod) {
 	} else if (filterMethod == 4) {
 		filterf = Mitchell_filter;
 		fwidth = Mitchell_support;
-	} else { //method 1 is the default: linear
-		filterf = triangle_filter;
-		fwidth = triangle_support;
 	}
 	CLIST *contrib = (CLIST *)calloc(dstXsize, sizeof(CLIST));
 	double xscale = (double)dstXsize / (double)srcXsize;

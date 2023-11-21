@@ -48,6 +48,19 @@
 	#define tensor_decomp //tensor_decomp support is optional
 #endif
 
+#ifndef USING_WASM
+	#ifdef __x86_64__
+		#include <immintrin.h>
+	#else
+		#include "arm_malloc.h"
+	#endif
+#endif
+#ifndef _mm_malloc
+	#define _mm_malloc(size, alignment) malloc(size)
+	#define _mm_free(ptr) free(ptr)
+	#undef SIMD
+#endif
+
 #ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
 	#ifdef __x86_64__
 		#ifdef DT32
@@ -64,13 +77,6 @@
 		#endif
 	#endif
 #endif
-#ifndef USING_WASM
-	#ifdef __x86_64__
-		#include <immintrin.h>
-	#else
-		#include "arm_malloc.h"
-	#endif
-#endif
 
 #ifdef bandpass
 	#include "bw.h"
@@ -81,7 +87,7 @@
 #ifdef tensor_decomp
 	#include "tensor.h"
 #endif
-
+#include "fdr.h"
 //#define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 //#ifdef TFCE //we now use in-built tfce function
 //	#include "tfce_pthread.h"
@@ -551,7 +557,7 @@ staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid
 	flt *kWeight = (flt *)_mm_malloc(nx * sizeof(flt), 64); //ensure sum of kernel = 1.0
 	for (int i = 0; i < nx; i++) {
 		kStart[i] = MAX(-cutoffvox, -i); //do not read below 0
-		kEnd[i] = MIN(cutoffvox, nx - i - 1); //do not read beyond final columnn
+		kEnd[i] = MIN(cutoffvox, nx - i - 1); //do not read beyond final column
 		if ((i > 0) && (kStart[i] == (kStart[i - 1])) && (kEnd[i] == (kEnd[i - 1]))) { //reuse weight
 			kWeight[i] = kWeight[i - 1];
 			continue;
@@ -608,7 +614,7 @@ staticx void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid)
 	flt *kWeight = (flt *)_mm_malloc(nx * sizeof(flt), 64); //ensure sum of kernel = 1.0
 	for (int i = 0; i < nx; i++) {
 		kStart[i] = MAX(-cutoffvox, -i); //do not read below 0
-		kEnd[i] = MIN(cutoffvox, nx - i - 1); //do not read beyond final columnn
+		kEnd[i] = MIN(cutoffvox, nx - i - 1); //do not read beyond final column
 		if ((i > 0) && (kStart[i] == (kStart[i - 1])) && (kEnd[i] == (kEnd[i - 1]))) { //reuse weight
 			kWeight[i] = kWeight[i - 1];
 			continue;
@@ -4596,6 +4602,29 @@ staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
 	return 0;
 } // nifti_binary()
 
+//bork
+staticx int nifti_fdr(nifti_image *nim, double qval) {
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("nifti_fdr: Unsupported datatype %d\n", nim->datatype);
+		exit(1);
+	}
+	if (nim->intent_code != NIFTI_INTENT_PVAL) {
+		printfx("nifti_fdr intent_code should be 22 (NIFTI_INTENT_PVAL) not %d\n", nim->intent_code);
+	}
+	#ifdef DT32
+	size_t nvox = nim->nx * nim->ny * nim->nz;
+	flt *img = (flt *)nim->data;
+	float thresh = fdr(img, qval, nvox);
+	printfx("nifti_fdr %g %g\n", qval, thresh);
+	#else
+	printfx("'-dt double' does not support fdr\n" );
+	exit(1);
+	#endif
+	
+
+	exit(1);
+}
+
 staticx void nifti_compare(nifti_image *nim, char *fin) {
 	if (nim->nvox < 1)
 		exit(1);
@@ -5205,6 +5234,10 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 		} else if (!strcmp(argv[ac], "--compare")) { //--function terminates without saving image
 			ac++;
 			nifti_compare(nim, argv[ac]); //always terminates
+		} else if (!strcmp(argv[ac], "-fdr")) { //--function terminates without saving image
+				ac++;
+				double qval = strtod(argv[ac], &end);
+			nifti_fdr(nim, qval); //always terminates
 		}
 		#endif //WASM does not (yet) resize images
 		else if (!strcmp(argv[ac], "-edt"))
@@ -5449,7 +5482,7 @@ static char* splitArgv(char **str, char **word){
 		(*str)++;
 		inquotes = true;
 	}
-	// Set phrase begining
+	// Set phrase beginning
 	*word = *str;
 	// Skip all chars if in quotes
 	if( inquotes ){

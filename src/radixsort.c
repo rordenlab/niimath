@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2014 Cameron Hart
+ * Copyright (c) 2014 Cameron matla
+ 
  *
  * This software is provided 'as-is', without any express or implied
  * warranty. In no event will the authors be held liable for any damages

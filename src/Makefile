@@ -3,7 +3,7 @@ CNAME=gcc
 #linker flags
 LFLAGS=-lm -lz
 #c flags
-CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH
+CFLAGS=-O1 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH
 # Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
 #CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
 
@@ -22,5 +22,5 @@ ifeq "$(OMP)" "1"
 endif
 
 all:
-	$(CNAME) $(CFLAGS) -o niimath niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
+	$(CNAME) $(CFLAGS) -o niimath niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
 	

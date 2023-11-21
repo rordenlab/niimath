@@ -401,7 +401,7 @@ void laplacian_smoothHC(vec3d *verts, vec3i *tris, int nvert, int ntri, double a
 	free(p);
 }
 
-void quadric_simplify_mesh(vec3d **vs, vec3i **ts, int* nvert, int *ntri, int target_count, double agressiveness, bool verbose, bool finishLossless) {
+void quadric_simplify_mesh(vec3d **vs, vec3i **ts, int* nvert, int *ntri, int target_count, double aggressiveness, bool verbose, bool finishLossless) {
 	// init: load vertices
 	vec3d *verts = *vs;
 	struct TVertex* vertices = (struct TVertex*) malloc(*nvert * sizeof(struct TVertex));
@@ -447,7 +447,7 @@ void quadric_simplify_mesh(vec3d **vs, vec3i **ts, int* nvert, int *ntri, int ta
 			//lossy: update mesh once in a while
 			if(iteration%5==0)
 				update_mesh(iteration, triangles, vertices, refs, &nref, &ntriOK, &vertex_count);
-			threshold = 0.000000001*pow((double)(iteration+3.0),agressiveness);
+			threshold = 0.000000001*pow((double)(iteration+3.0), aggressiveness);
 		} else {
 			if (iterationStartCount == (triangle_count-deleted_triangles)) break;
 			//lossless: update mesh constantly

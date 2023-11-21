@@ -52,6 +52,11 @@
   #include <immintrin.h>
 #endif
 
+#ifndef _mm_malloc
+  #define _mm_malloc(size, alignment) malloc(size)
+  #define _mm_free(ptr) free(ptr)
+#endif
+
 #ifndef M_PI //not defined by older gcc unless compiled with `-std=gnu99`:
   #define M_PI 3.14159265358979323846
 #endif

@@ -165,3 +165,11 @@ WASM memory management is limited. JavaScript protects memory, improving securit
 | -roi [xmin] [xsize] [ymin] [ysize] [zmin] [zsize] [tmin] [tsize]  | NO  |  zero outside roi (using voxel coordinates). Inputting -1 for a size will set it to the full image extent for that dimension |
 | -bptf  [hp_sigma] [lp_sigma]  | NO  |  (-t in ip.c) Bandpass temporal filtering; nonlinear highpass and Gaussian linear lowpass (with sigmas in volumes, not seconds); set either sigma[0 to skip that filter |
 | -roc [AROC-thresh] [outfile] [4Dnoiseonly] [truth]  | NO  |  take (normally binary) truth and test c |
+
+### Alternative
+
+One can use emscriptens built in file system and memory support if you compile as follows:
+
+```
+emcc -s USE_ZLIB=1 -O1 -DHAVE_ZLIB -DFSLSTYLE -DREJECT_COMPLEX -DNII2MESH -std=gnu99 -o niimathwasm.js niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -lm -lz
+```

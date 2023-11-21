@@ -28,5 +28,8 @@
     "url": "https://github.com/rordenlab/niimath/issues"
   },
   "homepage": "https://github.com/rordenlab/niimath#readme",
-  "devDependencies": {}
+  "dependencies": {
+    "nifti-reader-js": "^0.6.8",
+    "pako": "^2.1.0"
+  }
 }
