@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20221204"
+#define kMTHdate "v1.0.20231111"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -65,7 +65,6 @@ int show_help( void ) {
 	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
 	printf(" -bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
 	printf(" -bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) \n");
-	printf(" -c2h                     : reverse h2c transform\n");
 	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
@@ -77,8 +76,8 @@ int show_help( void ) {
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");
 	printf(" -power <exponent>        : raise the current image by following exponent\n");
-	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
-
+	printf(" -qform <code>            : set qform_code\n");
+	printf(" -sform <code>            : set sform_code\n");
 	#if defined(_OPENMP)
 	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
 	#else
@@ -198,6 +197,8 @@ int show_help( void ) {
 	printf(" -cpval   : Same as -pval, but gives FWE corrected P-values\n");
 	printf(" -ztop    : Convert Z-stat to (uncorrected) P\n");
 	printf(" -ptoz    : Convert (uncorrected) P to Z\n");
+	printf(" -ztopc    : Convert Z-stat to (uncorrected but clamped) P\n");
+	printf(" -ptozc    : Convert (uncorrected but clamped) P to Z\n");
 	printf(" -rank    : Convert data to ranks (over T dim)\n");
 	printf(" -ranknorm: Transform to Normal dist via ranks\n");
 	printf("\n");

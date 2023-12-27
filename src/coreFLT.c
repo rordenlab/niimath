@@ -49,17 +49,13 @@
 #endif
 
 #ifndef USING_WASM
-	#ifdef __x86_64__
-		#include <immintrin.h>
-	#else
-		#include "arm_malloc.h"
+	#ifdef EMSCRIPTEN
+		#define _mm_malloc(size, alignment) malloc(size)
+		#define _mm_free(ptr) free(ptr)
+		#undef SIMD
 	#endif
 #endif
-#ifndef _mm_malloc
-	#define _mm_malloc(size, alignment) malloc(size)
-	#define _mm_free(ptr) free(ptr)
-	#undef SIMD
-#endif
+
 
 #ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
 	#ifdef __x86_64__
@@ -75,6 +71,14 @@
 		#else
 			#undef SIMD
 		#endif
+	#endif
+#endif
+
+#ifndef USING_WASM
+	#ifdef __x86_64__
+		#include <immintrin.h>
+	#else
+		#include "arm_malloc.h"
 	#endif
 #endif
 
@@ -909,7 +913,7 @@ staticx int nifti_mask_below(nifti_image *nim, flt threshold, int isZeroFill) {
 	for (int i = 0; i < nim->nvox; i++) {
 		if ((isnanx(inimg[i])) || (inimg[i] >= threshold))
 			continue;
-		inimg[i] = 0.0;
+		inimg[i] = fill;
 	}
 	return 0;
 }
@@ -989,43 +993,6 @@ staticx int nifti_c2h(nifti_image *nim) {
 	}
 	return 0;
 } // nifti_c2h()
-
-staticx int nifti_h2c(nifti_image *nim) {
-//h2c: Hounsfield to Cormack
-// https://github.com/neurolabusc/Clinical/blob/master/clinical_h2c.m
-	flt kUninterestingDarkUnits = 900.0; //e.g. -1000..-100
-	flt kInterestingMidUnits = 200.0; //e.g. unenhanced CT: -100..+100
-	flt kMin = -1024.0; //some GE scanners place artificial rim around air
-	flt kScaleRatio = 10;
-	if (nim->nvox < 1)
-		return 1;
-	flt mn = darkest_voxel(nim);
-	flt mx = brightest_voxel(nim);
-	if ((mx < 100) || (mn > -500)) {
-		printfx("Image not in Hounsfield units: Intensity range %g..%g\n", mn, mx);
-		return 1;
-	}
-	flt *img = (flt *)nim->data;
-	if (mn < kMin) {//some GE scanners place artificial rim around air
-		for (int i = 0; i < nim->nvox; i++) {
-			if ((isnanx(img[i])) || (img[i] >= kMin))
-				continue;
-			img[i] = kMin;
-		}
-		mn = kMin;
-	}
-	for (int i = 0; i < nim->nvox; i++) {
-		if (isnanx(img[i]))
-			continue;
-		img[i] -= mn; //translate so min value is 0
-		flt boost = img[i] - kUninterestingDarkUnits;
-		boost = MAX(boost, 0.0);
-		boost = MIN(boost, kInterestingMidUnits);
-		boost = boost * (kScaleRatio - 1.0);
-		img[i] += boost;
-	}
-	return 0;
-} // nifti_h2c()
 
 staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *midThresh, flt *brightThresh) { //binarize image using Otsu's method
 //mode is 1..5 corresponding to 3/4, 2/3, 1/2 1/3 and 1/4 compartments made dark
@@ -2570,13 +2537,13 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
-					if (f32[i] != 0.0)
+					if (inf32[i] != 0.0)
 						continue;
 					int nNot0 = 0;
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
-						size_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2615,9 +2582,11 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
+					if (inf32[i] != 0.0)
+						continue;
 					int nOK = 0;
 					for (size_t k = 0; k < nkernel; k++) {
-						size_t vx = i + kernel[k];
+						int64_t vx = i + kernel[k];
 						if ((vx < 0) || (vx >= nVox3D))
 							continue;
 						//next handle edge cases
@@ -2627,9 +2596,13 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; //wrapped anterior-posterior
+						if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
 					} //for k
+					if (nOK < 1)
+						continue;
 					qsort(vxls, nOK, sizeof(flt), compare);
 					int itm = (nOK * 0.5);
 					f32[i] = vxls[itm];
@@ -2637,21 +2610,74 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 			} //for y
 		} //for z
 		_mm_free(vxls);
-	} else 
-	#endif //WASM does not support qsort
-	if (op == dilMk) {
+	} else if (op == dilDk) { //Modal Dilation of non-zero voxels
+		//for ties, choose larger value
+		flt *vxls = (flt *)_mm_malloc((nkernel) * sizeof(flt), 64);
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; //offset
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
-					if (f32[i] != 0.0)
+					if (inf32[i] != 0.0)
+						continue;
+					int nOK = 0;
+					for (size_t k = 0; k < nkernel; k++) {
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D))
+							continue;
+						//next handle edge cases
+						int dx = x + kernel[k + nkernel];
+						if ((dx < 0) || (dx >= nim->nx))
+							continue; //wrapped left-right
+						int dy = y + kernel[k + nkernel + nkernel];
+						if ((dy < 0) || (dy >= nim->ny))
+							continue; //wrapped anterior-posterior
+						if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+							continue;
+						vxls[nOK] = inf32[vx];
+						nOK++;
+					} //for k
+					if (nOK < 1)
+						continue;
+					qsort(vxls, nOK, sizeof(flt), compare);
+					float value = vxls[nOK-1];
+					float mode = value;
+					int count = 1;
+					int countMode = 1;
+					if (nOK > 1) {
+						for (int k = (nOK-2); k >= 0; k--) {
+							if (vxls[i] == value) { // count occurrences of the current number
+								++count;
+							} else { // now this is a different number
+								if (count > countMode) {
+									countMode = count; // mode is the biggest ocurrences
+									mode = value;
+								}
+								count = 1; // reset count for the new number
+								value = vxls[i];
+							}
+						}
+					}
+					f32[i] = mode;
+				} //for x
+			} //for y
+		} //for z
+		_mm_free(vxls);
+	} else
+	#endif //WASM does not support qsort
+	if (op == dilMk) { //Mean Dilation of non-zero voxels
+		for (int z = 0; z < nim->nz; z++) {
+			int i = (z * nxy) - 1; //offset
+			for (int y = 0; y < nim->ny; y++) {
+				for (int x = 0; x < nim->nx; x++) {
+					i++;
+					if (inf32[i] != 0.0)
 						continue;
 					int nNot0 = 0;
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
-						size_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2668,19 +2694,16 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 				} //for x
 			} //for y
 		} //for z
-	} else if (op == dilDk) { //maximum - fslmaths 6.0.1 emulation, note really MODE, max non-zero
+	} else if (op == dilFk) { // Maximum filtering of all voxels
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; //offset
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
-					if (f32[i] != 0.0)
-						continue;
-					//flt mx = -INFINITY;
-					flt mx = NAN;
+					flt mx = inf32[i];
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] <= mx) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2689,46 +2712,13 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; //wrapped anterior-posterior
-						flt v = inf32[vx];
-						if (v == 0.0)
-							continue;
-						mx = MAX(mx, inf32[vx]);
-						//with dilD a input voxel of 0
+						mx = inf32[vx];
+						//if (mx < 0) continue; //with dilF, do not make a zero voxel darker than 0
 					} //for k
-					//https://stackoverflow.com/questions/570669/checking-if-a-double-or-float-is-nan-in-c
-					// f != f will be true only if f is NaN
-					if (!(mx != mx))
-						f32[i] = mx;
-
+					f32[i] = mx;
 				} //for x
 			} //for y
 		} //for z
-	} else if (op == dilFk) { //maximum - fslmaths 6.0.1 appears to use "dilF" when the user requests "dilD"
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; //offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					flt mx = f32[i];
-					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] <= mx))
-							continue;
-						//next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; //wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; //wrapped anterior-posterior
-						mx = MAX(mx, inf32[vx]);
-						//if (mx < 0) continue; //with dilF, do not make a zero voxel darker than 0
-
-					} //for k
-					f32[i] = mx;
-				}				//for x
-			}					//for y
-		}						//for z
 	} else if (op == dilallk) { //	-dilall : Apply -dilM repeatedly until the entire FOV is covered");
 		kernel3D_dilall(nim, kernel, nkernel, vol);
 	} else if (op == eroFk) { //Minimum filtering of all voxels
@@ -2738,8 +2728,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2749,7 +2739,6 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; //wrapped anterior-posterior
 						f32[i] = MIN(f32[i], inf32[vx]);
-
 					} //for k
 				} //for x
 			} //for y
@@ -2766,8 +2755,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt sum = 0.0f;
 					flt wt = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2798,8 +2787,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt sumNeg = 0.0f;
 					flt wtNeg = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2838,8 +2827,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt sum = 0.0f;
 					//flt wt = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2858,16 +2847,17 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 		} //for z
 		_mm_free(kwt);
 	} else if (op == erok) {
+		// Erode by zeroing non-zero voxels when zero voxels found in kernel
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; //offset
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
-					if (f32[i] == 0.0)
+					if (inf32[i] == 0.0)
 						continue;
 					for (int k = 0; k < nkernel; k++) {
-						int vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] != 0.0))
+						int64_t vx = i + kernel[k];
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] != 0.0) || (inf32[vx] == NAN))
 							continue;
 						//next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2917,7 +2907,6 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 	// orient refers to slice direction: 1=x=Sagittal, 2=y=Coronal, 3=z=Axial, else 3D 
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
-	int64_t nvox4D = nvox3D * nVol;
 	flt *inimg4D = (flt *)nim->data;
 	#pragma omp parallel for
 	for (int v = 0; v < nVol; v++) {
@@ -4079,6 +4068,25 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		#endif //WASM does not like qsort
 	} else if (op == ztop1) {
 		#ifdef DT32 //issue8
+		flt mn = -5.419;
+		#else
+		flt mn = -8.2923;
+		#endif
+		flt mx = 8.2923;
+		size_t nClamp = 0;
+		for (size_t i = 0; i < nim->nvox; i++) {
+			if (f32[i] < mn) {
+				nClamp++;
+				f32[i] = 1.0; //ptoz = infinity
+			} else if (f32[i] > mx) {
+				nClamp++;
+				f32[i] = 0.0; //ptoz = -infinity
+			} else
+				f32[i] = qg(MAX(f32[i], mn));
+		}
+		if (nClamp > 0) printfx("ztop clamped %zu extreme z-scores\n", nClamp);
+	} else if (op == ztopc1) {
+		#ifdef DT32 //issue8
 		flt mn = -5.41;
 		#else
 		flt mn = -8.29;
@@ -4096,11 +4104,28 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		const flt kNaN = NAN;
 		//const flt kNaN = 0.0 / 0.0;
 		for (size_t i = 0; i < nim->nvox; i++) {
+			if (isnanx(f32[i]))
+				f32[i] = kNaN;
+			if ((f32[i] <= 0.0) || (f32[i] >= 1.0)) //for fslmaths compatibility
+				f32[i] = 0;
+			else
+				f32[i] = qginv(f32[i]);
+		}
+	} else if (op == ptozc1) {
+		//given p, return x such that Q(x)=p, for 0 < p < 1
+		// #ifdef DT32
+		const flt kNaN = NAN;
+		//const flt kNaN = 0.0 / 0.0;
+		size_t nClamp = 0;
+		for (size_t i = 0; i < nim->nvox; i++) {
+			if ((f32[i] <= 0.0) || (f32[i] >= 1.0))
+				nClamp ++;
 			if ((f32[i] < 0.0) || (f32[i] > 1.0))
 				f32[i] = kNaN;
 			else
 				f32[i] = qginv(f32[i]);
 		}
+		if (nClamp > 0) printfx("ztop clamped %zu extreme z-scores\n", nClamp);
 	} else if ((op == pval1) || (op == pval01)) {
 		int nvox3D = nim->nx * nim->ny * nim->nz;
 		int nvol = nim->nvox / nvox3D;
@@ -4999,8 +5024,12 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			op = ranknorm1;
 		if (!strcmp(argv[ac], "-ztop"))
 			op = ztop1;
+		if (!strcmp(argv[ac], "-ztopc"))
+			op = ztopc1;
 		if (!strcmp(argv[ac], "-ptoz"))
 			op = ptoz1;
+		if (!strcmp(argv[ac], "-ptozc"))
+			op = ptozc1;
 		if (!strcmp(argv[ac], "-pval"))
 			op = pval1;
 		if (!strcmp(argv[ac], "-pval0"))
@@ -5188,8 +5217,8 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 		#ifdef bwlabelx
 		} else if (strstr(argv[ac], "-bwlabel")) {
 			ac ++;
-			int conn = atoi(argv[ac]);
 			#ifdef DT32
+			int conn = atoi(argv[ac]);
 			size_t dim[3] = {nim->nx, nim->ny, nim->nz};
 			flt *img = (flt *)nim->data;
 			ok = bwlabel(img, conn, dim, false, false);
@@ -5198,11 +5227,7 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ok = EXIT_FAILURE;
 			#endif
 		#endif
-		} else if (!strcmp(argv[ac], "-h2c"))
-			ok = nifti_h2c(nim);
-		else if (!strcmp(argv[ac], "-c2h"))
-			ok = nifti_c2h(nim);
-		else if (!strcmp(argv[ac], "-sobel_binary"))
+		} else if (!strcmp(argv[ac], "-sobel_binary"))
 			ok = nifti_sobel(nim, 1);
 		else if (!strcmp(argv[ac], "-sobel"))
 			ok = nifti_sobel(nim, 0);
@@ -5347,6 +5372,16 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ac++;
 			double neg = strtod(argv[ac], &end);
 			ok = nifti_dog(nim, pos, neg, orient);
+		} else if (!strcmp(argv[ac], "-qform")) {
+			ac++;
+			int c = atoi(argv[ac]);
+			printfx("qform_code: %d -> %d\n", nim->qform_code, c);
+			nim->sform_code = c;
+		} else if (!strcmp(argv[ac], "-sform")) {
+			ac++;
+			int c = atoi(argv[ac]);
+			printfx("sform_code: %d -> %d\n", nim->sform_code, c);
+			nim->sform_code = c;
 		} else if (!strcmp(argv[ac], "-tfce")) {
 			ac++;
 			double H = strtod(argv[ac], &end);

@@ -6857,8 +6857,7 @@ int64_t nifti_read_buffer(znzFile fp, void* dataptr, int64_t ntot,
        fprintf(stderr,"+d nifti_read_buffer: swapping data bytes...\n");
     nifti_swap_Nbytes( (int)(ntot / nim->swapsize), nim->swapsize , dataptr ) ;
   }
-
-#ifdef isfinite
+#ifdef isfinitex
 {
   /* check input float arrays for goodness, and fix bad floats */
   int fix_count = 0 ;

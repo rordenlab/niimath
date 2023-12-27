@@ -20,9 +20,11 @@
 #else
 	#include <immintrin.h>
 #endif
-#ifndef _mm_malloc
-  #define _mm_malloc(size, alignment) malloc(size)
-  #define _mm_free(ptr) free(ptr)
+#ifndef USING_WASM
+	#ifdef EMSCRIPTEN
+		#define _mm_malloc(size, alignment) malloc(size)
+		#define _mm_free(ptr) free(ptr)
+	#endif
 #endif
 
 #ifdef USING_WASM

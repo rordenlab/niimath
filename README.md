@@ -4,7 +4,7 @@
 
 It is said that `imitation is the sincerest form of flattery`. This project emulates the popular [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) tool. fslmaths is advertized as a `general image calculator` and is not only one of the foundational tools for FSL's brain imaging pipelines (such as [FEAT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FEAT)), but has also been widely adopted by many tools. This popularity suggests that it fulfills an important niche. While scientists are often encouraged to discover novel solutions, it sometimes seems that replication is undervalued. Here are some specific reasons for creating this tool:
 
-1. While fslmaths is provided for without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects.
+1. While fslmaths is provided for without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects, in particular for commercial exploitation.
 2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. n.b. Subsequently, we helped update [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) that allows recent FSL releases to use this library,  improving the speed for all FSL tools.
 3. Minimal dependencies allow easy distribution, compilation and development. For example, it can be compiled for MacOS, Linux and Windows (fsl can not target Windows).
 4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)). 
@@ -15,7 +15,7 @@ It is said that `imitation is the sincerest form of flattery`. This project emul
  
 The Reason to use fslmaths instead of niimath:
 
-1. niimath is new and largely untested software. There may be unknown corner cases where produces poor results. fslmaths has been used for years and therefore has been battle tested. In the few instances where fslmaths generates results that bear no resemblance to its own documentation (as described below), one could argue it is the `correct` result (with comparison to itself). An example of this is `-dilD`, where fslmaths generates a blurred and spatially shifted image, which is not what the documentation describes. However, many tools may have been developed to assume this loss of high frequency signal and these tools may not perform well when provided with the result specified in the documentation. 
+1. niimath is new and largely untested software. There may be unknown corner cases where produces poor results. fslmaths has been used for years and therefore has been battle tested. In the few instances where fslmaths generates results that bear no resemblance to its own documentation (as described below), one could argue it is the `correct` result (with comparison to itself). However, many tools may have been developed to assume this loss of high frequency signal and these tools may not perform well when provided with the result specified in the documentation. 
  
 ## Installation
 
@@ -79,7 +79,6 @@ niimath has a few features not provided by fslmaths:
  - bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)
  - bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)
  - bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) 
- - c2h                     : reverse h2c transform
  - ceil                    : round voxels upwards to the nearest integer
  - crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range
  - dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)
@@ -90,7 +89,6 @@ niimath has a few features not provided by fslmaths:
  - mod                     : modulus fractional remainder - same as '-rem' but includes fractions
  - otsu <mode>             : binarize image using Otsu''s method (mode 1..5; higher yields more bright voxels))
  - power <exponent>        : raise the current image by following exponent
- - h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast
  - resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
  - round                   : round voxels to the nearest integer
  - sobel                   : fast edge detection
@@ -106,6 +104,8 @@ niimath has a few features not provided by fslmaths:
  - dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices
  - dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices
  - mesh                    : see separate section below
+ - qform <code>            : set qform code
+ - sform <code>            : set sform code
  - `--compare` <ref>       : report if images are identical, terminates without saving new image\n");
  - filename.nii            : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
 
@@ -135,7 +135,7 @@ Some operations do generate known meaningfully different results. These are list
 6. The fslmaths `-roc` function works differently than described in the help. It appears to ignore voxels near the edge of an image and generates "given object has non-finite elements" if any dimension is less than 12 voxels. When provided with an external noise file, it generates additional columns in the output file that are not described. It does not seem to precisely detect the desired `AROC-thresh`, but samples at different stepped intervals. niimath attempts to emulate the stepped intervals for reporting, but determines the precise cutoff.
 7. Be aware that fslmaths help suggests `If you apply a Binary operation (one that takes the current image and a new image together), when one is 3D and the other is 4D, the 3D image is cloned temporally to match the temporal dimensions of the 4D image.` This is not the case for -thr or -uthr: if the second item is 4D, only the first volume is used and the output remains 3D. Particularly odd is uthr: `fslmaths 3D -uthr 4D out` will fill input volume 3D with zeros, regardless of mask values.
 8. Perhaps understandably, `fslmaths in1 -rem 0 out` will throw an exception. However, `fslmaths in1 -rem in2 out` will throw an exception if any voxel in the image `in2` is zero. While this seems understandable, niimath provides a description for this error.
-9. The fslmaths function `-rem` returns the **integer** modulus remainder. This is unexpected, e.g. in Python `2.7 % 2` is 0.7, as is Matlab's `mod(2.7, 2)`, as is standard C `fmod`. niimath clones the fslmaths idiosyncratic behavior, but also includes a new function `-mod` to return the modulus fractional remainder. 
+9. The fslmaths function `-rem` returns the **integer** modulus remainder. This replicates the C `%` operator. This may be unexpected, e.g. in Python `2.7 % 2` is 0.7, as is Matlab's `mod(2.7, 2)`, as is standard C `fmod`. niimath clones the fslmaths  behavior, but also includes a new function `-mod` to return the modulus fractional remainder. 
 10. Be aware that fslmaths takes account of whether the image has a negative determinant or not (flipping the first dimension). However, fslstats does not do this, so fslstats coordinates are often misleading. For example, consider an image in RAS orientation, where the command `fslstats tfRAS -x` will give coordinates that are incompatible with fslmath's `tfceS` function. niimath attempts to emulate the behavior of fslmaths for the relevant functions (-index -roi, -tfceS). 
 11. Neither `-subsamp2` nor `-subsamp2offc` handle anti-aliasing. Be aware that `-subsamp2offc` can exhibit odd edge effects. The problem is simple to describe, for slices in the middle of a volume, and output slice is weighted 50% with the center slice, and 25% for the slice below and the slice above. This makes sense. However, bottom slices (as well as first rows, first columns, last rows, last columns, last slices) the filter weights 75% on the central slice and just 25% on the slice above it. Signal from this 2nd slice is heavily diluted. A better mixture would be 66% edge slice and 33% 2nd slice. This latter solution is used by niimath.
 12. fslmaths 6.0.0..6.0.3 were unable to process files where the string ".nii" appears in a folder name. For example, consider the folder "test.niim", the command `fslmaths ~/test.niim/RAS -add 0 tst` will [generate an exception](https://github.com/FCP-INDI/C-PAC/issues/976). niimath will recognize that this is a folder name and not a file extension and work correctly. niimath helped detect this anomaly and it is an example of how a clone can help provide feedback to the developers of the original project.
