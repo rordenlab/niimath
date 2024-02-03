@@ -3890,9 +3890,9 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 					size_t yo = y * nim->nx;
 					for (int x = 1; (x < (nim->nx - 1)); x++) {
 						size_t vx = zo + yo + x;
-						flt xv = sqr(inp[vx + 1] - inp[vx - 1]) * xscl;
-						flt yv = sqr(inp[vx + nim->nx] - inp[vx - nim->nx]) * yscl;
-						flt zv = sqr(inp[vx + nxy] - inp[vx - nxy]) * zscl;
+						fltx xv = sqr(inp[vx + 1] - inp[vx - 1]) * xscl;
+						fltx yv = sqr(inp[vx + nim->nx] - inp[vx - nim->nx]) * yscl;
+						fltx zv = sqr(inp[vx + nxy] - inp[vx - nxy]) * zscl;
 						o32[vx] = sqrt(xv + yv + zv) * xyzscl;
 					} //x
 				} //y
