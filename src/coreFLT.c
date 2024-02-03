@@ -2527,7 +2527,7 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
 	flt *inf32 = (flt *)_mm_malloc(nVox3D * sizeof(flt), 64);
-	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
+	xmemcpy(inf32, f32, nVox3D * sizeof(flt)); //memcpy(dest, src, sz)
 	int nxy = nim->nx * nim->ny;
 	size_t nZero = 1;
 	while (nZero > 0) {
@@ -2582,8 +2582,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 			for (int y = 0; y < nim->ny; y++) {
 				for (int x = 0; x < nim->nx; x++) {
 					i++;
-					if (inf32[i] != 0.0)
-						continue;
+					//if (inf32[i] != 0.0)
+					//	continue;
 					int nOK = 0;
 					for (size_t k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
@@ -2596,7 +2596,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; //wrapped anterior-posterior
-						if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						//if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if (inf32[vx] == NAN)
 							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
@@ -2646,15 +2647,15 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					int countMode = 1;
 					if (nOK > 1) {
 						for (int k = (nOK-2); k >= 0; k--) {
-							if (vxls[i] == value) { // count occurrences of the current number
-								++count;
-							} else { // now this is a different number
+							if (vxls[k] == value) { // count occurrences of the current number
+								count++;
 								if (count > countMode) {
 									countMode = count; // mode is the biggest ocurrences
 									mode = value;
 								}
+							} else { // now this is a different number
+								value = vxls[k];
 								count = 1; // reset count for the new number
-								value = vxls[i];
 							}
 						}
 					}
@@ -3843,11 +3844,12 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			printfx("edge requires non-zero pixdim1/pixdim2/pixdim3\n");
 			return 1;
 		}
-		flt xscl = 1.0 / (sqr(nim->dx));
-		flt yscl = 1.0 / (sqr(nim->dy));
-		flt zscl = 1.0 / (sqr(nim->dz));
-		flt xyzscl = 1.0 / (2.0 * sqrt(xscl + yscl + zscl));
-		if (nim->nz < 2) {				//no slices 'above' or 'below' for 2D
+		#define fltx double
+		fltx xscl = 1.0 / (sqr(nim->dx));
+		fltx yscl = 1.0 / (sqr(nim->dy));
+		fltx zscl = 1.0 / (sqr(nim->dz));
+		fltx xyzscl = 1.0 / (2.0 * sqrt(xscl + yscl + zscl));
+		if (nim->nz < 2) { //no slices 'above' or 'below' for 2D
 			size_t nxy = nim->nx * nim->ny; //slice increment
 			int nvol = nim->nvox / nxy;
 			if ((nvol * nxy) != nim->nvox)
@@ -3862,8 +3864,8 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 					size_t yo = y * nim->nx;
 					for (int x = 1; (x < (nim->nx - 1)); x++) {
 						size_t vx = yo + x;
-						flt xv = sqr(inp[vx + 1] - inp[vx - 1]) * xscl;
-						flt yv = sqr(inp[vx + nim->nx] - inp[vx - nim->nx]) * yscl;
+						fltx xv = sqr(inp[vx + 1] - inp[vx - 1]) * xscl;
+						fltx yv = sqr(inp[vx + nim->nx] - inp[vx - nim->nx]) * yscl;
 						o32[vx] = sqrt(xv + yv) * xyzscl;
 					} //x
 				} //y
@@ -4038,8 +4040,9 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			return 1;
 		if (nvol <= 1) {
 			//you are always first if you are the only one to show up...
+			const flt kNaN = NAN;
 			for (int i = 0; i < nim->nvox; i++)
-				f32[i] = 0;
+				f32[i] = kNaN;
 		} else {
 #pragma omp parallel for
 			for (int i = 0; i < nvox3D; i++) {
@@ -4621,7 +4624,8 @@ staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
 	}
 	nifti_image_free(nim2);
 	if (rem0) {
-		printfx("Warning -rem image included zeros (fslmaths exception)\n");
+		//n.b. newer versions of fslmaths nop longer crash
+		//printfx("Warning -rem image included zeros (fslmaths exception)\n");
 		return 0;
 	}
 	return 0;
@@ -4650,7 +4654,7 @@ staticx int nifti_fdr(nifti_image *nim, double qval) {
 	exit(1);
 }
 
-staticx void nifti_compare(nifti_image *nim, char *fin) {
+staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	if (nim->nvox < 1)
 		exit(1);
 	if (nim->datatype != DT_CALC) {
@@ -4770,7 +4774,10 @@ staticx void nifti_compare(nifti_image *nim, char *fin) {
 	//V1 comparison - EXIT_SUCCESS if all vectors are parallel (for DWI up vector [1 0 0] has same direction as down [-1 0 0])
 	if (nVol != 3) {
 		nifti_image_free(nim2);
-		exit(1);
+		if (maxDiff > thresh)
+			exit(1);
+		printfx("Maximum difference acceptable (less than threshold %g)\n", thresh);
+		exit(0);
 	}
 	int allParallel = 1;
 	//niimath ft_V1 -compare nt_V1
@@ -4801,7 +4808,10 @@ staticx void nifti_compare(nifti_image *nim, char *fin) {
 		exit(0);
 	}
 	nifti_image_free(nim2);
-	exit(1);
+	if (maxDiff > thresh)
+		exit(1);
+	printfx("Maximum difference acceptable (less than threshold %g)\n", thresh);
+	exit(0);
 } //nifti_compare()
 
 #endif // #ifndef USING_WASM
@@ -5258,7 +5268,13 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ok = nifti_crop(nim, tmin, tsize);
 		} else if (!strcmp(argv[ac], "--compare")) { //--function terminates without saving image
 			ac++;
-			nifti_compare(nim, argv[ac]); //always terminates
+			double thresh = 0.0;
+			if (ac < argc) {
+				thresh = strtod(argv[ac], &end);
+				ac++;
+			}
+			nifti_compare(nim, argv[ac], thresh);
+			//n.b. nifti_compare always terminates
 		} else if (!strcmp(argv[ac], "-fdr")) { //--function terminates without saving image
 				ac++;
 				double qval = strtod(argv[ac], &end);
@@ -5423,7 +5439,7 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			double v = strtod(argv[ac], &end);
 			//if (end == argv[ac]) {
 			if (strlen(argv[ac]) != (end - argv[ac])) { // "4d" will return numeric "4"
-				if ((op == power) || (op == clamp) || (op == uclamp) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed)) {
+				if ((op == thr) || (op == uthr) || (op == power) || (op == clamp) || (op == uclamp) || (op == thrp) || (op == thrP) || (op == uthrp) || (op == uthrP) || (op == seed)) {
 					printfx("Error: '%s' expects numeric value\n", argv[ac - 1]);
 					goto fail;
 				} else

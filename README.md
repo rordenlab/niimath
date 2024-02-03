@@ -38,6 +38,13 @@ cd niimath; mkdir build; cd build; cmake ..
 make
 ```
 
+Likewise, if you are compiling on Windows using cmake:
+
+```
+git clone https://github.com/rordenlab/niimath.git
+cd niimath & mkdir build & cd build & cmake ..
+msbuild niimath.sln
+```
 Alternatively, you can compile the software by running the terminal command `make` from the project's `src` folder if you are running Linux (or execute `windows.bat` if you are running Windows):
 
 ```
@@ -46,17 +53,9 @@ cd niimath/src
 make
 ```
 
-Likewise, if you are compiling on Windows:
-
-```
-git clone https://github.com/rordenlab/niimath.git
-cd niimath & mkdir build & cd build & cmake ..
-msbuild niimath.sln
-```
-
 Advanced users may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler `brew install gcc@9`.
 
-For Windows, the compilation will look like this (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
+For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
 
 ```
 cl /Feniimath niimath.c core.c tensor.c bwlabel.c bw.c core32.c core64.c fdr.c meshify.c MarchingCubes.c quadric.c base64.c radixsort.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DNII2MESH

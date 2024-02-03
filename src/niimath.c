@@ -45,7 +45,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20231111"
+#define kMTHdate "v1.0.20240202"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 int show_help( void ) {
@@ -98,6 +98,7 @@ int show_help( void ) {
 	printf(" -dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices\n");
 	printf(" -dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices\n");
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
+	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");
 	printf(" filename.nii             : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image\n");
 	printf("\n");
 	printf("Binary operations:\n");
