@@ -91,7 +91,7 @@ for:
       - cmake --build build
 
     after_build:
-      - export PATH=$PWD/build:$PATH basedir=$PWD/niimath_tests
+      - export PATH=$PWD/build/bin:$PATH basedir=$PWD/niimath_tests
       - git clone https://github.com/rordenlab/niimath_tests.git
       - ./niimath_tests/canonical_test.sh
 
