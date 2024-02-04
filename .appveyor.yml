@@ -91,9 +91,10 @@ for:
       - cmake --build build
 
     after_build:
-      - export exe=$PWD/build/bin/niimath tstexe=$PWD/build/bin/niimath basedir=$PWD/niimath_tests
-      - git clone https://github.com/rordenlab/niimath_tests.git
-      - ./niimath_tests/canonical_test.sh
+      - export builddir=$APPVEYOR_BUILD_FOLDER/build
+      - export exe=$builddir/bin/niimath tstexe=$builddir/bin/niimath basedir=$builddir/niimath_tests
+      - git clone https://github.com/rordenlab/niimath_tests.git $basedir
+      - cd $basedir; ./canonical_test.sh
 
 deploy:
   - provider: GitHub
