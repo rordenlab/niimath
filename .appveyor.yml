@@ -9,6 +9,9 @@ environment:
     - job_name: mac
       appveyor_build_worker_image: macos-catalina
 
+    - job_name: test
+      appveyor_build_worker_image: Ubuntu2004
+
 matrix:
   fast_finish: true
 
@@ -76,6 +79,21 @@ for:
       - lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
       - zip -j niimath_macos.zip ./build/niimath &>/dev/null
       - appveyor PushArtifact niimath_macos.zip
+
+  -
+    matrix:
+      only:
+        - job_name: test
+
+    build_script:
+      - export CC=gcc-8 CXX=g++-8
+      - cmake -Wno-dev -B build
+      - cmake --build build
+
+    after_build:
+      - export PATH=$PWD/build:$PATH basedir=$PWD/niimath_tests
+      - git clone https://github.com/rordenlab/niimath_tests.git
+      - ./niimath_tests/canonical_test.sh
 
 deploy:
   - provider: GitHub
