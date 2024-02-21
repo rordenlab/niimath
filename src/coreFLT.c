@@ -967,32 +967,45 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 	return 0;
 }
 
-staticx int nifti_c2h(nifti_image *nim) {
-//c2h: Cormack to Hounsfield
-// https://github.com/neurolabusc/Clinical/blob/master/clinical_c2h.m
-	flt kUninterestingDarkUnits = 900.0; //e.g. -1000..-100
-	flt kInterestingMidUnits = 200.0; //e.g. unenhanced CT: -100..+100
-	flt kScaleRatio = 10;
-	//flt kMax = kInterestingMidUnits * (kScaleRatio+1);
-	if (nim->nvox < 1)
-		return 1;
-	flt mn = darkest_voxel(nim);
-	if (mn < 0.0) {
-		printfx("Negative brightnesses impossible in the Cormack scale.\n");
-		return 1;
-	}
+staticx int nifti_h2c(nifti_image *nim, bool is_inverse) {
+	//lossless conversion of Hounsfield to Cormack Units (and back)
+	//  https://pubmed.ncbi.nlm.nih.gov/22440645/
+	// n.b. that this clamps the darks voxels to -1000 HU (air)
+	//   some GE CT use exceptionally dark voxels to indicate voxels outside FOV
+	//   an example where unsampled voxels have a value of -1500 are here:
+	//     https://github.com/neurolabusc/dcm_qa_ct
+	//   Be aware that the clamping is not lossless for these extreme values
+	//   This is intentional, improving performance of tools that assume air is darkest
+	flt k_min = -1000.0;
+	flt k_uninteresting_dark_units = 900.0;
+	flt k_interesting_mid_units = 200.0;
+	flt k_scale_ratio = 10.0;
 	flt *img = (flt *)nim->data;
-	for (int i = 0; i < nim->nvox; i++) {
-		if (isnanx(img[i]))
-			continue;
-		flt boost = img[i] - kUninterestingDarkUnits;
-		boost = MAX(boost, 0.0);
-		boost = MIN(boost, kInterestingMidUnits * kScaleRatio);
-		boost = boost * ((kScaleRatio - 1.0) / kScaleRatio);
-		img[i] = img[i] - boost - 1024.0;
+	if (is_inverse) {
+		// Calculate scaled interesting mid units for inverse operation
+		flt k_interesting_mid_units_scaled = k_interesting_mid_units * k_scale_ratio;
+		for (int i = 0; i < nim->nvox; i++) {
+			flt base = img[i] + k_min; //translate so min value is 0
+			flt boost = img[i] - k_uninteresting_dark_units;
+			boost = MAX(boost, 0.0);
+			boost = MIN(boost, k_interesting_mid_units_scaled);
+			boost = (boost / k_scale_ratio) * (k_scale_ratio - 1);
+			img[i] = base - boost;
+		}
+	} else {
+		// Convert image by setting minimum and boosting mid-range values
+		for (int i = 0; i < nim->nvox; i++) {
+			img[i] = MAX(img[i], k_min);
+			img[i] = img[i] - k_min;
+			flt boost = img[i] - k_uninteresting_dark_units;
+			boost = MAX(boost, 0.0);
+			boost = MIN(boost, k_interesting_mid_units);
+			boost = boost * (k_scale_ratio - 1);
+			img[i] += boost;
+		}
 	}
 	return 0;
-} // nifti_c2h()
+} // nifti_h2c()
 
 staticx flt otsu_thresholds(nifti_image *nim, int mode, flt *darkThresh, flt *midThresh, flt *brightThresh) { //binarize image using Otsu's method
 //mode is 1..5 corresponding to 3/4, 2/3, 1/2 1/3 and 1/4 compartments made dark
@@ -1815,7 +1828,7 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 		//Spielberg's code uses 8*sigma, does not match current fslmaths:
 		//tested with fslmaths freq4d -bptf 10 -1 nhp
 		//cutoff ~3: most difference: 4->0.0128902 3->2.98023e-08 2->-0.0455322 1->0.379412
-		int cutoffhp = ceil(3 * hp_sigma); //to do: check this! ~3
+		int cutoffhp = (int)(hp_sigma*3); //confirmed by Taylor Hanyik
 		hp = (double *)_mm_malloc((cutoffhp + 1 + cutoffhp) * sizeof(double), 64); //-cutoffhp..+cutoffhp
 		hp0 = hp + cutoffhp; //convert from 0..(2*cutoffhp) to -cutoffhp..+cutoffhp
 		for (int k = -cutoffhp; k <= cutoffhp; k++) //for each index in kernel
@@ -1856,7 +1869,7 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 		// fslmaths rest -bptf -1 5 flp
 		// 3->0.00154053 4->3.5204e-05 5->2.98023e-07, 6->identical
 		// Spielberg's code uses 8*sigma, so we will use that, even though precision seems excessive
-		int cutofflp = ceil(8 * lp_sigma); //to do: check this! at least 6
+		int cutofflp = (int)(lp_sigma*20)+2; //confirmed by Taylor Hanyik
 		lp = (double *)_mm_malloc((cutofflp + 1 + cutofflp) * sizeof(double), 64); //-cutofflp..+cutofflp
 		lp0 = lp + cutofflp; //convert from 0..(2*cutofflp) to -cutofflp..+cutofflp
 		for (int k = -cutofflp; k <= cutofflp; k++) //for each index in kernel
@@ -4759,6 +4772,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		printfx("  Descriptives consider voxels that are numeric in both images.\n");
 	}
 	printfx("  Most different voxel %g vs %g (difference %g)\n", img[differentVox], img2[differentVox], maxDiff);
+	printfx("  Most different voxel %.8g vs %.8g (difference %g)\n", img[differentVox], img2[differentVox], maxDiff);
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	size_t vx[4];
@@ -5237,7 +5251,11 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ok = EXIT_FAILURE;
 			#endif
 		#endif
-		} else if (!strcmp(argv[ac], "-sobel_binary"))
+		} else if (!strcmp(argv[ac], "-h2c"))
+			ok = nifti_h2c(nim, false); 
+		else if (!strcmp(argv[ac], "-c2h"))
+			ok = nifti_h2c(nim, true);
+		else if (!strcmp(argv[ac], "-sobel_binary"))
 			ok = nifti_sobel(nim, 1);
 		else if (!strcmp(argv[ac], "-sobel"))
 			ok = nifti_sobel(nim, 0);
