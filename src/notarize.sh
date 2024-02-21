@@ -9,8 +9,15 @@ APP_NAME=niimath
 APP_DIR=macos
 # security -v find-identity -p codesigning
 # security find-identity
+if [[ -z "$APPLE_ID_APP" ]]; then
+    echo "APPLE_ID_APP environment variable required"
+    echo "to find your ID, run:"
+    echo " security find-identity"
+    echo "then export this as a variable:"
+    echo " export APPLE_ID_APP=\"Developer ID Application: John Doe (69BBQ123RR)\""
+    exit 1
+fi
 
-APPLE_ID_INSTALL="3rd Party Mac Developer Installer: Christopher Rorden (68BQDQS28R)"
 
 cd "$(dirname "$0")"
 
@@ -27,8 +34,21 @@ strip ./niimathARM
 lipo -create -output ./${APP_DIR}/${APP_NAME} niimathX86 niimathARM
 rm ./niimathX86; rm ./niimathARM
 
-#pkgbuild --identifier "com.${COMPANY_NAME}.${APP_NAME}.pkg" --sign "${APPLE_ID_INSTALL}" --timestamp --root $APP_DIR --install-location /usr/local/bin/ ${APP_NAME}.pkg
+#code sign executable
+codesign --timestamp --options=runtime -s "${APPLE_ID_APP}" -v ./${APP_DIR}/${APP_NAME}
 
+#create a DMG
 hdiutil create -volname ${APP_NAME} -srcfolder ./${APP_DIR} -ov -format UDZO -layout SPUD -fs HFS+J  ${APP_NAME}_macOS.dmg
-
 xcrun notarytool submit ${APP_NAME}_macOS.dmg  --keychain-profile ${APP_NAME}  --wait
+
+#create a PKG
+if [[ -z "$APPLE_ID_INSTALL" ]]; then
+    echo "APPLE_ID_INSTALL environment variable required"
+    echo "to find your ID, run:"
+    echo " security find-identity"
+    echo "then export this as a variable:"
+    echo " export APPLE_ID_INSTALL=\"Developer ID Installer: John Doe (69BBQ123RR)\""
+    exit 1
+fi
+pkgbuild --identifier "com.${COMPANY_NAME}.${APP_NAME}.pkg" --sign "${APPLE_ID_INSTALL}" --timestamp --root $APP_DIR --install-location /usr/local/bin/ ${APP_NAME}_macOS.pkg
+xcrun notarytool submit ${APP_NAME}_macOS.pkg  --keychain-profile ${APP_NAME}  --wait
