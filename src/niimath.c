@@ -229,7 +229,7 @@ int main(int argc, char * argv[]) {
 	//fslmaths ing/inm are listed as "unary" but should be listed as binary
 	//"niimath in.nii" for fslhd style output
 	if( argc == 2 ) { //special case "niimath img.nii" reports header, a bit like fslhd
-		nifti_image * nim = nifti_image_read(argv[1], 1);
+		nifti_image * nim = nifti_image_read(argv[1], 0); // issue 5: read header, but not data
 		if( nim ) {
 			nifti_image_infodump(nim);
 			nifti_image_free( nim );
