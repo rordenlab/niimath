@@ -3,7 +3,7 @@ CNAME=gcc
 #linker flags
 LFLAGS=-lm -lz
 #c flags
-CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH
+CFLAGS=-O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX
 #CFLAGS=-O3 -ffast-math -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH
 # Westmere required for fast gz https://github.com/tikv/tikv/issues/4843
 #CFLAGS=-O3 -DHAVE_ZLIB -march=westmere
@@ -22,6 +22,12 @@ ifeq "$(OMP)" "1"
 	LFLAGS+= -static-libgcc -static-libstdc++ -L.
 endif
 
+MFLAGS= -DNII2MESH MarchingCubes.c meshify.c quadric.c
+#run "MESH=0 make" for minimal compile without nii2mesh functions
+ifeq "$(MESH)" "0"
+	MFLAGS=
+endif
+
 all:
-	$(CNAME) $(CFLAGS) -o niimath niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS)
+	$(CNAME) $(CFLAGS) $(MFLAGS) niimath.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib $(LFLAGS) -o niimath
 	

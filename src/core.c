@@ -8,10 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#ifndef USING_WASM
-	#define USE_MESH
-#endif
-#ifdef USE_MESH
+#ifdef NII2MESH
 	#include "meshify.h"
 	#include "quadric.h"
 #endif
@@ -910,7 +907,7 @@ int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 	return kernel;
 }
 
-#ifdef USE_MESH
+#ifdef NII2MESH
 int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, float reduceFraction, int preSmooth, bool onlyLargest, bool fillBubbles, int postSmooth, bool verbose, char * outnm, int quality) {
 	vec3d *pts = NULL;
 	vec3i *tris = NULL;
@@ -959,7 +956,7 @@ int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, fl
 #endif
 
 int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brightThresh, float imgMax, int arg, int argc, char *argv[]) {
-	#ifdef USE_MESH
+	#ifdef NII2MESH
 	#define mxStr 1024
 	float isolevel = midThresh;
 	float reduceFraction = 0.25;
@@ -1101,7 +1098,7 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 		return nii2mesh (img, nim, originalMC, isolevel, reduceFraction, preSmooth,onlyLargest, fillBubbles, postSmooth, verbose, argv[argc-1], quality);
 	}
 	#else
-		printfx("Not compiled for meshify");
+		printfx("Not compiled for meshify.\n");
 		return EXIT_FAILURE;
 	#endif
 }

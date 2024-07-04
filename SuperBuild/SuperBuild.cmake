@@ -20,6 +20,8 @@ if(FSLSTYLE)
    ADD_DEFINITIONS(-DPIGZ)
 endif()
 
+ADD_DEFINITIONS(-DNII2MESH)
+
 # Basic CMake build settings
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING

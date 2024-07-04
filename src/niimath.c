@@ -74,7 +74,9 @@ int show_help( void ) {
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
+#ifdef NII2MESH
 	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('nii2mesh bet -mesh -i d mesh.gii')\n");
+#endif
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");
 	printf(" -power <exponent>        : raise the current image by following exponent\n");
