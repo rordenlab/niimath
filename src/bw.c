@@ -46,18 +46,19 @@
 
 #include <stdlib.h>
 #include <math.h>
-#ifdef __aarch64__
-  #include "arm_malloc.h"
-#else
-  #include <immintrin.h>
-#endif
 
-#ifndef USING_WASM
-	#ifdef EMSCRIPTEN
-		#define _mm_malloc(size, alignment) malloc(size)
-		#define _mm_free(ptr) free(ptr)
+
+#ifdef EMSCRIPTEN
+	#define _mm_malloc(size, alignment) malloc(size)
+	#define _mm_free(ptr) free(ptr)
+#else
+	#ifdef __aarch64__
+	  #include "arm_malloc.h"
+	#else
+	  #include <immintrin.h>
 	#endif
 #endif
+
 
 #ifndef M_PI //not defined by older gcc unless compiled with `-std=gnu99`:
   #define M_PI 3.14159265358979323846

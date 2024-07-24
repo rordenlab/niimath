@@ -29,33 +29,17 @@
 	#include <omp.h>
 #endif
 
-#ifdef USING_WASM
+
+#define SIMD
+#define xmemcpy memcpy
+#define staticx static
+#include <nifti2_io.h>
+
+#ifdef EMSCRIPTEN
+	#define _mm_malloc(size, alignment) malloc(size)
+	#define _mm_free(ptr) free(ptr)
 	#undef SIMD
-	#define staticx
-	#include <string.h>
-	#include <stdbool.h>
-	#include <nifti2_wasm.h>
-	#include <emscripten.h>
-	#include <ctype.h>//#include <cctype>// <ctype.h> for isspace()
-	#include <stdbool.h>
-#else
-	#define SIMD
-	#define xmemcpy memcpy
-	#define staticx static
-	#include <nifti2_io.h>
-	#define bandpass
-	#define bwlabelx
-	#define tensor_decomp //tensor_decomp support is optional
 #endif
-
-#ifndef USING_WASM
-	#ifdef EMSCRIPTEN
-		#define _mm_malloc(size, alignment) malloc(size)
-		#define _mm_free(ptr) free(ptr)
-		#undef SIMD
-	#endif
-#endif
-
 
 #ifdef SIMD //explicitly vectorize (SSE,AVX,Neon)
 	#ifdef __x86_64__
@@ -74,24 +58,24 @@
 	#endif
 #endif
 
-#ifndef USING_WASM
-	#ifdef __x86_64__
-		#include <immintrin.h>
-	#else
-		#include "arm_malloc.h"
-	#endif
+#ifdef __x86_64__
+	#include <immintrin.h>
+#else
+	#include "arm_malloc.h"
 #endif
 
-#ifdef bandpass
+#ifdef HAVE_BUTTERWORTH
 	#include "bw.h"
 #endif
-#ifdef bwlabelx
+#ifdef NII2MESH
 	#include "bwlabel.h"
+	#include "fdr.h"
 #endif
-#ifdef tensor_decomp
+#ifdef HAVE_TENSOR
 	#include "tensor.h"
 #endif
-#include "fdr.h"
+
+#include <stdbool.h>
 //#define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 //#ifdef TFCE //we now use in-built tfce function
 //	#include "tfce_pthread.h"
@@ -173,6 +157,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 		tail--;
 	}
 } //nifti_fma()
+
 #else //if SIMD32 else SIMD64
 
 staticx void nifti_sqrt(flt *v, size_t n) {
@@ -281,16 +266,16 @@ staticx void nifti_fma(flt *v, size_t n, flt slope1, flt intercept1) {
 
 #define MY_LITTLE_ENDIAN (((union { unsigned x; unsigned char c; }){1}).c)
 #ifdef DT32
-staticx bool isnanx(flt f) { //isnan disabled by gcc -Ofast and -ffinite-math-only
-//4byte IEEE: msb[31] = signbit, bits[23-30] exponent, bits[0..22] mantissa
-//exponent of all 1s =   Infinity, NAN or Indeterminate
-	uint32_t i = *(long *)&f;
-	#ifdef MY_LITTLE_ENDIAN
-		return ((i&0x7f800000)==0x7f800000)&&(i&0x007fffff);
+staticx bool isnanx(flt f) {
+	#ifdef __EMSCRIPTEN__
+	// return false;
+	return isnan(f);
 	#else
-		return ((i&0x0000807f)==0x0000807f)&&(i&0xffff7f00);
+	return isnan(f);
 	#endif
-}
+} 
+//n.b. isnan disabled by gcc -Ofast and -ffinite-math-only
+// alternative methods have issues with sanitize and wasm
 #else
 
 staticx bool isnanx(double d) {
@@ -573,7 +558,7 @@ staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid
 		//printf("%d %d->%d %g\n", i, kStart[i], kEnd[i], kWeight[i]);
 	}
 	//apply kernel to each row
-	flt *tmp = _mm_malloc(nx * sizeof(flt), 64); //input values prior to blur
+	flt *tmp = (flt *) _mm_malloc(nx * sizeof(flt), 64); //input values prior to blur
 	for (int y = 0; y < ny; y++) {
 		//printf("-+ %d:%d\n", y, ny);
 		xmemcpy(tmp, img, nx * sizeof(flt));
@@ -653,76 +638,87 @@ staticx void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid)
 
 #endif // if OPENMP: blurP (parallel blur) is multi-threaded
 
-staticx int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
-	//https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-		
-	if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
-		printfx("Image size too small for Gaussian blur.\n");
-		return 1;
-	}
-	if (nim->datatype != DT_CALC)
-		return 1;
-	if ((SigmammX == 0) && (SigmammY == 0) && (SigmammZ == 0))
-		return 0; //all done: no smoothing, e.g. small kernel for difference of Gaussian
-	if (SigmammX < 0) //negative values for voxels, not mm
-		SigmammX = -SigmammX * nim->dx;
-	if (SigmammY < 0) //negative values for voxels, not mm
-		SigmammY = -SigmammY * nim->dy;
-	if (SigmammZ < 0) //negative values for voxels, not mm
-		SigmammZ = -SigmammZ * nim->dz;
-	flt *img = (flt *)nim->data;
-	int nVol = nim->nvox / nvox3D;
-	if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
-		return 1;
-	int nx = nim->nx;
-	int ny = nim->ny;
-	int nz = nim->nz;
-	if ((SigmammX <= 0.0) || (nx < 2))
-		goto DO_Y_BLUR;
-	//BLUR X
-	size_t nRow = MAX(nim->ny, 1);
-	nRow *= MAX(nim->nz, 1);
-	nRow *= MAX(nVol, 1);
+static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
+    //https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
+    int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+    flt *img = NULL;
+    int nVol = 0;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    size_t nRow = 0;
+
+    if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+        printf("Image size too small for Gaussian blur.\n");
+        return 1;
+    }
+    if (nim->datatype != DT_CALC)
+        return 1;
+    if ((SigmammX == 0) && (SigmammY == 0) && (SigmammZ == 0))
+        return 0; //all done: no smoothing, e.g. small kernel for difference of Gaussian
+    if (SigmammX < 0) //negative values for voxels, not mm
+        SigmammX = -SigmammX * nim->dx;
+    if (SigmammY < 0) //negative values for voxels, not mm
+        SigmammY = -SigmammY * nim->dy;
+    if (SigmammZ < 0) //negative values for voxels, not mm
+        SigmammZ = -SigmammZ * nim->dz;
+    img = (flt *)nim->data;
+    nVol = nim->nvox / nvox3D;
+    if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
+        return 1;
+    nx = nim->nx;
+    ny = nim->ny;
+    nz = nim->nz;
+
+    if ((SigmammX <= 0.0) || (nx < 2))
+        goto DO_Y_BLUR;
+    //BLUR X
+    nRow = MAX(nim->ny, 1);
+    nRow *= MAX(nim->nz, 1);
+    nRow *= MAX(nVol, 1);
 #if defined(_OPENMP)
-	if (omp_get_max_threads() > 1)
-		blurP(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
-	else
-		blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
+    if (omp_get_max_threads() > 1)
+        blurP(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
+    else
+        blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
 #else
-	blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
+    blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
 #endif
+
 DO_Y_BLUR:
-	//BLUR Y
-	if ((SigmammY <= 0.0) || (ny < 2))
-		goto DO_Z_BLUR;
-	nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
+    //BLUR Y
+    if ((SigmammY <= 0.0) || (ny < 2))
+        goto DO_Z_BLUR;
+    nRow = nim->nx * nim->nz; //transpose XYZ to YXZ and blur Y columns with XZ Rows
 #pragma omp parallel for
-	for (int v = 0; v < nVol; v++) { //transpose each volume separately
-		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
-		size_t vo = v * nvox3D; //volume offset
-		transposeXY(&img[vo], img3D, &nx, &ny, nz);
-		blurS(img3D, nim->ny, nRow, nim->dy, SigmammY, kernelWid);
-		transposeXY(img3D, &img[vo], &nx, &ny, nz);
-		_mm_free(img3D);
-	} //for each volume
+    for (int v = 0; v < nVol; v++) { //transpose each volume separately
+        flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+        size_t vo = v * nvox3D; //volume offset
+        transposeXY(&img[vo], img3D, &nx, &ny, nz);
+        blurS(img3D, nim->ny, nRow, nim->dy, SigmammY, kernelWid);
+        transposeXY(img3D, &img[vo], &nx, &ny, nz);
+        _mm_free(img3D);
+    } //for each volume
+
 DO_Z_BLUR:
-	//BLUR Z:
-	if ((SigmammZ <= 0.0) || (nim->nz < 2))
-		return 0; //all done!
-	nRow = nim->nx * nim->ny; //transpose XYZ to ZXY and blur Z columns with XY Rows
+    //BLUR Z:
+    if ((SigmammZ <= 0.0) || (nim->nz < 2))
+        return 0; //all done!
+    nRow = nim->nx * nim->ny; //transpose XYZ to ZXY and blur Z columns with XY Rows
 #pragma omp parallel for
-	for (int v = 0; v < nVol; v++) { //transpose each volume separately
-		//printf("volume %d uses thread %d\n", v, omp_get_thread_num());
-		flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
-		size_t vo = v * nvox3D; //volume offset
-		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
-		blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ, kernelWid);
-		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
-		_mm_free(img3D);
-	} //for each volume
-	return 0;
+    for (int v = 0; v < nVol; v++) { //transpose each volume separately
+        //printf("volume %d uses thread %d\n", v, omp_get_thread_num());
+        flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+        size_t vo = v * nvox3D; //volume offset
+        transposeXZ(&img[vo], img3D, &nx, ny, &nz);
+        blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ, kernelWid);
+        transposeXZ(img3D, &img[vo], &nx, ny, &nz);
+        _mm_free(img3D);
+    } //for each volume
+
+    return 0;
 } // nifti_smooth_gauss()
+
 
 staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
 	//https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;31f309c1.1307
@@ -764,7 +760,6 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 	if (mn == mx) {
 		*pct2 = mn;
 		*pct98 = mx;
-
 		return 0;
 	}
 	if (!ignoreZeroVoxels)
@@ -877,7 +872,7 @@ staticx int nifti_binarize(nifti_image *nim, flt threshold) { //binarize image u
 	return 0;
 }
 
-staticx flt brightest_voxel(nifti_image *nim) {
+/*staticx flt brightest_voxel(nifti_image *nim) {
 	if (nim->nvox < 1)
 		return 0.0;
 	flt *img = (flt *)nim->data;
@@ -887,7 +882,7 @@ staticx flt brightest_voxel(nifti_image *nim) {
 		mx = MAX(mx, img[i]);
 	}
 	return mx;
-}
+}*/
 
 staticx flt darkest_voxel(nifti_image *nim) {
 	if (nim->nvox < 1)
@@ -1050,7 +1045,7 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize 
 //makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
 	flt darkThresh, midThresh, brightThresh;
 	flt threshold = otsu_thresholds(nim, mode, &darkThresh, &midThresh, &brightThresh);
-	printf("%g %g %g\n", darkThresh, midThresh, brightThresh);
+	printf("Otsu %g %g %g\n", darkThresh, midThresh, brightThresh);
 	//apply otsu
 	if (makeBinary == 1)
 		return nifti_binarize(nim, threshold);
@@ -1148,11 +1143,9 @@ staticx int nifti_crop(nifti_image *nim, int tmin, int tsize) {
 		nim->ndim = 4;
 	//nim->dim[4] = nvolOut;
 	nim->nt = nvolOut;
-	#ifndef USING_WASM
 	nim->nu = 1;
 	nim->nv = 1;
 	nim->nw = 1;
-	#endif
 	return 0;
 }
 
@@ -1182,7 +1175,6 @@ staticx int nifti_rescale(nifti_image *nim, double scale, double intercept) {
 	return 0;
 }
 
-#ifndef USING_WASM
 staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int y, int z, double tfce_thresh) {
 	if (nim->nvox < 1)
 		return 1;
@@ -1291,7 +1283,6 @@ staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int 
 	_mm_free(k);
 	return 0;
 }
-#endif
 
 staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 	//https://www.fmrib.ox.ac.uk/datasets/techrep/tr08ss1/tr08ss1.pdf
@@ -1651,7 +1642,7 @@ staticx int nifti_detrend_linear(nifti_image *nim) {
 	return 0;
 } // nifti_detrend_linear()
 
-#ifdef bandpass
+#ifdef HAVE_BUTTERWORTH
 //https://github.com/QtSignalProcessing/QtSignalProcessing/blob/master/src/iir.cpp
 //https://github.com/rkuchumov/day_plot_diagrams/blob/8df48af431dc76b1656a627f1965d83e8693ddd7/data.c
 //https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
@@ -1800,7 +1791,7 @@ staticx int nifti_bandpass(nifti_image *nim, double hp_hz, double lp_hz, double 
 	}
 	return butterworth_filter((flt *)nim->data, nvox3D, nvol, 1 / TRsec, hp_hz, lp_hz);
 } // nifti_bandpass()
-#endif
+#endif // HAVE_BUTTERWORTH
 
 staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
 	//Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
@@ -1997,7 +1988,6 @@ staticx int nifti_demean(nifti_image *nim) {
 	return 0;
 } // nifti_demean()
 
-#ifndef USING_WASM
 staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, int percentage) {
 	//e.g. nifti_dim_reduce(nim, Tmean, 4) reduces 4th dimension, saving mean
 	//int nReduce = nim->dim[dim];
@@ -2174,7 +2164,6 @@ staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, in
 	nim->data = dat;
 	return 0;
 } // nifti_dim_reduce()
-#endif // WASM
 
 staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	sigmamm = fabs(sigmamm);
@@ -2286,7 +2275,6 @@ staticx flt calmin(nifti_image *nim) {
 	return mn;
 } // calmin()
 
-#ifndef USING_WASM
 staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	int nvox3D = nim->nx * nim->ny * nim->nz;
 	if ((nim->datatype != DT_CALC) || (nvox3D < 1))
@@ -2348,7 +2336,6 @@ staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	}
 	return 0;
 } // nifti_tensor_2()
-#endif //WASM
 
 staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 // MD= (Dxx+Dyy+Dzz)/3
@@ -2365,7 +2352,7 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 // 3dDTeig -uddata -prefix AFNIdwi.nii tensor.nii
 // fslmaths tensor.nii -tensor_decomp bork.nii
 // Creates 5*3D and 3*4D files for a total of 14 volumes L1,L2,L3,V1(3),V2(3),V3(3),FA,MD
-#ifdef tensor_decomp
+#ifdef HAVE_TENSOR
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
 		return 1;
 	if (nim->datatype != DT_CALC)
@@ -2587,7 +2574,6 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 	flt *inf32 = (flt *)_mm_malloc(nVox3D * sizeof(flt), 64);
 	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 	int nxy = nim->nx * nim->ny;
-	#ifndef USING_WASM //WASM does not support qsort
 	if (op == fmediank) {
 		flt *vxls = (flt *)_mm_malloc((nkernel) * sizeof(flt), 64);
 		for (int z = 0; z < nim->nz; z++) {
@@ -2678,7 +2664,6 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 		} //for z
 		_mm_free(vxls);
 	} else
-	#endif //WASM does not support qsort
 	if (op == dilMk) { //Mean Dilation of non-zero voxels
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; //offset
@@ -3186,10 +3171,10 @@ staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 #pragma omp parallel for
 	for (int v = 0; v < nvol; v++) {
 		flt *iv32 = i32 + (v * vox3D);
-		flt *imgin = _mm_malloc(vox3D * sizeof(flt), 64); //input values prior to blur
+		flt *imgin = (flt *) _mm_malloc(vox3D * sizeof(flt), 64); //input values prior to blur
 		//edge information:
 		flt mx = 0.0;
-		uint8_t *imgdir = _mm_malloc(vox3D * sizeof(uint8_t), 64); //image direction
+		uint8_t *imgdir = (uint8_t *) _mm_malloc(vox3D * sizeof(uint8_t), 64); //image direction
 		if (isBinary)
 			memset(imgdir, 0, vox3D * sizeof(uint8_t));
 		
@@ -3306,7 +3291,6 @@ staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 	return 0;
 } //nifti_sobel()
 
-#ifndef USING_WASM //WASM does not support changing sform/qform
 staticx int nifti_subsamp2(nifti_image *nim, int offc) {
 	//naive downsampling: this is provided purely to mimic the behavior of fslmaths
 	// see https://nbviewer.jupyter.org/urls/dl.dropbox.com/s/s0nw827nc4kcnaa/Aliasing.ipynb
@@ -3335,7 +3319,7 @@ staticx int nifti_subsamp2(nifti_image *nim, int offc) {
 	if (!neg_determ(nim))
 		x_flip = 1;
 	if (offc) {
-		int *wt = _mm_malloc(nvox3D * nvol * sizeof(int), 64); //weight, just for edges
+		int *wt = (int *) _mm_malloc(nvox3D * nvol * sizeof(int), 64); //weight, just for edges
 		for (int i = 0; i < (nvox3D * nvol); i++) {
 			wt[i] = 0;
 			o32[i] = 0.0;
@@ -3512,7 +3496,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 	for (int v = 0; v < nvol; v++) {
 		flt *iv32 = i32 + (v * invox3D);
 		//reduce in X: half the width: 1/2 input file size
-		flt *imgx = _mm_malloc(nx * nim->ny * nim->nz * sizeof(flt), 64); //input values prior to blur
+		flt *imgx = (flt *) _mm_malloc(nx * nim->ny * nim->nz * sizeof(flt), 64); //input values prior to blur
 		if (nx == nim->nx) //no change in x dimension
 			xmemcpy(imgx, iv32, nx * nim->ny * nim->nz * sizeof(flt));
 		else {
@@ -3532,12 +3516,12 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 			free(contrib);
 		}
 		//reduce in Y: half the height: 1/4 input size
-		flt *imgy = _mm_malloc(nx * ny * nim->nz * sizeof(flt), 64); //input values prior to blur
+		flt *imgy = (flt *) _mm_malloc(nx * ny * nim->nz * sizeof(flt), 64); //input values prior to blur
 		if (ny == nim->ny) //no change in y dimension
 			xmemcpy(imgy, imgx, nx * ny * nim->nz * sizeof(flt));
 		else {
 			CLIST *contrib = createFilter(nim->ny, ny, interp_method);
-			flt *iny = _mm_malloc(nim->ny * sizeof(flt), 64); //input values prior to resize
+			flt *iny = (flt *) _mm_malloc(nim->ny * sizeof(flt), 64); //input values prior to resize
 			for (int z = 0; z < nim->nz; z++) {
 				for (int x = 0; x < nx; x++) {
 					int yo = (z * nx * ny) + x; //output
@@ -3569,7 +3553,7 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 			xmemcpy(ov32, imgy, nx * ny * nz * sizeof(flt));
 		else {
 			CLIST *contrib = createFilter(nim->nz, nz, interp_method);
-			flt *inz = _mm_malloc(nim->nz * sizeof(flt), 64); //input values prior to resize
+			flt *inz = (flt *) _mm_malloc(nim->nz * sizeof(flt), 64); //input values prior to resize
 			int nxy = nx * ny;
 			for (int y = 0; y < ny; y++) {
 				for (int x = 0; x < nx; x++) {
@@ -3631,7 +3615,6 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 	nim->data = dat;
 	return 0;
 } // nifti_resize()
-#endif //WASM does not support changing sform/qform
 
 staticx int essentiallyEqual(float a, float b) {
 	if (isnanx(a) && isnanx(b))
@@ -3766,7 +3749,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 }
 
 #ifndef USING_R
-staticx void rand_test() {
+staticx void rand_test(void) {
 	//https://www.phoronix.com/scan.php?page=news_item&px=Linux-RdRand-Sanity-Check
 	int r0 = rand();
 	for (int i = 0; i < 7; i++)
@@ -3915,7 +3898,6 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		return 1; //edge for 3D volume(s)
 	} else if (op == index1) {
 		//nb FSLmaths flips dim[1] depending on determinant
-		#ifndef USING_WASM 
 		size_t idx = 0;
 		if (!neg_determ(nim)) { //flip x
 			size_t nyzt = nim->nvox / nim->nx;
@@ -3935,7 +3917,6 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				if (f32[i] != 0)
 					f32[i] = idx++;
-		#endif
 	} else if (op == nan1) {
 		for (size_t i = 0; i < nim->nvox; i++)
 			if (isnanx(f32[i]))
@@ -4003,7 +3984,6 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		nim->cal_min = mn;
 		nim->cal_max = mx;
 	} else if (op == rank1) {
-		#ifndef USING_WASM //WASM does not like qsort
 		int nvox3D = nim->nx * nim->ny * nim->nz;
 		int nvol = nim->nvox / nvox3D;
 		if ((nvox3D * nvol) != nim->nvox)
@@ -4044,9 +4024,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				_mm_free(k);
 			} //for i
 		} //nvol > 1
-		#endif //WASM does not like qsort
 	} else if ((op == rank1) || (op == ranknorm1)) {
-		#ifndef USING_WASM //WASM does not like qsort
 		int nvox3D = nim->nx * nim->ny * nim->nz;
 		int nvol = nim->nvox / nvox3D;
 		if ((nvox3D * nvol) != nim->nvox)
@@ -4081,7 +4059,6 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				_mm_free(k);
 			} //for i
 		} //nvol > 1
-		#endif //WASM does not like qsort
 	} else if (op == ztop1) {
 		#ifdef DT32 //issue8
 		flt mn = -5.419;
@@ -4267,7 +4244,6 @@ staticx int nifti_thrp(nifti_image *nim, double v, enum eOp op) {
 	return 0;
 } //nifti_thrp()
 
-#ifndef USING_WASM
 staticx int nifti_roc(nifti_image *nim, double fpThresh, const char *foutfile, const char *fnoise, const char *ftruth) {
 	if (nim->datatype != DT_CALC)
 		return 1;
@@ -4644,7 +4620,7 @@ staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
 	return 0;
 } // nifti_binary()
 
-//bork
+#ifdef NII2MESH
 staticx int nifti_fdr(nifti_image *nim, double qval) {
 	if (nim->datatype != DT_FLOAT32) {
 		printfx("nifti_fdr: Unsupported datatype %d\n", nim->datatype);
@@ -4666,6 +4642,7 @@ staticx int nifti_fdr(nifti_image *nim, double qval) {
 
 	exit(1);
 }
+#endif
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	if (nim->nvox < 1)
@@ -4828,13 +4805,10 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	exit(0);
 } //nifti_compare()
 
-#endif // #ifndef USING_WASM
-
-#ifndef USING_WASM
 #ifdef DT32
-int main32(int argc, char *argv[]) {
+ int main32(int argc, char *argv[]) {
 #else
-int main64(int argc, char *argv[]) {
+ int main64(int argc, char *argv[]) {
 #endif
 	char *fin = NULL, *fout = NULL;
 	//fslmaths in.nii out.nii changes datatype to flt, here we retain (similar to earlier versions of fslmaths)
@@ -4933,10 +4907,6 @@ int main64(int argc, char *argv[]) {
 	}
 #endif
 
-#else
-int mainWASM(nifti_image *nim, int argc, char *argv[]) {		
-	int ac = 0;
-#endif
 	//read operations
 	int nkernel = 0; //number of voxels in kernel
 	int *kernel = make_kernel(nim, &nkernel, 3, 3, 3);
@@ -5094,7 +5064,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			printfx("Warning: not compiled for OpenMP: '-p' ignored\n");
 #endif
 		} else if ((strlen(argv[ac]) > 4) && (argv[ac][0] == '-') && (isupper(argv[ac][1]))) { //isupper
-			#ifndef USING_WASM //WASM does not (yet) adjust image size
 			//All Dimensionality reduction operations names begin with Capital letter, no other commands do!
 			int dim = 0;
 			switch (argv[ac][1]) {
@@ -5137,7 +5106,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 				printfx("Error unknown dimensionality reduction operation: %s\n", argv[ac]);
 				ok = 1;
 			}
-			#endif //WASM does not (yet) adjust image size
 		} else if (!strcmp(argv[ac], "-roi")) {
 			//int , int , int , int , int , int , int , int )
 			if ((argc - ac) < 8) {
@@ -5174,7 +5142,7 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			double lp_sigma = strtod(argv[ac], &end);
 			//ok = nifti_bptf(nim, hp_sigma, lp_sigma);
 			ok = nifti_bptf(nim, hp_sigma, lp_sigma, 1);
-#ifdef bandpass
+#ifdef HAVE_BUTTERWORTH
 		} else if (!strcmp(argv[ac], "-bandpass")) {
 			// niimath test4D -bandpass 0.08 0.008 0 c
 			ac++;
@@ -5186,7 +5154,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ok = nifti_bandpass(nim, lp_hz, hp_hz, TRsec);
 #endif
 		} else if (!strcmp(argv[ac], "-roc")) {
-			#ifndef USING_WASM //WASM does not (yet) support Area-under-ROC
 			//-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth>
 			//-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth>
 			ac++;
@@ -5206,7 +5173,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 				printfx("Error: no output filename specified!\n"); //e.g. volume size might differ
 				goto fail;
 			}
-			#endif //WASM does not (yet) support Area-under-ROC
 		} else if (!strcmp(argv[ac], "-unsharp")) {
 			ac++;
 			double sigma = strtod(argv[ac], &end);
@@ -5237,15 +5203,18 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ac ++;
 			ok = nifti_mesh(nim, darkThresh, midThresh, brightThresh, mx, ac, argc+1, argv);
 			nifti_image_free(nim);
-			exit(ok);
-		#ifdef bwlabelx
+			return ok;
+		#ifdef NII2MESH
 		} else if (strstr(argv[ac], "-bwlabel")) {
 			ac ++;
 			#ifdef DT32
 			int conn = atoi(argv[ac]);
-			size_t dim[3] = {nim->nx, nim->ny, nim->nz};
+			size_t dim[3] = {(size_t)nim->nx, (size_t)nim->ny, (size_t)nim->nz};
 			flt *img = (flt *)nim->data;
-			ok = bwlabel(img, conn, dim, false, false);
+			//int nLabels = bwlabel(img, conn, dim, false, false);
+			int nLabels = bwlabel(img, conn, dim, false, true);
+			if (nLabels < 1)
+				ok = EXIT_FAILURE;
 			#else
 			printfx("'-dt double' does not support bwlabel\n" );
 			ok = EXIT_FAILURE;
@@ -5263,7 +5232,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			ok = nifti_demean(nim);
 		else if (!strcmp(argv[ac], "-detrend"))
 			ok = nifti_detrend_linear(nim);
-		#ifndef USING_WASM //WASM does not (yet) resize images
 		else if (!strcmp(argv[ac], "-subsamp2"))
 			ok = nifti_subsamp2(nim, 0);
 		else if (!strcmp(argv[ac], "-subsamp2offc"))
@@ -5293,12 +5261,13 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			}
 			nifti_compare(nim, argv[ac], thresh);
 			//n.b. nifti_compare always terminates
+		#ifdef NII2MESH
 		} else if (!strcmp(argv[ac], "-fdr")) { //--function terminates without saving image
 				ac++;
 				double qval = strtod(argv[ac], &end);
 			nifti_fdr(nim, qval); //always terminates
+		#endif
 		}
-		#endif //WASM does not (yet) resize images
 		else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-fillh"))
@@ -5324,12 +5293,10 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 				double mm = strtod(argv[ac], &end);
 				kernel = make_kernel_sphere(nim, &nkernel, mm);
 			}
-			#ifndef USING_WASM //WASM does not read files
 			if (!strcmp(argv[ac], "file")) {
 				ac++;
 				kernel = make_kernel_file(nim, &nkernel, argv[ac]);
 			}
-			#endif //WASM does not read files
 			if (!strcmp(argv[ac], "gauss")) {
 				ac++;
 				double mm = strtod(argv[ac], &end);
@@ -5357,7 +5324,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 				ok = 1;
 			}
 		} 
-		#ifndef USING_WASM //WASM does not handle tensors or file reads
 		else if (!strcmp(argv[ac], "-tensor_2lower")) {
 			ok = nifti_tensor_2(nim, 0);
 		} else if (!strcmp(argv[ac], "-tensor_2upper")) {
@@ -5388,7 +5354,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			if (!nim)
 				ok = 1; //error
 		} 
-		#endif //WASM does not handle tensors or file reads
 		else if (!strcmp(argv[ac], "-grid")) {
 			ac++;
 			double v = strtod(argv[ac], &end);
@@ -5425,7 +5390,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			int c = atoi(argv[ac]);
 			ok = nifti_tfce(nim, H, E, c);
 		} 
-		#ifndef USING_WASM //WASM does not support tfceS
 		else if (!strcmp(argv[ac], "-tfceS")) {
 			ac++;
 			double H = strtod(argv[ac], &end);
@@ -5443,7 +5407,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 			double tfce_thresh = strtod(argv[ac], &end);
 			ok = nifti_tfceS(nim, H, E, c, x, y, z, tfce_thresh);
 		} 
-		#endif //WASM does not support tfceS
 		else if (op == unknown) {
 			printfx("!!Error: unsupported operation '%s'\n", argv[ac]);
 			goto fail;
@@ -5461,11 +5424,7 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 					printfx("Error: '%s' expects numeric value\n", argv[ac - 1]);
 					goto fail;
 				} else
-					#ifdef USING_WASM
-					ok = 123; //WASM does not read files
-					#else
 					ok = nifti_binary(nim, argv[ac], op);
-					#endif
 			} else {
 				if (op == add)
 					ok = nifti_rescale(nim, 1.0, v);
@@ -5511,7 +5470,6 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 		if (ok != 0) return ok;
 		ac++;
 	}
-	#ifndef USING_WASM
 	//convert data to output type (-odt)
 	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
 		return 1;
@@ -5519,173 +5477,14 @@ int mainWASM(nifti_image *nim, int argc, char *argv[]) {
 	nifti_save(nim, ""); //nifti_image_write( nim );
 	// and clean up memory
 	nifti_image_free(nim);
-	#endif
 	if (kernel != NULL)
 		_mm_free(kernel);
 	return 0;
 
 fail:
-	#ifndef USING_WASM
 	nifti_image_free(nim);
-	#endif
 	if (kernel != NULL)
 		_mm_free(kernel);
 	return 1;
 }
 
-//All code below for WASM reading
-#ifdef USING_WASM
-static char* splitArgv(char **str, char **word){
-	const char QUOTE = '\'';
-	bool inquotes = false;
-	// optimization
-	if( **str == 0 )
-		return NULL;
-	// Skip leading spaces.
-	while (**str && isspace(**str)) 
-		(*str)++;
-	if( **str == '\0')
-	return NULL;
-	// Phrase in quotes is one arg
-	if( **str == QUOTE ){
-		(*str)++;
-		inquotes = true;
-	}
-	// Set phrase beginning
-	*word = *str;
-	// Skip all chars if in quotes
-	if( inquotes ){
-		while( **str && **str!=QUOTE )
-			(*str)++;
-		//if( **str!= QUOTE )
-	}else{
-		// Skip non-space characters.
-		while( **str && !isspace(**str) )
-			(*str)++;
-	}
-	// Null terminate the phrase and set `str` pointer to next symbol
-	if(**str)
-		*(*str)++ = '\0';
-	return *str;
-}
-
-char* parseStrToArgcArgvInsitu( char *str, const int argc_MAX, int *argc, char* argv[] ) {
-	*argc = 0;
-	while( *argc<argc_MAX-1 && splitArgv(&str, &argv[*argc]) ){
-		++(*argc);
-		if( *str == '\0' )
-		break;
-	}
-	argv[*argc] = NULL;
-	return str;
-};
-
-float clampf(float d, float min, float max) {
-	float t = d < min ? min : d;
-	return t > max ? max : t;
-}
-
-staticx int nifti_unscale(nifti_image *nim, double scale, double intercept) {
-	//invert linear transform of data
-	if ((nim->nvox < 1) || (scale == 0.0))
-		return 1;
-	flt *f32 = (flt *)nim->data;
-	if (intercept == 0.0) {
-		if (scale == 1.0)
-			return 0; //nothing to do
-		nifti_mul(f32, nim->nvox, 1.0 / scale);
-		return 0;
-	} else if (scale == 1.0) {
-		nifti_add(f32, nim->nvox, - intercept);
-		return 0;
-	}
-	flt scl = 1.0 / scale;
-	for (size_t i = 0; i < nim->nvox; i++ )
-		f32[i] = (f32[i] - intercept ) * scl;
-	return 0;
-}
-
-int mainWASM2(nifti_image *nim, int argc, char *argv[], float *vars) {
-	nim->scl_slope = vars[0];
-	nim->scl_inter = vars[1];
-	nim->cal_min = vars[2];
-	nim->cal_max = vars[3];
-	if (nim->scl_slope != 0.0)
-		nifti_rescale(nim, nim->scl_slope, nim->scl_inter);
-	int ret = mainWASM(nim, argc, argv);
-	if (nim->scl_slope == 0.0) //bogus vars*, do not rescale, do not waste time calculating robust range
-		return ret;
-	nifti_unscale(nim, nim->scl_slope, nim->scl_inter);
-	flt mn, mx;
-	nifti_robust_range(nim, &mn, &mx, 0);
-	vars[0] = nim->scl_slope;
-	vars[1] = nim->scl_inter;
-	vars[2] = mn;
-	vars[3] = mx;
-	return ret;
-}
-
-//niimathx extends 'niimath' call to have float vars that may be changed by computations
-//vars[0] = scl_slope
-//vars[1] = scl_inter
-//vars[2] = cal_min
-//vars[3] = cal_max
-__attribute__((used)) int niimathx (void *img, float *vars, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
-	int nvox = nx * ny * nz * MAX(nt, 1);
-	if (nvox < 1) return 101;
-	#define argc_MAX 128
-	char* argv[argc_MAX] = {0};
-	int argc=0;
-	char* rest = parseStrToArgcArgvInsitu(cmdstr,argc_MAX,&argc,argv);
-	if( *rest!='\0' )
-		return 1;
-	nifti_image nim;
-	nim.data = img;
-	nim.nvox = nvox;
-	nim.nx = nx;
-	nim.ny = ny;
-	nim.nz = nz;
-	nim.nt = nt;
-	nim.dx = dx;
-	nim.dy = dy;
-	nim.dz = dz;
-	nim.dt = dt;
-	nim.scl_slope = 1.0;
-	nim.scl_inter = 0.0;
-	nim.cal_max = 1.0;
-	nim.cal_min = 0.0;
-	nim.datatype = DT_FLOAT;
-	if (datatype == DT_FLOAT) 
-		return mainWASM2(&nim, argc, argv, vars);//niimath_core(&nim, cmdstr);
-	if (datatype == DT_SIGNED_SHORT) {
-		int16_t *img16 = (int16_t *)img;
-		float *img32 = (float *) _mm_malloc(nvox * sizeof(float), 64);
-		for (int i = 0; i < nvox; ++i)
-			img32[i] = img16[i];
-		nim.data = img32;
-		int ret = mainWASM2(&nim, argc, argv, vars);
-		for (int i = 0; i < nvox; ++i)
-			img16[i] = clampf(img32[i], -32768.0, 32767.0);//img32[i];
-		_mm_free(img32);
-		return ret;
-	}
-	if (datatype == DT_UNSIGNED_CHAR) {
-		uint8_t *img8 = (uint8_t *)img;
-		float *img32 = (float *) _mm_malloc(nvox * sizeof(float), 64);
-		for (int i = 0; i < nvox; ++i)
-			img32[i] = img8[i];
-		nim.data = img32;
-		int ret = mainWASM2(&nim, argc, argv, vars);
-		for (int i = 0; i < nvox; ++i)
-			img8[i] = clampf(img32[i], 0.0, 255.0); //img32[i]; 
-		_mm_free(img32);
-		return ret;
-	}
-	return 88;
-}
-
-__attribute__((used)) int niimath (void *img, int datatype, int nx, int ny, int nz, int nt, float dx, float dy, float dz, float dt, char * cmdstr){
-	float vars[] = {0.0, 0.0, 0.0, 0.0};
-	return niimathx (img, &vars[0], datatype, nx, ny, nz, nt, dx, dy, dz, dt, cmdstr);
-}
-#endif //WASM code

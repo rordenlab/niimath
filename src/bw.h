@@ -21,4 +21,8 @@ void Filt(double *X, int nX, double *a, double *b, int order, double *Z);
 void FiltRev(double *X, int nX, double *a, double *b, int order, double *Z);
 int butter_design(int order, double fl, double fh, double ** a, double ** b, double ** IC);
 
+#ifdef  __cplusplus
+}
+#endif
+
 #endif // EX_BUTTER_H

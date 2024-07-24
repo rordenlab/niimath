@@ -4903,7 +4903,6 @@ znzFile nifti_image_open(const char * hname, char * opts, nifti_image ** nim)
   if( ((*nim) == NULL)      || ((*nim)->iname == NULL) ||
       ((*nim)->nbyper <= 0) || ((*nim)->nvox <= 0)       )
      ERREX("bad header info") ;
-
   /* open image data file */
   fptr = znzopen( (*nim)->iname, opts, nifti_is_gzfile((*nim)->iname) );
   if( znz_isnull(fptr) ) ERREX("Can't open data file") ;
@@ -5454,7 +5453,7 @@ void * nifti_read_header( const char *hname, int *nver, int check )
       }
       memcpy(hresult, (void *)&n1hdr, h1size);
 
-      if ( check && ! nifti_hdr1_looks_good(hresult) ){
+      if ( check && ! nifti_hdr1_looks_good(( nifti_1_header *) hresult) ){
          LNI_FERR(fname,"nifti_1_header looks bad for file", hname);
          return hresult;
       }
@@ -5466,7 +5465,7 @@ void * nifti_read_header( const char *hname, int *nver, int check )
       }
       memcpy(hresult, &n2hdr, h2size);
 
-      if ( check && ! nifti_hdr2_looks_good(hresult) ){
+      if ( check && ! nifti_hdr2_looks_good((nifti_2_header *) hresult) ){
          LNI_FERR(fname,"nifti_2_header looks bad for file", hname);
          return hresult;
       }

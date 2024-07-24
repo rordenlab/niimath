@@ -58,7 +58,8 @@ void set_method    ( MCB *mcb, int originalMC ) {
 float get_data  (  MCB *mcb, int i,  int j,  int k )  { 
    return (mcb->data[ i + j*mcb->size_x + k*mcb->size_x*mcb->size_y]) ; 
 }
-void  set_data  (  MCB *mcb, float val,  int i,  int j,  int k ) {
+
+void set_data  (  MCB *mcb, float val,  int i,  int j,  int k ) {
   (mcb->data[ i + j*mcb->size_x + k*mcb->size_x*mcb->size_y] = val) ; 
 }
 int   get_x_vert(  MCB *mcb , int i,  int j,  int k )  { return (mcb->x_verts[ i + j*mcb->size_x + k*mcb->size_x*mcb->size_y] ); }
@@ -1065,7 +1066,8 @@ int add_c_vertex( MCB *mcb)
 }
 
 #ifdef NII2MESH
-int marchingCubes(float * img, size_t dim[3], int lo[3], int hi[3], int originalMC, float isolevel, vec3d **vs, vec3i **ts, int *nv, int *nt) {
+
+int marchingCubes(float * img, short dim[3], int lo[3], int hi[3], int originalMC, float isolevel, vec3d **vs, vec3i **ts, int *nv, int *nt) {
   MCB * mcp = MarchingCubes(-1, -1, -1);
   int NX = hi[0] - lo[0] + 1;
   int NY = hi[1] - lo[1] + 1;
@@ -1073,6 +1075,15 @@ int marchingCubes(float * img, size_t dim[3], int lo[3], int hi[3], int original
   set_resolution( mcp, NX, NY, NZ) ;
   init_all(mcp) ;
   float * im = mcp->data;
+  //initialize output volume, which can have one more row/column/slice than input
+  int inXYZ = dim[0] * dim[1] * dim[2];
+  int outXYZ = NX * NY * NZ;
+  float mn = img[0];
+  for (int i=0;i<inXYZ;i++)
+    mn = fmin(mn, img[i]);
+  mn = mn - isolevel;
+  for (int i=0;i<outXYZ;i++)
+    im[i] = mn;
   int i = 0;
   int inX = dim[0];
   int inXY = dim[0] * dim[1];
@@ -1081,7 +1092,8 @@ int marchingCubes(float * img, size_t dim[3], int lo[3], int hi[3], int original
       int zy = ((y+lo[1]) * inX) + ((z+lo[2]) * inXY);
       for (int x=0;x<NX;x++) {
         int j = lo[0] + x + zy;
-        im[i] = img[j] - isolevel;
+        if (j < inXYZ)
+          im[i] = img[j] - isolevel;
         i++;
       }
     }
@@ -1094,14 +1106,14 @@ int marchingCubes(float * img, size_t dim[3], int lo[3], int hi[3], int original
     return EXIT_FAILURE;
   }
   int npt = mcp->nverts;
-  *vs = malloc(npt*sizeof(vec3d));
+  *vs = (vec3d *) malloc(npt*sizeof(vec3d));
   for (int i = 0; i < npt; i++) {
     (*vs)[i].x = mcp->vertices[i].x + lo[0];
     (*vs)[i].y = mcp->vertices[i].y + lo[1];
     (*vs)[i].z = mcp->vertices[i].z + lo[2];
   }
   int ntri = mcp->ntrigs;
-  *ts = malloc(ntri * sizeof(vec3i));
+  *ts = (vec3i *) malloc(ntri * sizeof(vec3i));
   for (int i=0;i<ntri;i++) {
     (*ts)[i].x = mcp->triangles[i].v3;
     (*ts)[i].y = mcp->triangles[i].v2;

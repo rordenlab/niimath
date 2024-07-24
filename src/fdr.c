@@ -23,7 +23,6 @@
 #endif
 
 float fdr(float *pvals, double qval, size_t nvox) {
-	double cV = 1.0;
 	if ((qval < 0.0) || (qval > 1.0)) {
 		printfd("qval out of range (0-1).\n");
 		return NAN;

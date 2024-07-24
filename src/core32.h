@@ -1,17 +1,6 @@
-#ifndef CR_CORE32_H
-#define CR_CORE32_H
+#ifndef CORE32_H
+#define CORE32_H
 
-#ifdef  __cplusplus
-extern "C" {
-#endif
+int main32(int argc, char *argv[]);
 
-	int main32(int argc, char * argv[]);
-#ifdef  __cplusplus
-}
-#endif
-
-#endif //CR_CORE32_H
-
-
-
-
+#endif // CORE32_H

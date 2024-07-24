@@ -16,7 +16,9 @@
 	#endif
 #endif
 #include "meshify.h"
-#include "base64.h" //required for GIfTI
+#ifdef HAVE_FORMATS
+	#include "base64.h" //required for GIfTI
+#endif
 #include "bwlabel.h"
 #include "radixsort.h"
 #include "meshtypes.h"
@@ -32,15 +34,15 @@
 #define MAX(a,b) (((a)>(b))?(a):(b))
 #endif
 
-double sqr(double x) {
+static double sqr(double x) {
 	return x * x;
 }
 
-double dx(vec3d p0, vec3d p1) {
+static double dx(vec3d p0, vec3d p1) {
 	return sqrt( sqr(p0.x - p1.x) + sqr(p0.y - p1.y) + sqr(p0.z - p1.z));
 }
 
-int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool verbose) {
+static int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool verbose) {
 	//"vertex welding": reduces the number of vertices, number of faces unchanged
 	double startTime = clockMsec();
 	vec3d *pts = *inpt;
@@ -108,7 +110,7 @@ int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool verbose) {
 //#define DBL_EPSILON 2.2204460492503131e-16 // double
 #endif
 
-int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, bool verbose) {
+static int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, bool verbose) {
 	//reduces the number of triangles, number of vertices unchanged
 	double startTime = clockMsec();
 	vec3i *tris = *intris;
@@ -165,7 +167,7 @@ int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, bool verbo
 	return newtri;
 }
 
-int quick_smooth(float * img, int nx, int ny, int nz) {
+static int quick_smooth(float * img, int nx, int ny, int nz) {
 	if ((nx < 5) || (ny < 5) || (nz < 5))
 		return EXIT_FAILURE;
 	int nvox = nx * ny * nz;
@@ -213,7 +215,7 @@ int quick_smooth(float * img, int nx, int ny, int nz) {
 	return EXIT_SUCCESS;
 }
 
-void dilate(float * img, size_t dim[3], bool is26) {
+static void dilate(float * img, size_t dim[3], bool is26) {
 	int nx = dim[0];
 	int ny = dim[1];
 	int nz = dim[2];
@@ -261,14 +263,19 @@ void dilate(float * img, size_t dim[3], bool is26) {
 	free(k);
 }
 
-double clockMsec() { //return milliseconds since midnight
+double clockMsec(void) { //return milliseconds since midnight
 #ifdef _MSC_VER
 	clock_t t = clock();
 	return (double)((double)t) / (CLOCKS_PER_SEC / 1000.0);
 #else
-	struct timespec _t;
-	clock_gettime(CLOCK_MONOTONIC, &_t);
-	return _t.tv_sec*1000.0 + (_t.tv_nsec/1.0e6);
+	#ifdef __MINGW32__ //issue 4
+		time_t seconds_since_midnight = time(NULL) % 86400;
+		return seconds_since_midnight;
+	#else
+		struct timespec _t;
+		clock_gettime(CLOCK_MONOTONIC, &_t);
+		return _t.tv_sec*1000.0 + (_t.tv_nsec/1.0e6);
+	#endif
 #endif
 }
 
@@ -276,7 +283,7 @@ long timediff(double startTimeMsec, double endTimeMsec) {
 	return round(endTimeMsec - startTimeMsec);
 }
 
-int meshify(float * img, size_t dim[3], int originalMC, float isolevel, vec3i **t, vec3d **p, int *nt, int *np, int preSmooth, bool onlyLargest, bool fillBubbles, bool verbose) {
+int meshify(float * img, short dim[3], int originalMC, float isolevel, vec3i **t, vec3d **p, int *nt, int *np, bool preSmooth, bool onlyLargest, bool fillBubbles, bool verbose) {
 // img: input volume
 // hdr: nifti header
 // isolevel: air/surface threshold
@@ -381,12 +388,12 @@ int meshify(float * img, size_t dim[3], int originalMC, float isolevel, vec3i **
 	return EXIT_SUCCESS;
 }
 
-bool littleEndianPlatform () {
+static bool littleEndianPlatform () {
 	uint32_t value = 1;
 	return (*((char *) &value) == 1);
 }
 
-void swap_4bytes( size_t n , void *ar ) { // 4 bytes at a time
+static void swap_4bytes( size_t n , void *ar ) { // 4 bytes at a time
 	size_t ii ;
 	unsigned char * cp0 = (unsigned char *)ar, * cp1, * cp2 ;
 	unsigned char tval ;
@@ -400,60 +407,12 @@ void swap_4bytes( size_t n , void *ar ) { // 4 bytes at a time
 	return ;
 }
 
-typedef struct {
-	float x,y,z;
-} vec3s; //single precision (float32)
-
-vec3s vec3d2vec4s(vec3d v) {
-	return (vec3s){.x = (float)v.x, .y = (float)v.y, .z = (float)v.z};
-} // convert float64 to float32
-
-int save_freesurfer(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt) {
-//FreeSurfer Triangle Surface Binary Format http://www.grahamwideman.com/gw/brain/fs/surfacefileformats.htm
-	uint8_t magic[3] = {0xFF, 0xFF, 0xFE};
-	FILE *fp = fopen(fnm,"wb");
-	if (fp == NULL)
-		return EXIT_FAILURE;
-	fwrite(magic, 3, 1, fp);
-	time_t t = time(NULL);
-	char s[128] = "";
-	struct tm *tm = localtime(&t);
-	strftime(s, sizeof(s), "created by niimath on %c\n\n", tm);
-	fwrite(s, strlen(s), 1, fp);
-	int32_t VertexCount = npt;
-	int32_t FaceCount = ntri;
-	if ( &littleEndianPlatform) {
-		swap_4bytes(1, &VertexCount);
-		swap_4bytes(1, &FaceCount);
-	}
-	fwrite(&VertexCount, sizeof(int32_t), 1, fp);
-	fwrite(&FaceCount, sizeof(int32_t), 1, fp);
-	vec3s *pts32 = (vec3s *) malloc(npt * sizeof(vec3s));
-	for (int i = 0; i < npt; i++) //double->single precision
-		pts32[i] = vec3d2vec4s(pts[i]);
-	if (&littleEndianPlatform)
-		swap_4bytes(npt * 3, pts32);
-	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
-	free(pts32);
-	if (&littleEndianPlatform) {
-		vec3i *trisSwap = (vec3i *) malloc(ntri * sizeof(vec3i));
-		for (int i = 0; i < ntri; i++)
-			trisSwap[i] = tris[i];
-		swap_4bytes(ntri * 3, trisSwap);
-		fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
-		free(trisSwap);
-	} else
-		fwrite(tris, ntri * sizeof(vec3i), 1, fp);
-	fclose(fp);
-	return EXIT_SUCCESS;
-}
-
 #ifdef HAVE_ZLIB
 #ifdef HAVE_JSON
 
 enum TZipMethod {zmZlib, zmGzip, zmBase64, zmLzip, zmLzma, zmLz4, zmLz4hc};
 
-int zmat_run(const size_t inputsize, unsigned char *inputstr, size_t *outputsize, unsigned char **outputbuf, const int zipid, int *ret, const int iscompress){
+static int zmat_run(const size_t inputsize, unsigned char *inputstr, size_t *outputsize, unsigned char **outputbuf, const int zipid, int *ret, const int iscompress){
 	z_stream zs;
 	size_t buflen[2]={0};
 	*outputbuf=NULL;
@@ -520,7 +479,7 @@ int zmat_run(const size_t inputsize, unsigned char *inputstr, size_t *outputsize
 	return 0;
 }
 
-int save_jmsh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+static int save_jmsh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	FILE *fp;
 	cJSON *root=NULL, *hdr=NULL, *node=NULL, *face=NULL;
 	char *jsonstr=NULL;
@@ -592,24 +551,15 @@ int save_jmsh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 #endif //HAVE_JSON
 #endif //HAVE_ZLIB
 
-int save_json(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
-	FILE *fp = fopen(fnm,"w");
-	if (fp == NULL)
-		return EXIT_FAILURE;
-	fprintf(fp,"{\n");
-	fprintf(fp,"\t\"_DataInfo_\":{\n\t\t\"JMeshVersion\":\"0.5\",\n\t\t\"Comment\":\"Created by nii2mesh\"\n\t},\n");
-	fprintf(fp,"\t\"MeshVertex3\":[\n");
-	for (int i=0;i<npt;i++)
-		fprintf(fp, "[%g,\t%g,\t%g],\n", pts[i].x, pts[i].y,pts[i].z);
-	fprintf(fp,"\t],\n\t\"MeshTri3\":[\n");
-	for (int i=0;i<ntri;i++)
-		fprintf(fp, "[%d,\t%d,\t%d],\n", tris[i].x+1, tris[i].y+1, tris[i].z+1);
-	fprintf(fp,"\t]\n}\n");
-	fclose(fp);
-	return EXIT_SUCCESS;
-}
+typedef struct {
+	float x,y,z;
+} vec3s; //single precision (float32)
 
-int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz) {
+static vec3s vec3d2vec4s(vec3d v) {
+	return (vec3s){.x = (float)v.x, .y = (float)v.y, .z = (float)v.z};
+} // convert float64 to float32
+
+static int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz) {
 //https://github.com/neurolabusc/surf-ice/tree/master/mz3
 	#ifdef _MSC_VER
 #pragma pack(2)
@@ -688,7 +638,66 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	return EXIT_SUCCESS;
 }
 
-int save_off(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+#ifdef HAVE_FORMATS
+
+static int save_freesurfer(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt) {
+//FreeSurfer Triangle Surface Binary Format http://www.grahamwideman.com/gw/brain/fs/surfacefileformats.htm
+	uint8_t magic[3] = {0xFF, 0xFF, 0xFE};
+	FILE *fp = fopen(fnm,"wb");
+	if (fp == NULL)
+		return EXIT_FAILURE;
+	fwrite(magic, 3, 1, fp);
+	time_t t = time(NULL);
+	char s[128] = "";
+	struct tm *tm = localtime(&t);
+	strftime(s, sizeof(s), "created by niimath on %c\n\n", tm);
+	fwrite(s, strlen(s), 1, fp);
+	int32_t VertexCount = npt;
+	int32_t FaceCount = ntri;
+	if ( &littleEndianPlatform) {
+		swap_4bytes(1, &VertexCount);
+		swap_4bytes(1, &FaceCount);
+	}
+	fwrite(&VertexCount, sizeof(int32_t), 1, fp);
+	fwrite(&FaceCount, sizeof(int32_t), 1, fp);
+	vec3s *pts32 = (vec3s *) malloc(npt * sizeof(vec3s));
+	for (int i = 0; i < npt; i++) //double->single precision
+		pts32[i] = vec3d2vec4s(pts[i]);
+	if (&littleEndianPlatform)
+		swap_4bytes(npt * 3, pts32);
+	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
+	free(pts32);
+	if (&littleEndianPlatform) {
+		vec3i *trisSwap = (vec3i *) malloc(ntri * sizeof(vec3i));
+		for (int i = 0; i < ntri; i++)
+			trisSwap[i] = tris[i];
+		swap_4bytes(ntri * 3, trisSwap);
+		fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
+		free(trisSwap);
+	} else
+		fwrite(tris, ntri * sizeof(vec3i), 1, fp);
+	fclose(fp);
+	return EXIT_SUCCESS;
+}
+
+static int save_json(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+	FILE *fp = fopen(fnm,"w");
+	if (fp == NULL)
+		return EXIT_FAILURE;
+	fprintf(fp,"{\n");
+	fprintf(fp,"\t\"_DataInfo_\":{\n\t\t\"JMeshVersion\":\"0.5\",\n\t\t\"Comment\":\"Created by nii2mesh\"\n\t},\n");
+	fprintf(fp,"\t\"MeshVertex3\":[\n");
+	for (int i=0;i<npt;i++)
+		fprintf(fp, "[%g,\t%g,\t%g],\n", pts[i].x, pts[i].y,pts[i].z);
+	fprintf(fp,"\t],\n\t\"MeshTri3\":[\n");
+	for (int i=0;i<ntri;i++)
+		fprintf(fp, "[%d,\t%d,\t%d],\n", tris[i].x+1, tris[i].y+1, tris[i].z+1);
+	fprintf(fp,"\t]\n}\n");
+	fclose(fp);
+	return EXIT_SUCCESS;
+}
+
+static int save_off(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	FILE *fp = fopen(fnm,"w");
 	if (fp == NULL)
 		return EXIT_FAILURE;
@@ -701,7 +710,7 @@ int save_off(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	return EXIT_SUCCESS;
 }
 
-int save_obj(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+static int save_obj(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	FILE *fp = fopen(fnm,"w");
 	if (fp == NULL)
 		return EXIT_FAILURE;
@@ -713,7 +722,7 @@ int save_obj(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	return EXIT_SUCCESS;
 }
 
-int save_stl(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+static int save_stl(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	//binary STL http://paulbourke.net/dataformats/stl/
 	//n.b. like other tools, ignores formal restriction that all adjacent facets must share two common vertices.
 	//n.b. does not write normal
@@ -752,7 +761,7 @@ int save_stl(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	return EXIT_SUCCESS;
 }
 
-int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	#ifdef _MSC_VER
 #pragma pack(1)
 	typedef struct  {
@@ -807,7 +816,7 @@ int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	return EXIT_SUCCESS;
 }
 
-int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz){
+static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz){
 	//https://www.nitrc.org/projects/gifti/
 	//https://stackoverflow.com/questions/342409/how-do-i-base64-encode-decode-in-c
 	FILE *fp = fopen(fnm,"wb");
@@ -920,7 +929,7 @@ int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	return EXIT_SUCCESS;
 }
 
-int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
+static int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	typedef struct {
 		uint32_t n, x,y,z;
 	} vec4i;
@@ -959,6 +968,8 @@ int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt){
 	return EXIT_SUCCESS;
 }
 
+#endif //HAVE_FORMATS
+
 void strip_ext(char *fname){
 	char *end = fname + strlen(fname);
 	while (end > fname && *end != '.' && *end != '\\' && *end != '/') {
@@ -976,20 +987,15 @@ int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool 
 	strip_ext(basenm); // ~/file.nii -> ~/file
 	if (strlen(fnm) > strlen(basenm))
 		strcpy(ext, fnm + strlen(basenm));
-	if (strstr(ext, ".gii"))
+	if (strstr(ext, ".mz3"))
+		return save_mz3(fnm, tris, pts, ntri, npt, isGz);
+#ifdef HAVE_FORMATS
+	else if (strstr(ext, ".gii"))
 		return save_gii(fnm, tris, pts, ntri, npt, isGz);
 	else if ((strstr(ext, ".inflated")) || (strstr(ext, ".pial")))
 		return save_freesurfer(fnm, tris, pts, ntri, npt);
-#ifdef HAVE_ZLIB
-#ifdef HAVE_JSON
-	else if (strstr(ext, ".jmsh"))
-		return save_jmsh(fnm, tris, pts, ntri, npt);
-#endif //HAVE_JSON
-#endif //HAVE_ZLIB
 	else if (strstr(ext, ".json"))
 		return save_json(fnm, tris, pts, ntri, npt);
-	else if (strstr(ext, ".mz3"))
-		return save_mz3(fnm, tris, pts, ntri, npt, isGz);
 	else if (strstr(ext, ".off"))
 		return save_off(fnm, tris, pts, ntri, npt);
 	else if (strstr(ext, ".obj"))
@@ -1000,12 +1006,19 @@ int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool 
 		return save_stl(fnm, tris, pts, ntri, npt);
 	else if (strstr(ext, ".vtk"))
 		return save_vtk(fnm, tris, pts, ntri, npt);
+#endif //HAVE_FORMATS
+#ifdef HAVE_ZLIB
+#ifdef HAVE_JSON
+	else if (strstr(ext, ".jmsh"))
+		return save_jmsh(fnm, tris, pts, ntri, npt);
+#endif //HAVE_JSON
+#endif //HAVE_ZLIB
 	strcpy(basenm, fnm);
-	strcat(basenm, ".obj");
-	return save_obj(basenm, tris, pts, ntri, npt);
+	strcat(basenm, ".mz3");
+	return save_mz3(basenm, tris, pts, ntri, npt, isGz);
 }
 
-double sform(vec3d p, float srow[4]) {
+static double sform(vec3d p, float srow[4]) {
 	return (p.x * srow[0])+(p.y * srow[1])+(p.z * srow[2])+srow[3];
 }
 

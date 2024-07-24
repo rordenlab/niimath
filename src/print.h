@@ -9,9 +9,8 @@
 	#define printfx(...) REprintf(__VA_ARGS__)
 	int niimath_rand ();
 #else
-	#ifdef USING_WASM
-		//WASM is silent: use return value to detect an error
-		#define printfx(...)
+	#ifdef __EMSCRIPTEN__
+		#define printfx(...) printf( __VA_ARGS__)
 	#else
 		#include <stdio.h>
 		#define printfx(...) fprintf(stderr, __VA_ARGS__)

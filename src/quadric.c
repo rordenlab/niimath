@@ -524,3 +524,4 @@ void quadric_simplify_mesh(vec3d **vs, vec3i **ts, int* nvert, int *ntri, int ta
 	free(triangles);
 	free(vertices);
 } //quadric_simplify_mesh()
+

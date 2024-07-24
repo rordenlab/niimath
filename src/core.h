@@ -7,22 +7,11 @@ extern "C" {
 
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef USING_WASM
-  #include <nifti2_wasm.h>
-#else
-  #include <nifti2_io.h>
-#endif
+#include <nifti2_io.h>
 #include <float.h> //FLT_EPSILON
 //#include <immintrin.h>
 #include <limits.h>
 
-
-#ifdef USING_WASM
-void *xmalloc(size_t size);
-void xfree(void *p);
- #define _mm_malloc(size, alignment) xmalloc(size)
- #define _mm_free(ptr) xfree(ptr)
-#endif
 
 //CORE32 and CORE64 handle Float32 and Float64 operations, CORE handles shared code 
 
@@ -130,16 +119,12 @@ typedef struct {                   /** x4 vector struct **/
     float v[4] ;
 } vec4 ;
 
-#ifdef USING_WASM
-void xmemcpy ( void * destination, const void * source, size_t num );
-#else
 int nifti_save(nifti_image * nim, const char *postfix);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);
 mat44 xform(nifti_image * nim);
 int nifti_image_change_datatype ( nifti_image * nim, int dt , in_hdr * ihdr);
 float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
-#endif
 vec4 setVec4(float x, float y, float z);
 vec4 nifti_vect44mat44_mul(vec4 v, mat44 m );
 int neg_determ(nifti_image * nim);

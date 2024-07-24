@@ -1698,7 +1698,7 @@ void EIG_tsfunc(
 {
   #define SMALLNUMBER 1E-4
   int i,j;
-  static int nvox , ncall ;
+  // static int nvox , ncall ;
    int maxindex, minindex, midindex;
    float temp, minvalue, maxvalue;
    int sortvector[3];
@@ -1721,8 +1721,8 @@ void EIG_tsfunc(
 
       if( npts > 0 ){  /* the "start notification" */
 
-         nvox  = npts ;                       /* keep track of   */
-         ncall = 0 ;                          /* number of calls */
+         // nvox  = npts ;                       /* keep track of   */
+         // ncall = 0 ;                          /* number of calls */
 
       } else {  /* the "end notification" */
 

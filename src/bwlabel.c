@@ -10,6 +10,7 @@
  #include <unistd.h>
 #endif
 #include <stdint.h>
+#include "bwlabel.h"
 
 #define printfx(...) fprintf(stderr, __VA_ARGS__)
 
@@ -50,7 +51,7 @@
 #define MIN(A,B) ((A) > (B) ? (B) : (A))
 #endif
 
-void fill_tratab(uint32_t  *tt, uint32_t  *nabo, uint32_t  nr_set)  {
+static void fill_tratab(uint32_t  *tt, uint32_t  *nabo, uint32_t  nr_set)  {
 /*
 *tt   Translation table
 *nabo   Set of neighbours
@@ -90,20 +91,18 @@ nr_set   Number of neighbours in nabo
 
 #define idx(A,B,C,DIM) ((C)*DIM[0]*DIM[1] + (B)*DIM[0] + (A))
 
-uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
-                                  uint32_t  r,       /* row */
-                                  uint32_t  c,       /* column */
-                                  uint32_t  sl,      /* slice */
-                                  size_t        dim[3],  /* dimensions of il */
-                                  uint32_t  conn,    /* Connectivity criterion */
-                                  uint32_t  *tt)     /* Translation table */
-//                                  uint32_t  ttn)     /* Size of translation table */
+static uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
+                                    uint32_t  r,       /* row */
+                                    uint32_t  c,       /* column */
+                                    uint32_t  sl,      /* slice */
+                                    size_t   dim[3],  /* dimensions of il */
+                                    uint32_t  conn,    /* Connectivity criterion */
+                                    uint32_t *nabo,
+                                    uint32_t  *tt)     /* Translation table */
 {
-   uint32_t l=0;
-   uint32_t nabo[9];
-   uint32_t nr_set = 0;
-
    if (!sl) return(0);
+   uint32_t l=0;
+   uint32_t nr_set = 0;
    if (conn >= 6)
    {
       if ((l = il[idx(r,c,sl-1,dim)])) {nabo[nr_set++] = l;}
@@ -131,7 +130,7 @@ uint32_t check_previous_slice(uint32_t  *il,     /* Initial labelling map */
    else {return(0);}
 }
 
-void * mxRealloc(void *oldArray, size_t oldBytes, size_t newBytes) {
+static void * mxRealloc(void *oldArray, size_t oldBytes, size_t newBytes) {
    // https://octave.org/doxygen/3.8/df/d4e/mex_8cc_source.html
    //reallocate memory, preserve previous bytes
    if (newBytes <= 0) {
@@ -152,19 +151,21 @@ void * mxRealloc(void *oldArray, size_t oldBytes, size_t newBytes) {
 
 /* do_initial_labelling */
 
-uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
+static uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
                                   size_t        *dim,  /* Dimensions of bw */
                                   uint32_t  conn,  /* Connectivity criterion */
                                   uint32_t  *il,   /* Initially labelled map */
                                   uint32_t  **tt)  /* Translation table */
 {
+   const size_t kGrowSize = 10000;
    uint32_t  i = 0, j = 0;
    uint32_t  nabo[8];
    uint32_t  label = 1;
    uint32_t  nr_set = 0;
    uint32_t  l = 0;
    int32_t       sl, r, c;
-   uint32_t  ttn = 1000;
+   uint32_t  ttn = kGrowSize;
+   uint32_t nabo9[9];
    *tt = (uint32_t *)malloc(ttn * sizeof(uint32_t));
    memset(*tt, 0, ttn * sizeof(uint32_t));
    for (sl=0; sl<dim[2]; sl++)
@@ -176,7 +177,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
             nr_set = 0;
             if (bw[idx(r,c,sl,dim)])
             {
-               nabo[0] = check_previous_slice(il,r,c,sl,dim,conn,*tt /*,ttn*/);
+               nabo[0] = check_previous_slice(il,r,c,sl,dim,conn,nabo9, *tt /*,ttn*/);
                if (nabo[0]) {nr_set += 1;}
                /*
                   For six(surface)-connectivity
@@ -215,7 +216,10 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
                else
                {
                   il[idx(r,c,sl,dim)] = label;
-                  if (label >= ttn) {ttn += 1000; *tt = (uint32_t*)mxRealloc(*tt, (ttn - 1000)*sizeof(uint32_t), ttn*sizeof(uint32_t));}
+                  if (label >= ttn) {
+                    ttn += kGrowSize;
+                    *tt = (uint32_t*)mxRealloc(*tt, (ttn - kGrowSize)*sizeof(uint32_t), ttn*sizeof(uint32_t));
+                  }
                   (*tt)[label-1] = label;
                   label++;
                }
@@ -242,7 +246,7 @@ uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
 
 /* translate_labels */
 
-int translate_labels(uint32_t  *il,     /* Map of initial labels. */
+static int translate_labels(uint32_t  *il,     /* Map of initial labels. */
                         size_t        dim[3],  /* Dimensions of il. */
                         uint32_t  *tt,     /* Translation table. */
                         uint32_t  ttn,     /* Size of translation table. */
@@ -272,7 +276,15 @@ int translate_labels(uint32_t  *il,     /* Map of initial labels. */
    return(cl);
 }
 
-void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
+// #define MyOldUseFillH
+#ifdef MyOldUseFillH
+
+// The code below is the old method, that uses a classic flood fill to find bubbles
+// the new method runs the labelling cluster twice: once for zero and once for non-zero voxels
+// a bubble is a zero-intensity cluster that does not touch the edge of the volume
+// new method x23 faster for Iguana image, bigger benefits with air dilation distance
+
+static void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
   //aka nifti_fillh
   //all given binary image, interior 0 voxels set to 1
   int nx = dim[0];
@@ -355,8 +367,6 @@ void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
         imgBin[i] = label; //hidden internal voxel not found from the fill
     }
   }
-  //for (size_t i = 0; i < nvox; i++)
-  //  imgBin[i] = (vxs[i] == 0); //hidden internal voxel not found from the fill
   free(vxs);
   free(q);
   free(k);
@@ -387,15 +397,17 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
   free(il);
   free(tt);
   if ((nl > 0) && (onlyLargest)){
+    uint32_t *nls = (uint32_t *)malloc((nl+1) * sizeof(uint32_t));
+    for (int j = 0; j <= nl; j++)
+        nls[j] = 0;
+    for (int i = 0; i < nvox; i++) {
+        nls[l[i]]++;
+    }
     int mxL = 0;
     int mxN = 0;
     for (int j = 1; j <= nl; j++) {
-      int n = 0;
-      for (int i = 0; i < nvox; i++)
-        if (l[i] == j)
-          n++;
-      if (n > mxN) {
-        mxN = n;
+      if (nls[j] > mxN) {
+        mxN = nls[j];
         mxL = j;
       }
     } //for j: each label
@@ -404,10 +416,128 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
     nl = 1;
   } //if labels found
   if (fillBubbles)
-      fillh(l, dim, 1, nl);
+      fillh(l, dim, 0, nl);
   for (size_t i = 0; i < nvox; i++)
     img[i] = l[i];
   free(l);
   return nl;
 }
 
+#else //above: old code using fillh, below new code
+
+int bwlabelCore(float *img, int conn, size_t dim[3], bool onlyLargest) {
+  if ((conn!=6) && (conn!=18) && (conn!=26)) {
+     printfx("bwlabel: conn must be 6, 18 or 26.\n");
+     return 0;
+  }
+  if ((dim[0] < 2) || (dim[1] < 2) || (dim[2] < 1)) {
+    printfx("bwlabel: img must be 2 or 3-dimensional\n");
+    return 0;
+  }
+  size_t nvox = dim[0] * dim[1] * dim[2];
+  uint32_t *l = (uint32_t *)malloc(nvox * sizeof(uint32_t)); //output image
+  memset(l, 0, nvox * sizeof(uint32_t));
+  uint32_t *il = (uint32_t *)malloc(nvox * sizeof(uint32_t));
+  memset(il, 0, nvox * sizeof(uint32_t));
+  uint8_t *bw = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  memset(bw, 0, nvox * sizeof(uint8_t));
+  for (size_t i = 0; i < nvox; i++)
+    if (img[i] != 0.0) bw[i] = 1;
+  uint32_t  *tt = NULL;
+  uint32_t ttn = do_initial_labelling(bw,dim,conn,il,&tt);
+  free(bw);
+  int nl = translate_labels(il,dim,tt,ttn,l);
+  free(il);
+  free(tt);
+  if ((nl > 0) && (onlyLargest)){
+    uint32_t *nls = (uint32_t *)malloc((nl+1) * sizeof(uint32_t));
+    for (int j = 0; j <= nl; j++)
+        nls[j] = 0;
+    for (int i = 0; i < nvox; i++) {
+        nls[l[i]]++;
+    }
+    int mxL = 0;
+    int mxN = 0;
+    for (int j = 1; j <= nl; j++) {
+      if (nls[j] > mxN) {
+        mxN = nls[j];
+        mxL = j;
+      }
+    } //for j: each label
+    for (int i = 0; i < nvox; i++)
+      l[i] = (l[i] == mxL);
+    nl = 1;
+  } //if labels found
+  for (size_t i = 0; i < nvox; i++)
+    img[i] = l[i];
+  free(l);
+  return nl;
+}
+
+int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubbles) {
+  if (!fillBubbles) {
+    return bwlabelCore(img, conn, dim, onlyLargest);
+  }
+  size_t nvox = dim[0] * dim[1] * dim[2];
+  float *invertMaskF = (float *)malloc(nvox * sizeof(float));
+  memset(invertMaskF, 0, nvox * sizeof(float));
+  for (size_t i = 0; i < nvox; i++)
+    if (img[i] == 0.0) invertMaskF[i] = 1.0;
+  int nInvert = bwlabelCore(invertMaskF, 6, dim, false);
+  if (nInvert <= 1) { //no bubbles
+    free(invertMaskF);
+    return bwlabelCore(img, conn, dim, onlyLargest);
+  }
+  //bubbles exist - identify external labels that are on the boundary of the volume
+  uint32_t *invertMask = (uint32_t *)malloc(nvox * sizeof(uint32_t));
+  for (size_t i = 0; i < nvox; i++) {
+    invertMask[i] = round(invertMaskF[i]);
+  }
+  free(invertMaskF);
+  uint32_t *isEdgeLabel = (uint32_t *)malloc((nInvert + 1) * sizeof(uint32_t));
+  memset(isEdgeLabel, 0, (nInvert + 1)  * sizeof(uint32_t));
+  size_t x = dim[0];
+  size_t y = dim[1];
+  size_t z = dim[2];
+  size_t xy = x * y;
+  //check if label touches top or bottom slice
+  size_t offset = (z - 1) * xy; //start of final slice
+  for (size_t i = 0; i < xy; i++) {
+    isEdgeLabel[invertMask[i]]++;
+    isEdgeLabel[invertMask[i+offset]]++;
+  }
+  //check if label touches anterior or posterior row
+  size_t yoffset = (y - 1) * x; //start of final row
+  for (size_t zi = 0; zi < z; zi++) {
+    size_t zoffset = zi * xy; //start of slice
+    for (size_t xi = 0; xi < x; xi++) {
+      isEdgeLabel[invertMask[xi+zoffset]]++;
+      isEdgeLabel[invertMask[xi+yoffset+zoffset]]++;
+    }
+  }
+  //check if label touches left or right column
+  size_t xoffset = (x - 1); //start of final column
+  for (size_t zi = 0; zi < z; zi++) {
+    size_t zoffset = zi * xy; //start of slice
+    size_t yoffset0 = 0;
+    for (size_t yi = 0; yi < y; yi++) {
+      isEdgeLabel[invertMask[yoffset0+zoffset]]++;
+      isEdgeLabel[invertMask[xoffset+yoffset0+zoffset]]++;
+      yoffset0 += x;
+    }
+  }
+  //make all bubbles non-zero
+  // a bubble is an inverted label that does not touch an edge
+  //int nVx = 0;
+  for (size_t i = 0; i < nvox; i++) {
+    if (!isEdgeLabel[invertMask[i]]) {
+      img[i] = 1.0;
+      //nVx ++;
+    }
+  }
+  //printf("Filled %d voxels\n", nVx);
+  free(invertMask);
+  free(isEdgeLabel);
+  return bwlabelCore(img, conn, dim, onlyLargest);
+}
+#endif

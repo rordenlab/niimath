@@ -12,53 +12,24 @@
 	#include "meshify.h"
 	#include "quadric.h"
 #endif
-#ifdef __aarch64__
-	#include "arm_malloc.h"
+#ifdef EMSCRIPTEN
+	#define _mm_malloc(size, alignment) malloc(size)
+	#define _mm_free(ptr) free(ptr)
 #else
-	#include <immintrin.h>
-#endif
-#ifndef USING_WASM
-	#ifdef EMSCRIPTEN
-		#define _mm_malloc(size, alignment) malloc(size)
-		#define _mm_free(ptr) free(ptr)
+	#ifdef __aarch64__
+		#include "arm_malloc.h"
+	#else
+		#include <immintrin.h>
 	#endif
 #endif
 
-#ifdef USING_WASM
-#define WASM_EXPORT(name) \
-  __attribute__((export_name(#name))) \
-  name
-
-// Pull these in from walloc.c.
-                          
-void* WASM_EXPORT(walloc)(size_t size) {
-  return xmalloc(size);
-}
-
-void WASM_EXPORT(wfree)(void* ptr) {
-  xfree(ptr);
-}
-
-	void xmemcpy ( void * destination, const void * source, size_t num ) {
-		uint8_t * s = (uint8_t*) source;
-		uint8_t * d = (uint8_t*) destination;
-		for (size_t i = 0; i < num; i++)
-			d[i] = s[i];
-	}
-	#define staticx
-	#include <nifti2_wasm.h>
-#else
-	#define xmemcpy memcpy
-	#include <nifti2_io.h>
-#endif
+#define xmemcpy memcpy
+#include <nifti2_io.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846264338327
 #endif
 
-#ifdef _MSC_VER //MSVC conforms to C90 not C99: not variable length arrays
-//We can use this MSVC-compatible Mangled array for gcc and ClangLLVM
-//However, the readability suffers. Lets hope a future MSVC supports C99.
 int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
@@ -163,119 +134,6 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	return thresh;
 }
 
-
-#else
-int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
-//H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
-//nBin: number of bins in histogram, e.g. 256 for H[0..255]
-//mode: segment and levels 1: 3/4, 2: 2/3 3: 1/2, 4: 1/3, 5: 1/4
-//dark/bright/high: set to threshold
-	*dark = 0;
-	*mid = 0;
-	*bright = 0;
-	double Sum = 0.0;
-	for (int v = 0; v < nBin; v++)
-		Sum = Sum + H[v];
-	if (Sum <= 0)
-		return 0;
-	#ifdef _MSC_VER
-	#define kBin 2048
-	if (nBin > kBin) return 0;
-	double P[kBin][kBin];
-	double S[kBin][kBin];
-	#else
-	double P[nBin][nBin], S[nBin][nBin];
-	#endif
-	P[0][0] = H[0];
-	S[0][0] = H[0];
-	for (int v = 1; v < nBin; v++) {
-		double Prob = H[v]/Sum;
-		P[0][v] = P[0][v-1]+Prob;
-		S[0][v] = S[0][v-1]+(v+1)*Prob;
-	}
-	for (int u = 1; u < nBin; u++) {
-		for (int v = u; v < nBin; v++) {
-			P[u][v] = P[0][v]-P[0][u-1];
-			S[u][v] = S[0][v]-S[0][u-1];
-		}
-	}
-	//result is eq 29 from Liao
-	for (int u = 0; u < nBin; u++) {
-		for (int v = u; v < nBin; v++) {
-			if (P[u][v] != 0) //avoid divide by zero errors...
-				P[u][v] = sqr(S[u][v]) / P[u][v];
-		}
-	}
-	int thresh = 0;
-	if ((mode == 1) || (mode == 5)) {
-		int lo = (int)(0.25*nBin);
-		int mi = (int)(0.50*nBin);
-		int hi = (int)(0.75*nBin);
-		//double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
-		double max = P[0][lo] + P[lo+1][mi] + P[mi+1][hi] + P[hi+1][255];
-		for (int l = 0; l < (nBin-3); l++) {
-			for (int m = l + 1; m < (nBin-2); m++) {
-				for (int h = m + 1; h < (nBin-1); h++) {
-					//double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
-					double v = P[0][l] + P[l+1][m] + P[m+1][h] + P[h+1][255];
-					if (v > max) {
-						lo = l;
-						mi = m;
-						hi = h;
-						max = v;
-					} //new max
-				}//for h -> hi
-			} //for m -> mi
-		} //for l -> low
-		//printf(">>>>%d %d %d\n", lo, mi, hi);
-		if (mode == 1)
-			thresh = hi;
-		else
-			thresh = lo;
-		*dark = lo;
-		*mid = mi;
-		*bright = hi;
-	} else if ((mode == 2) || (mode == 4)) {
-		int lo = (int)(0.33*nBin);
-		int hi = (int)(0.67*nBin);
-		double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
-		for (int l = 0; l < (nBin-2); l++) {
-			for (int h = l + 1; h < (nBin-1); h++) {
-				double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
-				if (v > max) {
-					lo = l;
-					hi = h;
-					max = v;
-				} //new max
-			}//for h -> hi
-		} //for l -> low
-		if (mode == 1)
-			thresh = hi;
-		else
-			thresh = lo;
-		*dark = lo;
-		*mid = thresh;
-		*bright = hi;
-	} else { //two levels:
-		thresh = (int)(0.25*nBin); //nBin / 2;
-		double max = P[0][thresh]+P[thresh+1][nBin-1];
-		//exhaustively search
-		for (int i = 0; i < (nBin-1); i++) {
-			double v = P[0][i]+P[i+1][nBin-1];
-			if (v > max) {
-				thresh = i;
-				max = v;
-			}//new max
-		}
-		*dark = thresh;
-		*mid = thresh;
-		*bright = thresh;
-	}
-	return thresh;
-}
-#endif
-
-#ifndef USING_WASM
 int nifti_save(nifti_image *nim, const char *postfix) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */
 	char exthdr[5] = ".hdr";
@@ -420,7 +278,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 	nim->intent_name[15] = '\0';
 	return nim;
 }
-#endif //not USING_WASM
+
 vec4 setVec4(float x, float y, float z) {
 	vec4 v = {{x, y, z, 1}};
 	return v;
@@ -444,7 +302,6 @@ float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2) {
 	return sqrt(sqr(pos.v[0] - pos2.v[0]));
 }
 
-#ifndef USING_WASM
 float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	//examines each corner of two NIfTI images and returns the max difference in vertex location
 	// used to detect if two volumes are aligned
@@ -460,7 +317,6 @@ float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	mx = MAX(mx, vertexDisplacement(0, 0, nim->nz - 1, m, m2));
 	return mx;
 }
-#endif
 
 in_hdr set_input_hdr(nifti_image *nim) {
 	//remember input datatype, slope and intercept in case user saves back to this
@@ -471,7 +327,6 @@ in_hdr set_input_hdr(nifti_image *nim) {
 	return ihdr;
 }
 
-#ifndef USING_WASM
 int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	//returns -1 on failure, 0 if okay
 	if (nim->datatype == dt)
@@ -858,7 +713,6 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 	nifti_image_free(nim2);
 	return kernel;
 } //make_kernel_file()
-#endif //not USING_WASM
 
 int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 	// sphere of radius <size> mm centered on target voxel
@@ -916,15 +770,13 @@ int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, fl
 		printfx("'-dt double' does not support mesh\n" );
 		return EXIT_FAILURE;
 	}
-	size_t dim[3] = {nim->nx, nim->ny, nim->nz};
+	short dim[3] = {(short)nim->nx, (short)nim->ny, (short)nim->nz};
 	if (meshify(img, dim, originalMC, isolevel, &tris, &pts, &ntri, &npt, preSmooth, onlyLargest, fillBubbles, verbose) != EXIT_SUCCESS)
 		return EXIT_FAILURE;
-	#ifndef USING_WASM //TO DO: WASM must apply transform
-	float srow_x[4] = {nim->sto_xyz.m[0][0], nim->sto_xyz.m[0][1], nim->sto_xyz.m[0][2], nim->sto_xyz.m[0][3]} ;
-	float srow_y[4] = {nim->sto_xyz.m[1][0], nim->sto_xyz.m[1][1], nim->sto_xyz.m[1][2], nim->sto_xyz.m[1][3]} ;
-	float srow_z[4] = {nim->sto_xyz.m[2][0], nim->sto_xyz.m[2][1], nim->sto_xyz.m[2][2], nim->sto_xyz.m[2][3]} ;
+	float srow_x[4] = {(float)nim->sto_xyz.m[0][0], (float)nim->sto_xyz.m[0][1], (float)nim->sto_xyz.m[0][2], (float)nim->sto_xyz.m[0][3]} ;
+	float srow_y[4] = {(float)nim->sto_xyz.m[1][0], (float)nim->sto_xyz.m[1][1], (float)nim->sto_xyz.m[1][2], (float)nim->sto_xyz.m[1][3]} ;
+	float srow_z[4] = {(float)nim->sto_xyz.m[2][0], (float)nim->sto_xyz.m[2][1], (float)nim->sto_xyz.m[2][2], (float)nim->sto_xyz.m[2][3]} ;
 	apply_sform(tris, pts, ntri, npt, srow_x, srow_y, srow_z);
-	#endif
 	double startTime = clockMsec();
 	if (postSmooth > 0) {
 		laplacian_smoothHC(pts, tris, npt, ntri, 0.1, 0.5, postSmooth, true);
@@ -966,7 +818,7 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 	int postSmooth = 0;
 	int originalMC = 0;
 	int quality = 1;
-	bool verbose = false;
+	bool verbose = true;
 	char atlasFilename[mxStr] = "";
 	for (int i=arg;i<argc;i++) {
 		if (strcmp(argv[i],"-a") == 0)

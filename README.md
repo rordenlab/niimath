@@ -53,6 +53,14 @@ cd niimath/src
 make
 ```
 
+You can also compile this project to Web Assembly so it can be embedded in a web page, as shown in the [live demo](https://niivue.github.io/niivue-niimath/).
+
+```
+git clone https://github.com/rordenlab/niimath.git
+cd niimath/src
+make wasm
+```
+
 Advanced users may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler `brew install gcc@9`.
 
 For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :

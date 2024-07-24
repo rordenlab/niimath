@@ -16,7 +16,17 @@
 #include <stdio.h>
 #include <nifti2_io.h>
 #include "core32.h" //all 32-bit functions
-#include "core64.h" //all 64-bit functions
+#ifdef HAVE_64BITS
+	#include "core64.h" //all 64-bit functions
+#endif
+#ifdef NII2MESH
+	#include <stdbool.h>
+	#include "meshtypes.h"
+	#include "meshify.h"
+	#include "quadric.h"
+	#include <unistd.h>
+	#include <stdio.h>
+#endif
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -45,8 +55,264 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20240202"
+#define kMTHdate "v1.0.20240707"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
+
+#ifdef NII2MESH
+
+bool isMz3(const char *fnm) {
+	char basenm[768], ext[768] = "";
+	strcpy(basenm, fnm);
+	strip_ext(basenm); // ~/file.nii -> ~/file
+	if (strlen(fnm) > strlen(basenm))
+		strcpy(ext, fnm + strlen(basenm));
+	return strstr(ext, ".mz3");
+}
+
+void read_mz3(const char* filename, vec3d **verts, vec3i **tris, int* nvert, int* ntri) {
+	#ifdef _MSC_VER
+		#pragma pack(2)
+			struct mz3hdr {
+				uint16_t SIGNATURE, ATTR;
+				uint32_t NFACE, NVERT, NSKIP;
+			};
+		#pragma pack()
+	#else
+		struct __attribute__((__packed__)) mz3hdr {
+			uint16_t SIGNATURE, ATTR;
+			uint32_t NFACE, NVERT, NSKIP;
+		};
+	#endif
+	if( access( filename, F_OK ) != 0 ) {
+		printf("Unable to find a mz3 named %s\n", filename);
+		exit(EXIT_FAILURE);
+	}
+	FILE *fp = fopen(filename,"rb");
+	struct mz3hdr h;
+	size_t bytes_read = fread(&h, sizeof(struct mz3hdr), 1, fp);
+	if (bytes_read <= 0) {
+		printf("Unable to read %s\n", filename);
+		exit(EXIT_FAILURE);
+	}
+	uint16_t sig = 23117;
+	#ifdef HAVE_ZLIB
+	if (sig != h.SIGNATURE) {
+		fclose(fp);
+		gzFile fgz = gzopen(filename, "r");
+		if (! fgz) {
+			printf("gzopen error %s\n", filename);
+			exit(EXIT_FAILURE);
+		}
+		int bytes_read = gzread(fgz, &h, sizeof(struct mz3hdr));
+		if (sig != h.SIGNATURE) {
+			gzclose(fgz);
+			printf("Unable to read compressed mz3 %s\n", filename);
+			exit(EXIT_FAILURE);
+		}
+		*ntri = (int) h.NFACE;
+		*nvert = (int) h.NVERT;
+		uint32_t skip = h.NSKIP;
+		// fseek(fp, (int)(sizeof(struct mz3hdr) + skip), SEEK_SET);
+		uint32_t tribytes = h.NFACE * sizeof(vec3i);
+		*tris = (vec3i *) malloc(tribytes);
+		void * imgRaw = (void *) *tris;
+		bytes_read = gzread(fgz, imgRaw, tribytes);
+		if (bytes_read <= 0) {
+			printf("Unable to read compressed triangles %s\n", filename);
+			exit(EXIT_FAILURE);
+		}
+		uint32_t vertbytes32 = h.NVERT * 3 * sizeof(float);
+		float * verts32 = (float *) malloc(vertbytes32);
+		bytes_read = gzread(fgz, verts32, vertbytes32);
+		if (bytes_read <= 0) {
+			printf("Unable to read vertices %s\n", filename);
+			exit(EXIT_FAILURE);
+		}
+		*verts = (vec3d *) malloc(h.NVERT * sizeof(vec3d));
+		vec3d *vs = *verts;
+		int j = 0;
+		for (int i = 0; i < h.NVERT; i++) {
+			vec3d v;
+			v.x = verts32[j++];
+			v.y = verts32[j++];
+			v.z = verts32[j++];
+			vs[i] = v;
+		}
+		free(verts32);
+		gzclose(fgz);
+		return;
+	}
+	#endif
+	if (sig != h.SIGNATURE) {
+		fclose(fp);
+		printf("Unable to read mz3 (unable to read gz compressed) %s\n", filename);
+		exit(EXIT_FAILURE);
+	}
+	*ntri = (int) h.NFACE;
+	*nvert = (int) h.NVERT;
+	uint32_t skip = h.NSKIP;
+	fseek(fp, (int)(sizeof(struct mz3hdr) + skip), SEEK_SET);
+	uint32_t tribytes = h.NFACE * sizeof(vec3i);
+	*tris = (vec3i *) malloc(tribytes);
+	void * imgRaw = (void *) *tris;
+	bytes_read = fread(imgRaw, tribytes, 1, fp);
+	if (bytes_read <= 0) {
+		printf("Unable to read triangles %s\n", filename);
+		exit(EXIT_FAILURE);
+	}
+	uint32_t vertbytes32 = h.NVERT * 3 * sizeof(float);
+	float * verts32 = (float *) malloc(vertbytes32);
+	bytes_read = fread(verts32, vertbytes32, 1, fp);
+	if (bytes_read <= 0) {
+		printf("Unable to read vertices %s\n", filename);
+		exit(EXIT_FAILURE);
+	}
+	*verts = (vec3d *) malloc(h.NVERT * sizeof(vec3d));
+	vec3d *vs = *verts;
+	int j = 0;
+	for (int i = 0; i < h.NVERT; i++) {
+		vec3d v;
+		v.x = verts32[j++];
+		v.y = verts32[j++];
+		v.z = verts32[j++];
+		vs[i] = v;
+	}
+	free(verts32);
+	fclose(fp);
+}
+
+int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, bool verbose, int quality) {
+	vec3d *pts = NULL;
+	vec3i *tris = NULL;
+	int ntri, npt;
+	read_mz3(innm, &pts, &tris, &npt, &ntri);
+	double agressiveness = 7.0; //7 = default for Simplify.h
+	if (quality == 0) //fast
+		agressiveness = 8.0;
+	if (quality == 2) //best
+		agressiveness = 5.0;
+	int startVert = npt;
+	int startTri = ntri;
+	int target_count = round((float)ntri * reduceFraction);
+	double startTime = clockMsec();
+	quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, agressiveness, verbose, (quality > 1));
+	if (verbose)
+		printf("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
+	save_mesh(outnm, tris, pts, ntri, npt, (quality > 0));
+	free(tris);
+	free(pts);
+	return EXIT_SUCCESS;
+}
+
+int mainMz3(int argc,char **argv) {
+	float isolevel = 0.0;
+	int isoDarkMediumBright123 = 2;
+	float reduceFraction = 0.25;
+	bool onlyLargest = true;
+	bool fillBubbles = false;
+	int postSmooth = 0;
+	int quality = 1;
+	int originalMC = 0;
+	bool verbose = true;
+	if (argc > 3) {
+		for (int i=2;i<(argc-1);i++) {
+			if (strcmp(argv[i],"-b") == 0)
+				fillBubbles = atoi(argv[i+1]);
+			if (strcmp(argv[i],"-i") == 0) {
+				if (strlen(argv[i+1]) < 1) continue;
+				if (toupper(argv[i+1][0]) == 'D')
+					isoDarkMediumBright123 = 1;
+				else if (toupper(argv[i+1][0]) == 'M')
+					isoDarkMediumBright123 = 2;
+				else if (toupper(argv[i+1][0]) == 'B')
+					isoDarkMediumBright123 = 3;
+				else {
+					isoDarkMediumBright123 = 0; //custom
+					isolevel = atof(argv[i+1]);
+				}
+			}
+			if (strcmp(argv[i],"-l") == 0)
+				onlyLargest = atoi(argv[i+1]);
+			if (strcmp(argv[i],"-o") == 0)
+				originalMC = atoi(argv[i+1]);
+			if (strcmp(argv[i],"-q") == 0)
+				quality = atoi(argv[i+1]);
+			if (strcmp(argv[i],"-s") == 0)
+				postSmooth = atoi(argv[i+1]);
+			if (strcmp(argv[i],"-r") == 0)
+				reduceFraction = atof(argv[i+1]);
+			if (strcmp(argv[i],"-v") == 0)
+				verbose = atoi(argv[i+1]);
+		}
+	}
+	return simplify_mz3(argv[1], argv[argc-1], reduceFraction, verbose, quality);
+}
+#endif // NII2MESH
+
+#ifdef __EMSCRIPTEN__
+//["string", "number", "string", "number","boolean","boolean","number","boolean"], // param
+//[filename, percentage, simplify_name, isoValue, onlyLargest, fillBubbles,postSmooth, verbose]
+extern "C" {
+	int simplify(const char* args) {
+		// Duplicate the input string to avoid modifying the original
+		char *args_copy = strdup(args);
+		if (!args_copy) {
+			fprintf(stderr, "Memory allocation error\n");
+			return -1;
+		}
+		// Count the number of arguments
+		int argc = 0;
+		char *token = strtok(args_copy, " ");
+		while (token) {
+			argc++;
+			token = strtok(NULL, " ");
+		}
+		// Allocate memory for argv
+		char **argv = (char **)malloc((argc + 1) * sizeof(char *));
+		if (!argv) {
+			fprintf(stderr, "Memory allocation error\n");
+			free(args_copy);
+			return -1;
+		}
+		// Split the original input string into arguments
+		strcpy(args_copy, args);
+		argc = 0;
+		token = strtok(args_copy, " ");
+		while (token) {
+			argv[argc] = strdup(token);
+			if (!argv[argc]) {
+				fprintf(stderr, "Memory allocation error\n");
+				// Free previously allocated memory
+				for (int i = 0; i < argc; i++) {
+					free(argv[i]);
+				}
+				free(argv);
+				free(args_copy);
+				return -1;
+			}
+			argc++;
+			token = strtok(NULL, " ");
+		}
+		argv[argc] = NULL; // Null-terminate the argv array
+		// Call the fcn function with the parsed arguments
+		int result = EXIT_SUCCESS;
+		if (isMz3(argv[1])) {
+			result = mainMz3(argc, argv);
+		} else {
+			result = main32(argc, argv);
+		}
+		// Free allocated memory
+		for (int i = 0; i < argc; i++) {
+			free(argv[i]);
+		}
+		free(argv);
+		free(args_copy);
+	
+		return result;
+	}
+}
+
+#else
 
 int show_help( void ) {
 	printf("Chris Rorden's niimath version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
@@ -62,9 +328,13 @@ int show_help( void ) {
 	printf(" ""input"" will set the datatype to that of the original image\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
+#ifdef HAVE_BUTTERWORTH
 	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
+#endif
 	printf(" -bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
+#ifdef NII2MESH
 	printf(" -bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) \n");
+#endif
 	printf(" -c2h                     : reverse h2c transform\n");
 	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
@@ -75,7 +345,7 @@ int show_help( void ) {
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 #ifdef NII2MESH
-	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('nii2mesh bet -mesh -i d mesh.gii')\n");
+	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')\n");
 #endif
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");
@@ -239,6 +509,9 @@ int main(int argc, char * argv[]) {
 		}
 	}
 	if( argc < 3 ) return show_help(); //minimal command has input and output: "niimath  in.nii  out.nii"
+	if (isMz3(argv[1])) {
+		return mainMz3(argc, argv);
+	}
 	int dtCalc = DT_FLOAT32; //data type for calculation
 	int ac = 1;
 	if( ! strcmp(argv[ac], "-dt") ) {
@@ -255,6 +528,15 @@ int main(int argc, char * argv[]) {
 	}
 	if (dtCalc == DT_FLOAT32)
 		return(main32(argc, argv));	
-	else 
+	else
+	#ifdef HAVE_64BITS
 		return(main64(argc, argv));
+	#else
+	{
+		fprintf(stderr,"'-dt' error: only not compiled for 'double' calculations\n");
+		return(EXIT_FAILURE);
+	}
+	#endif 
+		
 } //main()
+#endif
