@@ -1,17 +1,19 @@
-#include <stdbool.h>
-#include "core.h"
-#include "print.h"
-#define _USE_MATH_DEFINES //microsoft compiler
+#include <ctype.h>
 #include <float.h> //FLT_EPSILON
 #include <limits.h>
 #include <math.h>
+#include <nifti2_io.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
+#include "core.h"
+#include "print.h"
+
 #ifdef NII2MESH
 	#include "meshify.h"
 	#include "quadric.h"
 #endif
+
 #ifdef EMSCRIPTEN
 	#define _mm_malloc(size, alignment) malloc(size)
 	#define _mm_free(ptr) free(ptr)
@@ -23,8 +25,13 @@
 	#endif
 #endif
 
+#if defined(_OPENMP) //compile with 'OMP=1 make -j'
+	#include <omp.h>
+#endif
+
 #define xmemcpy memcpy
-#include <nifti2_io.h>
+
+#define _USE_MATH_DEFINES //microsoft compiler
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846264338327
@@ -852,7 +859,7 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 			verbose = atoi(argv[i+1]);
 	}
 	if (verbose)
-		printfx("bubbles=%d isolevel=%g preSmooth=%d quality=%d smooth=%d reduction=%g verbose=%d\n", 
+		printfx("bubbles=%d isolevel=%g preSmooth=%d quality=%d smooth=%d reduction=%g verbose=%d\n",
 			fillBubbles, isolevel, preSmooth, quality, postSmooth, reduceFraction, verbose);
 	if (strlen(atlasFilename) > 0) {
 		int nLabel = trunc(imgMax);
