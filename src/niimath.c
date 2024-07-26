@@ -515,9 +515,13 @@ int main(int argc, char * argv[]) {
 		}
 	}
 	if( argc < 3 ) return show_help(); //minimal command has input and output: "niimath  in.nii  out.nii"
+
+#ifdef NII2MESH
 	if (isMz3(argv[1])) {
 		return mainMz3(argc, argv);
 	}
+#endif
+
 	int dtCalc = DT_FLOAT32; //data type for calculation
 	int ac = 1;
 	if( ! strcmp(argv[ac], "-dt") ) {

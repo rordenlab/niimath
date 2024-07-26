@@ -15,19 +15,54 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING
         "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)
-    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS  "Debug;Release;RelWithDebInfo;MinSizeRel")
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug;Release;RelWithDebInfo;MinSizeRel")
 endif()
 
 #emulate fslmaths behavior, add pigz support
 option(FSLSTYLE "FSL behavior, pigz support" ON)
 if(FSLSTYLE)
    ADD_DEFINITIONS(-DFSLSTYLE)
-   ADD_DEFINITIONS(-DREJECT_COMPLEX)
    ADD_DEFINITIONS(-DPIGZ)
+   ADD_DEFINITIONS(-DREJECT_COMPLEX)
 endif()
 
-# Add NII2MESH support
-ADD_DEFINITIONS(-DNII2MESH)
+if(NOT BUILD_FLAVOR)
+    set(BUILD_FLAVOR "all" CACHE STRING
+        "Choose the flavor of build, options are: all tiny nano." FORCE)
+    set_property(CACHE BUILD_FLAVOR PROPERTY STRINGS  "all;tiny;nano")
+endif()
+
+if(${BUILD_FLAVOR} STREQUAL "all")
+    ADD_DEFINITIONS(-DHAVE_64BITS)
+    set(ADDITIONAL_SRCS core64.c)
+    ADD_DEFINITIONS(-DHAVE_BUTTERWORTH)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bw.c)
+    ADD_DEFINITIONS(-DHAVE_FORMATS)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} base64.c)
+    ADD_DEFINITIONS(-DHAVE_TENSOR)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} tensor.c)
+    ADD_DEFINITIONS(-DNII2MESH)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
+
+    option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
+    if(USE_CLASSIC_CUBES)
+        ADD_DEFINITIONS(-DUSE_CLASSIC_CUBES)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} oldcubes.c)
+    else()
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} MarchingCubes.c)
+    endif()
+elseif(${BUILD_FLAVOR} STREQUAL "tiny")
+    ADD_DEFINITIONS(-DNII2MESH)
+    set(ADDITIONAL_SRCS bwlabel.c fdr.c meshify.c oldcubes.c quadric.c radixsort.c)
+
+    option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
+    if(USE_CLASSIC_CUBES)
+        ADD_DEFINITIONS(-DUSE_CLASSIC_CUBES)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} oldcubes.c)
+    else()
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} MarchingCubes.c)
+    endif()
+endif()
 
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
     #e.g.  cmake -DOPENMP_XCODE=ON ..
@@ -81,19 +116,10 @@ set(PROGRAMS niimath)
 set(NIIMATH_SRCS
     niimath.c
     core.c
-    tensor.c
-    bwlabel.c
-    bw.c
     core32.c
-    core64.c
-    fdr.c
     niftilib/nifti2_io.c
     znzlib/znzlib.c
-    meshify.c
-    MarchingCubes.c
-    quadric.c
-    base64.c
-    radixsort.c
+    ${ADDITIONAL_SRCS}
 )
 
 include_directories(niftilib)
