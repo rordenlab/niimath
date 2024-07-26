@@ -7,7 +7,7 @@ environment:
       appveyor_build_worker_image: Ubuntu2004
 
     - job_name: mac
-      appveyor_build_worker_image: macos-catalina
+      appveyor_build_worker_image: macos-monterey
 
     - job_name: test
       appveyor_build_worker_image: Ubuntu2004
@@ -69,10 +69,12 @@ for:
         - job_name: mac
 
     build_script:
-      - sudo xcode-select -s /Applications/Xcode-12.3.app
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -B build/x86_64
+      - brew install libomp
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=ON -B build/x86_64
       - cmake --build build/x86_64
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -B build/arm64
+      - brew fetch --force --bottle-tag=arm64_monterey libomp
+      - brew reinstall $(brew --cache --bottle-tag=arm64_monterey libomp)
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=ON -B build/arm64
       - cmake --build build/arm64
 
     after_build:
