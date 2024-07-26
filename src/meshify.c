@@ -567,7 +567,7 @@ static int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 		uint16_t SIGNATURE, ATTR;
 		uint32_t NFACE, NVERT, NSKIP;
 	};
-#pragma pack()	
+#pragma pack()
 	#else
 	struct __attribute__((__packed__)) mz3hdr {
 		uint16_t SIGNATURE, ATTR;
@@ -732,7 +732,7 @@ static int save_stl(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 		vec3s norm, pts[3];
 		uint16_t spacer;
 	} tfacet;
-#pragma pack()	
+#pragma pack()
 	#else
 	typedef struct  __attribute__((__packed__)) {
 		vec3s norm, pts[3];
@@ -768,7 +768,7 @@ static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 		uint8_t n;
 		int32_t x,y,z;
 	} vec1b3i;
-#pragma pack()	
+#pragma pack()
 	#else
 	typedef struct  __attribute__((__packed__)) {
 		uint8_t n;
@@ -860,7 +860,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	#ifdef HAVE_ZLIB
 	if (isGz) {
 		unsigned long srcLen = ntri * sizeof(vec3i);
-		unsigned long destLen = compressBound(srcLen);
+		uLongf destLen = compressBound(srcLen);
 		unsigned char* ostream = (unsigned char*) malloc(destLen);
 		int res = compress(ostream, &destLen,(const unsigned char *) tris, srcLen);
 		if (res != Z_OK)
@@ -909,7 +909,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	#ifdef HAVE_ZLIB
 	if (isGz) {
 		unsigned long srcLen = npt * sizeof(vec3s);
-		unsigned long destLen = compressBound(srcLen);
+		uLongf destLen = compressBound(srcLen);
 		unsigned char* ostream = (unsigned char*) malloc(destLen);
 		int res = compress(ostream, &destLen,(const unsigned char *) pts32, srcLen);
 		if (res != Z_OK)
