@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1.0)
+cmake_minimum_required(VERSION 3.5)
 
 project(console C)
 
@@ -61,20 +61,12 @@ include (CheckCCompilerFlag)
 if(UNIX)
     check_c_compiler_flag(-march=armv8-a+crc ARM_CRC)
     if(ARM_CRC)
-        # wrong answer for Apple Silicon: check_cxx_compiler_flag(-msse2 HAS_SSE2)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crc")
     else()
 	    check_c_compiler_flag(-msse2 HAS_SSE2)
 	    if(HAS_SSE2)
 	        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse2 -mfpmath=sse")
 	    endif()
-    endif()
-endif()
-
-# support crc intrinsics for ARM CPUs
-if(UNIX)
-    check_c_compiler_flag(-march=armv8-a+crc HAS_CRC)
-    if(HAS_CRC)
-    	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crc")
     endif()
 endif()
 
