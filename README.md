@@ -7,16 +7,16 @@ It is said that `imitation is the sincerest form of flattery`. This project emul
 1. While fslmaths is provided for without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects, in particular for commercial exploitation.
 2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. n.b. Subsequently, we helped update [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) that allows recent FSL releases to use this library,  improving the speed for all FSL tools.
 3. Minimal dependencies allow easy distribution, compilation and development. For example, it can be compiled for MacOS, Linux and Windows (fsl can not target Windows).
-4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)). 
-5. Most programs are developed organically, with new features added as need arises. Cloning an existing tool provides a full specification, which can lead to optimization. niimath uses explicit single and double precision pipelines that allow the compiler to better use advanced instructions (every x86_64 CPU provides SSE, but high level code has trouble optimizing these routines). The result is that modern compilers are able to create operations that are limited by memory bandwidth, obviating the need for [hand tuning](https://github.com/neurolabusc/simd) the code. 
-6. Developing a robust regression testing dataset has allowed us to discover a few edge cases where fslmaths provides anomalous or unexpected answers (see below). Therefore, this can benefit the popular tool that is being cloned. 
+4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)).
+5. Most programs are developed organically, with new features added as need arises. Cloning an existing tool provides a full specification, which can lead to optimization. niimath uses explicit single and double precision pipelines that allow the compiler to better use advanced instructions (every x86_64 CPU provides SSE, but high level code has trouble optimizing these routines). The result is that modern compilers are able to create operations that are limited by memory bandwidth, obviating the need for [hand tuning](https://github.com/neurolabusc/simd) the code.
+6. Developing a robust regression testing dataset has allowed us to discover a few edge cases where fslmaths provides anomalous or unexpected answers (see below). Therefore, this can benefit the popular tool that is being cloned.
 7. While the code is completely reverse engineered, the FSL team has been gracious to allow us to copy their error messages and help information. This allows true plug in compatibility. They have also provided pseudo code for poorly documented routines. This will allow the community to better understand the actual algorithms.
 8. This project provides an open-source foundation to introduce new features that fill gaps with the current FSL tools (e.g. unsharp, sobel, resize functions). For future releases, Bob Cox has graciously provided permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools that provide performance unavailable within [FSL](https://neurostars.org/t/bandpass-filtering-different-outputs-from-fsl-and-nipype-custom-function/824). Including them in this project ensures they work in a familiar manner to other FSL tools (and leverage the same environment variables).
- 
+
 The Reason to use fslmaths instead of niimath:
 
-1. niimath is new and largely untested software. There may be unknown corner cases where produces poor results. fslmaths has been used for years and therefore has been battle tested. In the few instances where fslmaths generates results that bear no resemblance to its own documentation (as described below), one could argue it is the `correct` result (with comparison to itself). However, many tools may have been developed to assume this loss of high frequency signal and these tools may not perform well when provided with the result specified in the documentation. 
- 
+1. niimath is new and largely untested software. There may be unknown corner cases where produces poor results. fslmaths has been used for years and therefore has been battle tested. In the few instances where fslmaths generates results that bear no resemblance to its own documentation (as described below), one could argue it is the `correct` result (with comparison to itself). However, many tools may have been developed to assume this loss of high frequency signal and these tools may not perform well when provided with the result specified in the documentation.
+
 ## Installation
 
 You can get niimath using three methods:
@@ -37,6 +37,8 @@ git clone https://github.com/rordenlab/niimath.git
 cd niimath; mkdir build; cd build; cmake ..
 make
 ```
+
+If you want to enable OpenMP support on macOS, you have to install `libomp` first using `brew install libomp`, and then use `cmake -DOPENMP_XCODE=ON ..` to configure the project in the above commands.
 
 Likewise, if you are compiling on Windows using cmake:
 
@@ -61,7 +63,7 @@ cd niimath/src
 make wasm
 ```
 
-Advanced users may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler `brew install gcc@9`.
+Advanced users using the `Makefile` may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler (for example, `brew install gcc@9`).
 
 For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
 
@@ -87,11 +89,11 @@ niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-math
  - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export NIFTI_GZ` or `export NIFTI` from the command line or profile to select between compressed (smaller) or uncompressed (faster) results. Windows users can use `set` instead of `export`.
  - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded compresson.
 
-niimath has a few features not provided by fslmaths: 
+niimath has a few features not provided by fslmaths:
 
  - `bandpass <hp> <lp> <tr>`: Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)
  - `bptfm <hp> <lp>`        : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)
- - `bwlabel <conn>`         : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) 
+ - `bwlabel <conn>`         : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26)
  - `ceil`                   : round voxels upwards to the nearest integer
  - `crop <tmin> <tsize>`    : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range
  - `dehaze <mode>`          : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)
@@ -102,7 +104,7 @@ niimath has a few features not provided by fslmaths:
  - `mod`                    : modulus fractional remainder - same as '-rem' but includes fractions
  - `otsu <mode>`            : binarize image using Otsu''s method (mode 1..5; higher yields more bright voxels))
  - `power <exponent>`       : raise the current image by following exponent
- - `resize <X> <Y> <Z> <m>` : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
+ - `resize <X> <Y> <Z> <m>` : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");
  - `round`                  : round voxels to the nearest integer
  - `sobel`                  : fast edge detection
  - `sobel_binary`           : sobel creating binary edge
@@ -141,15 +143,15 @@ Image 2 Descriptives
 
 Some operations do generate known meaningfully different results. These are listed below, with the rationale for the discrepancy provided:
 
-1. The command "fslmaths inputimg -add 0 outputimg -odt input" can convert a uint8 image float output despite explicit request to retain input type. This occurs if the input image header has a non-unitary scale slope or non-zero intercept. In contrast, niimath retains both the datatype and the intensity scaling parameters. 
+1. The command "fslmaths inputimg -add 0 outputimg -odt input" can convert a uint8 image float output despite explicit request to retain input type. This occurs if the input image header has a non-unitary scale slope or non-zero intercept. In contrast, niimath retains both the datatype and the intensity scaling parameters.
 2. Different versions of fslmaths perform differently for the pass through "fslmaths in out" which is useful for copying files. Old versions will losslessly save in the input datatype, while fslmaths 6.0 converts the data to float. niimath retains the datatype.
 3. The fslmaths function `-fillh26` will sometimes fill unconnected regions. An example has been provided to the FSL team. niimath provides the correct solution.
 4. The fslmaths `-dilD` function does not do what it claims. It introduces a blurring effect that reduces edge artifacts that plague iterative morphology operations. Unfortunately, this effect is conducted in a consistent order that introduces a spatial shift in signal. In contrast, niimath does the dilation as described. Note there are [better solutions](https://github.com/neurolabusc/niiSmooth) for these functions. The niimath '-edt' operation can also be used for dilation.
 6. The fslmaths `-roc` function works differently than described in the help. It appears to ignore voxels near the edge of an image and generates "given object has non-finite elements" if any dimension is less than 12 voxels. When provided with an external noise file, it generates additional columns in the output file that are not described. It does not seem to precisely detect the desired `AROC-thresh`, but samples at different stepped intervals. niimath attempts to emulate the stepped intervals for reporting, but determines the precise cutoff.
 7. Be aware that fslmaths help suggests `If you apply a Binary operation (one that takes the current image and a new image together), when one is 3D and the other is 4D, the 3D image is cloned temporally to match the temporal dimensions of the 4D image.` This is not the case for -thr or -uthr: if the second item is 4D, only the first volume is used and the output remains 3D. Particularly odd is uthr: `fslmaths 3D -uthr 4D out` will fill input volume 3D with zeros, regardless of mask values.
 8. Perhaps understandably, `fslmaths in1 -rem 0 out` will throw an exception. However, `fslmaths in1 -rem in2 out` will throw an exception if any voxel in the image `in2` is zero. While this seems understandable, niimath provides a description for this error.
-9. The fslmaths function `-rem` returns the **integer** modulus remainder. This replicates the C `%` operator. This may be unexpected, e.g. in Python `2.7 % 2` is 0.7, as is Matlab's `mod(2.7, 2)`, as is standard C `fmod`. niimath clones the fslmaths  behavior, but also includes a new function `-mod` to return the modulus fractional remainder. 
-10. Be aware that fslmaths takes account of whether the image has a negative determinant or not (flipping the first dimension). However, fslstats does not do this, so fslstats coordinates are often misleading. For example, consider an image in RAS orientation, where the command `fslstats tfRAS -x` will give coordinates that are incompatible with fslmath's `tfceS` function. niimath attempts to emulate the behavior of fslmaths for the relevant functions (-index -roi, -tfceS). 
+9. The fslmaths function `-rem` returns the **integer** modulus remainder. This replicates the C `%` operator. This may be unexpected, e.g. in Python `2.7 % 2` is 0.7, as is Matlab's `mod(2.7, 2)`, as is standard C `fmod`. niimath clones the fslmaths  behavior, but also includes a new function `-mod` to return the modulus fractional remainder.
+10. Be aware that fslmaths takes account of whether the image has a negative determinant or not (flipping the first dimension). However, fslstats does not do this, so fslstats coordinates are often misleading. For example, consider an image in RAS orientation, where the command `fslstats tfRAS -x` will give coordinates that are incompatible with fslmath's `tfceS` function. niimath attempts to emulate the behavior of fslmaths for the relevant functions (-index -roi, -tfceS).
 11. Neither `-subsamp2` nor `-subsamp2offc` handle anti-aliasing. Be aware that `-subsamp2offc` can exhibit odd edge effects. The problem is simple to describe, for slices in the middle of a volume, and output slice is weighted 50% with the center slice, and 25% for the slice below and the slice above. This makes sense. However, bottom slices (as well as first rows, first columns, last rows, last columns, last slices) the filter weights 75% on the central slice and just 25% on the slice above it. Signal from this 2nd slice is heavily diluted. A better mixture would be 66% edge slice and 33% 2nd slice. This latter solution is used by niimath.
 12. fslmaths 6.0.0..6.0.3 were unable to process files where the string ".nii" appears in a folder name. For example, consider the folder "test.niim", the command `fslmaths ~/test.niim/RAS -add 0 tst` will [generate an exception](https://github.com/FCP-INDI/C-PAC/issues/976). niimath will recognize that this is a folder name and not a file extension and work correctly. niimath helped detect this anomaly and it is an example of how a clone can help provide feedback to the developers of the original project.
 13. The fslmaths function [`-ztop`](https://github.com/rordenlab/niimath/issues/8) fails to clamp extreme values.
@@ -206,6 +208,6 @@ niimath is licensed under the 2-Clause BSD License. Except where noted, the code
 
   - [imbibe](https://github.com/jonclayden/imbibe) is a R wrapper for niimath, allowing the performance of tuned code with the convenience of a scripting language.
   - [3dcalc](https://afni.nimh.nih.gov/pub/dist/doc/program_help/3dcalc.html) is AFNI's tool for image arithmetic.
-  - [c3d](https://sourceforge.net/p/c3d/git/ci/master/tree/doc/c3d.md) provides mathematical functions and format conversion for medical images. 
+  - [c3d](https://sourceforge.net/p/c3d/git/ci/master/tree/doc/c3d.md) provides mathematical functions and format conversion for medical images.
   - [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) is the inspiration for niimath.
 
