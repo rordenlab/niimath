@@ -255,71 +255,7 @@ int mainMz3(int argc,char **argv) {
 }
 #endif // NII2MESH
 
-#ifdef __EMSCRIPTEN__
-//["string", "number", "string", "number","boolean","boolean","number","boolean"], // param
-//[filename, percentage, simplify_name, isoValue, onlyLargest, fillBubbles,postSmooth, verbose]
-extern "C" {
-	int simplify(const char* args) {
-		// Duplicate the input string to avoid modifying the original
-		char *args_copy = strdup(args);
-		if (!args_copy) {
-			fprintf(stderr, "Memory allocation error\n");
-			return -1;
-		}
-		// Count the number of arguments
-		int argc = 0;
-		char *token = strtok(args_copy, " ");
-		while (token) {
-			argc++;
-			token = strtok(NULL, " ");
-		}
-		// Allocate memory for argv
-		char **argv = (char **)malloc((argc + 1) * sizeof(char *));
-		if (!argv) {
-			fprintf(stderr, "Memory allocation error\n");
-			free(args_copy);
-			return -1;
-		}
-		// Split the original input string into arguments
-		strcpy(args_copy, args);
-		argc = 0;
-		token = strtok(args_copy, " ");
-		while (token) {
-			argv[argc] = strdup(token);
-			if (!argv[argc]) {
-				fprintf(stderr, "Memory allocation error\n");
-				// Free previously allocated memory
-				for (int i = 0; i < argc; i++) {
-					free(argv[i]);
-				}
-				free(argv);
-				free(args_copy);
-				return -1;
-			}
-			argc++;
-			token = strtok(NULL, " ");
-		}
-		argv[argc] = NULL; // Null-terminate the argv array
-		// Call the fcn function with the parsed arguments
-		int result = EXIT_SUCCESS;
-		if (isMz3(argv[1])) {
-			result = mainMz3(argc, argv);
-		} else {
-			result = main32(argc, argv);
-		}
-		// Free allocated memory
-		for (int i = 0; i < argc; i++) {
-			free(argv[i]);
-		}
-		free(argv);
-		free(args_copy);
-
-		return result;
-	}
-}
-
-#else
-
+#ifndef __EMSCRIPTEN__
 int show_help( void ) {
 	printf("Chris Rorden's niimath version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     //printf("Chris Rorden's niimath version %s (%llu-bit %s)\n", kMATHvers, (unsigned long long) sizeof(size_t)*8, kOS);
@@ -499,6 +435,7 @@ int show_help( void ) {
 	printf("     niimath 4D_inputVolume -Tmean -mul -1 -add 4D_inputVolume demeaned_4D_inputVolume\n");
     return 0;
 }
+#endif //ifndef __EMSCRIPTEN__
 
 int main(int argc, char * argv[]) {
 	//fslmaths in.nii out.nii changes datatype to float, here we retain (similar to earlier versions of fslmaths)
@@ -514,8 +451,9 @@ int main(int argc, char * argv[]) {
 			return 0; //minimal command has input and output: "niimath  in.nii  out.nii"
 		}
 	}
+	#ifndef __EMSCRIPTEN__
 	if( argc < 3 ) return show_help(); //minimal command has input and output: "niimath  in.nii  out.nii"
-
+	#endif 
 #ifdef NII2MESH
 	if (isMz3(argv[1])) {
 		return mainMz3(argc, argv);
@@ -549,4 +487,3 @@ int main(int argc, char * argv[]) {
 	#endif
 
 } //main()
-#endif

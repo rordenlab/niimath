@@ -4816,8 +4816,14 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	//fslmaths robust range not fully described, this emulation is close
 	//fslmaths ing/inm are listed as "unary" but should be listed as binary
 	if (argc < 3) {
+		#ifndef __EMSCRIPTEN__
 		printfx("Fatal: show_help shown by wrapper function\n");
 		exit(1);
+		#else
+		//n.b. creating web worker seems to run "main" with no parameters
+		//"Too few arguments for WASM\n");
+		exit(1);
+		#endif
 	}
 	int dtCalc = DT_FLOAT32; //data type for calculation
 	int dtOut = DT_FLOAT32; //data type for calculation
