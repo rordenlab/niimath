@@ -6,11 +6,11 @@
  * gcc -O3 -lm -lz -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib
  *
  * OpenMP (parallel threading)
- *  gcc-9  -fopenmp -lm  -I./darwin ./darwin/libz.a -DHAVE_ZLIB -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib -I./znzlib 
+ *  gcc-9  -fopenmp -lm  -I./darwin ./darwin/libz.a -DHAVE_ZLIB -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
  *
  *----------------------------------------------------------------------
  */
- 
+
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,7 +24,13 @@
 	#include "meshtypes.h"
 	#include "meshify.h"
 	#include "quadric.h"
-	#include <unistd.h>
+	#ifdef _MSC_VER
+		#include <io.h>
+		#define access _access
+		#define F_OK    00       /* Test for existence.  */
+	#else
+		#include <unistd.h>
+	#endif
 	#include <stdio.h>
 #endif
 
@@ -307,7 +313,7 @@ extern "C" {
 		}
 		free(argv);
 		free(args_copy);
-	
+
 		return result;
 	}
 }
@@ -329,7 +335,7 @@ int show_help( void ) {
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
 #ifdef HAVE_BUTTERWORTH
-	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");  
+	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");
 #endif
 	printf(" -bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
 #ifdef NII2MESH
@@ -357,7 +363,7 @@ int show_help( void ) {
 	#else
 	printf(" -p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif
-	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");  
+	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");
 	printf(" -round                   : round voxels to the nearest integer\n");
 	printf(" -sobel                   : fast edge detection\n");
 	printf(" -sobel_binary            : sobel creating binary edge\n");
@@ -527,7 +533,7 @@ int main(int argc, char * argv[]) {
 		if( argc < (ac+2) ) return 1; //insufficient arguments remain
 	}
 	if (dtCalc == DT_FLOAT32)
-		return(main32(argc, argv));	
+		return(main32(argc, argv));
 	else
 	#ifdef HAVE_64BITS
 		return(main64(argc, argv));
@@ -536,7 +542,7 @@ int main(int argc, char * argv[]) {
 		fprintf(stderr,"'-dt' error: only not compiled for 'double' calculations\n");
 		return(EXIT_FAILURE);
 	}
-	#endif 
-		
+	#endif
+
 } //main()
 #endif
