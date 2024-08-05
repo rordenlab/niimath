@@ -507,6 +507,90 @@ staticx int nifti_edt(nifti_image *nim) {
 	return 0;
 } //nifti_edt()
 
+staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
+	flt thick = fabs(wallThickness);
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if (nVol != 1)
+		return 1;
+	flt *img3D = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	flt *img = (flt *)nim->data;
+	int nThresh = 0;
+	flt mn = img[0];
+	for (size_t i = 0; i < nim->nvox; i++) {
+		img3D[i] = img[i];
+		mn = fmin(mn, img3D[i]);
+		if (img[i] >= threshold) {
+			img[i] = 1;
+			nThresh++;
+		} else
+			img[i] = 0;
+	}
+	if (nThresh < 1) {
+		printf("Hollow error, no voxels survive threshold %g\n", threshold);
+		return 1;
+	}
+	#ifdef NII2MESH
+		#ifdef DT32
+			int conn = 6;
+			size_t dim[3] = {(size_t)nim->nx, (size_t)nim->ny, (size_t)nim->nz};
+			//select largest item, fill bubbles
+			bwlabel(img, conn, dim, true, true);
+		#endif
+	#endif
+	int ret = nifti_edt(nim);
+	// measure thickest depth
+	float mx = img[0];
+	int mxidx = 0;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] > mx) {
+			mx = img[i];
+			mxidx = i;
+		} 
+	}
+	if (mx <= thick) {
+		printf("Hollow error, no surface deeper than %g (deepest point %g)\n", thick, mx);
+		return 1;
+	}
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] > thick)
+			img[i] = mn;
+		else
+			img[i] = img3D[i];
+	}
+	_mm_free(img3D);
+	if (wallThickness < 0.0) {
+		//hollow 3D printing often requires escape hole
+		// we will create a hole to one of the deepest voxels
+		int nx = nim->nx;
+		int ny = nim->ny;
+		int nz = nim->nz;
+		int nxy = nx * ny;
+		int z = floor(mxidx / nxy);
+		mxidx %= nxy;
+		int y = floor(mxidx / nx);
+		int x = mxidx % nx;
+		//size of escape hole
+		int escape = ceil(thick / 1.0);
+		//for (size_t zi = 0; zi < z; zi++) {
+		for (int zi = z-escape; zi < (z+escape); zi++) {
+			//for (size_t yi = y-thick2; yi <= (y+thick2); yi++) {
+			for (int yi = y; yi < ny; yi++) {
+				for (int xi = x-escape; xi <= (x + escape); xi++) {
+					int xclamp = MIN(MAX(xi, 0), nx - 1);
+					int zclamp = MIN(MAX(zi, 0), nz - 1);
+					int idx = xclamp + (yi * nx) + (zclamp * nxy);
+					img[idx] = mn;
+				}
+			}
+			
+		}
+
+	}
+	//		nifti_hollow(nim, thresh, thick);
+	return ret;
+}
+
 //kernelWid influences width of kernel, use negative values for round, positive for ceil
 // kenrnelWid of 2.5 means the kernel will be (2 * ceil(2.5 * sigma))+1 voxels wide
 // kenrnelWid of -6.0 means the kernel will be (2 * round(6.0 * sigma))+1 voxels wide
@@ -3096,6 +3180,11 @@ staticx int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize
 	if (nim->datatype != DT_CALC)
 		return 1;
 	flt *f32 = (flt *)nim->data;
+	//issue26:  Inputting -1 for a size will set it to the full image extent for that dimension. 
+	if (xsize < 0) xsize = nim->nx;
+	if (ysize < 0) ysize = nim->ny;
+	if (zsize < 0) zsize = nim->nz;
+	if (tsize < 0) tsize = nim->nt;
 	//if (neg_determ(nim))
 	//	do something profound; //determinants do not seem to influence "-roi"?
 	int xmax = xmin + xsize - 1;
@@ -5179,6 +5268,12 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 				printfx("Error: no output filename specified!\n"); //e.g. volume size might differ
 				goto fail;
 			}
+		} else if (!strcmp(argv[ac], "-hollow")) {
+			ac++;
+			double thresh = strtod(argv[ac], &end);
+			ac++;
+			double thick = strtod(argv[ac], &end);
+			nifti_hollow(nim, thresh, thick);
 		} else if (!strcmp(argv[ac], "-unsharp")) {
 			ac++;
 			double sigma = strtod(argv[ac], &end);
