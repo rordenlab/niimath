@@ -287,7 +287,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 }
 
 vec4 setVec4(float x, float y, float z) {
-	vec4 v = {{x, y, z, 1}};
+	vec4 v = {{x, y, z, 1.0}};
 	return v;
 }
 

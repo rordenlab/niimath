@@ -74,6 +74,9 @@
 #ifdef HAVE_TENSOR
 	#include "tensor.h"
 #endif
+#ifdef HAVE_CONFORM
+	#include "conform.h"
+#endif
 
 #include <stdbool.h>
 //#define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
@@ -506,6 +509,55 @@ staticx int nifti_edt(nifti_image *nim) {
 	nifti_sqrt(img, nim->nvox);
 	return 0;
 } //nifti_edt()
+
+// "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
+// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -max scalar imgout
+staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if (nVol != 1)
+		return 1;
+	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	flt *img = (flt *)nim->data;
+	memcpy(imgIn, img, nvox3D * sizeof(float));
+	//step 1: threshold and make invert binary
+	// -thr iso -binv
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] >= iso)
+			img[i] = 0;
+		else
+			img[i] = 1;
+	}
+	//step2 apply distance transform
+	// -edt
+	nifti_edt(nim);
+	//step 3: threshold and make invert binary
+	// -thr $dx1 -binv
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] >= dx1)
+			img[i] = 0;
+		else
+			img[i] = 1;
+	}
+	//step4 apply distance transform
+	// -edt
+	nifti_edt(nim);
+	//step 5: threshold and make binary, set surviving voxels to iso
+	// -thr $dx2 -bin -mul $iso
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] < dx2)
+			img[i] = 0;
+		else
+			img[i] = iso;
+	}
+	//step 6 - voxel is brightest of original and mask
+	// -max scalar
+	for (size_t i = 0; i < nim->nvox; i++) {
+		img[i] = fmax(img[i], imgIn[i]);
+	}
+	_mm_free(imgIn);
+	return 0;
+}
 
 staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 	flt thick = fabs(wallThickness);
@@ -4723,15 +4775,28 @@ staticx int nifti_fdr(nifti_image *nim, double qval) {
 	flt *img = (flt *)nim->data;
 	float thresh = fdr(img, qval, nvox);
 	printfx("nifti_fdr %g %g\n", qval, thresh);
+	exit(0);
 	#else
 	printfx("'-dt double' does not support fdr\n" );
 	exit(1);
 	#endif
-	
-
-	exit(1);
 }
 #endif
+
+#ifdef HAVE_CONFORM
+staticx int nifti_conform(nifti_image *nim) {
+	#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("conform: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	return conform(nim);
+	#else
+	printfx("'-dt double' does not support conform\n" );
+	return 1;
+	#endif
+}
+#endif //HAVE_CONFORM
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	if (nim->nvox < 1)
@@ -5368,8 +5433,24 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 				double qval = strtod(argv[ac], &end);
 			nifti_fdr(nim, qval); //always terminates
 		#endif
+		#ifdef HAVE_CONFORM
+		} else if ((!strcmp(argv[ac], "-conform")) || (!strcmp(argv[ac], "--conform"))) {
+			ok = nifti_conform(nim);
+			//printf("MORK\n");
+			//exit(42);
+		#endif
 		}
-		else if (!strcmp(argv[ac], "-edt"))
+		else if (!strcmp(argv[ac], "-close")) {
+			// "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
+			// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -max scalar imgout
+			ac++;
+			double iso = strtod(argv[ac], &end);
+			ac++;
+			double dx1 = strtod(argv[ac], &end);
+			ac++;
+			double dx2 = strtod(argv[ac], &end);
+			ok = nifti_close(nim, iso, dx1, dx2);
+		} else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-fillh"))
 			ok = nifti_fillh(nim, 0);

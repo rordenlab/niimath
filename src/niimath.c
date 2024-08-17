@@ -61,7 +61,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20240731"
+#define kMTHdate "v1.0.20240817"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -279,11 +279,15 @@ int show_help( void ) {
 #endif
 	printf(" -c2h                     : reverse h2c transform\n");
 	printf(" -ceil                    : round voxels upwards to the nearest integer\n");
+#ifdef HAVE_CONFORM
+	printf(" -conform                 : reslice to 1mm size in coronal slice direction with 256^3 voxels\n");
+#endif
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
 	printf(" -detrend                 : remove linear trend (and mean) from input\n");
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
+	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 #ifdef NII2MESH

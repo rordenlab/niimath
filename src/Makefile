@@ -2,7 +2,11 @@
 CNAME=gcc
 #universal flags always included
 UFLAGS= niimath.c core.c core32.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -lm
+#experimental conform feature
+UFLAGS+= conform.c -DHAVE_CONFORM
 UFLAGS64= -DHAVE_64BITS core64.c
+
+
 #Zlib flags
 ZFLAGS= -DHAVE_ZLIB -lz
 #compiler flags
@@ -34,7 +38,7 @@ ifeq "$(MESH)" "0"
 endif
 
 all:
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM
 tiny:
@@ -44,9 +48,13 @@ tiny:
 nano:
 	$(CNAME) $(CFLAGS) $(UFLAGS) -o niimath
 
+# quick and dirty
+debug:
+	$(CNAME) -O0 $(MFLAGS) $(UFLAGS) -o niimath
+
 # sanitize checks memory errors - similar to tiny/wasm
 sanitize:
-	g++ -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(MFLAGS) $(UFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(MFLAGS) $(UFLAGS) -o niimath
 
 wasm:
 	emcc -O3 $(MFLAGS) $(UFLAGS) -s DEMANGLE_SUPPORT=1 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o niimath.js
