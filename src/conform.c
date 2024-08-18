@@ -298,11 +298,9 @@ int conform(nifti_image *nim) {
 					if (fx < 0 || fy < 0 || fz < 0) {
 						continue;
 					}
-					// n.b. cx = fx + 1 unless fx is an integer
-					// no performance benefits noted changing ceil to + 1
-					int cx = ceil(ix);
-					int cy = ceil(iy);
-					int cz = ceil(iz);
+					int cx = fx + 1;
+					int cy = fy + 1;
+					int cz = fz + 1;
 					if (cx >= dimX || cy >= dimY || cz >= dimZ) {
 						continue;
 					}
