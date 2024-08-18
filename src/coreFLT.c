@@ -553,7 +553,10 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	//step 6 - voxel is brightest of original and mask
 	// -max scalar
 	for (size_t i = 0; i < nim->nvox; i++) {
-		img[i] = fmax(img[i], imgIn[i]);
+		if (img[i] > 0)
+			img[i] = fmax(img[i], imgIn[i]);
+		else
+			img[i] = imgIn[i];
 	}
 	_mm_free(imgIn);
 	return 0;
@@ -5442,7 +5445,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		}
 		else if (!strcmp(argv[ac], "-close")) {
 			// "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
-			// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -max scalar imgout
+			// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -mas scalar imgout
 			ac++;
 			double iso = strtod(argv[ac], &end);
 			ac++;
