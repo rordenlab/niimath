@@ -3,5 +3,7 @@
 /bin/
 /src/niimath
 niimath
-/dist
-/node_modules
+dist
+node_modules
+niimath.js
+niimath.wasm
