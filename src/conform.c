@@ -272,10 +272,14 @@ int conform(nifti_image *nim) {
 	nim->nz = outDim;
 	int nvoxOut = outDim * outDim * outDim;
 	nim->nvox = nvoxOut;
-	//nim->data = (float *)_mm_malloc(outDim * outDim * outDim * sizeof(float), 64);
 	free(nim->data);  // Free the memory allocated with calloc
-	nim->data = calloc(1,nvoxOut * sizeof(float)) ;
-	float *out_img = (float *)nim->data;
+	float *out_img = (float *)_mm_malloc(nvoxOut * sizeof(float), 64); //output image
+	memset(out_img, 0, nim->nvox * sizeof(float)); //zero array
+	nim->data = (void *) out_img;
+	if (nim->data == NULL) {
+		printfx("conform failed to allocate memory\n");
+		return -1; // Return an error code if allocation fails
+	}
 	int i = -1;
 	//n.b. fastsurfer conform uses linear interpolation: "order = 1"
 	// likewise, mri_convert reports "Reslicing using trilinear interpolation"
