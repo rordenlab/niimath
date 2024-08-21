@@ -7,24 +7,26 @@ import Module from './niimath.js';
 // initialise an instance of the Emscripten Module so that
 // it is ready when the worker receives a message.
 // We keep a reference to the module so that the worker can reuse it 
-// for all subsequent calls without having to reinitialise it (which is slow due to the WASM loading)
+// for all subsequent calls without having to reinitialise it (which could be slow due to the WASM loading)
 let mod = null
 Module().then((initializedMod) => {
   mod = initializedMod
+  // Send a ready message once initialization is complete
+  // so we can signal to the main thread that the worker is ready.
+  // The Niimath.init() method will wait for this message before resolving the promise.
+  self.postMessage({ type: 'ready' });
 })
 
 // error handler in the worker
 self.onerror = function (message, error) {
   self.postMessage({ type: 'error', message: message, error: error ? error.stack : null });
 };
-
 // unhandled promise rejection handler in the worker
 self.onunhandledrejection = function (event) {
   self.postMessage({ type: 'error', message: event.reason ? event.reason.message : 'Unhandled rejection', error: event.reason ? event.reason.stack : null });
 };
 
-// Handle messages from the main thread
-self.addEventListener('message', (e) => {
+const handleMessage = (e) => {
   try {
     const file = e.data.blob;
     const args = e.data.cmd;
@@ -80,4 +82,7 @@ self.addEventListener('message', (e) => {
     // Send error details back to the main thread
     self.postMessage({ type: 'error', message: err.message, error: err.stack });
   }
-}, false);
+}
+
+// Handle messages from the main thread
+self.addEventListener('message', handleMessage, false);

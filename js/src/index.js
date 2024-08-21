@@ -1,74 +1,99 @@
+import operators from './niimathOperators.json';
 export class Niimath {
   constructor() {
-    this.worker = this.createWorker();
+    this.worker = null;
+    this.operators = operators;
   }
 
-  createWorker() {
-    // Create a new worker. The import.meta.url is relevant for module bundlers.
-    const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-    
-    // Handle errors from the worker
-    worker.onmessage = function (event) {
-      if (event.data.type === 'error') {
-        console.error('Worker Error:', event.data.message);
-        if (event.data.error) {
-          console.error('Stack Trace:', event.data.error);
+  init() {
+    this.worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+    return new Promise((resolve, reject) => {
+      // Handle worker ready message.
+      // This gets reassigned in the run() method, 
+      // but we need to handle the ready message before that.
+      // Maybe there is a less hacky way to do this?
+      this.worker.onmessage =  (event) => {
+        if (event.data && event.data.type === 'ready') {
+          resolve(true); // Resolve the promise when the worker is ready
         }
       }
-    };
-
-    return worker;
+  
+      // Handle worker init errors.
+      this.worker.onerror = (error) => {
+        reject(new Error(`Worker failed to load: ${error.message}`));
+      }
+    });
   }
 
-  // Create a new ImageProcessor instance with the given file.
-  // This only supports a single file for now. 
   image(file) {
-    return new ImageProcessor(this.worker, file);
+    return new ImageProcessor({worker: this.worker, file, operators: this.operators});
   }
 }
 
-// ImageProcessor class to handle niimath image processing commands.
 class ImageProcessor {
-  constructor(worker, file) {
-    this.worker = worker; // The worker to send commands to. Important to use a separate thread for processing.
+
+  constructor({worker, file, operators}) {
+    this.worker = worker;
     this.file = file;
-    this.commands = []; // The list of commands to execute. Will be populated by ImageProcessor niimath operators
+    this.operators = operators;
+    this.commands = [];
+    this._generateMethods();
   }
 
-  // use _ prefix to indicate a private method (although it's not enforced in JS just like in Python).
-  // Could use TypeScript in the future.
   _addCommand(cmd, ...args) {
-    // each item must be a string, so we force it here.
-    // e.g. niimath.dog(1, 2) will add '-dog', '1', '2' to the commands array.
     this.commands.push(cmd, ...args.map(String));
     return this;
   }
 
-  sobel() {
-    return this._addCommand('-sobel');
+  _generateMethods() {
+    Object.keys(this.operators).forEach((methodName) => {
+      const definition = this.operators[methodName];
+
+      if (methodName === 'kernel') {
+        // special case for kernels because they have different types with varying arguments
+        Object.keys(definition.subOperations).forEach((subOpName) => {
+          const subOpDefinition = definition.subOperations[subOpName];
+          this[`kernel${subOpName.charAt(0).toUpperCase() + subOpName.slice(1)}`] = (...args) => {
+            if (args.length !== subOpDefinition.args.length) {
+              throw new Error(`Expected ${subOpDefinition.args.length} arguments for kernel ${subOpName}, but got ${args.length}`);
+            }
+            return this._addCommand('-kernel', subOpName, ...args);
+          };
+        });
+      } else {
+        // all other non-kernel operations
+        this[methodName] = (...args) => {
+          if (args.length < definition.args.length || (!definition.optional && args.length > definition.args.length)) {
+            throw new Error(`Expected ${definition.args.length} arguments for ${methodName}, but got ${args.length}`);
+          }
+          return this._addCommand(`-${methodName}`, ...args);
+        };
+      }
+    });
   }
 
-  dog(sigma1, sigma2) {
-    return this._addCommand('-dog', sigma1, sigma2);
-  }
-
-  // run command. e.g. niimath.image(file).dog(2, 3.2).run('output.nii')
   async run(outName = 'output.nii') {
     return new Promise((resolve, reject) => {
       this.worker.onmessage = (e) => {
         if (e.data.type === 'error') {
           reject(new Error(e.data.message));
         } else {
+          // get the output file and the exit code from niimath wasm
           const { blob, exitCode } = e.data;
           if (exitCode === 0) {
+            // success
             resolve(blob);
           } else {
+            // error
             reject(new Error(`niimath processing failed with exit code ${exitCode}`));
           }
         }
       };
 
       const args = [this.file.name, ...this.commands, outName];
+      if (this.worker === null) {
+        reject(new Error('Worker not initialized. Did you await the init() method?'));
+      }
       this.worker.postMessage({ blob: this.file, cmd: args, outName: outName });
     });
   }

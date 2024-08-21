@@ -16,6 +16,8 @@ For example, the [difference of gaussian](https://www.biorxiv.org/content/biorxi
 import { Niimath } from '@niivue/niimath';
 
 const niimath = new Niimath();
+// call the init() method to load the wasm before processing images
+await niimath.init();
 
 // 1. selectedFile is a browser File object
 // 2. note the use of the final run() method to execute the command. 

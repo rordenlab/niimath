@@ -42,10 +42,13 @@
       processButton.disabled = true;
 
       try {
-
-        const outFile = await niimath.image(selectedFile)
-          .dog(2, 3.2)
-          .run();
+        console.log('Initializing niimath wasm...');
+        await niimath.init();
+        console.log('niimath wasm initialized.');
+        const t0 = performance.now();
+        const outFile = await niimath.image(selectedFile).sobel().thr(20).fmean().otsu(5).run()
+        const t1 = performance.now();
+        console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
 
         // Create a download link for the processed file
         const url = URL.createObjectURL(outFile);

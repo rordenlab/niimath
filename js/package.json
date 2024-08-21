@@ -11,10 +11,12 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "node esbuild.config.js",
-    "make": "make wasm -C ../src",
-    "prebuild": "npm run make && node scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
+    "makeTiny": "make tiny -C ../src",
+    "makeWasm": "make wasm -C ../src",
+    "parseHelpText": "node scripts/parseNiimathHelp.js",
+    "prebuild": "npm run makeTiny && npm run parseHelpText && npm run makeWasm && node scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
     "demo": "npm run build && npx http-server .",
-    "pub": "npm publish --access public"
+    "pub": "npm run build && npm publish --access public"
   },
   "keywords": ["niivue", "niimath", "nifti", "medical", "imaging", "brain"],
   "author": "NiiVue developers",
