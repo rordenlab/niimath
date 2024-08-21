@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Niimath WASM Demo</title>
+</head>
+
+<body>
+  <h1>Niimath WASM Demo</h1>
+  <input type="file" id="fileInput">
+  <button id="processButton" disabled>Process Image</button>
+  <p id="status">Please select a NIfTI image file to process.</p>
+  <a id="downloadLink" style="display: none;">Download Processed Image</a>
+
+  <script type="module">
+    import { Niimath } from './dist/index.js';
+    const niimath = new Niimath();
+    const fileInput = document.getElementById('fileInput');
+    const processButton = document.getElementById('processButton');
+    const status = document.getElementById('status');
+    const downloadLink = document.getElementById('downloadLink');
+
+    let selectedFile = null;
+
+    fileInput.addEventListener('change', async (event) => {
+      selectedFile = event.target.files[0];
+      if (selectedFile) {
+        processButton.disabled = false;
+        status.textContent = `Selected file: ${selectedFile.name}`;
+      } else {
+        processButton.disabled = true;
+        status.textContent = 'Please select a NIfTI image file to process.';
+      }
+    });
+
+    processButton.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      status.textContent = 'Processing...';
+      processButton.disabled = true;
+
+      try {
+        console.log('Initializing niimath wasm...');
+        await niimath.init();
+        console.log('niimath wasm initialized.');
+        const t0 = performance.now();
+        const outFile = await niimath.image(selectedFile).sobel().thr(20).fmean().otsu(5).run()
+        const t1 = performance.now();
+        console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
+
+        // Create a download link for the processed file
+        const url = URL.createObjectURL(outFile);
+        downloadLink.href = url;
+        downloadLink.download = 'processed_image.nii.gz';
+        downloadLink.style.display = 'block';
+        downloadLink.textContent = 'Download Processed Image';
+
+        status.textContent = 'Processing complete!';
+      } catch (error) {
+        console.error('Processing failed:', error);
+        status.textContent = 'Processing failed. Please check the console for details.';
+      } finally {
+        processButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,31 @@
+{
+  "name": "@niivue/niimath",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "node esbuild.config.js",
+    "makeTiny": "make tiny -C ../src",
+    "makeWasm": "make wasm -C ../src",
+    "parseHelpText": "node scripts/parseNiimathHelp.js",
+    "prebuild": "npm run makeTiny && npm run parseHelpText && npm run makeWasm && node scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
+    "demo": "npm run build && npx http-server .",
+    "pub": "npm run build && npm publish --access public"
+  },
+  "keywords": ["niivue", "niimath", "nifti", "medical", "imaging", "brain"],
+  "author": "NiiVue developers",
+  "license": "BSD-2-Clause",
+  "description": "A javascript library to easily use the WASM build of Chris Rorden's niimath command line program written in C",
+  "files": [
+    "dist/"
+  ],
+  "devDependencies": {
+    "esbuild": "^0.23.1"
+  }
+}

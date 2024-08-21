@@ -1,4 +1,10 @@
+# niimath
+
 [![Build status](https://ci.appveyor.com/api/projects/status/7o0xp2fgbhadkgn1?svg=true)](https://ci.appveyor.com/project/neurolabusc/niimath)
+
+## JavaScript/WebAssembly
+
+To read the WASM specific README, please click [here](./js/README.md). The rest of this README is for the `niimath` CLI program.
 
 ## About
 
