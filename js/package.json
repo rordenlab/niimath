@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "exports": {
@@ -18,7 +18,14 @@
     "demo": "npm run build && npx http-server .",
     "pub": "npm run build && npm publish --access public"
   },
-  "keywords": ["niivue", "niimath", "nifti", "medical", "imaging", "brain"],
+  "keywords": [
+    "niivue",
+    "niimath",
+    "nifti",
+    "medical",
+    "imaging",
+    "brain"
+  ],
   "author": "NiiVue developers",
   "license": "BSD-2-Clause",
   "description": "A javascript library to easily use the WASM build of Chris Rorden's niimath command line program written in C",

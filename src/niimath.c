@@ -291,7 +291,22 @@ int show_help( void ) {
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 #ifdef NII2MESH
+	printf("\n");
+	printf(" The mesh option has multiple sub-options:\n");
 	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')\n");
+	// We should indent the next few help lines to indicate that they are sub-options of -mesh
+	// DO NOT USE TABS!!! Use spaces to indent
+	printf("    -i <isovalue>            : 'd'ark, 'm'edium, 'b'right or numeric isosurface\n");
+	printf("    -a <atlasFile>           : roi based atlas to mesh\n");
+	printf("    -b <fillBubbles>         : fill bubbles\n");
+	printf("    -l <onlyLargest>         : only largest\n");
+	printf("    -o <originalMC>          : original marching cubes\n");
+	printf("    -q <quality>             : quality\n");
+	printf("    -s <postSmooth>          : post smooth\n");
+	printf("    -r <reduceFraction>      : reduce fraction\n");
+	printf("    -v <verbose>             : verbose\n");
+	// add -hollow <threshold> <wallThickness> if mesh support enabled
+	printf(" -hollow <threshold> <thickness> : hollow out a mesh\n");
 #endif
 	printf(" -mod                     : modulus fractional remainder - same as '-rem' but includes fractions\n");
 	printf(" -otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)\n");

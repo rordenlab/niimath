@@ -8,7 +8,7 @@
 
 The `@niivue/niimath` JavaScript library offers an object oriented API for working with the `niimath` CLI. Since `niimath` is a CLI tool, the API implemented in `@niivue/niimath` is just a wrapper around the CLI options and arguments. 
 
-### example
+### Example: volumes
 
 For example, the [difference of gaussian](https://www.biorxiv.org/content/biorxiv/early/2022/09/17/2022.09.14.507937.full.pdf) command `niimath input.nii -dog 2 3.2 output.nii` can be executed using the following `@niivue/niimath` JavaScript code:
 
@@ -23,6 +23,37 @@ await niimath.init();
 // 2. note the use of the final run() method to execute the command. 
 // 3. note the use of await. The run method returns a promise that resolves to the output file if the command is successful.
 const outFile = await niimath.image(selectedFile).dog(2, 3.2).run();
+```
+
+### Example: meshes
+
+The `@niivue/niimath` library also supports the `-mesh` options available in the `niimath` CLI. However, the JavaScript API is slightly different from the volume processing due to the use of the `-mesh` suboptions. 
+
+```javascript
+import { Niimath } from '@niivue/niimath';
+const niimath = new Niimath();
+await niimath.init();
+const outName = 'out.mz3'; // outname must be a mesh format!
+const outMesh = await niimath.image(selectedFile)
+  .mesh({
+    i: 'm', // 'd'ark, 'm'edium, 'b'right or numeric (e.g. 128) isosurface
+    b: 1, // fill bubbles
+  })
+  .run(outName);
+/*
+Here's the help from the niimath CLI program
+The mesh option has multiple sub-options:
+ -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')
+        -i <isovalue>            : 'd'ark, 'm'edium, 'b'right or numeric isosurface
+        -a <atlasFile>           : roi based atlas to mesh
+        -b <fillBubbles>         : fill bubbles
+        -l <onlyLargest>         : only largest
+        -o <originalMC>          : original marching cubes
+        -q <quality>             : quality
+        -s <postSmooth>          : post smooth
+        -r <reduceFraction>      : reduce fraction
+        -v <verbose>             : verbose
+*/
 ```
 
 ## Installation
