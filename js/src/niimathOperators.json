@@ -4,92 +4,167 @@
       "hp",
       "lp"
     ],
-    "help": "-bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)"
+    "help": "Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)"
   },
   "bwlabel": {
     "args": [
       "conn"
     ],
-    "help": "-bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26)"
+    "help": "Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26)"
   },
   "c2h": {
     "args": [],
-    "help": "-c2h                     : reverse h2c transform"
+    "help": "reverse h2c transform"
   },
   "ceil": {
     "args": [],
-    "help": "-ceil                    : round voxels upwards to the nearest integer"
+    "help": "round voxels upwards to the nearest integer"
+  },
+  "conform": {
+    "args": [],
+    "help": "reslice to 1mm size in coronal slice direction with 256^3 voxels"
   },
   "crop": {
     "args": [
       "tmin",
       "tsize"
     ],
-    "help": "-crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range"
+    "help": "remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range"
   },
   "dehaze": {
     "args": [
       "mode"
     ],
-    "help": "-dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)"
+    "help": "set dark voxels to zero (mode 1..5; higher yields more surviving voxels)"
   },
   "detrend": {
     "args": [],
-    "help": "-detrend                 : remove linear trend (and mean) from input"
+    "help": "remove linear trend (and mean) from input"
   },
   "demean": {
     "args": [],
-    "help": "-demean                  : remove average signal across volumes (requires 4D input)"
+    "help": "remove average signal across volumes (requires 4D input)"
   },
   "edt": {
     "args": [],
-    "help": "-edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input"
+    "help": "estimate Euler Distance Transform (distance field). Assumes isotropic input"
+  },
+  "close": {
+    "args": [
+      "thr",
+      "dx1",
+      "dx2"
+    ],
+    "help": "morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)"
   },
   "floor": {
     "args": [],
-    "help": "-floor                   : round voxels downwards to the nearest integer"
+    "help": "round voxels downwards to the nearest integer"
   },
   "h2c": {
     "args": [],
-    "help": "-h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast"
+    "help": "convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast"
   },
   "mesh": {
     "args": [],
-    "help": "-mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')"
+    "help": "meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')",
+    "subOperations": {
+      "i": {
+        "args": [
+          "isovalue"
+        ],
+        "help": "'d'ark, 'm'edium, 'b'right or numeric isosurface"
+      },
+      "a": {
+        "args": [
+          "atlasFile"
+        ],
+        "help": "roi based atlas to mesh"
+      },
+      "b": {
+        "args": [
+          "fillBubbles"
+        ],
+        "help": "fill bubbles"
+      },
+      "l": {
+        "args": [
+          "onlyLargest"
+        ],
+        "help": "only largest"
+      },
+      "o": {
+        "args": [
+          "originalMC"
+        ],
+        "help": "original marching cubes"
+      },
+      "q": {
+        "args": [
+          "quality"
+        ],
+        "help": "quality"
+      },
+      "s": {
+        "args": [
+          "postSmooth"
+        ],
+        "help": "post smooth"
+      },
+      "r": {
+        "args": [
+          "reduceFraction"
+        ],
+        "help": "reduce fraction"
+      },
+      "v": {
+        "args": [
+          "verbose"
+        ],
+        "help": "verbose"
+      }
+    }
+  },
+  "hollow": {
+    "args": [
+      "threshold",
+      "thickness"
+    ],
+    "help": "hollow out a mesh"
   },
   "mod": {
     "args": [],
-    "help": "-mod                     : modulus fractional remainder - same as '-rem' but includes fractions"
+    "help": "modulus fractional remainder - same as '-rem' but includes fractions"
   },
   "otsu": {
     "args": [
       "mode"
     ],
-    "help": "-otsu <mode>             : binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)"
+    "help": "binarize image using Otsu's method (mode 1..5; higher yields more bright voxels)"
   },
   "power": {
     "args": [
       "exponent"
     ],
-    "help": "-power <exponent>        : raise the current image by following exponent"
+    "help": "raise the current image by following exponent"
   },
   "qform": {
     "args": [
       "code"
     ],
-    "help": "-qform <code>            : set qform_code"
+    "help": "set qform_code"
   },
   "sform": {
     "args": [
       "code"
     ],
-    "help": "-sform <code>            : set sform_code"
+    "help": "set sform_code"
   },
   "p": {
     "args": [
       "threads"
     ],
-    "help": "-p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support"
+    "help": "set maximum number of parallel threads. DISABLED: recompile for OpenMP support"
   },
   "resize": {
     "args": [
@@ -98,286 +173,286 @@
       "Z",
       "m"
     ],
-    "help": "-resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)"
+    "help": "grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)"
   },
   "round": {
     "args": [],
-    "help": "-round                   : round voxels to the nearest integer"
+    "help": "round voxels to the nearest integer"
   },
   "sobel": {
     "args": [],
-    "help": "-sobel                   : fast edge detection"
+    "help": "fast edge detection"
   },
   "sobel_binary": {
     "args": [],
-    "help": "-sobel_binary            : sobel creating binary edge"
+    "help": "sobel creating binary edge"
   },
   "tensor_2lower": {
     "args": [],
-    "help": "-tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order"
+    "help": "convert FSL style upper triangle image to NIfTI standard lower triangle order"
   },
   "tensor_2upper": {
     "args": [],
-    "help": "-tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order"
+    "help": "convert NIfTI standard lower triangle image to FSL style upper triangle order"
   },
   "tensor_decomp_lower": {
     "args": [],
-    "help": "-tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)"
+    "help": "as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)"
   },
   "trunc": {
     "args": [],
-    "help": "-trunc                   : truncates the decimal value from floating point value and returns integer value"
+    "help": "truncates the decimal value from floating point value and returns integer value"
   },
   "unsharp": {
     "args": [
       "sigma",
       "scl"
     ],
-    "help": "-unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical)"
+    "help": "edge enhancing unsharp mask (sigma in mm, not voxels; 1.0 is typical)"
   },
   "dog": {
     "args": [
       "sPos",
       "sNeg"
     ],
-    "help": "-dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)"
+    "help": "difference of gaussian with zero-crossing edges (positive and negative sigma mm)"
   },
   "dogr": {
     "args": [
       "sPos",
       "sNeg"
     ],
-    "help": "-dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)"
+    "help": "as dog, without zero-crossing (raw rather than binarized data)"
   },
   "dogx": {
     "args": [
       "sPos",
       "sNeg"
     ],
-    "help": "-dogx <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices"
+    "help": "as dog, zero-crossing for 2D sagittal slices"
   },
   "dogy": {
     "args": [
       "sPos",
       "sNeg"
     ],
-    "help": "-dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices"
+    "help": "as dog, zero-crossing for 2D coronal slices"
   },
   "dogz": {
     "args": [
       "sPos",
       "sNeg"
     ],
-    "help": "-dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices"
+    "help": "as dog, zero-crossing for 2D axial slices"
   },
   "add": {
     "args": [
       "input"
     ],
-    "help": "-add <input>             : add following input to current image"
+    "help": "add following input to current image"
   },
   "sub": {
     "args": [
       "input"
     ],
-    "help": "-sub <input>             : subtract following input from current image"
+    "help": "subtract following input from current image"
   },
   "mul": {
     "args": [
       "input"
     ],
-    "help": "-mul <input>             : multiply current image by following input"
+    "help": "multiply current image by following input"
   },
   "div": {
     "args": [
       "input"
     ],
-    "help": "-div <input>             : divide current image by following input"
+    "help": "divide current image by following input"
   },
   "rem": {
     "args": [
       "number"
     ],
-    "help": "-rem <number>            : modulus remainder - divide current image by following input and take remainder"
+    "help": "modulus remainder - divide current image by following input and take remainder"
   },
   "mas": {
     "args": [
       "file"
     ],
-    "help": "-mas <file>              : use (following image>0) to mask current image"
+    "help": "use (following image>0) to mask current image"
   },
   "thr": {
     "args": [
       "number"
     ],
-    "help": "-thr <number>            : use following number to threshold current image (zero anything below the number)"
+    "help": "use following number to threshold current image (zero anything below the number)"
   },
   "thrp": {
     "args": [
       "input"
     ],
-    "help": "-thrp <input>>           : use following percentage (0-100) of ROBUST RANGE to threshold current image (zero anything below the number)"
+    "help": "use following percentage (0-100) of ROBUST RANGE to threshold current image (zero anything below the number)"
   },
   "thrP": {
     "args": [
       "input"
     ],
-    "help": "-thrP <input>            : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold below"
+    "help": "use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold below"
   },
   "uthr": {
     "args": [
       "number"
     ],
-    "help": "-uthr <number>           : use following number to upper-threshold current image (zero anything above the number)"
+    "help": "use following number to upper-threshold current image (zero anything above the number)"
   },
   "uthrp": {
     "args": [
       "input"
     ],
-    "help": "-uthrp <input>           : use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)"
+    "help": "use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)"
   },
   "uthrP": {
     "args": [
       "input"
     ],
-    "help": "-uthrP <input>           : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold above"
+    "help": "use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold above"
   },
   "clamp": {
     "args": [
       "input"
     ],
-    "help": "-clamp <input>           : use following percentage (0-100) of ROBUST RANGE to threshold current image (anything below set to this threshold)"
+    "help": "use following percentage (0-100) of ROBUST RANGE to threshold current image (anything below set to this threshold)"
   },
   "uclamp": {
     "args": [
       "input"
     ],
-    "help": "-uclamp <input>          : use following percentage (0-100) of ROBUST RANGE to threshold current image (anything above set to this threshold)"
+    "help": "use following percentage (0-100) of ROBUST RANGE to threshold current image (anything above set to this threshold)"
   },
   "max": {
     "args": [
       "input"
     ],
-    "help": "-max <input>             : take maximum of following input and current image"
+    "help": "take maximum of following input and current image"
   },
   "min": {
     "args": [
       "input"
     ],
-    "help": "-min <input>             : take minimum of following input and current image"
+    "help": "take minimum of following input and current image"
   },
   "seed": {
     "args": [
       "number"
     ],
-    "help": "-seed <number>           : seed random number generator with following number"
+    "help": "seed random number generator with following number"
   },
   "restart": {
     "args": [
       "file"
     ],
-    "help": "-restart <file>          : replace the current image with input for future processing operations"
+    "help": "replace the current image with input for future processing operations"
   },
   "save": {
     "args": [],
-    "help": "-save : save the current working image to the input filename"
+    "help": "save the current working image to the input filename"
   },
   "inm": {
     "args": [
       "mean"
     ],
-    "help": "-inm <mean>              :  (-i i ip.c) intensity normalisation (per 3D volume mean)"
+    "help": "(-i i ip.c) intensity normalisation (per 3D volume mean)"
   },
   "ing": {
     "args": [
       "mean"
     ],
-    "help": "-ing <mean>              :  (-I i ip.c) intensity normalisation, global 4D mean)"
+    "help": "(-I i ip.c) intensity normalisation, global 4D mean)"
   },
   "s": {
     "args": [
       "sigma"
     ],
-    "help": "-s <sigma> : create a gauss kernel of sigma mm and perform mean filtering"
+    "help": "create a gauss kernel of sigma mm and perform mean filtering"
   },
   "exp": {
     "args": [],
-    "help": "-exp   : exponential"
+    "help": "exponential"
   },
   "log": {
     "args": [],
-    "help": "-log   : natural logarithm"
+    "help": "natural logarithm"
   },
   "sin": {
     "args": [],
-    "help": "-sin   : sine function"
+    "help": "sine function"
   },
   "cos": {
     "args": [],
-    "help": "-cos   : cosine function"
+    "help": "cosine function"
   },
   "tan": {
     "args": [],
-    "help": "-tan   : tangent function"
+    "help": "tangent function"
   },
   "asin": {
     "args": [],
-    "help": "-asin  : arc sine function"
+    "help": "arc sine function"
   },
   "acos": {
     "args": [],
-    "help": "-acos  : arc cosine function"
+    "help": "arc cosine function"
   },
   "atan": {
     "args": [],
-    "help": "-atan  : arc tangent function"
+    "help": "arc tangent function"
   },
   "sqr": {
     "args": [],
-    "help": "-sqr   : square"
+    "help": "square"
   },
   "sqrt": {
     "args": [],
-    "help": "-sqrt  : square root"
+    "help": "square root"
   },
   "recip": {
     "args": [],
-    "help": "-recip : reciprocal (1/current image)"
+    "help": "reciprocal (1/current image)"
   },
   "abs": {
     "args": [],
-    "help": "-abs   : absolute value"
+    "help": "absolute value"
   },
   "bin": {
     "args": [],
-    "help": "-bin   : use (current image>0) to binarise"
+    "help": "use (current image>0) to binarise"
   },
   "binv": {
     "args": [],
-    "help": "-binv  : binarise and invert (binarisation and logical inversion)"
+    "help": "binarise and invert (binarisation and logical inversion)"
   },
   "fillh": {
     "args": [],
-    "help": "-fillh : fill holes in a binary mask (holes are internal - i.e. do not touch the edge of the FOV)"
+    "help": "fill holes in a binary mask (holes are internal - i.e. do not touch the edge of the FOV)"
   },
   "fillh26": {
     "args": [],
-    "help": "-fillh26 : fill holes using 26 connectivity"
+    "help": "fill holes using 26 connectivity"
   },
   "index": {
     "args": [],
-    "help": "-index : replace each nonzero voxel with a unique (subject to wrapping) index number"
+    "help": "replace each nonzero voxel with a unique (subject to wrapping) index number"
   },
   "grid": {
     "args": [
       "value",
       "spacing"
     ],
-    "help": "-grid <value> <spacing> : add a 3D grid of intensity <value> with grid spacing <spacing>"
+    "help": "add a 3D grid of intensity <value> with grid spacing <spacing>"
   },
   "edge": {
     "args": [],
-    "help": "-edge  : edge strength"
+    "help": "edge strength"
   },
   "tfce": {
     "args": [
@@ -385,7 +460,7 @@
       "E",
       "connectivity"
     ],
-    "help": "-tfce <H> <E> <connectivity>: enhance with TFCE, e.g. -tfce 2 0.5 6 (maybe change 6 to 26 for skeletons)"
+    "help": "enhance with TFCE, e.g. -tfce 2 0.5 6 (maybe change 6 to 26 for skeletons)"
   },
   "tfceS": {
     "args": [
@@ -397,53 +472,53 @@
       "Z",
       "tfce_thresh"
     ],
-    "help": "-tfceS <H> <E> <connectivity> <X> <Y> <Z> <tfce_thresh>: show support area for voxel (X,Y,Z)"
+    "help": "show support area for voxel (X,Y,Z)"
   },
   "nan": {
     "args": [],
-    "help": "-nan   : replace NaNs (improper numbers) with 0"
+    "help": "replace NaNs (improper numbers) with 0"
   },
   "nanm": {
     "args": [],
-    "help": "-nanm  : make NaN (improper number) mask with 1 for NaN voxels, 0 otherwise"
+    "help": "make NaN (improper number) mask with 1 for NaN voxels, 0 otherwise"
   },
   "rand": {
     "args": [],
-    "help": "-rand  : add uniform noise (range 0:1)"
+    "help": "add uniform noise (range 0:1)"
   },
   "randn": {
     "args": [],
-    "help": "-randn : add Gaussian noise (mean=0 sigma=1)"
+    "help": "add Gaussian noise (mean=0 sigma=1)"
   },
   "range": {
     "args": [],
-    "help": "-range : set the output calmin/max to full data range"
+    "help": "set the output calmin/max to full data range"
   },
   "tensor_decomp": {
     "args": [],
-    "help": "-tensor_decomp : convert a 4D (6-timepoint )tensor image into L1,2,3,FA,MD,MO,V1,2,3 (remaining image in pipeline is FA)"
+    "help": "convert a 4D (6-timepoint )tensor image into L1,2,3,FA,MD,MO,V1,2,3 (remaining image in pipeline is FA)"
   },
   "kernel": {
     "subOperations": {
       "3D": {
         "args": [],
-        "help": "-kernel 3D : 3x3x3 box centered on target voxel (set as default kernel)"
+        "help": "3x3x3 box centered on target voxel (set as default kernel)"
       },
       "2D": {
         "args": [],
-        "help": "-kernel 2D : 3x3x1 box centered on target voxel"
+        "help": "3x3x1 box centered on target voxel"
       },
       "box": {
         "args": [
           "size"
         ],
-        "help": "-kernel box    <size>     : all voxels in a cube of width <size> mm centered on target voxel"
+        "help": "all voxels in a cube of width <size> mm centered on target voxel"
       },
       "boxv": {
         "args": [
           "size"
         ],
-        "help": "-kernel boxv   <size>     : all voxels in a cube of width <size> voxels centered on target voxel, CAUTION: size should be an odd number"
+        "help": "all voxels in a cube of width <size> voxels centered on target voxel, CAUTION: size should be an odd number"
       },
       "boxv3": {
         "args": [
@@ -451,141 +526,141 @@
           "Y",
           "Z"
         ],
-        "help": "-kernel boxv3  <X> <Y> <Z>: all voxels in a cuboid of dimensions X x Y x Z centered on target voxel, CAUTION: size should be an odd number"
+        "help": "all voxels in a cuboid of dimensions X x Y x Z centered on target voxel, CAUTION: size should be an odd number"
       },
       "gauss": {
         "args": [
           "sigma"
         ],
-        "help": "-kernel gauss  <sigma>    : gaussian kernel (sigma in mm, not voxels)"
+        "help": "gaussian kernel (sigma in mm, not voxels)"
       },
       "sphere": {
         "args": [
           "size"
         ],
-        "help": "-kernel sphere <size>     : all voxels in a sphere of radius <size> mm centered on target voxel"
+        "help": "all voxels in a sphere of radius <size> mm centered on target voxel"
       },
       "file": {
         "args": [
           "filename"
         ],
-        "help": "-kernel file   <filename> : use external file as kernel"
+        "help": "use external file as kernel"
       }
     }
   },
   "dilM": {
     "args": [],
-    "help": "-dilM    : Mean Dilation of non-zero voxels"
+    "help": "Mean Dilation of non-zero voxels"
   },
   "dilD": {
     "args": [],
-    "help": "-dilD    : Maximum Dilation of non-zero voxels (emulating output of fslmaths 6.0.1, max not modal)"
+    "help": "Maximum Dilation of non-zero voxels (emulating output of fslmaths 6.0.1, max not modal)"
   },
   "dilF": {
     "args": [],
-    "help": "-dilF    : Maximum filtering of all voxels"
+    "help": "Maximum filtering of all voxels"
   },
   "dilall": {
     "args": [],
-    "help": "-dilall  : Apply -dilM repeatedly until the entire FOV is covered"
+    "help": "Apply -dilM repeatedly until the entire FOV is covered"
   },
   "ero": {
     "args": [],
-    "help": "-ero     : Erode by zeroing non-zero voxels when zero voxels found in kernel"
+    "help": "Erode by zeroing non-zero voxels when zero voxels found in kernel"
   },
   "eroF": {
     "args": [],
-    "help": "-eroF    : Minimum filtering of all voxels"
+    "help": "Minimum filtering of all voxels"
   },
   "fmedian": {
     "args": [],
-    "help": "-fmedian : Median Filtering"
+    "help": "Median Filtering"
   },
   "fmean": {
     "args": [],
-    "help": "-fmean   : Mean filtering, kernel weighted (conventionally used with gauss kernel)"
+    "help": "Mean filtering, kernel weighted (conventionally used with gauss kernel)"
   },
   "fmeanu": {
     "args": [],
-    "help": "-fmeanu  : Mean filtering, kernel weighted, un-normalized (gives edge effects)"
+    "help": "Mean filtering, kernel weighted, un-normalized (gives edge effects)"
   },
   "subsamp2": {
     "args": [],
-    "help": "-subsamp2  : downsamples image by a factor of 2 (keeping new voxels centered on old)"
+    "help": "downsamples image by a factor of 2 (keeping new voxels centered on old)"
   },
   "subsamp2offc": {
     "args": [],
-    "help": "-subsamp2offc  : downsamples image by a factor of 2 (non-centered)"
+    "help": "downsamples image by a factor of 2 (non-centered)"
   },
   "Tmean": {
     "args": [],
-    "help": "-Tmean   : mean across time"
+    "help": "mean across time"
   },
   "Tstd": {
     "args": [],
-    "help": "-Tstd    : standard deviation across time"
+    "help": "standard deviation across time"
   },
   "Tmax": {
     "args": [],
-    "help": "-Tmax    : max across time"
+    "help": "max across time"
   },
   "Tmaxn": {
     "args": [],
-    "help": "-Tmaxn   : time index of max across time"
+    "help": "time index of max across time"
   },
   "Tmin": {
     "args": [],
-    "help": "-Tmin    : min across time"
+    "help": "min across time"
   },
   "Tmedian": {
     "args": [],
-    "help": "-Tmedian : median across time"
+    "help": "median across time"
   },
   "Tperc": {
     "args": [
       "percentage"
     ],
-    "help": "-Tperc <percentage> : nth percentile (0-100) of FULL RANGE across time"
+    "help": "nth percentile (0-100) of FULL RANGE across time"
   },
   "Tar1": {
     "args": [],
-    "help": "-Tar1    : temporal AR(1) coefficient (use -odt float and probably demean first)"
+    "help": "temporal AR(1) coefficient (use -odt float and probably demean first)"
   },
   "pval": {
     "args": [],
-    "help": "-pval    : Nonparametric uncorrected P-value, assuming timepoints are the permutations; first timepoint is actual (unpermuted) stats image"
+    "help": "Nonparametric uncorrected P-value, assuming timepoints are the permutations; first timepoint is actual (unpermuted) stats image"
   },
   "pval0": {
     "args": [],
-    "help": "-pval0   : Same as -pval, but treat zeros as missing data"
+    "help": "Same as -pval, but treat zeros as missing data"
   },
   "cpval": {
     "args": [],
-    "help": "-cpval   : Same as -pval, but gives FWE corrected P-values"
+    "help": "Same as -pval, but gives FWE corrected P-values"
   },
   "ztop": {
     "args": [],
-    "help": "-ztop    : Convert Z-stat to (uncorrected) P"
+    "help": "Convert Z-stat to (uncorrected) P"
   },
   "ptoz": {
     "args": [],
-    "help": "-ptoz    : Convert (uncorrected) P to Z"
+    "help": "Convert (uncorrected) P to Z"
   },
   "ztopc": {
     "args": [],
-    "help": "-ztopc    : Convert Z-stat to (uncorrected but clamped) P"
+    "help": "Convert Z-stat to (uncorrected but clamped) P"
   },
   "ptozc": {
     "args": [],
-    "help": "-ptozc    : Convert (uncorrected but clamped) P to Z"
+    "help": "Convert (uncorrected but clamped) P to Z"
   },
   "rank": {
     "args": [],
-    "help": "-rank    : Convert data to ranks (over T dim)"
+    "help": "Convert data to ranks (over T dim)"
   },
   "ranknorm": {
     "args": [],
-    "help": "-ranknorm: Transform to Normal dist via ranks"
+    "help": "Transform to Normal dist via ranks"
   },
   "roi": {
     "args": [
@@ -598,14 +673,14 @@
       "tmin",
       "tsize"
     ],
-    "help": "-roi <xmin> <xsize> <ymin> <ysize> <zmin> <zsize> <tmin> <tsize> : zero outside roi (using voxel coordinates). Inputting -1 for a size will set it to the full image extent for that dimension"
+    "help": "zero outside roi (using voxel coordinates). Inputting -1 for a size will set it to the full image extent for that dimension"
   },
   "bptf": {
     "args": [
       "hp_sigma",
       "lp_sigma"
     ],
-    "help": "-bptf  <hp_sigma> <lp_sigma> : (-t in ip.c) Bandpass temporal filtering; nonlinear highpass and Gaussian linear lowpass (with sigmas in volumes, not seconds); set either sigma<0 to skip that filter"
+    "help": "(-t in ip.c) Bandpass temporal filtering; nonlinear highpass and Gaussian linear lowpass (with sigmas in volumes, not seconds); set either sigma<0 to skip that filter"
   },
   "roc": {
     "args": [
@@ -613,6 +688,6 @@
       "outfile",
       "truth"
     ],
-    "help": "-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth> : take (normally binary) truth and test current image in ROC analysis against truth. <AROC-thresh> is usually 0.05 and is limit of Area-under-ROC measure FP axis. <outfile> is a text file of the ROC curve (triplets of values: FP TP threshold). If the truth image contains negative voxels these get excluded from all calculations. If <AROC-thresh> is positive then the [4Dnoiseonly] option needs to be set, and the FP rate is determined from this noise-only data, and is set to be the fraction of timepoints where any FP (anywhere) is seen, as found in the noise-only 4d-dataset. This is then controlling the FWE rate. If <AROC-thresh> is negative the FP rate is calculated from the zero-value parts of the <truth> image, this time averaging voxelwise FP rate over all timepoints. In both cases the TP rate is the average fraction of truth=positive voxels correctly found"
+    "help": "take (normally binary) truth and test current image in ROC analysis against truth. <AROC-thresh> is usually 0.05 and is limit of Area-under-ROC measure FP axis. <outfile> is a text file of the ROC curve (triplets of values: FP TP threshold). If the truth image contains negative voxels these get excluded from all calculations. If <AROC-thresh> is positive then the [4Dnoiseonly] option needs to be set, and the FP rate is determined from this noise-only data, and is set to be the fraction of timepoints where any FP (anywhere) is seen, as found in the noise-only 4d-dataset. This is then controlling the FWE rate. If <AROC-thresh> is negative the FP rate is calculated from the zero-value parts of the <truth> image, this time averaging voxelwise FP rate over all timepoints. In both cases the TP rate is the average fraction of truth=positive voxels correctly found"
   }
 }

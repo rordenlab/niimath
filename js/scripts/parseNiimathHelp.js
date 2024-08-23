@@ -7,6 +7,7 @@ function parseHelpText(helpText) {
   const methodDefinitions = {};
 
   let currentKernel = false;
+  let currentMesh = false;
 
   lines.forEach(line => {
     // Handle kernel operations
@@ -20,12 +21,19 @@ function parseHelpText(helpText) {
     const match = line.match(/^\s*(-[\w]+)\s*(.*?)\s*:\s*(.*)/);
 
     if (match) {
+      // each -mesh suboption has at least 4 spaces before the dash (DO NOT USE TABS)
+      // so we can use this to determine if we are in a mesh suboption after seeing the -mesh string.
+      // Store the first 4 characters of the line to determine if we are in a mesh suboption
+      const leadingChars = line.substring(0, 4);
+      const nSpaces = '    ';
       const command = match[1].trim();
+      // console log below is for debugging
+      // console.log(leadingChars, command, leadingChars === nSpaces);
       const argsString = match[2].trim();
       const args = argsString.split(/\s+/).filter(arg => arg.startsWith('<') && arg.endsWith('>'));
       const key = command.replace(/^-+/, ''); // Remove leading dashes
 
-      const helpText = line.trim();
+      const helpText = match[3].trim();
 
       if (currentKernel) {
         // Special handling for kernel operations
@@ -41,12 +49,29 @@ function parseHelpText(helpText) {
             };
           }
         }
+      } else if (command === '-mesh') {
+        // Special handling for the mesh option
+        currentMesh = true;
+        methodDefinitions.mesh = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText,
+          subOperations: {}
+        };
+        // check if this is a valid mesh suboption (which is indented in the help text)
+      } else if (currentMesh && leadingChars === nSpaces && command.startsWith('-')) {
+        // Handling sub-options of the mesh command
+        const subKey = command.replace(/^-+/, ''); // Remove leading dashes
+        methodDefinitions.mesh.subOperations[subKey] = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText
+        };
       } else {
-        // General case for non-kernel operations
+        // General case for non-kernel and non-mesh operations
         methodDefinitions[key] = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
+        currentMesh = false; // Stop handling mesh sub-options if another main option is encountered
       }
     }
 

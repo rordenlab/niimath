@@ -12,12 +12,12 @@ export class Niimath {
       // This gets reassigned in the run() method, 
       // but we need to handle the ready message before that.
       // Maybe there is a less hacky way to do this?
-      this.worker.onmessage =  (event) => {
+      this.worker.onmessage = (event) => {
         if (event.data && event.data.type === 'ready') {
           resolve(true); // Resolve the promise when the worker is ready
         }
       }
-  
+
       // Handle worker init errors.
       this.worker.onerror = (error) => {
         reject(new Error(`Worker failed to load: ${error.message}`));
@@ -26,13 +26,13 @@ export class Niimath {
   }
 
   image(file) {
-    return new ImageProcessor({worker: this.worker, file, operators: this.operators});
+    return new ImageProcessor({ worker: this.worker, file, operators: this.operators });
   }
 }
 
 class ImageProcessor {
 
-  constructor({worker, file, operators}) {
+  constructor({ worker, file, operators }) {
     this.worker = worker;
     this.file = file;
     this.operators = operators;
@@ -50,7 +50,7 @@ class ImageProcessor {
       const definition = this.operators[methodName];
 
       if (methodName === 'kernel') {
-        // special case for kernels because they have different types with varying arguments
+        // Special case for kernels because they have different types with varying arguments
         Object.keys(definition.subOperations).forEach((subOpName) => {
           const subOpDefinition = definition.subOperations[subOpName];
           this[`kernel${subOpName.charAt(0).toUpperCase() + subOpName.slice(1)}`] = (...args) => {
@@ -60,8 +60,34 @@ class ImageProcessor {
             return this._addCommand('-kernel', subOpName, ...args);
           };
         });
+      } else if (methodName === 'mesh') {
+        // Special case for mesh because it has sub-options that can be passed as an object
+        this.mesh = (options = {}) => {
+          const subCommands = [];
+
+          Object.keys(options).forEach((subOptionKey) => {
+            if (definition.subOperations[subOptionKey]) {
+              const subOpDefinition = definition.subOperations[subOptionKey];
+              const subOptionValue = options[subOptionKey];
+
+              if (subOpDefinition.args.length > 0 && subOptionValue === undefined) {
+                throw new Error(`Sub-option -${subOptionKey} requires a value.`);
+              }
+
+              subCommands.push(`-${subOptionKey}`);
+
+              if (subOpDefinition.args.length > 0) {
+                subCommands.push(subOptionValue);
+              }
+            } else {
+              throw new Error(`Invalid sub-option -${subOptionKey} for mesh.`);
+            }
+          });
+
+          return this._addCommand('-mesh', ...subCommands);
+        };
       } else {
-        // all other non-kernel operations
+        // General case for non-kernel and non-mesh operations
         this[methodName] = (...args) => {
           if (args.length < definition.args.length || (!definition.optional && args.length > definition.args.length)) {
             throw new Error(`Expected ${definition.args.length} arguments for ${methodName}, but got ${args.length}`);

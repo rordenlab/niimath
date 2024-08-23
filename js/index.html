@@ -45,15 +45,33 @@
         console.log('Initializing niimath wasm...');
         await niimath.init();
         console.log('niimath wasm initialized.');
+
         const t0 = performance.now();
-        const outFile = await niimath.image(selectedFile).sobel().thr(20).fmean().otsu(5).run()
+
+        // test the -mesh command and mesh output
+        const outName = 'out.mz3';
+        const outFile = await niimath.image(selectedFile)
+        .mesh({
+          i: 'm', // 'm' for medium
+          b: 1, // fill bubbles
+          v: 0 // not verbose
+        })
+        .run(outName)
         const t1 = performance.now();
         console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
+
+        // test with a volume output
+        // const outName = 'out.nii';
+        // const outFile = await niimath.image(selectedFile)
+        // .sobel()
+        // .run(outName)
+        // const t1 = performance.now();
+        // console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
 
         // Create a download link for the processed file
         const url = URL.createObjectURL(outFile);
         downloadLink.href = url;
-        downloadLink.download = 'processed_image.nii.gz';
+        downloadLink.download = outName;
         downloadLink.style.display = 'block';
         downloadLink.textContent = 'Download Processed Image';
 
