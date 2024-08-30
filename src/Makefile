@@ -40,6 +40,10 @@ endif
 all:
 	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) -flto -o niimath
 
+#issue30: static build 
+static:
+	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) -flto -o niimath
+	
 # tiny: terminal executable to emulate WASM
 tiny:
 	$(CNAME) $(CFLAGS) $(MFLAGS) $(UFLAGS) -o niimath
