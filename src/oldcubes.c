@@ -495,6 +495,7 @@ int marchingCubes(float * img, short dim[3], int lo[3], int hi[3], int originalM
 	}
 	if (npt < 3) {
 		free(pts);
+		printf("marching cubes failed to identify triangles with an isolevel of %g\n", isolevel);
 		return EXIT_FAILURE;
 	}
 	*vs = (vec3d *) malloc(npt*sizeof(vec3d));
