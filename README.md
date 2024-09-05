@@ -208,9 +208,6 @@ niimath can also be compiled to WebAssembly (Wasm) allowing it to be inserted in
 
 ## License
 
-# codespell-ignore-next
-Hart
-
 <!-- codespell-ignore-line --> niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020-2022. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. The Butterworth Filter Coefficients in `bw.c` are from [Exstrom Labs](http://www.exstrom.com/journal/sigproc/) and the authors provided permission for it to be included in this project under the [LGPL](https://www.gnu.org/licenses/lgpl-3.0.en.html), the file provides additional details. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation. The PolygoniseCube function comes from Cory Bloyd's public domain [Marching Cubes example](http://paulbourke.net/geometry/polygonise/) program described here. The bwlabel.cpp file was written by Jesper Andersson, who has explicitly allowed this to be shared using the BSD 2-Clause license. The [high performance](https://github.com/gaspardpetit/base64) base64.cpp was written by Jouni Malinen and is distributed under the BSD license. The mesh simplification was written by [Sven Forstmann](https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification) and distributed under the MIT license. It was ported from C++ to C by Chris Rorden.  The [radixsort.c](https://github.com/bitshifter/radixsort) was written by Cameron Hart (2014) using the zlib license.
 
 ## Links
