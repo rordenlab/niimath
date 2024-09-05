@@ -1,7 +1,7 @@
 environment:
   matrix:
     - job_name: win
-      appveyor_build_worker_image: Visual Studio 2019
+      appveyor_build_worker_image: Visual Studio 2022
 
     - job_name: linux
       appveyor_build_worker_image: Ubuntu2004
@@ -55,7 +55,7 @@ for:
         - job_name: linux
 
     build_script:
-      - export CC=gcc-8 CXX=g++-8
+      - export CC=gcc-9 CXX=g++-9
       - cmake -Wno-dev -B build
       - cmake --build build
 
@@ -88,7 +88,7 @@ for:
         - job_name: test
 
     build_script:
-      - export CC=gcc-8 CXX=g++-8
+      - export CC=gcc-9 CXX=g++-9
       - cmake -Wno-dev -B build
       - cmake --build build
 
