@@ -4799,6 +4799,19 @@ staticx int nifti_conform(nifti_image *nim) {
 	return 1;
 	#endif
 }
+
+staticx int nifti_comply(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear) {
+	#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("comply: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	return comply(nim, outDims, outPixDims, f_high, isLinear);
+	#else
+	printfx("'-dt double' does not support comply\n" );
+	return 1;
+	#endif
+}
 #endif //HAVE_CONFORM
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
@@ -5439,8 +5452,27 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		#ifdef HAVE_CONFORM
 		} else if ((!strcmp(argv[ac], "-conform")) || (!strcmp(argv[ac], "--conform"))) {
 			ok = nifti_conform(nim);
-			//printf("MORK\n");
-			//exit(42);
+		} else if ((!strcmp(argv[ac], "-comply")) || (!strcmp(argv[ac], "--comply"))) {
+			ac++;
+			int nx = atoi(argv[ac]);
+			ac++;
+			int ny = atoi(argv[ac]);
+			ac++;
+			int nz = atoi(argv[ac]);
+			ac++;
+			double dx = strtod(argv[ac], &end);
+			ac++;
+			double dy = strtod(argv[ac], &end);
+			ac++;
+			double dz = strtod(argv[ac], &end);
+			ac++;
+			double f_high = strtod(argv[ac], &end);
+			ac++;
+			const int isLinear = atoi(argv[ac]);
+			int outDims[3] = {nx, ny, nz};
+			const float outPixDims[3] = {dx, dy, dz};
+			printfx("Comply dim %d*%d*%d, pixdim %g*%g*%g, f_high %g linear %d\n", nx,ny,nz, dx,dy,dz, f_high, isLinear);
+			ok = nifti_comply(nim, outDims, outPixDims, f_high, isLinear);
 		#endif
 		}
 		else if (!strcmp(argv[ac], "-close")) {

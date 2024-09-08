@@ -111,7 +111,7 @@ void getscale(float* img, size_t voxnum, float dst_min, float dst_max, float f_l
 	free(hist);
 }
 
-void voxelIntensityScale(nifti_image *nim) {
+void voxelIntensityScale(nifti_image *nim, float f_high) {
 	size_t nvox = nim->nx * nim->ny * nim->nz;
 	float *img = (float *)nim->data;
 	float dst_min = 0;
@@ -119,7 +119,7 @@ void voxelIntensityScale(nifti_image *nim) {
 	float f_low = 0.0;
 	//n.b. fastsurfer conform.py uses f_high = 0.98
 	//  mri_convert command line output reports fhi=0.999
-	float f_high = 0.98; //fsl style 2% robust range
+	//float f_high = 0.98; //fsl style 2% robust range
 	//float f_high = 0.999; //fastsurfer/mri_convert compatibility
 	float src_min;
 	float scale;
@@ -187,21 +187,21 @@ void printVec4(vec4 v) {
 	printfx("v= [%g, %g, %g, %g]\n", v.v[0], v.v[1], v.v[2], v.v[3]);
 }*/
 
-void conformVox2Vox(const int* inDims, mat44* in_affine, int outDim, float outMM, int toRAS, mat44* out_affine, mat44* vox2vox, mat44* inv_vox2vox) {
+void conformVox2Vox(const int* inDims, mat44* in_affine, const int outDims[3], const float outMM[3], int toRAS, mat44* out_affine, mat44* vox2vox, mat44* inv_vox2vox) {
 	mat44 affine;
 	memcpy(&affine, in_affine, sizeof(mat44));
 	vec4 half = setVec4(inDims[0] / 2.0f, inDims[1] / 2.0f, inDims[2] / 2.0f);
 	vec4 Pxyz_c = nifti_vect44mat44_mul(half, affine );
-	vec4 delta = setVec4(outMM, outMM, outMM);
+	vec4 delta = setVec4(outMM[0], outMM[1], outMM[2]);
 	mat44 Mdc;
 	if (toRAS) {
 		LOAD_MAT44(Mdc, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
 	} else {
 		LOAD_MAT44(Mdc, -1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0);
 	}
-	vec4 dims = setVec4(outDim, outDim, outDim);
+	vec4 dims = setVec4(outDims[0], outDims[1], outDims[2]);
 	mat44 MdcD = scaleMat44(Mdc, delta);
-	vec4 vol_center = setVec4(outDim, outDim, outDim);
+	vec4 vol_center = setVec4(outDims[0], outDims[1], outDims[2]);
 	vol_center = nifti_vect44mat44_mul(vol_center, MdcD );
 	vol_center = scaleVec4(vol_center, 0.5);
 	vec4 translate = subtractVec4(Pxyz_c, vol_center);
@@ -224,21 +224,18 @@ mat44 f642f32mat44(const nifti_dmat44* dmat) {
 	return result;
 }
 
-int conform(nifti_image *nim) {
+int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear, int isRAS) {
 	int nvoxIn = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvoxIn;
 	if (nVol != 1)
 		return 1;
 	//normalize voxel brightness 0..255
-	voxelIntensityScale(nim);
+	voxelIntensityScale(nim, f_high);
 	//estimate spatial transform
 	const int inDims[3] = {(int)nim->nx, (int)nim->ny, (int)nim->nz};
 	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
 	mat44 out_affine, vox2vox, inv_vox2vox;
-	int outDim = 256;
-	float outPixDim = 1.0;
-	int isRAS = 0;
-	conformVox2Vox(inDims, &in_affine, outDim, outPixDim, isRAS, &out_affine, &vox2vox, &inv_vox2vox);
+	conformVox2Vox(inDims, &in_affine, outDims, outPixDims, isRAS, &out_affine, &vox2vox, &inv_vox2vox);
 	//set output header
 	for (int i = 0; i < 4; i++) {
 		for (int j = 0; j < 4; j++) {
@@ -251,9 +248,9 @@ int conform(nifti_image *nim) {
 		&nim->quatern_b, &nim->quatern_c, &nim->quatern_d,
 		&nim->qoffset_x, &nim->qoffset_y, &nim->qoffset_z,
 		&nim->dx, &nim->dy, &nim->dz, &nim->qfac);
-	nim->dx = outPixDim;
-	nim->dy = outPixDim;
-	nim->dz = outPixDim;
+	nim->dx = outPixDims[0];
+	nim->dy = outPixDims[1];
+	nim->dz = outPixDims[2];
 	nim->scl_slope = 1.0;
 	nim->scl_inter = 0.0;
 	nim->cal_min = 0.0;
@@ -267,10 +264,10 @@ int conform(nifti_image *nim) {
 	int dimZ = nim->nz;
 	int dimXY = dimX * dimY;
 	//set output
-	nim->nx = outDim;
-	nim->ny = outDim;
-	nim->nz = outDim;
-	int nvoxOut = outDim * outDim * outDim;
+	nim->nx = outDims[0];
+	nim->ny = outDims[1];
+	nim->nz = outDims[2];
+	int nvoxOut = outDims[0] * outDims[1] * outDims[2];
 	nim->nvox = nvoxOut;
 	free(nim->data);  // Free the memory allocated with calloc
 	float *out_img = (float *)_mm_malloc(nvoxOut * sizeof(float), 64); //output image
@@ -283,15 +280,14 @@ int conform(nifti_image *nim) {
 	int i = -1;
 	//n.b. fastsurfer conform uses linear interpolation: "order = 1"
 	// likewise, mri_convert reports "Reslicing using trilinear interpolation"
-	//bool isLinear = true;
-	//if (isLinear) {
-		for (int z = 0; z < outDim; z++) {
-			for (int y = 0; y < outDim; y++) {
+	if (isLinear) {
+		for (int z = 0; z < outDims[2]; z++) {
+			for (int y = 0; y < outDims[1]; y++) {
 				// loop hoisting
 				int ixYZ = y * inv_vox2vox.m[0][1] + z * inv_vox2vox.m[0][2] + inv_vox2vox.m[0][3];
 				int iyYZ = y * inv_vox2vox.m[1][1] + z * inv_vox2vox.m[1][2] + inv_vox2vox.m[1][3];
 				int izYZ = y * inv_vox2vox.m[2][1] + z * inv_vox2vox.m[2][2] + inv_vox2vox.m[2][3];
-				for (int x = 0; x < outDim; x++) {
+				for (int x = 0; x < outDims[0]; x++) {
 					float ix = x * inv_vox2vox.m[0][0] + ixYZ;
 					float iy = x * inv_vox2vox.m[1][0] + iyYZ;
 					float iz = x * inv_vox2vox.m[2][0] + izYZ;
@@ -330,14 +326,14 @@ int conform(nifti_image *nim) {
 				} // x
 			} // y
 		} // x
-	/*} else { //if linear else nearest neighbor
-		for (int z = 0; z < outDim; z++) {
-			for (int y = 0; y < outDim; y++) {
+	} else { //if linear else nearest neighbor
+		for (int z = 0; z < outDims[2]; z++) {
+			for (int y = 0; y < outDims[1]; y++) {
 					// loop hoisting
 					int ixYZ = y * inv_vox2vox.m[0][1] + z * inv_vox2vox.m[0][2] + inv_vox2vox.m[0][3];
 					int iyYZ = y * inv_vox2vox.m[1][1] + z * inv_vox2vox.m[1][2] + inv_vox2vox.m[1][3];
 					int izYZ = y * inv_vox2vox.m[2][1] + z * inv_vox2vox.m[2][2] + inv_vox2vox.m[2][3];
-					for (int x = 0; x < outDim; x++) {
+					for (int x = 0; x < outDims[0]; x++) {
 						int ix = round(x * inv_vox2vox.m[0][0] + ixYZ);
 						int iy = round(x * inv_vox2vox.m[1][0] + iyYZ);
 						int iz = round(x * inv_vox2vox.m[2][0] + izYZ);
@@ -353,8 +349,23 @@ int conform(nifti_image *nim) {
 					} // z
 			} // y
 		} // x
-	} //nearest neighbor*/
+	} //nearest neighbor
 	_mm_free(in_img);
 	return 0;
 }
 
+int conform(nifti_image *nim) {
+	const int outDims[3] = {256, 256, 256};
+	const float outPixDims[3] = {1.0, 1.0, 1.0};
+	//n.b. the freesurfer 0.999 can lead little soft tissue dynamic range for 7T T1w images with arterial flow artifacts
+	// mri_convert command line output reports fhi=0.999
+	// https://github.com/Deep-MI/FastSurfer/blob/4557d3bc4d9d54ed908cd222030bc038efc54c2a/FastSurferCNN/data_loader/conform.py#L285
+	//float f_high = 0.98; //fsl style 2% robust range
+	//float f_high = 0.999; //fastsurfer/mri_convert compatibility
+	const float f_high = 0.98;
+	return conform_core(nim, outDims, outPixDims, f_high, 1, 0); //1,0: isLinear(true), isRAS(false)
+}
+
+int comply(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear) {
+	return conform_core(nim, outDims, outPixDims, f_high, isLinear, 1); //1: isRAS(true)
+}
