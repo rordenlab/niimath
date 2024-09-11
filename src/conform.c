@@ -230,7 +230,8 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 	if (nVol != 1)
 		return 1;
 	//normalize voxel brightness 0..255
-	voxelIntensityScale(nim, f_high);
+	if (f_high > 0.0)
+		voxelIntensityScale(nim, f_high);
 	//estimate spatial transform
 	const int inDims[3] = {(int)nim->nx, (int)nim->ny, (int)nim->nz};
 	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
