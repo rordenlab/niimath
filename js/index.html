@@ -49,24 +49,26 @@
         const t0 = performance.now();
 
         // test the -mesh command and mesh output
-        const outName = 'out.mz3';
-        const outFile = await niimath.image(selectedFile)
-        .mesh({
-          i: 'm', // 'm' for medium
-          b: 1, // fill bubbles
-          v: 0 // not verbose
-        })
-        .run(outName)
-        const t1 = performance.now();
-        console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
-
-        // test with a volume output
-        // const outName = 'out.nii.gz';
+        // const outName = 'out.mz3';
         // const outFile = await niimath.image(selectedFile)
-        // .sobel()
+        // .mesh({
+        //   i: 'm', // 'm' for medium
+        //   b: 1, // fill bubbles
+        //   v: 0 // not verbose
+        // })
         // .run(outName)
         // const t1 = performance.now();
         // console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
+
+        // test with a volume output
+        const outName = 'out.nii.gz';
+        niimath.setOutputDataType('input')
+        const outFile = await niimath.image(selectedFile)
+        .sobel()
+        .run(outName)
+        console.log(niimath.outputDataType)
+        const t1 = performance.now();
+        console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
 
         // Create a download link for the processed file
         const url = URL.createObjectURL(outFile);
