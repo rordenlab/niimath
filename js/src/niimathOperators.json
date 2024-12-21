@@ -24,6 +24,19 @@
     "args": [],
     "help": "reslice to 1mm size in coronal slice direction with 256^3 voxels"
   },
+  "comply": {
+    "args": [
+      "nx",
+      "ny",
+      "nz",
+      "dx",
+      "dy",
+      "dz",
+      "f_high",
+      "isLinear"
+    ],
+    "help": "conform to axial slice with dx*dy*dzmm size and dx*dy*dz voxels. f_high bright clamping (0.98 for top 2%). Linear (1) or nearest-neighbor (0)"
+  },
   "crop": {
     "args": [
       "tmin",

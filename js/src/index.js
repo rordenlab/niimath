@@ -3,6 +3,8 @@ export class Niimath {
   constructor() {
     this.worker = null;
     this.operators = operators;
+    this.outputDataType = 'float'; // Possible datatypes are: char short int float double input
+    this.dataTypes = {char: 'char', short: 'short', int: 'int', float: 'float', double: 'double', input: 'input'};
   }
 
   init() {
@@ -25,18 +27,27 @@ export class Niimath {
     });
   }
 
+  setOutputDataType(type) {
+    if (Object.values(this.dataTypes).includes(type)) {
+      this.outputDataType = type;
+    } else {
+      throw new Error(`Invalid data type: ${type}`);
+    }
+  }
+
   image(file) {
-    return new ImageProcessor({ worker: this.worker, file, operators: this.operators });
+    return new ImageProcessor({ worker: this.worker, file, operators: this.operators, outputDataType: this.outputDataType });
   }
 }
 
 class ImageProcessor {
 
-  constructor({ worker, file, operators }) {
+  constructor({ worker, file, operators, outputDataType }) {
     this.worker = worker;
     this.file = file;
     this.operators = operators;
     this.commands = [];
+    this.outputDataType = outputDataType ? outputDataType : 'float'; // default to float
     this._generateMethods();
   }
 
@@ -116,7 +127,7 @@ class ImageProcessor {
         }
       };
 
-      const args = [this.file.name, ...this.commands, outName];
+      const args = [this.file.name, ...this.commands, outName, '-odt', this.outputDataType];
       if (this.worker === null) {
         reject(new Error('Worker not initialized. Did you await the init() method?'));
       }
