@@ -559,7 +559,7 @@ static vec3s vec3d2vec4s(vec3d v) {
 	return (vec3s){.x = (float)v.x, .y = (float)v.y, .z = (float)v.z};
 } // convert float64 to float32
 
-static int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz) {
+int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz, float *perVertexScalar) {
 //https://github.com/neurolabusc/surf-ice/tree/master/mz3
 	#ifdef _MSC_VER
 #pragma pack(2)
@@ -574,9 +574,12 @@ static int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 		uint32_t NFACE, NVERT, NSKIP;
 	};
 	#endif
+	bool hasPerVertexScalar = (perVertexScalar != NULL);
 	struct mz3hdr h;
 	h.SIGNATURE = 0x5A4D;
 	h.ATTR = 3;//isFACE +1 isVERT +2
+	if (hasPerVertexScalar)
+		h.ATTR += 8;//isSCALAR +8
 	h.NFACE = ntri;
 	h.NVERT = npt;
 	h.NSKIP = 0;
@@ -632,6 +635,9 @@ static int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	#endif
 	{
 		fwrite(pts32, npt * sizeof(vec3s), 1, fp);
+		if (hasPerVertexScalar) {
+			fwrite(perVertexScalar, npt * sizeof(float), 1, fp);
+		}
 		fclose(fp);
 	}
 	free(pts32);
@@ -988,7 +994,7 @@ int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool 
 	if (strlen(fnm) > strlen(basenm))
 		strcpy(ext, fnm + strlen(basenm));
 	if (strstr(ext, ".mz3"))
-		return save_mz3(fnm, tris, pts, ntri, npt, isGz);
+		return save_mz3(fnm, tris, pts, ntri, npt, isGz, NULL);
 #ifdef HAVE_FORMATS
 	else if (strstr(ext, ".gii"))
 		return save_gii(fnm, tris, pts, ntri, npt, isGz);
@@ -1015,7 +1021,7 @@ int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool 
 #endif //HAVE_ZLIB
 	strcpy(basenm, fnm);
 	strcat(basenm, ".mz3");
-	return save_mz3(basenm, tris, pts, ntri, npt, isGz);
+	return save_mz3(basenm, tris, pts, ntri, npt, isGz, NULL);
 }
 
 static double sform(vec3d p, float srow[4]) {
