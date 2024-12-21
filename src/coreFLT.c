@@ -2476,7 +2476,7 @@ staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	return 0;
 } // nifti_tensor_2()
 
-staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
+staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes gzMode) {
 // MD= (Dxx+Dyy+Dzz)/3
 //https://github.com/ANTsX/ANTs/wiki/Importing-diffusion-tensor-data-from-other-software
 // dtifit produces upper-triangular order: xx xy xz yy yz zz
@@ -2561,17 +2561,17 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	//save V1
 	outv = out32 + (nvox3D * 3);
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V1");
+	nifti_save(nim, "_V1", gzMode);
 	//save V2
 	outv = out32 + (nvox3D * 6);
 	//xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V2");
+	nifti_save(nim, "_V2", gzMode);
 	//save V3
 	outv = out32 + (nvox3D * 9);
 	//xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V3");
+	nifti_save(nim, "_V3", gzMode);
 	//release 4D memory
 	//free(dat);
 	//save 3D images
@@ -2587,26 +2587,26 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L1");
+	nifti_save(nim, "_L1", gzMode);
 	//save L2
 	outv = out32 + (nvox3D * 1);
 	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L2");
+	nifti_save(nim, "_L2", gzMode);
 	//save L3
 	outv = out32 + (nvox3D * 2);
 	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L3");
+	nifti_save(nim, "_L3", gzMode);
 	//save MD
 	outv = out32 + (nvox3D * 13);
 	//xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_min = calmin(nim);
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_MD");
+	nifti_save(nim, "_MD", gzMode);
 	//single volume data
 	//void *dat = (void *)calloc(1, nvox3D * sizeof(flt));
 	void *dat = (void *)aligned_calloc(nvox3D * sizeof(flt));
@@ -2644,13 +2644,13 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle) {
 		d = MAX(d, -1.0);
 		fa32[i] = d;
 	}
-	nifti_save(nim, "_MO");
+	nifti_save(nim, "_MO", gzMode);
 	//save FA
 	outv = out32 + (nvox3D * 12);
 	xmemcpy(fa32, outv, nvox3D * sizeof(flt));
 	nim->cal_min = 0;
 	nim->cal_max = 1;
-	nifti_save(nim, "_FA");
+	nifti_save(nim, "_FA", gzMode);
 	//keep FA in memory
 	nim->cal_max = 0;
 	_mm_free(out32);
@@ -4995,6 +4995,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		exit(1);
 		#endif
 	}
+	gzModes gzMode = GZ_ENVIRONMENT;
 	int dtCalc = DT_FLOAT32; //data type for calculation
 	int dtOut = DT_FLOAT32; //data type for calculation
 	int ac = 1;
@@ -5022,7 +5023,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		ac++;
 		if (nifti_set_filenames(nim, fout, 0, 1))
 			return 1;
-		nifti_save(nim, ""); //nifti_image_write( nim );
+		nifti_save(nim, "", gzMode); //nifti_image_write( nim );
 		nifti_image_free(nim);
 		return 0;
 	} //end pass through
@@ -5402,6 +5403,15 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 			ok = EXIT_FAILURE;
 			#endif
 		#endif
+		} else if (!strcmp(argv[ac], "-gz")) {
+			ac ++;
+			int mode = atoi(argv[ac]);
+			if (mode == 0)
+				gzMode = GZ_FALSE;
+			else if (mode == 1)
+				gzMode = GZ_TRUE;
+			else
+				gzMode = GZ_ENVIRONMENT;
 		} else if (!strcmp(argv[ac], "-h2c"))
 			ok = nifti_h2c(nim, false); 
 		else if (!strcmp(argv[ac], "-c2h"))
@@ -5546,16 +5556,16 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		} else if (!strcmp(argv[ac], "-tensor_2upper")) {
 			ok = nifti_tensor_2(nim, 1);
 		} else if (!strcmp(argv[ac], "-tensor_decomp")) {
-			ok = nifti_tensor_decomp(nim, 1);
+			ok = nifti_tensor_decomp(nim, 1, gzMode);
 		} else if (!strcmp(argv[ac], "-tensor_decomp_lower")) {
-			ok = nifti_tensor_decomp(nim, 0);
+			ok = nifti_tensor_decomp(nim, 0, gzMode);
 		} else if (!strcmp(argv[ac], "-save")) {
 			ac++;
 			char *fout2 = argv[ac];
 			if (nifti_set_filenames(nim, fout2, 1, 1))
 				ok = 1;
 			else {
-				nifti_save(nim, ""); //nifti_image_write( nim );
+				nifti_save(nim, "", gzMode); //nifti_image_write( nim );
 				nifti_set_filenames(nim, fout, 1, 1);
 			}
 		} 
@@ -5691,7 +5701,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
 		return 1;
 	// if we get here, write the output dataset
-	nifti_save(nim, ""); //nifti_image_write( nim );
+	nifti_save(nim, "", gzMode); //nifti_image_write( nim );
 	// and clean up memory
 	nifti_image_free(nim);
 	if (kernel != NULL)

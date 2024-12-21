@@ -12,6 +12,11 @@ extern "C" {
 //#include <immintrin.h>
 #include <limits.h>
 
+typedef enum {
+    GZ_ENVIRONMENT, // Use the environment settings
+    GZ_FALSE,       // Uncompressed output
+    GZ_TRUE         // Gzipped output
+} gzModes;
 
 //CORE32 and CORE64 handle Float32 and Float64 operations, CORE handles shared code 
 
@@ -119,7 +124,7 @@ typedef struct {                   /** x4 vector struct **/
     float v[4] ;
 } vec4 ;
 
-int nifti_save(nifti_image * nim, const char *postfix);
+int nifti_save(nifti_image * nim, const char *postfix, gzModes gzMode);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);
 mat44 xform(nifti_image * nim);

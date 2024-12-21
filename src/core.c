@@ -141,7 +141,7 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	return thresh;
 }
 
-int nifti_save(nifti_image *nim, const char *postfix) {
+int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */
 	char exthdr[5] = ".hdr";
 	char extimg[5] = ".img";
@@ -200,6 +200,10 @@ int nifti_save(nifti_image *nim, const char *postfix) {
 #ifdef HAVE_ZLIB // if compression is requested, make sure of suffix
 	if ((value == NULL) || strstr(value, gzKey))
 		isGz = 1; //NIFTI2_GZ, NIFTI2_PAIR_GZ, NIFTI_GZ, NIFTI_PAIR_GZ
+	if (gzMode == GZ_FALSE)
+		isGz = 0;
+	if (gzMode == GZ_TRUE)
+		isGz = 1;
 #endif
 	if ((value != NULL) && strstr(value, pairKey)) {
 		strcat(hname, exthdr);

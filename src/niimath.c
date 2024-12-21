@@ -290,6 +290,7 @@ int show_help( void ) {
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
+	printf(" -gz <mode>               : NIfTI gzip mode (0=uncompressed, 1=compressed, else FSL environment; default -1)\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
 #ifdef NII2MESH
 	printf("\n");
