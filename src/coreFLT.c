@@ -1233,7 +1233,7 @@ staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt Sigm
 	_mm_free(simg);
 	//return original data
 	nim->data = indat;
-	//nim->nvox = nvox3D * nVol;
+	nim->nvox = nvox3D * nVol;
 	return 0;
 } //nifti_unsharp()
 
@@ -4787,6 +4787,19 @@ staticx int nifti_fdr(nifti_image *nim, double qval) {
 #endif
 
 #ifdef HAVE_CONFORM
+staticx int nifti_ras(nifti_image *nim) {
+	#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("ras: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	return toRAS(nim);
+	#else
+	printfx("'-dt double' does not support ras\n" );
+	return 1;
+	#endif
+}
+
 staticx int nifti_conform(nifti_image *nim) {
 	#ifdef DT32
 	if (nim->datatype != DT_FLOAT32) {
@@ -5460,6 +5473,8 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 			nifti_fdr(nim, qval); //always terminates
 		#endif
 		#ifdef HAVE_CONFORM
+		} else if (!strcmp(argv[ac], "-ras")) {
+			ok = nifti_ras(nim);
 		} else if ((!strcmp(argv[ac], "-conform")) || (!strcmp(argv[ac], "--conform"))) {
 			ok = nifti_conform(nim);
 		} else if ((!strcmp(argv[ac], "-comply")) || (!strcmp(argv[ac], "--comply"))) {

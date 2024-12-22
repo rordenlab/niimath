@@ -370,3 +370,156 @@ int conform(nifti_image *nim) {
 int comply(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear) {
 	return conform_core(nim, outDims, outPixDims, f_high, isLinear, 1); //1: isRAS(true)
 }
+
+// Helper function to find the index of the maximum absolute value in a row
+int find_max_index(float row[3]) {
+	int max_index = 0;
+	for (int i = 1; i < 3; i++) {
+		if (fabs(row[i]) > fabs(row[max_index])) {
+			max_index = i;
+		}
+	}
+	return max_index;
+}
+
+// Function to determine the order and flips to convert to RAS
+void get_ras_order(mat44 m44, int perms[3]) {
+	float *rows[3] = {m44.m[0], m44.m[1], m44.m[2]};
+	int used[3] = {0, 0, 0}; // To track used indices
+	for (int i = 0; i < 3; i++) {
+		int max_index = find_max_index(rows[i]);
+		if (used[max_index]) {
+			printfx("Error: Duplicate max index detected. Spatial transform matrix is invalid.\n");
+			return;
+		}
+		used[max_index] = 1;
+		// Determine the sign based on the value
+		perms[i] = (rows[i][max_index] > 0) ? (max_index + 1) : -(max_index + 1);
+	}
+}
+
+void permute_affine(mat44 inAff, mat44 *outAff, int inDims[3], int perms[3]) {
+	// Initialize the output affine matrix to zero
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			outAff->m[i][j] = 0.0;
+		}
+	}
+	// Determine the corner of the input volume that will become the new origin
+	int corner[3] = {0, 0, 0};;
+	for (int i = 0; i < 3; i++) {
+		if (perms[i] > 0) continue;
+		int perm = abs(perms[i]) - 1;
+		corner[perm] = inDims[perm] - 1;
+	}
+	// printfx("Corner %d %d %d\n", corner[0], corner[1], corner[2]); 
+	vec4 newCorner = setVec4(corner[0], corner[1], corner[2]);
+	vec4 newOrigin = nifti_vect44mat44_mul(newCorner, inAff);
+	// Fill the rotation/scaling part of the output affine
+	for (int i = 0; i < 3; i++) {
+		int srcAxis = abs(perms[i]) - 1;
+		float sign = (perms[i] > 0) ? 1.0 : -1.0;
+		for (int j = 0; j < 3; j++) {
+			outAff->m[j][i] = sign * inAff.m[j][srcAxis];
+		}
+	}
+	// Set the translation (new origin)
+	for (int i = 0; i < 3; i++) {
+		outAff->m[i][3] = newOrigin.v[i];
+	}
+	// Set the homogeneous row
+	outAff->m[3][3] = 1.0;
+	// printfx("%g %g %g %g\n", outAff->m[0][0], outAff->m[0][1], outAff->m[0][2], outAff->m[0][3]);
+	// printfx("%g %g %g %g\n", outAff->m[1][0], outAff->m[1][1], outAff->m[1][2], outAff->m[1][3]);
+	// printfx("%g %g %g %g\n", outAff->m[2][0], outAff->m[2][1], outAff->m[2][2], outAff->m[2][3]);
+	// printfx("%g %g %g %g\n", outAff->m[3][0], outAff->m[3][1], outAff->m[3][2], outAff->m[3][3]);
+}
+
+int toRAS(nifti_image *nim) {
+	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
+	int perms[3];
+	get_ras_order(in_affine, perms);
+	if ((perms[0] == 1) && (perms[1] == 2) && (perms[2] == 3)) {
+		// data already in RAS
+		return EXIT_SUCCESS;
+	}
+	//
+	int inDims[3] = {(int)nim->nx, (int)nim->ny, (int)nim->nz};
+	// printfx("RAS Order: [%d, %d, %d]\n", perms[0], perms[1], perms[2]);
+	int outDims[3];
+	for (int i = 0; i < 3; i++) {
+		outDims[i] = inDims[abs(perms[i]) - 1];
+	}
+	// Iterate over all voxels in the output array
+	// Rather than lots of mults, strides allow adds for rows, columns and slices
+	// https://mrtrix.readthedocs.io/en/dev/getting_started/image_data.html#strides
+	int offs[3] = {1, inDims[0], inDims[0] * inDims[1]}; // offset between column, row, slice
+	int inStrides[3] = {offs[abs(perms[0])-1], offs[abs(perms[1])-1], offs[abs(perms[2])-1]};
+	int inStarts[3] = {0, 0, 0}; // offset between row, column, slice
+	for (int i = 0; i < 3; i++) {
+		if (perms[i] > 0) continue;
+		int dim = inDims[abs(perms[i]) - 1];
+		inStarts[i] = (dim - 1) * inStrides[i];
+		inStrides[i] = - inStrides[i];
+		// printf("flipping dim[%d]\n", i);
+	}
+	// printfx("Strides: [%d %d %d]\n", inStrides[0], inStrides[1], inStrides[2]);
+	// printfx("Starts: [%d %d %d]\n", inStarts[0], inStarts[1], inStarts[2]);
+	int nvox3D = inDims[0] * inDims[1] * inDims[2];
+	int nVol = nim->nvox / nvox3D;
+	float *in_img = (float *)_mm_malloc(nvox3D * sizeof(float), 64);
+	float *ras_img = (float *)nim->data;
+	int mx = - 1;
+	int mn = 1;
+	for (int v = 0; v < nVol; v++) { //transpose each volume separately
+		size_t dstIndex = 0; //volume offset
+		memcpy(in_img, ras_img, nvox3D * sizeof(float)); // dest <- src, sz
+		int zOffset = inStarts[2];
+		for (int z = 0; z < outDims[2]; z++) {
+			int yOffset = inStarts[1];
+			for (int y = 0; y < outDims[1]; y++) {
+				int xOffset = inStarts[0];
+				for (int x = 0; x < outDims[0]; x++) {
+					int srcIndex = xOffset + yOffset + zOffset;
+					mx = MAX(srcIndex, mx);
+					mn = MIN(srcIndex, mn);
+					ras_img[dstIndex] = in_img[srcIndex];
+					dstIndex ++;
+					xOffset += inStrides[0];
+				} // for x: column
+				yOffset += inStrides[1];
+			} //for y: row
+			zOffset += inStrides[2];
+		} //for z slice
+		ras_img += nvox3D;
+	} // for v : volume
+	_mm_free(in_img);
+	if ((mn != 0) || (mx != (nvox3D - 1))) {
+		printf("ERROR expected %d..%d not 0..%d\n", mn, mx, nvox3D - 1);
+		return EXIT_FAILURE;
+	}
+	// save header
+	// printfx("in dims = [%lld %lld %lld]\n", nim->nx, nim->ny, nim->nz);
+	// printfx("in pixdims = [%g %g %g]\n", nim->dx, nim->dy, nim->dz);
+	nim->nx = outDims[0];
+	nim->ny = outDims[1];
+	nim->nz = outDims[2];
+	nim->dim[1] = nim->nx;
+	nim->dim[2] = nim->ny;
+	nim->dim[3] = nim->nz;
+	float inPixDims[3] = {(float)nim->dx, (float)nim->dy, (float)nim->dz};
+	nim->dx = inPixDims[abs(perms[0])-1];
+	nim->dy = inPixDims[abs(perms[1])-1];
+	nim->dz = inPixDims[abs(perms[2])-1];
+	// printfx("out dims = [%lld %lld %lld]\n", nim->nx, nim->ny, nim->nz);
+	// printfx("out pixdims = [%g %g %g]\n", nim->dx, nim->dy, nim->dz);
+	mat44 out_affine;
+	permute_affine(in_affine, &out_affine, inDims, perms);
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			nim->sto_xyz.m[i][j] = out_affine.m[i][j];
+			nim->qto_xyz.m[i][j] = out_affine.m[i][j];
+		}
+	}
+	return EXIT_SUCCESS;
+}
