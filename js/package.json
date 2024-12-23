@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "1.0.0-v1.0.20241222",
+  "version": "1.0.0",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "exports": {
