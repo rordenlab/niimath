@@ -227,8 +227,10 @@ mat44 f642f32mat44(const nifti_dmat44* dmat) {
 int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear, int isRAS) {
 	int nvoxIn = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvoxIn;
-	if (nVol != 1)
-		return 1;
+	if (nVol != 1) {
+		printfx("conform failed: only for 3D data not 4D time series.\n"); 
+		return EXIT_FAILURE;
+	}
 	//normalize voxel brightness 0..255
 	if (f_high > 0.0)
 		voxelIntensityScale(nim, f_high);
@@ -276,7 +278,7 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 	nim->data = (void *) out_img;
 	if (nim->data == NULL) {
 		printfx("conform failed to allocate memory\n");
-		return -1; // Return an error code if allocation fails
+		return EXIT_FAILURE; // Return an error code if allocation fails
 	}
 	int i = -1;
 	//n.b. fastsurfer conform uses linear interpolation: "order = 1"
@@ -352,7 +354,7 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 		} // x
 	} //nearest neighbor
 	_mm_free(in_img);
-	return 0;
+	return EXIT_SUCCESS;
 }
 
 int conform(nifti_image *nim) {
