@@ -5055,6 +5055,8 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	if (!strcmp(argv[argc - 2], "-odt")) {
 		if (!strcmp(argv[argc - 1], "double")) {
 			dtOut = DT_FLOAT64;
+		} else if (!strcmp(argv[argc - 1], "float")) {
+			dtOut = DT_FLOAT32;
 		} else if (!strcmp(argv[argc - 1], "flt")) {
 			dtOut = DT_FLOAT32;
 		} else if (!strcmp(argv[argc - 1], "int")) {
@@ -5068,7 +5070,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		} else if (!strcmp(argv[argc - 1], "input")) {
 			dtOut = nim->datatype; //ihdr.datatype; //!
 		} else {
-			printfx("Error: Unknown datatype '%s' - Possible datatypes are: char short ushort int flt double input\n", argv[argc - 1]);
+			printfx("Error: Unknown datatype '%s' - Possible datatypes are: char short ushort int float double input\n", argv[argc - 1]);
 			return 2;
 		}
 		argc = argc - 2;
