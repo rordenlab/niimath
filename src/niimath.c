@@ -61,7 +61,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20241222"
+#define kMTHdate "v1.0.20250505"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -283,6 +283,9 @@ int show_help( void ) {
 	printf(" -ras                     : reorder and flip dimensions to RAS orientation\n");
 	printf(" -conform                 : reslice to 1mm size in coronal slice direction with 256^3 voxels\n");
 	printf(" -comply <nx> <ny> <nz> <dx> <dy> <dz> <f_high> <isLinear> : conform to axial slice with dx*dy*dzmm size and dx*dy*dz voxels. f_high bright clamping (0.98 for top 2%%). Linear (1) or nearest-neighbor (0)\n");
+	printf(" -reslice <target>        : reslice to match image 'target' using linear interpolation\n");
+	printf(" -reslice_nn <target>     : reslice to match image 'target' using nearest neighbor interpolation\n");
+
 #endif
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");

@@ -54,7 +54,7 @@ nano:
 
 # quick and dirty
 debug:
-	$(CNAME) -O0 $(MFLAGS) $(UFLAGS) -o niimath
+	$(CNAME) -O0 $(MFLAGS) $(UFLAGS) $(ZFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 sanitize:
