@@ -2339,7 +2339,7 @@ staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	*nkernel = n;
 	int kernelWeight = (int)((double)INT_MAX / (double)n); //requires <limits.h>
 	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
-	double *wt = (double *)_mm_malloc((n) * sizeof(double), 64); //precess weight: temporary
+	double *wt = (double *)_mm_malloc((n) * sizeof(double), 64); //weight: temporary
 	//second pass: fill surviving voxels
 	int i = 0;
 	double expd = 2.0 * sigmamm * sigmamm;
@@ -2363,7 +2363,7 @@ staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	int n = x * y * z;
 	*nkernel = n;
 	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
-	double *wt = (double *)_mm_malloc((n) * sizeof(double), 64); //precess weight: temporary
+	double *wt = (double *)_mm_malloc((n) * sizeof(double), 64); //weight: temporary
 	int i = 0;
 	double expd = 2.0 * sigmamm * sigmamm;
 	for (int zi = zlo; zi < (zlo + z); zi++)
@@ -2522,7 +2522,7 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes g
 #endif
 	flt *out32 = (flt *)_mm_malloc(14 * nvox3D * sizeof(flt), 64);
 	for (size_t i = 0; i < nvox3D; i++) {
-		//n.b. in6 and out14 are ALWAYS float regradless of DT32, e.g. single even if DT=double
+		//n.b. in6 and out14 are ALWAYS float regardless of DT32, e.g. single even if DT=double
 		float *in6 = (float *)_mm_malloc(6 * sizeof(float), 64);
 		float *out14 = (float *)_mm_malloc(14 * sizeof(float), 64);
 		size_t iv = i;
@@ -2788,7 +2788,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 							if (vxls[k] == value) { // count occurrences of the current number
 								count++;
 								if (count > countMode) {
-									countMode = count; // mode is the biggest ocurrences
+									countMode = count; // mode is the most frequents occurrence
 									mode = value;
 								}
 							} else { // now this is a different number
@@ -3058,7 +3058,7 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 		int yj = nx;
 		int zk = nx * ny;
 		int64_t nxyz = nx * ny * nz;
-		//orient: only look for edges in 2D, ignore on dimesion
+		//orient: only look for edges in 2D, ignore on dimension
 		if (orient == 1) xi = yj;
 		if (orient == 2) yj = 1;
 		if (orient == 3) zk = 1;

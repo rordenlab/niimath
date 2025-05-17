@@ -133,13 +133,19 @@ static int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, boo
 			ndegenerate++;
 			continue;
 		}
+		if (tris[i].x == tris[i].y || tris[i].x == tris[i].z || tris[i].y == tris[i].z) {
+				isdegenerate[i] = 1;
+				ndegenerate++;
+				continue;
+		}
 #define REQUIRE_SIGNIFICANT_AREA
 #ifdef REQUIRE_SIGNIFICANT_AREA
 		// use Heron’s Formula to eliminate triangles of tiny area
 		//  see Kahan: Miscalculating Area and Angles of a Needle-like Triangle
 		//  https://people.eecs.berkeley.edu/~wkahan/Triangle.pdf
+		// n.b. scale area improves watertight check
 		double area4 = 0.25 * sqrt((a + (b + c)) * (c - (a - b)) * (c + (a - b)) * (a + (b - c)));
-		if (area4 < FLT_EPSILON) {
+		if (area4 < 1e-10 * (a * b)) {
 			isdegenerate[i] = 1;
 			ndegenerate++;
 		}

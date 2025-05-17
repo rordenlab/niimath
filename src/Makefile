@@ -19,7 +19,7 @@ BFLAGS= -DHAVE_BUTTERWORTH bw.c
 #Tensor decomposition
 TFILES= -DHAVE_TENSOR tensor.c
 #Marching Cubes flag
-#MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c MarchingCubes.c
+# MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c MarchingCubes.c radixsort.c fdr.c
 MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
 
 ifeq ($(CXX),g++)
@@ -57,6 +57,7 @@ debug:
 	$(CNAME) -O0 $(MFLAGS) $(UFLAGS) $(ZFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
+# on MacOS consider: export MallocNanoZone=0
 sanitize:
 	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(MFLAGS) $(UFLAGS) $(ZFLAGS) -o niimath
 

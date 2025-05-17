@@ -796,15 +796,15 @@ int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, fl
 		startTime = clockMsec();
 	}
 	if ((reduceFraction < 1.0) || (quality > 1)) { //lossless for high quality
-		double agressiveness = 7.0; //7 = default for Simplify.h
+		double aggressiveness = 7.0; //7 = default for Simplify.h
 		if (quality == 0) //fast
-			agressiveness = 8.0;
+			aggressiveness = 8.0;
 		if (quality == 2) //best
-			agressiveness = 5.0;
+			aggressiveness = 5.0;
 		int startVert = npt;
 		int startTri = ntri;
 		int target_count = round((float)ntri * reduceFraction);
-		quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, agressiveness, verbose, (quality > 1));
+		quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, aggressiveness, verbose, (quality > 1));
 		if (verbose)
 			printfx("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
 		startTime = clockMsec();

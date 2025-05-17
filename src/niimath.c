@@ -192,16 +192,16 @@ int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, bo
 	vec3i *tris = NULL;
 	int ntri, npt;
 	read_mz3(innm, &pts, &tris, &npt, &ntri);
-	double agressiveness = 7.0; //7 = default for Simplify.h
+	double aggressiveness = 7.0; //7 = default for Simplify.h
 	if (quality == 0) //fast
-		agressiveness = 8.0;
+		aggressiveness = 8.0;
 	if (quality == 2) //best
-		agressiveness = 5.0;
+		aggressiveness = 5.0;
 	int startVert = npt;
 	int startTri = ntri;
 	int target_count = round((float)ntri * reduceFraction);
 	double startTime = clockMsec();
-	quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, agressiveness, verbose, (quality > 1));
+	quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, aggressiveness, verbose, (quality > 1));
 	if (verbose)
 		printf("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
 	save_mesh(outnm, tris, pts, ntri, npt, (quality > 0));

@@ -1296,7 +1296,7 @@ float * compute_data(int obj_type, int *dim) {
       {
         x = ( (float) i ) / sx - tx ;
         switch(obj_type) {
-         case 0: //cushin
+         case 0: //cushion
             val = z*z*x*x - z*z*z*z - 2*z*x*x + 2*z*z*z + x*x - z*z - (x*x - z)*(x*x - z) - y*y*y*y - 2*x*x*y*y - y*y*z*z + 2*y*y*z + y*y;
             break;
          case 1: //sphere
