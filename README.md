@@ -2,10 +2,6 @@
 
 [![Build status](https://ci.appveyor.com/api/projects/status/7o0xp2fgbhadkgn1?svg=true)](https://ci.appveyor.com/project/neurolabusc/niimath)
 
-## JavaScript/WebAssembly
-
-To read the WASM specific README, please click [here](./js/README.md). The rest of this README is for the `niimath` CLI program.
-
 ## About
 
 It is said that `imitation is the sincerest form of flattery`. This project emulates the popular [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) tool. fslmaths is a `general image calculator` and is not only one of the foundational tools for FSL's brain imaging pipelines (such as [FEAT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FEAT)), but has also been widely adopted by many tools. This popularity suggests that it fulfills an important niche. While scientists are often encouraged to discover novel solutions, it sometimes seems that replication is undervalued. Here are some specific reasons for creating this tool:
@@ -25,12 +21,14 @@ The Reason to use fslmaths instead of niimath:
 
 ## Installation
 
-You can get niimath using three methods:
+You can get niimath using several methods:
 
  - (Recommended) Download latest compiled release from [Github release web page](https://github.com/rordenlab/niimath/releases).
+ - (Recommended) Download latest compiled release from [pypi](https://pypi.org/project/niimath/):
+  * `pip install niimath`
  - (Recommended) You can also download from the command line for Linux, MacOS and Windows:
   * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_lnx.zip`
-  * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_universal.pkg`
+  * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_macos.zip`
   * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_win.zip`
  - (Developers) Download the source code from [GitHub](https://github.com/rordenlab/niimath), the next section describes how to build the software.
 
@@ -87,6 +85,10 @@ make
 exit
 sudo chown $(whoami) ./niimath/src/niimath
 ```
+
+## JavaScript/WebAssembly
+
+To read the WASM specific README, please click [here](./js/README.md). The rest of this README is for the `niimath` CLI program.
 
 ## Usage
 
