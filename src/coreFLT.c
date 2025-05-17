@@ -442,14 +442,14 @@ staticx void edt1(flt *df, int n, flt delta) { //first dimension is simple
 staticx int nifti_edt(nifti_image *nim) {
 	//https://github.com/neurolabusc/DistanceFields
 	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
-		return 1;
+		return EXIT_FAILURE;
 	if (nim->datatype != DT_CALC)
-		return 1;
+		return EXIT_FAILURE;
 	flt *img = (flt *)nim->data;
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
-		return 1;
+		return EXIT_FAILURE;
 	int nx = nim->nx;
 	int ny = nim->ny;
 	int nz = nim->nz;
@@ -507,8 +507,46 @@ staticx int nifti_edt(nifti_image *nim) {
 		_mm_free(img3D);
 	} //for each volume
 	nifti_sqrt(img, nim->nvox);
-	return 0;
+	return EXIT_SUCCESS;
 } //nifti_edt()
+
+
+staticx int nifti_sedt(nifti_image *nim) {
+	//signed distance fields, both negative and positive values
+	//https://github.com/neurolabusc/DistanceFields
+	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
+		return EXIT_FAILURE;
+	if (nim->datatype != DT_CALC)
+		return EXIT_FAILURE;
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
+		return EXIT_FAILURE;
+	// clone data
+	int ok = nifti_edt(nim);
+	if (ok != EXIT_SUCCESS)
+		return ok;
+	flt *img = (flt *)nim->data;
+	flt *imgEDT = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	memcpy(imgEDT, img, nvox3D * sizeof(float));
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] > 0.0)
+			img[i] = 0;
+		else
+			img[i] = 1;
+	}
+	ok = nifti_edt(nim);
+	if (ok != EXIT_SUCCESS)
+		return ok;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] <= 0.0)
+			img[i] = imgEDT[i];
+		else
+			img[i] = - img[i];
+	}
+	_mm_free(imgEDT);
+	return EXIT_SUCCESS;
+}  //nifti_sedt()
 
 // "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
 // niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -max scalar imgout
@@ -5540,6 +5578,8 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 			ok = nifti_close(nim, iso, dx1, dx2);
 		} else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
+		else if (!strcmp(argv[ac], "-sedt"))
+			ok = nifti_sedt(nim);
 		else if (!strcmp(argv[ac], "-fillh"))
 			ok = nifti_fillh(nim, 0);
 		else if (!strcmp(argv[ac], "-fillh26"))
