@@ -251,6 +251,10 @@ int mainMz3(int argc,char **argv) {
 				verbose = atoi(argv[i+1]);
 		}
 	}
+	if ((reduceFraction <= 0.0) || (reduceFraction >= 1.0)) {
+		fprintf(stderr,"Mesh reduction factor should be > 0 and < 1.\n");
+		return(EXIT_FAILURE);
+	}
 	return simplify_mz3(argv[1], argv[argc-1], reduceFraction, verbose, quality);
 }
 #endif // NII2MESH

@@ -107,68 +107,6 @@ static int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool ver
 	return nnew;
 }
 
-static int unify_verticesOld(vec3d **inpt, vec3i *tris, int npt, int ntri, bool verbose) {
-	//"vertex welding": reduces the number of vertices, number of faces unchanged
-	double startTime = clockMsec();
-	vec3d *pts = *inpt;
-	int *old2new = (int *)malloc(npt * sizeof(int));
-	vec3d pt0 = pts[0];
-	float *dx_in = (float *)malloc(npt * sizeof(float));
-	float *dx_out = (float *)malloc(npt * sizeof(float));
-	uint32_t *idx_in = (uint32_t *)malloc(npt * sizeof(uint32_t));
-	uint32_t *idx_out = (uint32_t *)malloc(npt * sizeof(uint32_t));
-	for (int i = 0; i < npt; i++) {
-		// printf("%d %d\n", i, npt);
-		dx_in[i] = dx(pt0, pts[i]);
-		idx_in[i] = i;
-		old2new[i] = -1; // not yet set
-	}
-	radix11sort_f32(dx_in, dx_out, idx_in, idx_out, npt);
-	free(dx_in);
-	free(idx_in);
-	int nnew = 0;		 // number of unique vertices
-	float tol = 0.00001; // tolerance: accept two vertices as identical if they are nearer
-	for (int i = 0; i < npt; i++) {
-		if (old2new[idx_out[i]] >= 0)
-			continue; // already assigned
-		float dx0 = dx_out[i];
-		vec3d pt0 = pts[idx_out[i]];
-		int j = i;
-		while ((j < npt) && ((dx_out[j] - dx0) < tol)) {
-			if (dx(pt0, pts[idx_out[j]]) < tol) {
-				old2new[idx_out[j]] = nnew;
-			}
-			j++;
-		}
-		nnew++;
-	}
-	free(dx_out);
-	free(idx_out);
-	if (npt == nnew) {
-		if (verbose)
-			printf("Unify vertices found no shared vertices\n");
-		free(old2new);
-		return npt;
-	}
-	for (int i = 0; i < ntri; i++) { // remap face indices
-		tris[i].x = old2new[tris[i].x];
-		tris[i].y = old2new[tris[i].y];
-		tris[i].z = old2new[tris[i].z];
-	}
-	vec3d *oldpts = (vec3d *)malloc(npt * sizeof(vec3d));
-	for (int i = 0; i < npt; i++)
-		oldpts[i] = pts[i];
-	free(*inpt);
-	*inpt = (vec3d *)malloc(nnew * sizeof(vec3d));
-	pts = *inpt;
-	for (int i = 0; i < npt; i++)
-		pts[old2new[i]] = oldpts[i];
-	free(oldpts);
-	free(old2new);
-	if (verbose)
-		printf("vertex welding %d -> %d: %ld ms\n", npt, nnew, timediff(startTime, clockMsec()));
-	return nnew;
-}
 
 #ifndef FLT_EPSILON
 #define FLT_EPSILON 1.19209290e-07F // float

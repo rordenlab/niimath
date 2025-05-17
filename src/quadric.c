@@ -68,24 +68,24 @@ double symMatDet(TSymetricMatrix m, int a11, int a12, int a13, int a21, int a22,
 	- m[a13]*m[a22]*m[a31] - m[a11]*m[a23]*m[a32]- m[a12]*m[a21]*m[a33];
 } // symMatDet()
 
-vec3d ptf(double x, double y, double z) {
+static inline vec3d ptf(double x, double y, double z) {
 	return (vec3d){.x = x, .y = y, .z = z};
 }// ptf()
 
-vec3d vCross(vec3d v1, vec3d v2) { //cross-product
+static inline vec3d vCross(vec3d v1, vec3d v2) { //cross-product
 	return ptf(v1.y * v2.z - v1.z * v2.y, v1.z * v2.x - v1.x * v2.z,
 		v1.x * v2.y - v1.y * v2.x);
 }
 
-vec3d vSum(vec3d a, vec3d b){ //add two vectors
+static inline  vec3d vSum(vec3d a, vec3d b){ //add two vectors
 	return ptf(a.x+b.x, a.y+b.y, a.z+b.z);
 }
 
-vec3d vSubtract(vec3d a, vec3d b){
+static inline vec3d vSubtract(vec3d a, vec3d b){
 	return ptf(a.x-b.x, a.y-b.y, a.z-b.z);
 }
 
-void vNormalize(vec3d *v){ //make vector unit length
+static inline void vNormalize(vec3d *v){ //make vector unit length
 	double len = sqrt( (v->x*v->x) + (v->y*v->y) + (v->z*v->z));
 	if (len <= 0) len = 0.001;
 	v->x = v->x / len;
@@ -93,11 +93,11 @@ void vNormalize(vec3d *v){ //make vector unit length
 	v->z = v->z / len;
 }
 
-double vDot (vec3d a,vec3d b){ //dot product
+static inline double vDot (vec3d a,vec3d b){ //dot product
 	return a.x*b.x + a.y*b.y + a.z*b.z;
 } // vDot()
 
-vec3d vMult(vec3d a, double v){ //multiply
+static inline vec3d vMult(vec3d a, double v){ //multiply
 	return ptf(a.x*v, a.y*v, a.z*v);
 } // vMult()
 
@@ -321,7 +321,7 @@ bool flipped(vec3d p,int i0,int i1,struct TVertex v0, struct TVertex v1,bool *de
 	return false;
 }
 
-void laplacian_smooth(vec3d *verts, vec3i *tris, int nvert, int ntri) {
+void laplacian_smooth(vec3d *restrict verts, vec3i *restrict tris, int nvert, int ntri) {
 	vec3d* sum = (vec3d*) malloc(nvert * sizeof(vec3d));
 	memset(sum, 0, nvert * sizeof(vec3d));
 	int* num = (int*) malloc(nvert * sizeof(int));
