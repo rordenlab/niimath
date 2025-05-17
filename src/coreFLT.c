@@ -825,7 +825,7 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
     int nz = 0;
     size_t nRow = 0;
 
-    if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+    if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)) {
         printf("Image size too small for Gaussian blur.\n");
         return 1;
     }

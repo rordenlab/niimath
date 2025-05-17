@@ -101,7 +101,7 @@ deploy:
     release: version $(RELEASE_VERSION) ($(APPVEYOR_REPO_TAG_NAME))
     description: ""
     auth_token:
-      secure: 90KUxJbQyRfqQ6N6EOMy4ZVqSt8/bdEpenZBIFSRCyagmvQlGfyN0yKKkeknmtPg
+      secure: Uln5DKXa0/tSBuSTZGhjmJAr9FN0RaB8uwz5FQ35dpKubzWsny+WergApgHz4Igs
     artifact: /niimath_.*\.zip/
     draft: false
     prerelease: false
