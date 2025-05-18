@@ -21,15 +21,7 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install build tools
-        run: |
-          pip install build twine
-
-      - name: Build package
-        run: |
-          python -m build
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: casperdcl/deploy-pypi@v2
         with:
-          skip-existing: true
+          build: -s
+          upload: true

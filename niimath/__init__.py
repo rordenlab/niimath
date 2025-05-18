@@ -13,10 +13,29 @@ except ImportError: # pragma: nocover
         __version__ = "UNKNOWN"
 __all__ = ['bin', 'bin_path', 'main']
 
+import os
+import platform
 from pathlib import Path
 
-bin_path = Path(__file__).resolve().parent / "niimath"
+# Handle platform-specific binary naming
+system = platform.system()
+if system == "Windows":
+    bin_name = "niimath.exe"
+else:
+    bin_name = "niimath"
+
+# Check for binary in bin directory (standard installation)
+bin_path = Path(__file__).resolve().parent / "bin" / bin_name
+
+# Fallback to direct directory for backward compatibility
+if not bin_path.exists():
+    bin_path = Path(__file__).resolve().parent / bin_name
+
 bin = str(bin_path)
+
+# Make the binary executable on Unix systems
+if system != "Windows" and bin_path.exists():
+    os.chmod(bin, os.stat(bin).st_mode | 0o111)
 
 
 def main(args=None, **run_kwargs):
@@ -24,7 +43,7 @@ def main(args=None, **run_kwargs):
     Arguments:
       args: defaults to `sys.argv[1:]`.
       **run_kwargs: passed to `subprocess.run`.
-    Returns: `int` exit code from dcm2niix execution.
+    Returns: `int` exit code from niimath execution.
     """
     if args is None:
         import sys
