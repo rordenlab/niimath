@@ -159,4 +159,10 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     endif()
 endif()
 
-install(TARGETS ${PROGRAMS} DESTINATION bin)
+option(INSTALL_IN_PY_PACKAGE "Install binary to Python package dir" OFF)
+
+if(INSTALL_IN_PY_PACKAGE)
+  install(TARGETS ${PROGRAMS} DESTINATION ${CMAKE_INSTALL_PREFIX}/niimath)
+else()
+  install(TARGETS ${PROGRAMS} DESTINATION bin)
+endif()
