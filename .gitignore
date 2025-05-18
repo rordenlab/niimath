@@ -7,6 +7,7 @@ node_modules
 niimath.js
 niimath.wasm
 # Python packaging artifacts
+niimath/_dist_ver.py
 niimath.egg-info/
 dist/
 build/
