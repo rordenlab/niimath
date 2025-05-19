@@ -19,20 +19,12 @@ jobs:
         with:
           python-version: '3.x'
 
-      # Environment variables set as secrets
-      - name: Set up PyPI credentials
-        run: |
-          echo "Setting up PyPI credentials"
-          echo ${{ secrets.PYPI_API_TOKEN }} | sed 's/./*/g'
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-
       - uses: casperdcl/deploy-pypi@v2
         with:
           build: -s
           upload: true
-          registry_domain: "https://upload.pypi.org"
         env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""  # Disable OIDC flow
+          ACTIONS_ID_TOKEN_REQUEST_URL: ""    # Disable OIDC flow
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
