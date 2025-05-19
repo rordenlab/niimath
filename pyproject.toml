@@ -13,6 +13,7 @@ build-backend = "setuptools.build_meta"
 write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
 local_scheme = "no-local-version"
+version_scheme = "release-branch-semver"
 
 [project]
 name = "niimath"
