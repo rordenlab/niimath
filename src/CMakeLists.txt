@@ -43,6 +43,8 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} tensor.c)
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
+    ADD_DEFINITIONS(-DHAVE_CONFORM)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c)
 
     option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
     if(USE_CLASSIC_CUBES)
@@ -117,6 +119,7 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     core32.c
+    coreFLT.c
     niftilib/nifti2_io.c
     znzlib/znzlib.c
     ${ADDITIONAL_SRCS}
