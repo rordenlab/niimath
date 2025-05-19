@@ -119,7 +119,6 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     core32.c
-    coreFLT.c
     niftilib/nifti2_io.c
     znzlib/znzlib.c
     ${ADDITIONAL_SRCS}

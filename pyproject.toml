@@ -13,7 +13,9 @@ build-backend = "setuptools.build_meta"
 write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
 local_scheme = "no-local-version"
-version_scheme = "release-branch-semver"
+tag_regex = "^v(\\d+\\.\\d+\\.\\d+.*?)$"
+fallback_version = "1.0.20250518"
+version_scheme = "no-guess-dev"
 
 [project]
 name = "niimath"
