@@ -5,10 +5,18 @@ from pathlib import Path
 from setuptools_scm import get_version
 from skbuild import setup
 
-# Get version from SCM (Git tags)
-__version__ = get_version(root=".", relative_to=__file__)
-# Clean up the version to be just the tag part
-tag_version = __version__.split("+")[0].split(".dev")[0].split(".post")[0]
+# Get version directly from most recent git tag
+import subprocess
+try:
+    # Get the latest tag without commits since then
+    tag_version = subprocess.check_output(['git', 'describe', '--tags', '--abbrev=0'], 
+                                         universal_newlines=True).strip()
+    # Remove leading 'v' if present
+    if tag_version.startswith('v'):
+        tag_version = tag_version[1:]
+except (subprocess.SubprocessError, OSError):
+    # Fallback version if git command fails
+    tag_version = "1.0.20250518"
 
 # Clean problematic pip env entries in CMakeCache
 for i in (Path(__file__).resolve().parent / "_skbuild").rglob("CMakeCache.txt"):
