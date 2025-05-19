@@ -15,4 +15,4 @@ __pycache__/
 # Generated version file
 niimath/_dist_ver.py
 # scikit-build
-_skbuild/
+_skbuild/niimath/_dist_ver.py
