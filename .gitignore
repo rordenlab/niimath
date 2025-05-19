@@ -12,3 +12,7 @@ dist/
 build/
 __pycache__/
 *.py[cod]
+# Generated version file
+niimath/_dist_ver.py
+# scikit-build
+_skbuild/

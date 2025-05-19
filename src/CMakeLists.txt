@@ -159,4 +159,11 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     endif()
 endif()
 
-install(TARGETS ${PROGRAMS} DESTINATION bin)
+# For Python package, we need to install to the package directory
+if(SKBUILD)
+    # scikit-build sets SKBUILD environment variable
+    # Install directly in the niimath package directory
+    install(TARGETS ${PROGRAMS} DESTINATION niimath)
+else()
+    install(TARGETS ${PROGRAMS} DESTINATION bin)
+endif()
