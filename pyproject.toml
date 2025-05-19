@@ -12,6 +12,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools_scm]
 write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
+local_scheme = "no-local-version"
 
 [project]
 name = "niimath"
