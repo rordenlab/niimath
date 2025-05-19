@@ -7,6 +7,8 @@ on:
 
 jobs:
   pypi:
+    permissions:
+      id-token: write  # required for trusted publishing to PyPI
     runs-on: ubuntu-latest
 
     steps:
@@ -23,8 +25,3 @@ jobs:
         with:
           build: -s
           upload: true
-        env:
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""  # Disable OIDC flow
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""    # Disable OIDC flow
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
