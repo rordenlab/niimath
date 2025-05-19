@@ -1888,6 +1888,10 @@ staticx int butterworth_filter(flt *img, int nvox3D, int nvol, double fs, double
 	int nX = nvol;
 	int nA = 0;
 	nA = butter_design(order, 2.0 * lowcut / fs, 2.0 * highcut / fs, &a, &b, &IC);
+	if (nA <= 1) {
+		printfx("Butterworth design does not make sense\n");
+		return EXIT_FAILURE;
+	}
 	int nEdge = 3 * (nA - 1);
 	if ((nA < 1) || (nX <= nEdge)) {
 		printfx("filter requires at least %d samples\n", nEdge);

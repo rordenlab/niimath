@@ -42,6 +42,10 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
 //mode: segment and levels 1: 3/4, 2: 2/3 3: 1/2, 4: 1/3, 5: 1/4
 //dark/bright/high: set to threshold
+	if (nBin <= 0 || nBin > 32767) { // or 46340
+		printf("nii_otsu error: nBin (%d) is too large for safe indexing\n", nBin);
+		return 0;
+	}
 	int thresh = 0;
 	*dark = 0;
 	*mid = 0;
