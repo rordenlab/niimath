@@ -81,13 +81,12 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		int lo = (int)(0.25*nBin);
 		int mi = (int)(0.50*nBin);
 		int hi = (int)(0.75*nBin);
-		//double max = P[0][lo] + P[lo+1][hi] + P[hi+1][nBin-1];
-		double max = P[lo] + P[((lo+1)*nBin)+mi] + P[((mi+1)*nBin)+hi] + P[((hi+1)*nBin)+255];
+		double max = P[lo] + P[((lo+1)*nBin)+mi] + P[((mi+1)*nBin)+hi] + P[((hi+1)*nBin)+(nBin-1)];
 		for (int l = 0; l < (nBin-3); l++) {
 			for (int m = l + 1; m < (nBin-2); m++) {
 				for (int h = m + 1; h < (nBin-1); h++) {
 					//double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
-					double v = P[l] + P[((l+1)*nBin)+m] + P[((m+1)*nBin)+h] + P[((h+1)*nBin)+255];
+					double v = P[l] + P[((l+1)*nBin)+m] + P[((m+1)*nBin)+h] + P[((h+1)*nBin)+(nBin-1)];
 					if (v > max) {
 						lo = l;
 						mi = m;

@@ -56,6 +56,9 @@ nano:
 debug:
 	$(CNAME) -O0 $(MFLAGS) $(UFLAGS) $(ZFLAGS) -o niimath
 
+verbose:
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(MFLAGS) $(UFLAGS) $(ZFLAGS) -o niimath
+
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
 sanitize:

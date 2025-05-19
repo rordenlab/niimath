@@ -2436,6 +2436,7 @@ staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 	return kernel;
 } // make_kernel_gauss()
 
+#ifdef HAVE_TENSOR
 staticx flt calmax(nifti_image *nim) {
 	if ((nim->nvox < 1) || (nim->datatype != DT_CALC))
 		return 0.0;
@@ -2455,6 +2456,7 @@ staticx flt calmin(nifti_image *nim) {
 		mn = MIN(mn, in32[i]);
 	return mn;
 } // calmin()
+#endif // HAVE_TENSOR
 
 staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	int nvox3D = nim->nx * nim->ny * nim->nz;
@@ -2698,6 +2700,9 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes g
 	_mm_free(out32);
 	return 0;
 #else
+	(void)nim;
+	(void)isUpperTriangle;
+	(void)gzMode;
 	printfx("not compiled to support tensor_decomp\n");
 	return 1;
 #endif

@@ -118,6 +118,20 @@ void read_mz3(const char* filename, vec3d **verts, vec3i **tris, int* nvert, int
 		*ntri = (int) h.NFACE;
 		*nvert = (int) h.NVERT;
 		uint32_t skip = h.NSKIP;
+		if (skip > 0) {
+			const size_t bufsize = 4096;
+			unsigned char buf[bufsize];
+			uint32_t remaining = skip;
+			while (remaining > 0) {
+				size_t n = (remaining > bufsize) ? bufsize : remaining;
+				int br = gzread(fgz, buf, n);
+				if (br != (int)n) {
+					printf("Unable to skip %u bytes in compressed file %s\n", skip, filename);
+					exit(EXIT_FAILURE);
+				}
+				remaining -= br;
+			}
+		}
 		// fseek(fp, (int)(sizeof(struct mz3hdr) + skip), SEEK_SET);
 		uint32_t tribytes = h.NFACE * sizeof(vec3i);
 		*tris = (vec3i *) malloc(tribytes);
@@ -211,40 +225,13 @@ int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, bo
 }
 
 int mainMz3(int argc,char **argv) {
-	float isolevel = 0.0;
-	int isoDarkMediumBright123 = 2;
-	float reduceFraction = 0.25;
-	bool onlyLargest = true;
-	bool fillBubbles = false;
-	int postSmooth = 0;
 	int quality = 1;
-	int originalMC = 0;
+	float reduceFraction = 0.25;
 	bool verbose = true;
 	if (argc > 3) {
 		for (int i=2;i<(argc-1);i++) {
-			if (strcmp(argv[i],"-b") == 0)
-				fillBubbles = atoi(argv[i+1]);
-			if (strcmp(argv[i],"-i") == 0) {
-				if (strlen(argv[i+1]) < 1) continue;
-				if (toupper(argv[i+1][0]) == 'D')
-					isoDarkMediumBright123 = 1;
-				else if (toupper(argv[i+1][0]) == 'M')
-					isoDarkMediumBright123 = 2;
-				else if (toupper(argv[i+1][0]) == 'B')
-					isoDarkMediumBright123 = 3;
-				else {
-					isoDarkMediumBright123 = 0; //custom
-					isolevel = atof(argv[i+1]);
-				}
-			}
-			if (strcmp(argv[i],"-l") == 0)
-				onlyLargest = atoi(argv[i+1]);
-			if (strcmp(argv[i],"-o") == 0)
-				originalMC = atoi(argv[i+1]);
 			if (strcmp(argv[i],"-q") == 0)
 				quality = atoi(argv[i+1]);
-			if (strcmp(argv[i],"-s") == 0)
-				postSmooth = atoi(argv[i+1]);
 			if (strcmp(argv[i],"-r") == 0)
 				reduceFraction = atof(argv[i+1]);
 			if (strcmp(argv[i],"-v") == 0)

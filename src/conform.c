@@ -9,14 +9,25 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef EMSCRIPTEN
-#define _mm_malloc(size, alignment) malloc(size)
-#define _mm_free(ptr) free(ptr)
+	#define _mm_malloc(size, alignment) malloc(size)
+	#define _mm_free(ptr) free(ptr)
 #else
-#ifdef __x86_64__
-#include <immintrin.h>
-#else
-#include "arm_malloc.h"
-#endif
+	#if defined(_MSC_VER)
+		// MSVC (x86 or ARM64)
+		#include <malloc.h>  // provides _aligned_malloc / _aligned_free
+		#define _mm_malloc(size, alignment) _aligned_malloc(size, alignment)
+		#define _mm_free(ptr) _aligned_free(ptr)
+	#elif defined(__x86_64__) || defined(__SSE__)
+		// GCC/Clang on x86
+		#include <immintrin.h>
+	#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
+		// GCC/Clang on ARM: use custom or fallback
+		#include "arm_malloc.h"
+	#else
+		// fallback
+		#define _mm_malloc(size, alignment) malloc(size)
+		#define _mm_free(ptr) free(ptr)
+	#endif
 #endif
 
 // conform.py functions follow
@@ -199,7 +210,6 @@ void conformVox2Vox(const int *inDims, mat44 *in_affine, const int outDims[3], c
 	} else {
 		LOAD_MAT44(Mdc, -1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0);
 	}
-	vec4 dims = setVec4(outDims[0], outDims[1], outDims[2]);
 	mat44 MdcD = scaleMat44(Mdc, delta);
 	vec4 vol_center = setVec4(outDims[0], outDims[1], outDims[2]);
 	vol_center = nifti_vect44mat44_mul(vol_center, MdcD);
@@ -224,7 +234,7 @@ mat44 f642f32mat44(const nifti_dmat44 *dmat) {
 	return result;
 }
 
-void resliceVox2Vox(const int *inDims, mat44 *in_affine, const int outDims[3], mat44 *out_affine, mat44 *vox2vox, mat44 *inv_vox2vox) {
+void resliceVox2Vox(mat44 *in_affine, mat44 *out_affine, mat44 *vox2vox, mat44 *inv_vox2vox) {
 	// Compute vox2vox = inv(out_affine) * in_affine
 	mat44 inv_out_affine = nifti_mat44_inverse(*out_affine);
 	*vox2vox = nifti_mat44_mul(inv_out_affine, *in_affine);
@@ -361,13 +371,12 @@ int reslice(nifti_image *nim, nifti_image *nim2, int isLinear) {
 		printfx("conform failed: only for 3D data not 4D time series.\n");
 		return EXIT_FAILURE;
 	}
-	const int inDims[3] = {(int)nim->nx, (int)nim->ny, (int)nim->nz};
 	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
 	const int outDims[3] = {(int)nim2->nx, (int)nim2->ny, (int)nim2->nz};
 	const float outPixDims[3] = {(int)nim2->dx, (int)nim2->dy, (int)nim2->dz};
 	mat44 out_affine = f642f32mat44(&nim2->sto_xyz);
 	mat44 vox2vox, inv_vox2vox;
-	resliceVox2Vox(inDims, &in_affine, outDims, &out_affine, &vox2vox, &inv_vox2vox);
+	resliceVox2Vox(&in_affine, &out_affine, &vox2vox, &inv_vox2vox);
 	return doReslice(nim, outPixDims, outDims, out_affine, inv_vox2vox, isLinear);
 }
 
@@ -387,123 +396,6 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 	mat44 out_affine, vox2vox, inv_vox2vox;
 	conformVox2Vox(inDims, &in_affine, outDims, outPixDims, isRAS, &out_affine, &vox2vox, &inv_vox2vox);
 	return doReslice(nim, outPixDims, outDims, out_affine, inv_vox2vox, isLinear);
-	/*
-		//set output header
-		for (int i = 0; i < 4; i++) {
-			for (int j = 0; j < 4; j++) {
-				nim->sto_xyz.m[i][j] = out_affine.m[i][j];
-				nim->qto_xyz.m[i][j] = out_affine.m[i][j];
-			}
-		}
-		//set output header quaternion
-		nifti_dmat44_to_quatern(nim->sto_xyz ,
-			&nim->quatern_b, &nim->quatern_c, &nim->quatern_d,
-			&nim->qoffset_x, &nim->qoffset_y, &nim->qoffset_z,
-			&nim->dx, &nim->dy, &nim->dz, &nim->qfac);
-		nim->dx = outPixDims[0];
-		nim->dy = outPixDims[1];
-		nim->dz = outPixDims[2];
-		nim->scl_slope = 1.0;
-		nim->scl_inter = 0.0;
-		nim->cal_min = 0.0;
-		nim->cal_max = 0.0;
-		//reslice data
-		float *in_img = (float *)_mm_malloc(nvoxIn * sizeof(float), 64); //alloc for each volume to allow openmp
-		float *raw_img = (float *)nim->data;
-		memcpy(in_img, raw_img, nvoxIn * sizeof(float));
-		int dimX = nim->nx;
-		int dimY = nim->ny;
-		int dimZ = nim->nz;
-		int dimXY = dimX * dimY;
-		//set output
-		nim->nx = outDims[0];
-		nim->ny = outDims[1];
-		nim->nz = outDims[2];
-		int nvoxOut = outDims[0] * outDims[1] * outDims[2];
-		nim->nvox = nvoxOut;
-		free(nim->data);  // Free the memory allocated with calloc
-		float *out_img = (float *)_mm_malloc(nvoxOut * sizeof(float), 64); //output image
-		memset(out_img, 0, nim->nvox * sizeof(float)); //zero array
-		nim->data = (void *) out_img;
-		if (nim->data == NULL) {
-			printfx("conform failed to allocate memory\n");
-			return EXIT_FAILURE; // Return an error code if allocation fails
-		}
-		int i = -1;
-		//n.b. fastsurfer conform uses linear interpolation: "order = 1"
-		// likewise, mri_convert reports "Reslicing using trilinear interpolation"
-		if (isLinear) {
-			for (int z = 0; z < outDims[2]; z++) {
-				for (int y = 0; y < outDims[1]; y++) {
-					// loop hoisting
-					int ixYZ = y * inv_vox2vox.m[0][1] + z * inv_vox2vox.m[0][2] + inv_vox2vox.m[0][3];
-					int iyYZ = y * inv_vox2vox.m[1][1] + z * inv_vox2vox.m[1][2] + inv_vox2vox.m[1][3];
-					int izYZ = y * inv_vox2vox.m[2][1] + z * inv_vox2vox.m[2][2] + inv_vox2vox.m[2][3];
-					for (int x = 0; x < outDims[0]; x++) {
-						float ix = x * inv_vox2vox.m[0][0] + ixYZ;
-						float iy = x * inv_vox2vox.m[1][0] + iyYZ;
-						float iz = x * inv_vox2vox.m[2][0] + izYZ;
-						int fx = floor(ix);
-						int fy = floor(iy);
-						int fz = floor(iz);
-						i++;
-						if (fx < 0 || fy < 0 || fz < 0) {
-							continue;
-						}
-						int cx = fx + 1;
-						int cy = fy + 1;
-						int cz = fz + 1;
-						if (cx >= dimX || cy >= dimY || cz >= dimZ) {
-							continue;
-						}
-						// residual fractions
-						float rcx = ix - fx;
-						float rcy = iy - fy;
-						float rcz = iz - fz;
-						float rfx = 1.0 - rcx;
-						float rfy = 1.0 - rcy;
-						float rfz = 1.0 - rcz;
-						//floor voxel index for all 3 dimensions
-						int fff = fx + fy * dimX + fz * dimXY;
-						float vx = 0.0;
-						vx += in_img[fff] * rfx * rfy * rfz;
-						vx += in_img[fff + dimXY] * rfx * rfy * rcz;
-						vx += in_img[fff + dimX] * rfx * rcy * rfz;
-						vx += in_img[fff + dimX + dimXY] * rfx * rcy * rcz;
-						vx += in_img[fff + 1] * rcx * rfy * rfz;
-						vx += in_img[fff + 1 + dimXY] * rcx * rfy * rcz;
-						vx += in_img[fff + 1 + dimX] * rcx * rcy * rfz;
-						vx += in_img[fff + 1 + dimX + dimXY] * rcx * rcy * rcz;
-						out_img[i] = vx;
-					} // x
-				} // y
-			} // x
-		} else { //if linear else nearest neighbor
-			for (int z = 0; z < outDims[2]; z++) {
-				for (int y = 0; y < outDims[1]; y++) {
-						// loop hoisting
-						int ixYZ = y * inv_vox2vox.m[0][1] + z * inv_vox2vox.m[0][2] + inv_vox2vox.m[0][3];
-						int iyYZ = y * inv_vox2vox.m[1][1] + z * inv_vox2vox.m[1][2] + inv_vox2vox.m[1][3];
-						int izYZ = y * inv_vox2vox.m[2][1] + z * inv_vox2vox.m[2][2] + inv_vox2vox.m[2][3];
-						for (int x = 0; x < outDims[0]; x++) {
-							int ix = round(x * inv_vox2vox.m[0][0] + ixYZ);
-							int iy = round(x * inv_vox2vox.m[1][0] + iyYZ);
-							int iz = round(x * inv_vox2vox.m[2][0] + izYZ);
-							i++;
-							if (ix < 0 || iy < 0 || iz < 0) {
-								continue;
-							}
-							if (ix >= dimX || iy >= dimY || iz >= dimZ) {
-								continue;
-							}
-							//out_img[i] = in_img[voxidx(ix, iy, iz)];
-							out_img[i] = in_img[ix + iy * dimX + iz * dimXY];
-						} // z
-				} // y
-			} // x
-		} //nearest neighbor
-		_mm_free(in_img);
-		return EXIT_SUCCESS;*/
 }
 
 int conform(nifti_image *nim) {
