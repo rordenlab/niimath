@@ -119,20 +119,19 @@ void read_mz3(const char* filename, vec3d **verts, vec3i **tris, int* nvert, int
 		*nvert = (int) h.NVERT;
 		uint32_t skip = h.NSKIP;
 		if (skip > 0) {
-			const size_t bufsize = 4096;
-			unsigned char buf[bufsize];
-			uint32_t remaining = skip;
-			while (remaining > 0) {
-				size_t n = (remaining > bufsize) ? bufsize : remaining;
-				int br = gzread(fgz, buf, n);
-				if (br != (int)n) {
-					printf("Unable to skip %u bytes in compressed file %s\n", skip, filename);
-					exit(EXIT_FAILURE);
+			#define GZSKIP_BUFSIZE 4096
+				unsigned char buf[GZSKIP_BUFSIZE];
+				uint32_t remaining = skip;
+				while (remaining > 0) {
+						size_t n = (remaining > GZSKIP_BUFSIZE) ? GZSKIP_BUFSIZE : remaining;
+						int br = gzread(fgz, buf, (unsigned int)n);
+						if (br <= 0) {
+								printf("Unable to skip %u bytes in compressed file %s\n", skip, filename);
+								exit(EXIT_FAILURE);
+						}
+						remaining -= br;
 				}
-				remaining -= br;
-			}
 		}
-		// fseek(fp, (int)(sizeof(struct mz3hdr) + skip), SEEK_SET);
 		uint32_t tribytes = h.NFACE * sizeof(vec3i);
 		*tris = (vec3i *) malloc(tribytes);
 		void * imgRaw = (void *) *tris;
