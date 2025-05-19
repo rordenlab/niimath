@@ -7,8 +7,6 @@ on:
 
 jobs:
   pypi:
-    permissions:
-      id-token: write  # required for trusted publishing to PyPI
     runs-on: ubuntu-latest
 
     steps:
@@ -25,3 +23,6 @@ jobs:
         with:
           build: -s
           upload: true
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          registry_domain: https://upload.pypi.org
