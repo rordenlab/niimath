@@ -1,28 +1,13 @@
 name: Release
-
-on:
-  push:
-    tags:
-      - 'v*.*.*'
-
+on: {push: {tags: ['v*.*.*']}}
 jobs:
   pypi:
+    permissions: {id-token: write}
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: false  # niimath has no submodules
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - uses: casperdcl/deploy-pypi@v2
-        with:
-          build: -s
-          upload: true
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          registry_domain: https://upload.pypi.org
+    - uses: actions/checkout@v4
+      with: {fetch-depth: 0, submodules: false}
+    - uses: actions/setup-python@v5
+      with: {python-version: '3.x'}
+    - uses: casperdcl/deploy-pypi@v2
+      with: {build: -s, upload: true}

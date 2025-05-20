@@ -24,6 +24,9 @@ license = {file = "LICENSE"}
 authors = [
   {name = "The niimath developers"}
 ]
+maintainers = [
+  {name = "Casper da Costa-Luis", email = "imaging@cdcl.ml"}
+]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
