@@ -38,6 +38,8 @@ jobs:
   upload_pypi:
     needs: build_wheels
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
 
     steps:
       - uses: actions/download-artifact@v4
@@ -54,4 +56,4 @@ jobs:
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          packages_dir: final_dist
+          packages-dir: final_dist
