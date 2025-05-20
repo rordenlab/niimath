@@ -26,6 +26,9 @@ jobs:
 
       - name: Build wheels
         run: python -m cibuildwheel --output-dir dist
+        env:
+          CIBW_ARCHS: auto64
+          CIBW_SKIP: "pp*"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -51,3 +54,4 @@ jobs:
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
+          packages_dir: final_dist
