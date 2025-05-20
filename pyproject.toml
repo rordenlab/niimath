@@ -1,28 +1,29 @@
 [build-system]
-requires = [
-  "setuptools>=42",
-  "wheel",
-  "setuptools_scm[toml]>=3.4",
-  "scikit-build>=0.11.0",
-  "cmake>=3.5",
-  "ninja"
-]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools_scm>=7", "scikit-build-core[pyproject]>=0.5"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+sdist.include = ["niimath/_dist_ver.py"]
+minimum-version = "0.5"
+cmake.minimum-version = "3.5"
 
 [tool.setuptools_scm]
 write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
-local_scheme = "no-local-version"
-version_scheme = "no-guess-dev"
 
 [project]
 name = "niimath"
 description = "NIfTI arithmetic utilities"
 readme = "README.md"
 requires-python = ">=3.7"
+keywords = ["research", "neuroimaging", "neuroscience", "mri", "nifti", "dcm", "nii", "nitrc"]
 license = {file = "LICENSE"}
 authors = [
   {name = "The niimath developers"}
+]
+maintainers = [
+  {name = "Casper da Costa-Luis", email = "imaging@cdcl.ml"}
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -34,6 +35,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.scripts]
+niimath = "niimath:main"
+
 [project.urls]
-"Homepage" = "https://github.com/rordenlab/niimath"
-"Documentation" = "https://github.com/rordenlab/niimath"
+repository = "https://github.com/rordenlab/niimath"
+changelog = "https://github.com/rordenlab/niimath/releases"

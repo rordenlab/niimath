@@ -4,7 +4,10 @@ if(COMMAND CMAKE_POLICY)
     CMAKE_POLICY(SET CMP0003 NEW)
 endif()
 
-project(niimath)
+if(NOT SKBUILD_PROJECT_NAME)
+  set(SKBUILD_PROJECT_NAME niimath)
+endif()
+project(${SKBUILD_PROJECT_NAME})
 
 # These must be set BEFORE any add_subdirectory or include() that compiles code
 set(BUILD_SHARED_LIBS OFF)

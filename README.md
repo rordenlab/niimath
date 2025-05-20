@@ -24,7 +24,7 @@ The Reason to use fslmaths instead of niimath:
 You can get niimath using several methods:
 
  - (Recommended) Download latest compiled release from [Github release web page](https://github.com/rordenlab/niimath/releases).
- - (Recommended) Download latest compiled release from [pypi](https://pypi.org/project/niimath/):
+ - (Recommended) Download & compile latest source release from [PyPI](https://pypi.org/project/niimath/):
   * `pip install niimath`
  - (Recommended) You can also download from the command line for Linux, MacOS and Windows:
   * `curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_lnx.zip`
