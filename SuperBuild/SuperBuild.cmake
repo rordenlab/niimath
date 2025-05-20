@@ -12,7 +12,7 @@ else()
     set(git_protocol "https://")
 endif()
 
-#emulate fslmaths behavior, add pigz support
+# emulate fslmaths behavior, add pigz support
 option(FSLSTYLE "FSL behavior, pigz support" ON)
 if(FSLSTYLE)
    ADD_DEFINITIONS(-DFSLSTYLE)
@@ -35,6 +35,12 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 option(USE_STATIC_RUNTIME "Use static runtime" ON)
+
+# Ensure static MSVC runtime and static libraries
+set(BUILD_SHARED_LIBS OFF)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
     option(OPENMP_XCODE "Build with OpenMP support" OFF)
@@ -78,6 +84,9 @@ ExternalProject_Add(src
         -DUSE_STATIC_RUNTIME:BOOL=${USE_STATIC_RUNTIME}
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
+        # forward static runtime and static linking
+        -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}
+        -DBUILD_SHARED_LIBS:BOOL=${BUILD_SHARED_LIBS}
 )
 
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION bin
