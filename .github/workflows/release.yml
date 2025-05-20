@@ -1,28 +1,53 @@
-name: Release
+name: Build and publish wheels
 
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
 
 jobs:
-  pypi:
-    runs-on: ubuntu-latest
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: false  # niimath has no submodules
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.11'
 
-      - uses: casperdcl/deploy-pypi@v2
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel
+
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir dist
+
+      - uses: actions/upload-artifact@v4
         with:
-          build: -s
-          upload: true
+          name: wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  upload_pypi:
+    needs: build_wheels
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+
+      - name: Combine all wheels into one folder
+        run: |
+          mkdir final_dist
+          find dist-artifacts -name '*.whl' -exec cp {} final_dist/ \;
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.8.12
+        with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
-          registry_domain: https://upload.pypi.org
