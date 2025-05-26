@@ -2983,15 +2983,37 @@ void old_swap_nifti_header( nifti_1_header *h , int is_nifti )
 -----------------------------------------------------------------------------*/
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <poll.h>
-#include <unistd.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+  #include <fcntl.h>
+#else
+  #include <unistd.h>
+  #include <poll.h>
+#endif
+
 int stdin_has_data() {
+#ifdef _WIN32
+    DWORD bytesAvailable = 0;
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (hStdin == INVALID_HANDLE_VALUE)
+        return 0;
+
+    // Only works if stdin is a pipe or file (not console/terminal)
+    if (!PeekNamedPipe(hStdin, NULL, 0, NULL, &bytesAvailable, NULL))
+        return 0;
+
+    return bytesAvailable > 0;
+#else
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
     int ret = poll(&pfd, 1, 0);  // timeout = 0 → non-blocking
     return (ret > 0 && (pfd.revents & POLLIN));
+#endif
 }
+
 /*---------------------------------------------------------------------------*/
 /*! return the size of a file, in bytes
 
