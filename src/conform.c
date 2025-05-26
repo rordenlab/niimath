@@ -373,7 +373,7 @@ int reslice(nifti_image *nim, nifti_image *nim2, int isLinear) {
 	}
 	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
 	const int outDims[3] = {(int)nim2->nx, (int)nim2->ny, (int)nim2->nz};
-	const float outPixDims[3] = {(int)nim2->dx, (int)nim2->dy, (int)nim2->dz};
+	const float outPixDims[3] = {nim2->dx, nim2->dy, nim2->dz};
 	mat44 out_affine = f642f32mat44(&nim2->sto_xyz);
 	mat44 vox2vox, inv_vox2vox;
 	resliceVox2Vox(&in_affine, &out_affine, &vox2vox, &inv_vox2vox);
