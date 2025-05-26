@@ -5682,7 +5682,7 @@ nifti_image *nifti_image_read( const char *hname , int read_data )
    /**- read the data if desired, then bug out */
    if( read_data ){
       if (isStdIn) {
-        nim->iname = strdup("-");
+        nim->iname = nifti_strdup("-");
         if (ni_ver != 1) {
             fprintf(stderr,"piped input only supports NIFTI-1\n");
             return NULL;

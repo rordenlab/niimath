@@ -1,6 +1,6 @@
 ## About
 
-`niimath` is a high-performance command-line tool for manipulating NIfTI images. Because `niimath` is so fast, the main bottleneck in many workflows is disk I/O. To enable efficient workflows, niimath supports reading from and writing to standard input/output streams using the special filename `-`.
+`niimath` is a high-performance command-line tool for manipulating NIfTI images. Because `niimath` is so fast, the main bottleneck in many workflows is disk I/O. To enable efficient workflows, niimath supports reading from and writing to standard input/output streams using the special filename `-`. It is important to note that both the input and output must be single-file NIfTI-1 images (e.g. `img.nii`). Compressed files (e.g. `img.nii.gz`) must be decompressed prior to using the memory stream input.
 
 This streaming capability is especially useful for chaining tools together without writing intermediate results to disk. For example:
 
@@ -31,4 +31,11 @@ python read_stdin.py
 
 # Pipe a NIfTI image to niimath and capture the output via stdout, fully in memory
 python read_write_stream.py
+
+# Use nibabel to_bytes() and from_bytes() to call niimath using pipes
+python nibabel_niimath.py
 ```
+
+## Limitations
+
+These features are currently only supported on Unix operating systems (Linux and MacOS). Memory piping works differently on Windows computers.

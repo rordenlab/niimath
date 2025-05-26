@@ -49,7 +49,7 @@ Likewise, if you are compiling on Windows using cmake:
 ```
 git clone https://github.com/rordenlab/niimath.git
 cd niimath & mkdir build & cd build & cmake ..
-msbuild niimath.sln
+cmake --build .
 ```
 Alternatively, you can compile the software by running the terminal command `make` from the project's `src` folder if you are running Linux (or execute `windows.bat` if you are running Windows):
 
