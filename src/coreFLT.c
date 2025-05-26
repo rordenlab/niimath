@@ -555,6 +555,10 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	int nVol = nim->nvox / nvox3D;
 	if (nVol != 1)
 		return 1;
+	if (dx1 <= 0.0) {
+		printfx("close function requires positive dilation (but erode can be 0).\n");
+		return EXIT_FAILURE;
+	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
 	memcpy(imgIn, img, nvox3D * sizeof(float));
@@ -566,7 +570,7 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 		else
 			img[i] = 1;
 	}
-	//step2 apply distance transform
+	//step2 apply distance transform to DILATE (required)
 	// -edt
 	nifti_edt(nim);
 	//step 3: threshold and make invert binary
@@ -577,22 +581,24 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 		else
 			img[i] = 1;
 	}
-	//step4 apply distance transform
+	//step4 apply distance transform to ERODE (optional)
 	// -edt
-	nifti_edt(nim);
-	//step 5: threshold and make binary, set surviving voxels to iso
-	// -thr $dx2 -bin -mul $iso
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (img[i] < dx2)
-			img[i] = 0;
-		else
-			img[i] = iso;
+	if (dx2 > 0.0) {
+		nifti_edt(nim);
+		//step 5: threshold and make binary, set surviving voxels to iso
+		// -thr $dx2 -bin -mul $iso
+		for (size_t i = 0; i < nim->nvox; i++) {
+			if (img[i] < dx2)
+				img[i] = 0;
+			//else
+			//	img[i] = iso;
+		}
 	}
 	//step 6 - voxel is brightest of original and mask
 	// -max scalar
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] > 0)
-			img[i] = fmax(img[i], imgIn[i]);
+			img[i] = fmax(iso, imgIn[i]);
 		else
 			img[i] = imgIn[i];
 	}
@@ -620,7 +626,7 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 			img[i] = 0;
 	}
 	if (nThresh < 1) {
-		printf("Hollow error, no voxels survive threshold %g\n", threshold);
+		printfx("Hollow error, no voxels survive threshold %g\n", threshold);
 		return 1;
 	}
 	#ifdef NII2MESH
@@ -642,7 +648,7 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 		} 
 	}
 	if (mx <= thick) {
-		printf("Hollow error, no surface deeper than %g (deepest point %g)\n", thick, mx);
+		printfx("Hollow error, no surface deeper than %g (deepest point %g)\n", thick, mx);
 		return 1;
 	}
 	for (size_t i = 0; i < nim->nvox; i++) {
