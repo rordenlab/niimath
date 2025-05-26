@@ -832,7 +832,7 @@ static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt 
     size_t nRow = 0;
 
     if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)) {
-        printf("Image size too small for Gaussian blur.\n");
+        printfx("Image size too small for Gaussian blur.\n");
         return 1;
     }
     if (nim->datatype != DT_CALC)
@@ -1228,7 +1228,7 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { //binarize 
 //makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
 	flt darkThresh, midThresh, brightThresh;
 	flt threshold = otsu_thresholds(nim, mode, &darkThresh, &midThresh, &brightThresh);
-	printf("Otsu %g %g %g\n", darkThresh, midThresh, brightThresh);
+	printfx("Otsu %g %g %g\n", darkThresh, midThresh, brightThresh);
 	//apply otsu
 	if (makeBinary == 1)
 		return nifti_binarize(nim, threshold);

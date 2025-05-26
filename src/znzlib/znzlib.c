@@ -57,28 +57,38 @@ znzFile znzopen(const char *path, const char *mode, int use_compression)
 
 #ifdef HAVE_ZLIB
   file->zfptr = NULL;
+#endif
 
+  file->withz = 0;
+
+  // Special case: read/write uncompressed to stdout
+  if (strcmp(path, "-") == 0) {
+    if (mode[0] == 'r')
+      file->nzfptr = stdin;
+    else
+      file->nzfptr = stdout;
+    return file;
+  }
+
+#ifdef HAVE_ZLIB
   if (use_compression) {
     file->withz = 1;
     if((file->zfptr = gzopen(path,mode)) == NULL) {
         free(file);
-        file = NULL;
+        return NULL;
     }
-  } else {
-#endif
-
-    file->withz = 0;
-    if((file->nzfptr = fopen(path,mode)) == NULL) {
-      free(file);
-      file = NULL;
-    }
-
-#ifdef HAVE_ZLIB
+    return file;
   }
 #endif
 
+  if((file->nzfptr = fopen(path,mode)) == NULL) {
+    free(file);
+    return NULL;
+  }
+
   return file;
 }
+
 
 
 znzFile znzdopen(int fd, const char *mode, int use_compression)
@@ -111,18 +121,23 @@ znzFile znzdopen(int fd, const char *mode, int use_compression)
 int Xznzclose(znzFile * file)
 {
   int retval = 0;
-  if (*file!=NULL) {
+  if (*file != NULL) {
 #ifdef HAVE_ZLIB
-    if ((*file)->zfptr!=NULL)  { retval = gzclose((*file)->zfptr); }
+    if ((*file)->zfptr != NULL) {
+      retval = gzclose((*file)->zfptr);
+    } else
 #endif
-    if ((*file)->nzfptr!=NULL) { retval = fclose((*file)->nzfptr); }
+    if ((*file)->nzfptr != NULL) {
+      // Do not close stdout
+      if ((*file)->nzfptr != stdout && (*file)->nzfptr != stdin)
+        retval = fclose((*file)->nzfptr);
+    }
 
     free(*file);
     *file = NULL;
   }
   return retval;
 }
-
 
 /* we already assume ints are 4 bytes */
 #undef ZNZ_MAX_BLOCK_SIZE
@@ -198,12 +213,39 @@ size_t znzwrite(const void* buf, size_t size, size_t nmemb, znzFile file)
 
 long znzseek(znzFile file, long offset, int whence)
 {
-  if (file==NULL) { return 0; }
+  if (file == NULL) return 0;
+
 #ifdef HAVE_ZLIB
-  if (file->zfptr!=NULL) return (long) gzseek(file->zfptr,offset,whence);
+  if (file->zfptr != NULL) {
+    return (long) gzseek(file->zfptr, offset, whence);
+  }
 #endif
-  return fseek(file->nzfptr,offset,whence);
+
+  // Handle non-compressed input
+  if (file->nzfptr == stdin) {
+    if (whence == SEEK_SET && offset > 0) {
+      // Read and discard bytes from stdin until offset is reached
+      long skipped = 0;
+      char buf[512];
+      while (skipped < offset) {
+        size_t to_read = (offset - skipped < (long)sizeof(buf)) ? (offset - skipped) : sizeof(buf);
+        size_t bytes = fread(buf, 1, to_read, file->nzfptr);
+        if (bytes == 0) {
+          fprintf(stderr, "** znzseek: failed to skip %ld bytes on stdin (only skipped %ld)\n", offset, skipped);
+          return -1;
+        }
+        skipped += bytes;
+      }
+      return 0;
+    } else {
+      fprintf(stderr, "** znzseek: unsupported seek on stdin (whence=%d, offset=%ld)\n", whence, offset);
+      return -1;
+    }
+  }
+
+  return fseek(file->nzfptr, offset, whence);
 }
+
 
 int znzrewind(znzFile stream)
 {

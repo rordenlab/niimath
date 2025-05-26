@@ -2,6 +2,8 @@
 /build/
 /bin/
 /src/niimath
+/library/borg.nii.gz
+/library/blurred.nii.gz
 dist
 node_modules
 niimath.js
