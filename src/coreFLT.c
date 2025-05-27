@@ -548,6 +548,71 @@ staticx int nifti_sedt(nifti_image *nim) {
 	return EXIT_SUCCESS;
 }  //nifti_sedt()
 
+//  "-dilate 1 2" creates isosurface of 1, zeros all voxels beyond distance 2 
+staticx int (nifti_image *nim, flt iso, flt dx) {
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if (nVol != 1)
+		return 1;
+	if (dx <= 0.0) {
+		printfx("erode function requires positive dilation (but erode can be 0).\n");
+		return EXIT_FAILURE;
+	}
+	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	flt *img = (flt *)nim->data;
+	memcpy(imgIn, img, nvox3D * sizeof(float));
+	//step 1: threshold and make invert binary
+	// -thr iso -binv
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] >= iso)
+			img[i] = 0;
+		else
+			img[i] = 1;
+	}
+	nifti_edt(nim);
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] <= dx)
+			img[i] = imgIn[i];
+		else
+			img[i] = 0.0;
+	}
+	_mm_free(imgIn);
+	return 0;
+}
+
+
+//  "-close 1 2" creates isosurface of 1, zeros all voxels distance 2 of this
+staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
+	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+	int nVol = nim->nvox / nvox3D;
+	if (nVol != 1)
+		return 1;
+	if (dx <= 0.0) {
+		printfx("erode function requires positive dilation (but erode can be 0).\n");
+		return EXIT_FAILURE;
+	}
+	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); //alloc for each volume to allow openmp
+	flt *img = (flt *)nim->data;
+	memcpy(imgIn, img, nvox3D * sizeof(float));
+	//step 1: threshold and make invert binary
+	// -thr iso -binv
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] >= iso)
+			img[i] = 1;
+		else
+			img[i] = 0;
+	}
+	nifti_edt(nim);
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (img[i] >= dx)
+			img[i] = imgIn[i];
+		else
+			img[i] = 0.0;
+	}
+	_mm_free(imgIn);
+	return 0;
+}
+
 // "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
 // niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -max scalar imgout
 staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
@@ -5580,8 +5645,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 			printfx("Comply dim %d*%d*%d, pixdim %g*%g*%g, f_high %g linear %d\n", nx,ny,nz, dx,dy,dz, f_high, isLinear);
 			ok = nifti_comply(nim, outDims, outPixDims, f_high, isLinear);
 		#endif
-		}
-		else if (!strcmp(argv[ac], "-close")) {
+		} else if (!strcmp(argv[ac], "-close")) {
 			// "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
 			// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -mas scalar imgout
 			ac++;
@@ -5591,6 +5655,18 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 			ac++;
 			double dx2 = strtod(argv[ac], &end);
 			ok = nifti_close(nim, iso, dx1, dx2);
+		} else if (!strcmp(argv[ac], "-dilate")) {
+			ac++;
+			double iso = strtod(argv[ac], &end);
+			ac++;
+			double dx = strtod(argv[ac], &end);
+			ok = nifti_dilate(nim, iso, dx);
+		} else if (!strcmp(argv[ac], "-erode")) {
+			ac++;
+			double iso = strtod(argv[ac], &end);
+			ac++;
+			double dx = strtod(argv[ac], &end);
+			ok = nifti_erode(nim, iso, dx);
 		} else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-sedt"))

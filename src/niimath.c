@@ -11,6 +11,10 @@
  *----------------------------------------------------------------------
  */
 
+#ifdef _WIN32
+	#include <fcntl.h>
+	#include <io.h>
+#endif
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -277,12 +281,14 @@ int show_help( void ) {
 	printf(" -reslice_nn <target>     : reslice to match image 'target' using nearest neighbor interpolation\n");
 
 #endif
+	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
 	printf(" -detrend                 : remove linear trend (and mean) from input\n");
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
+	printf(" -dilate <thr> <dx>        : morphological bilate binarizes with `thr`, grows up to distance `dx`\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
-	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
+	printf(" -erode <thr> <dx>        : morphological erode binarizes with `thr`, shrinks within distance `dx`\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -gz <mode>               : NIfTI gzip mode (0=uncompressed, 1=compressed, else FSL environment; default -1)\n");
 	printf(" -h2c                     : convert CT scans from 'Hounsfield' to 'Cormack' units to emphasize soft tissue contrast\n");
@@ -459,6 +465,9 @@ int main(int argc, char * argv[]) {
 	//fslmaths robust range not fully described, this emulation is close
 	//fslmaths ing/inm are listed as "unary" but should be listed as binary
 	//"niimath in.nii" for fslhd style output
+	#ifdef _WIN32
+		_setmode(_fileno(stdin), _O_BINARY);
+	#endif
 	if( argc == 2 ) { //special case "niimath img.nii" reports header, a bit like fslhd
 		nifti_image * nim = nifti_image_read(argv[1], 0); // issue 5: read header, but not data
 		if( nim ) {

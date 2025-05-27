@@ -7691,6 +7691,11 @@ znzFile nifti_image_write_hdr_img2(nifti_image *nim, int write_opts,
         #endif //PIGZ
       }
       if (isStdOut) {
+       if (g_opts.debug > 2)
+         fprintf(stderr, "+d writing uncompressed data to stdout\n");
+       #ifdef _WIN32
+          _setmode(_fileno(stdout), _O_BINARY);
+       #endif
        //if (g_opts.debug > 2) 
        fprintf(stderr, "+d writing uncompressed data to stdout\n");
        fp = znzopen("-", opts, 0);  // no compression
