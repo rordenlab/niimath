@@ -4971,6 +4971,39 @@ staticx int nifti_reslice(nifti_image *nim, char *fin, int isLinear) {
 	return 1;
 #endif
 }
+
+staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
+#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("reslice: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	nifti_image *nimMsk = nifti_image_read(fin, 1); // nifti_image_read2(fin, 1);
+	if (!nimMsk) {
+		printfx("** failed to read NIfTI image from '%s'\n", fin);
+		exit(2);
+	}
+	in_hdr ihdr = set_input_hdr(nimMsk);
+	if (nifti_image_change_datatype(nimMsk, DT_FLOAT32, &ihdr) != 0)
+		return 1;
+	flt *img = (flt *)nim->data;
+	flt mn = INFINITY;
+	for (int i = 0; i < nim->nvox; i++)
+		mn = MIN(mn, img[i]);
+	int isLinear = 0;
+	int ok = reslice(nimMsk, nim, isLinear);
+	flt *imgMsk = (flt *)nimMsk->data;
+	for (int i = 0; i < nim->nvox; i++) {
+		if (imgMsk[i] <= 0)
+			img[i] = mn;
+	}
+	nifti_image_free(nimMsk);
+	return ok;
+#else
+	printfx("'-dt double' does not support reslice\n");
+	return 1;
+#endif
+}
 #endif // HAVE_CONFORM
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
@@ -5630,6 +5663,9 @@ int main64(int argc, char *argv[]) {
 		} else if ((!strcmp(argv[ac], "-reslice")) || (!strcmp(argv[ac], "--reslice"))) {
 			ac++;
 			ok = nifti_reslice(nim, argv[ac], 1);
+		} else if ((!strcmp(argv[ac], "-reslice_mask")) || (!strcmp(argv[ac], "--reslice_mask"))) {
+			ac++;
+			ok = nifti_reslice_mask(nim, argv[ac]);
 		} else if ((!strcmp(argv[ac], "-conform")) || (!strcmp(argv[ac], "--conform"))) {
 			ok = nifti_conform(nim);
 		} else if ((!strcmp(argv[ac], "-comply")) || (!strcmp(argv[ac], "--comply"))) {

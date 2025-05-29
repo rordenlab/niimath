@@ -65,7 +65,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20250527"
+#define kMTHdate "v1.0.20250529"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -279,6 +279,7 @@ int show_help( void ) {
 	printf(" -comply <nx> <ny> <nz> <dx> <dy> <dz> <f_high> <isLinear> : conform to axial slice with dx*dy*dzmm size and dx*dy*dz voxels. f_high bright clamping (0.98 for top 2%%). Linear (1) or nearest-neighbor (0)\n");
 	printf(" -reslice <target>        : reslice to match image 'target' using linear interpolation\n");
 	printf(" -reslice_nn <target>     : reslice to match image 'target' using nearest neighbor interpolation\n");
+	printf(" -reslice_mask <mask>     : reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity\n");
 
 #endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
