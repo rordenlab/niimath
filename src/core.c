@@ -341,9 +341,34 @@ in_hdr set_input_hdr(nifti_image *nim) {
 	return ihdr;
 }
 
+static inline int32_t clamp_i32(double x) {
+	if (x > INT32_MAX) return INT32_MAX;
+	if (x < INT32_MIN) return INT32_MIN;
+	return (int32_t)round(x);
+}
+
+static inline int16_t clamp_i16(double x) {
+	if (x > INT16_MAX) return INT16_MAX;
+	if (x < INT16_MIN) return INT16_MIN;
+	return (int16_t)round(x);
+}
+
+static inline uint16_t clamp_u16(double x) {
+	if (x > UINT16_MAX) return UINT16_MAX;
+	if (x < 0.0) return 0;
+	return (uint16_t)round(x);
+}
+
+static inline uint8_t clamp_u8(double x) {
+	if (x > UINT8_MAX) return UINT8_MAX;
+	if (x < 0.0) return 0;
+	return (uint8_t)round(x);
+}
+
 int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	//returns -1 on failure, 0 if okay
-	if (nim->datatype == dt)
+	bool isRescale = (nim->scl_slope != 1.0) || (nim->scl_inter != 0);
+	if ((nim->datatype == dt) && (!isRescale))
 		return 0; //no change!
 	if (nim->nvox < 1)
 		return -1;
@@ -351,13 +376,13 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		nim->scl_slope = 1.0;
 	float scl = nim->scl_slope;
 	float inter = nim->scl_inter;
-	if (ihdr->datatype == dt) { //saving BACK to original format, e.g. int16 converted to float32 for calculations and saved back to int16
-		nim->scl_slope = ihdr->scl_slope;
-		nim->scl_inter = ihdr->scl_inter;
-	} else {
+	//if (ihdr->datatype == dt) { //saving BACK to original format, e.g. int16 converted to float32 for calculations and saved back to int16
+	//	nim->scl_slope = ihdr->scl_slope;
+	//	nim->scl_inter = ihdr->scl_inter;
+	//} else {
 		nim->scl_slope = 1.0f;
 		nim->scl_inter = 0.0f;
-	}
+	//}
 	int idt = nim->datatype; //input datatype
 	double *f64 = (double *)nim->data;
 	float *f32 = (float *)nim->data;
@@ -371,23 +396,31 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	int8_t *i8 = (int8_t *)nim->data;
 	int ok = -1;
 	if (dt == DT_FLOAT64) {
+		if (idt == DT_FLOAT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				f64[i] = (f64[i] * scl) + inter;
+			return 0;
+		}
 		nim->datatype = DT_FLOAT64;
 		nim->nbyper = 8;
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				f64[i] = (u64[i] * scl) + inter;
+			return 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				f64[i] = (i64[i] * scl) + inter;
+			return 0;
+		}
+		
+		
+		//following change nbyper
 		void *dat = (void *)calloc(1, nim->nvox * sizeof(double));
 		double *o64 = (double *)dat;
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o64[i] = (f32[i] * scl) + inter; //<<<<<<<<>>>>
-			ok = 0;
-		}
-		if (idt == DT_UINT64) {
-			for (size_t i = 0; i < nim->nvox; i++)
-				o64[i] = (u64[i] * scl) + inter;
-			ok = 0;
-		}
-		if (idt == DT_INT64) {
-			for (size_t i = 0; i < nim->nvox; i++)
-				o64[i] = (i64[i] * scl) + inter;
+				o64[i] = (f32[i] * scl) + inter;
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
@@ -428,19 +461,14 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		free(dat);
 	} //if (dt == DT_FLOAT64
 	if (dt == DT_FLOAT32) {
+		if (idt == DT_FLOAT32) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				f32[i] = (f32[i] * scl) + inter;
+			return 0;
+		}
 		float *o32 = (float *)nim->data;
 		nim->datatype = DT_FLOAT32;
 		nim->nbyper = 4;
-		if (idt == DT_UINT64) {
-			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = (u64[i] * scl) + inter;
-			return 0;
-		}
-		if (idt == DT_INT64) {
-			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = (i64[i] * scl) + inter;
-			return 0;
-		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (u32[i] * scl) + inter;
@@ -458,6 +486,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (f64[i] * scl) + inter;
 			ok = 0;
+		}
+		if (idt == DT_UINT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (u64[i] * scl) + inter;
+			return 0;
+		}
+		if (idt == DT_INT64) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				o32[i] = (i64[i] * scl) + inter;
+			return 0;
 		}
 		if (idt == DT_UINT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -487,17 +525,22 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		free(dat);
 	} //if (dt == DT_FLOAT32)
 	if (dt == DT_INT32) {
+		if (idt == DT_INT32) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				i32[i] = clamp_i32((i32[i] * scl) + inter);
+			return 0;
+		}
 		int32_t *o32 = (int32_t *)nim->data;
 		nim->datatype = DT_INT32;
 		nim->nbyper = 4;
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((u32[i] * scl) + inter);
+				o32[i] = clamp_i32(round((u32[i] * scl) + inter));
 			return 0;
 		}
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((f32[i] * scl) + inter);
+				o32[i] = clamp_i32(round((f32[i] * scl) + inter));
 			return 0;
 		}
 		//following change nbyper
@@ -505,31 +548,31 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		o32 = (int32_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round(f64[i] * scl) + inter;
+				o32[i] = clamp_i32(round(f64[i] * scl) + inter);
 			ok = 0;
 		}
 		if (idt == DT_UINT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((u16[i] * scl) + inter);
+				o32[i] = clamp_i32(round((u16[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_INT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((i16[i] * scl) + inter);
+				o32[i] = clamp_i32(round((i16[i] * scl) + inter));
 			free(nim->data);
 			nim->data = dat;
 			ok = 0;
 		}
 		if (idt == DT_UINT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((u8[i] * scl) + inter);
+				o32[i] = clamp_i32(round((u8[i] * scl) + inter));
 			free(nim->data);
 			nim->data = dat;
 			ok = 0;
 		}
 		if (idt == DT_INT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o32[i] = round((i8[i] * scl) + inter);
+				o32[i] = clamp_i32(round((i8[i] * scl) + inter));
 			free(nim->data);
 			nim->data = dat;
 			ok = 0;
@@ -542,12 +585,17 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		free(dat);
 	} //if (dt == DT_INT32)
 	if (dt == DT_INT16) {
+		if (idt == DT_INT16) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				i16[i] = clamp_i16((i16[i] * scl) + inter);
+			return 0;
+		}
 		int16_t *o16 = (int16_t *)nim->data;
 		nim->datatype = DT_INT16;
 		nim->nbyper = 2;
 		if (idt == DT_UINT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((u16[i] * scl) + inter);
+				o16[i] = clamp_i16(round((u16[i] * scl) + inter));
 			return 0;
 		}
 		//following change nbyper
@@ -555,27 +603,27 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		o16 = (int16_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round(f64[i] * scl) + inter;
+				o16[i] = clamp_i16(round(f64[i] * scl) + inter);
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((u32[i] * scl) + inter);
+				o16[i] = clamp_i16(round((u32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((f32[i] * scl) + inter);
+				o16[i] = clamp_i16(round((f32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_UINT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((u8[i] * scl) + inter);
+				o16[i] = clamp_i16(round((u8[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_INT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((i8[i] * scl) + inter);
+				o16[i] = clamp_i16(round((i8[i] * scl) + inter));
 			ok = 0;
 		}
 		if (ok == 0) {
@@ -586,12 +634,17 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		free(dat);
 	} //if (dt == DT_INT16)
 	if (dt == DT_UINT16) {
+		if (idt == DT_UINT16) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				u16[i] = clamp_u16((u16[i] * scl) + inter);
+			return 0;
+		}
 		uint16_t *o16 = (uint16_t *)nim->data;
 		nim->datatype = DT_UINT16;
 		nim->nbyper = 2;
 		if (idt == DT_INT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((i16[i] * scl) + inter);
+				o16[i] = clamp_u16(round((i16[i] * scl) + inter));
 			return 0;
 		}
 		//following change nbyper
@@ -599,27 +652,27 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		o16 = (uint16_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round(f64[i] * scl) + inter;
+				o16[i] = clamp_u16(round(f64[i] * scl) + inter);
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((u32[i] * scl) + inter);
+				o16[i] = clamp_u16(round((u32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((f32[i] * scl) + inter);
+				o16[i] = clamp_u16(round((f32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_UINT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((u8[i] * scl) + inter);
+				o16[i] = clamp_u16(round((u8[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_INT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o16[i] = round((i8[i] * scl) + inter);
+				o16[i] = clamp_u16(round((i8[i] * scl) + inter));
 			ok = 0;
 		}
 		if (ok == 0) {
@@ -630,12 +683,17 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		free(dat);
 	} //if (dt == DT_UINT16)
 	if (dt == DT_UINT8) {
+		if (idt == DT_UINT8) {
+			for (size_t i = 0; i < nim->nvox; i++)
+				u8[i] = clamp_u8(round((u8[i] * scl) + inter));
+			return 0;
+		}
 		uint8_t *o8 = (uint8_t *)nim->data;
 		nim->datatype = DT_UINT8;
 		nim->nbyper = 1;
 		if (idt == DT_INT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round((i8[i] * scl) + inter);
+				o8[i] = clamp_u8(round((i8[i] * scl) + inter));
 			return 0;
 		}
 		//following change nbyper
@@ -643,27 +701,27 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		o8 = (uint8_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round(f64[i] * scl) + inter;
+				o8[i] = clamp_u8(round(f64[i] * scl) + inter);
 			ok = 0;
 		}
 		if (idt == DT_UINT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round((u16[i] * scl) + inter);
+				o8[i] = clamp_u8(round((u16[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_INT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round((i16[i] * scl) + inter);
+				o8[i] = clamp_u8(round((i16[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_UINT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round((u32[i] * scl) + inter);
+				o8[i] = clamp_u8(round((u32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
-				o8[i] = round((f32[i] * scl) + inter);
+				o8[i] = clamp_u8(round((f32[i] * scl) + inter));
 			ok = 0;
 		}
 		if (ok == 0) {

@@ -260,7 +260,7 @@ int show_help( void ) {
 	printf("Datatype information:\n");
 	printf(" -dt sets the datatype used internally for calculations (default float for all except double images)\n");
 	printf(" -odt sets the output datatype ( default is float )\n");
-	printf(" Possible datatypes are: char short int float double input\n");
+	printf(" Possible datatypes are: char short int float double input input_force\n");
 	printf(" ""input"" will set the datatype to that of the original image\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");

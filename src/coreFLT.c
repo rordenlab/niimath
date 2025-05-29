@@ -5246,8 +5246,13 @@ int main64(int argc, char *argv[]) {
 			dtOut = DT_UINT16;
 		} else if (!strcmp(argv[argc - 1], "char")) {
 			dtOut = DT_UINT8;
+		} else if (!strcmp(argv[argc - 1], "input_force")) {
+				dtOut = nim->datatype;
 		} else if (!strcmp(argv[argc - 1], "input")) {
-			dtOut = nim->datatype; // ihdr.datatype; //!
+			if ((nim->scl_slope != 1.0) || (nim->scl_inter != 0.0)) {
+				printfx("ignoring '-odt input' because input image uses scaling (slope = %g, intercept = %g); use '-odt input_force' to override this behavior\n", nim->scl_slope, nim->scl_inter);
+			} else
+				dtOut = nim->datatype; // ihdr.datatype; //!
 		} else {
 			printfx("Error: Unknown datatype '%s' - Possible datatypes are: char short ushort int float double input\n", argv[argc - 1]);
 			return 2;
