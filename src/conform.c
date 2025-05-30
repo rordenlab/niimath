@@ -242,6 +242,10 @@ void resliceVox2Vox(mat44 *in_affine, mat44 *out_affine, mat44 *vox2vox, mat44 *
 }
 
 int doReslice(nifti_image *nim, const float outPixDims[3], const int outDims[3], mat44 out_affine, mat44 inv_vox2vox, int isLinear) {
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("conform only supports FLOAT32 images\n");
+		return EXIT_FAILURE;
+	}
 	int nvoxIn = nim->nx * nim->ny * MAX(nim->nz, 1);
 	// set output header
 	for (int i = 0; i < 4; i++) {
@@ -282,7 +286,7 @@ int doReslice(nifti_image *nim, const float outPixDims[3], const int outDims[3],
 	nim->data = (void *)out_img;
 	if (nim->data == NULL) {
 		printfx("conform failed to allocate memory\n");
-		return EXIT_FAILURE; // Return an error code if allocation fails
+		return EXIT_FAILURE;
 	}
 	// find minimimum of input image, used to fill output voxels outside bounding box
 	float mn = in_img[0];
