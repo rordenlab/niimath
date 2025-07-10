@@ -65,7 +65,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20250529"
+#define kMTHdate "v1.0.20250707"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -260,7 +260,7 @@ int show_help( void ) {
 	printf("Datatype information:\n");
 	printf(" -dt sets the datatype used internally for calculations (default float for all except double images)\n");
 	printf(" -odt sets the output datatype ( default is float )\n");
-	printf(" Possible datatypes are: char short int float double input input_force\n");
+	printf(" Possible datatypes are: char short int float double input input_force rgb rgba\n");
 	printf(" ""input"" will set the datatype to that of the original image\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
@@ -289,6 +289,7 @@ int show_help( void ) {
 	printf(" -demean                  : remove average signal across volumes (requires 4D input)\n");
 	printf(" -dilate <thr> <dx>        : morphological bilate binarizes with `thr`, grows up to distance `dx`\n");
 	printf(" -edt                     : estimate Euler Distance Transform (distance field). Assumes isotropic input\n");
+	printf(" -edginess                : compute scalar field of local vector contrast (Euclidean distance between each voxel and its neighbors; useful for RGB or multi-channel data)\n");
 	printf(" -erode <thr> <dx>        : morphological erode binarizes with `thr`, shrinks within distance `dx`\n");
 	printf(" -floor                   : round voxels downwards to the nearest integer\n");
 	printf(" -gz <mode>               : NIfTI gzip mode (0=uncompressed, 1=compressed, else FSL environment; default -1)\n");

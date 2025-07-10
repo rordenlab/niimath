@@ -549,6 +549,75 @@ staticx int nifti_sedt(nifti_image *nim) {
 	return EXIT_SUCCESS;
 } // nifti_sedt()
 
+static int nifti_edginess(nifti_image *nim) {
+	// Compute scalar field of local vector contrast (Euclidean distance between each voxel and its neighbors)
+	if ((nim->nvox < 1) || (nim->nx < 2) || (nim->ny < 2) || (nim->nz < 1))
+		return EXIT_FAILURE;
+	if (nim->datatype != DT_CALC)
+		return EXIT_FAILURE;
+
+	int nx = nim->nx;
+	int ny = nim->ny;
+	int nz = nim->nz;
+	int nvox3D = nx * ny * nz;
+	int nVol = nim->nvox / nvox3D;
+	if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
+		return EXIT_FAILURE;
+
+	flt *img = (flt *)nim->data;
+	// n.b. calloc guarantees zeroed values
+	flt *imgOut = (flt *)calloc(nvox3D, sizeof(flt));
+	if (!imgOut)
+		return EXIT_FAILURE;
+	// offsets to neighbors in 3D volume
+	int dx[6] = { -1, 1, 0, 0, 0, 0 };
+	int dy[6] = { 0, 0, -1, 1, 0, 0 };
+	int dz[6] = { 0, 0, 0, 0, -1, 1 };
+	for (int z = 1; z < nz - 1; z++) {
+		for (int y = 1; y < ny - 1; y++) {
+			for (int x = 1; x < nx - 1; x++) {
+				int i = x + y * nx + z * nx * ny;
+				flt totalDist = 0.0;
+				int nUsed = 0;
+
+				for (int n = 0; n < 6; n++) {
+					int xn = x + dx[n];
+					int yn = y + dy[n];
+					int zn = z + dz[n];
+					int j = xn + yn * nx + zn * nx * ny;
+
+					flt dist = 0.0;
+					for (int v = 0; v < nVol; v++) {
+						flt a = img[i + v * nvox3D];
+						flt b = img[j + v * nvox3D];
+						flt d = a - b;
+						dist += d * d;
+					}
+					totalDist += sqrtf(dist);
+					nUsed++;
+				}
+				imgOut[i] = totalDist / nUsed; 
+			}
+		}
+	}
+	flt mx = imgOut[0];
+	for (size_t i = 0; i < nvox3D; i++)
+		mx = MAX(mx, imgOut[i]);
+	if (mx > 0.0) {
+		for (size_t i = 0; i < nvox3D; i++)
+			imgOut[i] = imgOut[i] / mx;
+	}
+	free(nim->data);
+	nim->nt = 1;
+	nim->nu = 1;
+	nim->nv = 1;
+	nim->nw = 1;
+	nim->nvox = nvox3D;
+	nim->data = imgOut;
+	return EXIT_SUCCESS;
+}
+
+
 //  "-dilate 1 2" creates isosurface of 1, zeros all voxels beyond distance 2
 staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
@@ -5246,6 +5315,10 @@ int main64(int argc, char *argv[]) {
 			dtOut = DT_UINT16;
 		} else if (!strcmp(argv[argc - 1], "char")) {
 			dtOut = DT_UINT8;
+		} else if (!strcmp(argv[argc - 1], "rgba")) {
+			dtOut = DT_RGBA32;
+		} else if (!strcmp(argv[argc - 1], "rgb")) {
+			dtOut = DT_RGB;
 		} else if (!strcmp(argv[argc - 1], "input_force")) {
 				dtOut = nim->datatype;
 		} else if (!strcmp(argv[argc - 1], "input")) {
@@ -5721,6 +5794,8 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-sedt"))
 			ok = nifti_sedt(nim);
+		else if (!strcmp(argv[ac], "-edginess"))
+			ok = nifti_edginess(nim);
 		else if (!strcmp(argv[ac], "-fillh"))
 			ok = nifti_fillh(nim, 0);
 		else if (!strcmp(argv[ac], "-fillh26"))

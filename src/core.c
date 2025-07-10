@@ -384,6 +384,36 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		nim->scl_inter = 0.0f;
 	//}
 	int idt = nim->datatype; //input datatype
+	if ((idt == DT_RGB24) || (idt == DT_RGBA32)) {
+		// convert single volume RGB into 3 scalar volumes
+		int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+		int nVol = nim->nvox / nvox3D;
+		if (nVol != 1) {
+			printfx("multivolume (%d) RGB/RGBA (DT %d) not supported.\n", nVol, idt);
+			return EXIT_FAILURE;
+		}
+		uint8_t *i8 = (uint8_t *)nim->data;
+		int nComponents = 3;
+		if (idt == DT_RGBA32)
+			nComponents = 4;
+		void *dat = (void *)calloc(1, nComponents * nim->nvox * sizeof(uint8_t));
+		uint8_t *o8 = (uint8_t *)dat;
+		size_t j = 0;
+		for (size_t i = 0; i < nim->nvox; i++) {
+			o8[i] = i8[j++];
+			o8[i + nim->nvox] = i8[j++];
+			o8[i + nim->nvox + nim->nvox] = i8[j++];
+			if (idt == DT_RGBA32)
+				o8[i + nim->nvox+ nim->nvox + nim->nvox] = i8[j++];
+		}
+		idt = DT_UINT8;
+		nim->datatype = DT_UINT8;
+		nim->nbyper = 1;
+		nim->nt = nComponents;
+		nim->nvox *= nComponents;
+		free(nim->data);
+		nim->data = dat;
+	}
 	double *f64 = (double *)nim->data;
 	float *f32 = (float *)nim->data;
 	uint64_t *u64 = (uint64_t *)nim->data;
@@ -395,6 +425,45 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	uint8_t *u8 = (uint8_t *)nim->data;
 	int8_t *i8 = (int8_t *)nim->data;
 	int ok = -1;
+	if ((dt == DT_RGBA32) || (dt == DT_RGB24)) {
+		int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
+		int nVol = nim->nvox / nvox3D;
+		if (idt != DT_FLOAT32) {
+			printfx("RGB/RGBA output requires at least float32 input.\n");
+			return EXIT_FAILURE;
+		}
+		int nComponents = 3;
+		if (dt == DT_RGBA32)
+			nComponents = 4;
+		if (nVol < nComponents) {
+			printfx("RGB/RGBA output requires at least %d volumes of input.\n", nComponents);
+			return EXIT_FAILURE;
+		}
+		if (nVol > nComponents) {
+			printfx("RGB/RGBA output only uses first %d volumes of input.\n", nComponents);
+		}
+		nim->nt = 1;
+		nim->nu = 1;
+		nim->nv = 1;
+		nim->nw = 1;
+		nim->nvox = nvox3D;
+		nim->datatype = dt;
+		nim->nbyper = nComponents;
+		void *dat = (void *)calloc(1, nComponents * nim->nvox * sizeof(uint8_t));
+		uint8_t *o8 = (uint8_t *)dat;
+		size_t j = 0;
+		for (size_t i = 0; i < nim->nvox; i++) {
+			o8[j++] = clamp_u8(round((f32[i] * scl) + inter));
+			o8[j++] = clamp_u8(round((f32[i+nim->nvox] * scl) + inter));
+			o8[j++] = clamp_u8(round((f32[i+nim->nvox+nim->nvox] * scl) + inter));
+			if (nComponents == 4) {
+				o8[j++] = clamp_u8(round((f32[i+nim->nvox+nim->nvox+nim->nvox] * scl) + inter));
+			}
+		}
+		free(nim->data);
+		nim->data = dat;
+		return 0;
+	}
 	if (dt == DT_FLOAT64) {
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -413,8 +482,6 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 				f64[i] = (i64[i] * scl) + inter;
 			return 0;
 		}
-		
-		
 		//following change nbyper
 		void *dat = (void *)calloc(1, nim->nvox * sizeof(double));
 		double *o64 = (double *)dat;
