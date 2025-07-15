@@ -650,6 +650,24 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	return 0;
 }
 
+
+// scale voxel intensities 0..1
+staticx int nifti_scale01(nifti_image *nim) {
+	flt *img = (flt *)nim->data;
+	flt mx = img[0];
+	flt mn = img[0];
+	for (size_t i = 0; i < nim->nvox; i++) {
+		mx = MAX(mx, img[i]);
+		mn = MIN(mn, img[i]);
+	}
+	// printfx("range %g..%g\n", mn, mx);
+	if (mn >= mx) return EXIT_FAILURE;
+	flt rescale = 1.0 / (mx - mn);
+	for (size_t i = 0; i < nim->nvox; i++)
+		img[i] = (img[i] - mn) * rescale;
+	return EXIT_SUCCESS;
+}
+
 //  "-close 1 2" creates isosurface of 1, zeros all voxels distance 2 of this
 staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
@@ -5792,6 +5810,8 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_erode(nim, iso, dx);
 		} else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
+		else if (!strcmp(argv[ac], "-scale01"))
+			ok = nifti_scale01(nim);
 		else if (!strcmp(argv[ac], "-sedt"))
 			ok = nifti_sedt(nim);
 		else if (!strcmp(argv[ac], "-edginess"))

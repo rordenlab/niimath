@@ -324,7 +324,8 @@ int show_help( void ) {
 	#endif
 	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");
 	printf(" -round                   : round voxels to the nearest integer\n");
-	printf(" -sedt                     : estimate signed Euler Distance Transform (distance field). Assumes isotropic input\n");
+	printf(" -scale01                 : linearly rescale intensities to the range 0–1 using global min/max\n");
+	printf(" -sedt                    : estimate signed Euler Distance Transform (distance field). Assumes isotropic input\n");
 	printf(" -sobel                   : fast edge detection\n");
 	printf(" -sobel_binary            : sobel creating binary edge\n");
 	printf(" -tensor_2lower           : convert FSL style upper triangle image to NIfTI standard lower triangle order\n");
