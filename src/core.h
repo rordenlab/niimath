@@ -92,6 +92,7 @@ enum eOp { unknown,
 };
 enum eDimReduceOp { Tmean,
 					Tstd,
+					Tsum,
 					Tmax,
 					Tmaxn,
 					Tmin,

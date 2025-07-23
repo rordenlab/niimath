@@ -650,7 +650,6 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	return 0;
 }
 
-
 // scale voxel intensities 0..1
 staticx int nifti_scale01(nifti_image *nim) {
 	flt *img = (flt *)nim->data;
@@ -2480,6 +2479,8 @@ staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, in
 			}
 			if (op == Tmean)
 				o32[i] = sum / nReduce; // mean
+			else if (op == Tsum)
+				o32[i] = sum;
 			else if (op == Tmax)
 				o32[i] = mx; // max
 			else if (op == Tmaxn)
@@ -5555,6 +5556,8 @@ int main64(int argc, char *argv[]) {
 				ok = nifti_dim_reduce(nim, Tmean, dim, 0);
 			else if (strstr(argv[ac], "std"))
 				ok = nifti_dim_reduce(nim, Tstd, dim, 0);
+			else if (strstr(argv[ac], "sum"))
+				ok = nifti_dim_reduce(nim, Tsum, dim, 0);
 			else if (strstr(argv[ac], "maxn"))
 				ok = nifti_dim_reduce(nim, Tmaxn, dim, 0); // test maxn BEFORE max
 			else if (strstr(argv[ac], "max"))

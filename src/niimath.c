@@ -426,6 +426,7 @@ int show_help( void ) {
 	printf("  (the ""T"" can be replaced by X, Y or Z to collapse across a different dimension)\n");
 	printf(" -Tmean   : mean across time\n");
 	printf(" -Tstd    : standard deviation across time\n");
+	printf(" -Tsum    : sum across time\n");
 	printf(" -Tmax    : max across time\n");
 	printf(" -Tmaxn   : time index of max across time\n");
 	printf(" -Tmin    : min across time\n");
