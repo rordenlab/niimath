@@ -39,6 +39,7 @@
 
 void scalecrop(float *img, size_t voxnum, float dst_min, float dst_max, float src_min, float scale) {
 	// Crop the intensity ranges to specific min and max values.
+	// printfx("v = min(%g + %g * (v - %g), %g)\n", dst_min, scale, src_min, dst_max);
 	for (size_t i = 0; i < voxnum; i++) {
 		float val = img[i];
 		val = dst_min + scale * (val - src_min);
@@ -58,13 +59,23 @@ void getscale(float *img, size_t voxnum, float dst_min, float dst_max, float f_l
 	}
 	// count num_nonzero_voxels (nz)
 	size_t nz = 0;
+	size_t nltz = 0; //number less than zero
 	for (size_t i = 0; i < voxnum; i++) {
 		if (fabs(img[i]) >= 1e-15) {
 			nz++;
 		}
+		if (img[i] < 0.0) {
+			nltz ++;
+		}
 	}
 	if (*src_min < 0.0) {
-		printfx("conform: Input image has value(s) below 0.0 !\n");
+		double pct_lt0 = 100.0 * ((double)nltz / (double)voxnum);
+		if (pct_lt0 < 2.0) {
+			printfx("conform: image has %.4f%% of voxels < 0 (ignoring negative values)\n", pct_lt0);
+			*src_min = 0.0;
+		} else {
+			printfx("conform: image has %.4f%% of voxels < 0 (consider -thr 0)\n", pct_lt0);
+		}
 	}
 	printfx("conform input:    min: %f  max: %f\n", *src_min, src_max);
 	if ((f_low <= 0.0) && (f_high >= 1.0)) {
@@ -80,6 +91,7 @@ void getscale(float *img, size_t voxnum, float dst_min, float dst_max, float f_l
 		float val = img[i];
 		int bin = (int)((val - *src_min) / bin_size);
 		bin = fmin(bin, histosize - 1);
+		bin = fmax(bin, 0);
 		hist[bin]++;
 	}
 	// Compute cumulative sum
@@ -384,6 +396,55 @@ int reslice(nifti_image *nim, nifti_image *nim2, int isLinear) {
 	return doReslice(nim, outPixDims, outDims, out_affine, inv_vox2vox, isLinear);
 }
 
+static bool is_finite_float(float x) {
+    return isfinite(x); // checks !isnan && !isinf
+}
+
+int is_valid_mat44(mat44 m) {
+    const float tol = 1e-6f; // tolerance for zero check
+    int row_nonzero, col_nonzero;
+    // 1. All values must be finite
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            if (!is_finite_float(m.m[r][c])) {
+                return 0; // invalid
+            }
+        }
+    }
+    // 2. 3x3 spatial block: each row has at least one non-zero
+    for (int r = 0; r < 3; r++) {
+        row_nonzero = 0;
+        for (int c = 0; c < 3; c++) {
+            if (fabsf(m.m[r][c]) > tol) {
+                row_nonzero = 1;
+                break;
+            }
+        }
+        if (!row_nonzero) return 0;
+    }
+    // 3. 3x3 spatial block: each column has at least one non-zero
+    for (int c = 0; c < 3; c++) {
+        col_nonzero = 0;
+        for (int r = 0; r < 3; r++) {
+            if (fabsf(m.m[r][c]) > tol) {
+                col_nonzero = 1;
+                break;
+            }
+        }
+        if (!col_nonzero) return 0;
+    }
+    // 4. Determinant of 3x3 spatial block should not be near zero
+    float det =
+        m.m[0][0]*(m.m[1][1]*m.m[2][2] - m.m[1][2]*m.m[2][1]) -
+        m.m[0][1]*(m.m[1][0]*m.m[2][2] - m.m[1][2]*m.m[2][0]) +
+        m.m[0][2]*(m.m[1][0]*m.m[2][1] - m.m[1][1]*m.m[2][0]);
+    if (fabsf(det) < tol) {
+        return 0; // singular / degenerate spatial transform
+    }
+    // Passed all tests
+    return 1;
+}
+
 int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[3], float f_high, int isLinear, int isRAS) {
 	int nvoxIn = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvoxIn;
@@ -396,7 +457,26 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 		voxelIntensityScale(nim, f_high);
 	// estimate spatial transform
 	const int inDims[3] = {(int)nim->nx, (int)nim->ny, (int)nim->nz};
-	mat44 in_affine = f642f32mat44(&nim->sto_xyz);
+	mat44 in_affine;
+	mat44 primary_affine;
+	mat44 secondary_affine;
+	if (nim->qform_code > nim->sform_code) {
+			primary_affine   = f642f32mat44(&nim->qto_xyz);
+			secondary_affine = f642f32mat44(&nim->sto_xyz);
+	} else {
+			primary_affine   = f642f32mat44(&nim->sto_xyz);
+			secondary_affine = f642f32mat44(&nim->qto_xyz);
+	}
+	if (is_valid_mat44(primary_affine)) {
+			in_affine = primary_affine;
+	} else {
+			if (is_valid_mat44(secondary_affine)) {
+					in_affine = secondary_affine;
+			} else {
+					printfx("NIfTI sform and qform invalid\n");
+					return EXIT_FAILURE;
+			}
+	}
 	mat44 out_affine, vox2vox, inv_vox2vox;
 	conformVox2Vox(inDims, &in_affine, outDims, outPixDims, isRAS, &out_affine, &vox2vox, &inv_vox2vox);
 	return doReslice(nim, outPixDims, outDims, out_affine, inv_vox2vox, isLinear);

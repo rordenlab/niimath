@@ -5371,7 +5371,7 @@ int main64(int argc, char *argv[]) {
 		printfx("Using %d threads\n", maxNumThreads);
 	} else {
 		omp_set_num_threads(1);
-		printfx("Single threaded\n");
+		// printfx("Single threaded\n");
 	}
 #endif
 
