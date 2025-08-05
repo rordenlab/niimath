@@ -271,6 +271,9 @@ int doReslice(nifti_image *nim, const float outPixDims[3], const int outDims[3],
 							&nim->quatern_b, &nim->quatern_c, &nim->quatern_d,
 							&nim->qoffset_x, &nim->qoffset_y, &nim->qoffset_z,
 							&nim->dx, &nim->dy, &nim->dz, &nim->qfac);
+	int max_code = (nim->qform_code > nim->sform_code) ? nim->qform_code : nim->sform_code;
+	nim->qform_code = max_code;
+	nim->sform_code = max_code;
 	nim->dx = outPixDims[0];
 	nim->dy = outPixDims[1];
 	nim->dz = outPixDims[2];
@@ -461,10 +464,10 @@ int conform_core(nifti_image *nim, const int outDims[3], const float outPixDims[
 	mat44 primary_affine;
 	mat44 secondary_affine;
 	if (nim->qform_code > nim->sform_code) {
-			primary_affine   = f642f32mat44(&nim->qto_xyz);
+			primary_affine = f642f32mat44(&nim->qto_xyz);
 			secondary_affine = f642f32mat44(&nim->sto_xyz);
 	} else {
-			primary_affine   = f642f32mat44(&nim->sto_xyz);
+			primary_affine = f642f32mat44(&nim->sto_xyz);
 			secondary_affine = f642f32mat44(&nim->qto_xyz);
 	}
 	if (is_valid_mat44(primary_affine)) {
