@@ -63,6 +63,9 @@
 #include "arm_malloc.h"
 #endif
 
+#ifdef HAVE_BMP
+#include "bmp.h"
+#endif
 #ifdef HAVE_BUTTERWORTH
 #include "bw.h"
 #endif
@@ -5612,6 +5615,48 @@ int main64(int argc, char *argv[]) {
 			double lp_sigma = strtod(argv[ac], &end);
 			// ok = nifti_bptf(nim, hp_sigma, lp_sigma);
 			ok = nifti_bptf(nim, hp_sigma, lp_sigma, 1);
+#ifdef HAVE_BMP
+		} else if (!strcmp(argv[ac], "-bitmap")) {
+			ok = nifti_ras(nim);
+			flt mn, mx;
+			// Compute robust range for main image
+			nifti_robust_range(nim, &mn, &mx, 0);
+			nim->cal_min = mn;
+			nim->cal_max = mx;
+			ac++;
+			nifti_image *nim2 = NULL;
+			// If next argument exists and is NOT a flag (doesn't start with '-'),
+			// and it's not the last argument (which should be the output bitmap filename),
+			// then treat it as an overlay filename.
+			if (ac + 1 < argc && argv[ac][0] != '-') {
+				nim2 = nifti_image_read2(argv[ac], 1);
+				if (!nim2) {
+					printfx("unable to read %s\n", argv[ac]); // e.g. volume size might differ
+					goto fail;
+				}
+				if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
+					printfx("unable to read %s\n", argv[ac]); // e.g. volume size might differ
+					goto fail;
+				}
+				ok = nifti_ras(nim2);
+				// ok = nifti_otsu(nim2, 5, 0);
+				// ok = nifti_dog(nim2, 2.0, 3.2, 0);
+				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
+					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+					goto fail;
+				}
+				nifti_robust_range(nim2, &mn, &mx, 0);
+				nim2->cal_min = mn;
+				nim2->cal_max = mx;
+				ac++; // consume overlay argument
+			}
+			int new_argc = argc - ac;
+			char **new_argv = argv + ac;
+			ok = nim2png(nim, nim2, new_argc, (const char **)new_argv, fout);
+			if (nim2) nifti_image_free(nim2);
+			nifti_image_free(nim);
+			return ok;
+#endif
 #ifdef HAVE_BUTTERWORTH
 		} else if (!strcmp(argv[ac], "-bandpass")) {
 			// niimath test4D -bandpass 0.08 0.008 0 c
