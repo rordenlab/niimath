@@ -23,7 +23,7 @@ TFILES= -DHAVE_TENSOR tensor.c
 # MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c MarchingCubes.c radixsort.c fdr.c
 MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
 #Bitmap ceation
-BMPFLAGS= -DHAVE_BMP bmp.c
+BMPFLAGS= -DHAVE_BMP filter.c bmp.c
 
 ifeq ($(CXX),g++)
 	CFLAGS += -std=gnu99

@@ -10,395 +10,104 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// stb_image_write for PNG output (single-file header)
-// If you already include STB_IMAGE_WRITE_IMPLEMENTATION once elsewhere, remove the define here.
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "filter.h"
 #include "stb_image_write.h"
 
-// Dale Schumacher, "General Filtered Image Rescaling", in Graphics Gems III, Academic Press, 1992
-// https://github.com/erich666/GraphicsGems/tree/master/gemsiii
-// write_png_scale.c
-// Requires filter.c (Graphics Gems zoom/filter functions) to be compiled and linked.
-// See the uploaded filter.c (Graphics Gems) for zoom() and filters. :contentReference[oaicite:1]{index=1}
-/* --- Begin minimal Graphics Gems resampling code (transplanted) --- */
-/* Source: Dale Schumacher, "General Filtered Image Rescaling", Graphics Gems III.
-   Public domain. See filter.c for full original code. :contentReference[oaicite:1]{index=1} */
-
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-
-/* Pixel and Image types used by zoom() */
-typedef unsigned char Pixel;
-
-typedef struct {
-    int xsize;
-    int ysize;
-    Pixel *data;
-    int span;
-} Image;
-
-/* small macros */
-#ifndef CLAMP
-#define CLAMP(v, lo, hi) ( ((v) < (lo)) ? (lo) : (((v) > (hi)) ? (hi) : (v)) )
-#endif
-
-/* create/destroy Image */
-Image * new_image(int xsize, int ysize) {
-    Image *image;
-    if ((image = (Image *)malloc(sizeof(Image))) &&
-        (image->data = (Pixel *)calloc((size_t)ysize, (size_t)xsize))) {
-        image->xsize = xsize;
-        image->ysize = ysize;
-        image->span  = xsize;
-    } else {
-        free(image);
-        image = NULL;
-    }
-    return image;
-}
-
-void free_image(Image *image) {
-    if (!image) return;
-    free(image->data);
-    free(image);
-}
-
-/* basic pixel access helpers used by zoom() */
-Pixel get_pixel(Image *image, int x, int y) {
-    if (!image) return 0;
-    if ((x < 0) || (x >= image->xsize) || (y < 0) || (y >= image->ysize)) return 0;
-    return image->data[y * image->span + x];
-}
-
-void get_row(Pixel *row, Image *image, int y) {
-    if (!image) return;
-    if ((y < 0) || (y >= image->ysize)) return;
-    memcpy(row, image->data + (y * image->span), (size_t)image->xsize);
-}
-
-void get_column(Pixel *col, Image *image, int x) {
-    if (!image) return;
-    if ((x < 0) || (x >= image->xsize)) return;
-    int d = image->span;
-    Pixel *p = image->data + x;
-    for (int i = image->ysize; i-- > 0; p += d) *col++ = *p;
-}
-
-Pixel put_pixel(Image *image, int x, int y, Pixel data) {
-    if (!image) return 0;
-    if ((x < 0) || (x >= image->xsize) || (y < 0) || (y >= image->ysize)) return 0;
-    image->data[y * image->span + x] = data;
-    return data;
-}
-
-/* filter support constants and filter functions (we expose box and triangle) */
-#define box_support      (0.5)
-#define triangle_support (1.0)
-
-double box_filter(double t) {
-    if ((t > -0.5) && (t <= 0.5)) return 1.0;
-    return 0.0;
-}
-
-double triangle_filter(double t) {
-    if (t < 0.0) t = -t;
-    if (t < 1.0) return 1.0 - t;
-    return 0.0;
-}
-
-/* Contribution lists used by zoom() */
-typedef struct {
-    int pixel;
-    double weight;
-} CONTRIB;
-
-typedef struct {
-    int n;
-    CONTRIB *p;
-} CLIST;
-
-static CLIST *contrib = NULL; /* allocated by zoom() */
-
-/* zoom() implementation (two-pass separable resampler) */
-void zoom(Image *dst, Image *src, double (*filterf)(double), double fwidth) {
-    if (!dst || !src || !filterf) return;
-    Image *tmp;
-    double xscale = (double)dst->xsize / (double)src->xsize;
-    double yscale = (double)dst->ysize / (double)src->ysize;
-
-    /* intermediate image */
-    tmp = new_image(dst->xsize, src->ysize);
-    if (!tmp) return;
-
-    /* horizontal contribution lists */
-    contrib = (CLIST *)calloc((size_t)dst->xsize, sizeof(CLIST));
-    if (!contrib) { free_image(tmp); return; }
-
-    if (xscale < 1.0) {
-        double width = fwidth / xscale;
-        double fscale = 1.0 / xscale;
-        for (int i = 0; i < dst->xsize; ++i) {
-            contrib[i].n = 0;
-            int pcount = (int)(width * 2 + 1);
-            contrib[i].p = (CONTRIB *)calloc((size_t)pcount, sizeof(CONTRIB));
-            double center = (double)i / xscale;
-            int left = (int)ceil(center - width);
-            int right = (int)floor(center + width);
-            for (int j = left; j <= right; ++j) {
-                double weight = center - (double)j;
-                weight = (*filterf)(weight / fscale) / fscale;
-                int n;
-                if (j < 0) n = -j;
-                else if (j >= src->xsize) n = (src->xsize - j) + src->xsize - 1;
-                else n = j;
-                int k = contrib[i].n++;
-                contrib[i].p[k].pixel = n;
-                contrib[i].p[k].weight = weight;
-            }
-        }
-    } else {
-        for (int i = 0; i < dst->xsize; ++i) {
-            contrib[i].n = 0;
-            int pcount = (int)(fwidth * 2 + 1);
-            contrib[i].p = (CONTRIB *)calloc((size_t)pcount, sizeof(CONTRIB));
-            double center = (double)i / xscale;
-            int left = (int)ceil(center - fwidth);
-            int right = (int)floor(center + fwidth);
-            for (int j = left; j <= right; ++j) {
-                double weight = center - (double)j;
-                weight = (*filterf)(weight);
-                int n;
-                if (j < 0) n = -j;
-                else if (j >= src->xsize) n = (src->xsize - j) + src->xsize - 1;
-                else n = j;
-                int k = contrib[i].n++;
-                contrib[i].p[k].pixel = n;
-                contrib[i].p[k].weight = weight;
-            }
-        }
-    }
-
-    /* apply horizontal filter (src -> tmp) */
-    Pixel *raster = (Pixel *)calloc((size_t)src->xsize, sizeof(Pixel));
-    if (!raster) { /* cleanup */ for (int i=0;i<dst->xsize;++i) free(contrib[i].p); free(contrib); free_image(tmp); return; }
-    for (int k = 0; k < tmp->ysize; ++k) {
-        get_row(raster, src, k);
-        for (int i = 0; i < tmp->xsize; ++i) {
-            double weight = 0.0;
-            for (int j = 0; j < contrib[i].n; ++j) {
-                weight += raster[contrib[i].p[j].pixel] * contrib[i].p[j].weight;
-            }
-            put_pixel(tmp, i, k, (Pixel)CLAMP(weight, 0, 255));
-        }
-    }
-    free(raster);
-
-    /* free horizontal contrib arrays */
-    for (int i = 0; i < tmp->xsize; ++i) free(contrib[i].p);
-    free(contrib);
-
-    /* vertical contribution lists */
-    contrib = (CLIST *)calloc((size_t)dst->ysize, sizeof(CLIST));
-    if (!contrib) { free_image(tmp); return; }
-
-    if (yscale < 1.0) {
-        double width = fwidth / yscale;
-        double fscale = 1.0 / yscale;
-        for (int i = 0; i < dst->ysize; ++i) {
-            contrib[i].n = 0;
-            int pcount = (int)(width * 2 + 1);
-            contrib[i].p = (CONTRIB *)calloc((size_t)pcount, sizeof(CONTRIB));
-            double center = (double)i / yscale;
-            int left = (int)ceil(center - width);
-            int right = (int)floor(center + width);
-            for (int j = left; j <= right; ++j) {
-                double weight = center - (double)j;
-                weight = (*filterf)(weight / fscale) / fscale;
-                int n;
-                if (j < 0) n = -j;
-                else if (j >= tmp->ysize) n = (tmp->ysize - j) + tmp->ysize - 1;
-                else n = j;
-                int k = contrib[i].n++;
-                contrib[i].p[k].pixel = n;
-                contrib[i].p[k].weight = weight;
-            }
-        }
-    } else {
-        for (int i = 0; i < dst->ysize; ++i) {
-            contrib[i].n = 0;
-            int pcount = (int)(fwidth * 2 + 1);
-            contrib[i].p = (CONTRIB *)calloc((size_t)pcount, sizeof(CONTRIB));
-            double center = (double)i / yscale;
-            int left = (int)ceil(center - fwidth);
-            int right = (int)floor(center + fwidth);
-            for (int j = left; j <= right; ++j) {
-                double weight = center - (double)j;
-                weight = (*filterf)(weight);
-                int n;
-                if (j < 0) n = -j;
-                else if (j >= tmp->ysize) n = (tmp->ysize - j) + tmp->ysize - 1;
-                else n = j;
-                int k = contrib[i].n++;
-                contrib[i].p[k].pixel = n;
-                contrib[i].p[k].weight = weight;
-            }
-        }
-    }
-
-    /* apply vertical filter (tmp -> dst) */
-    raster = (Pixel *)calloc((size_t)tmp->ysize, sizeof(Pixel));
-    if (!raster) { for (int i=0;i<dst->ysize;++i) free(contrib[i].p); free(contrib); free_image(tmp); return; }
-    for (int k = 0; k < dst->xsize; ++k) {
-        get_column(raster, tmp, k);
-        for (int i = 0; i < dst->ysize; ++i) {
-            double weight = 0.0;
-            for (int j = 0; j < contrib[i].n; ++j) {
-                weight += raster[contrib[i].p[j].pixel] * contrib[i].p[j].weight;
-            }
-            put_pixel(dst, k, i, (Pixel)CLAMP(weight, 0, 255));
-        }
-    }
-    free(raster);
-
-    /* free vertical contrib arrays */
-    for (int i = 0; i < dst->ysize; ++i) free(contrib[i].p);
-    free(contrib);
-
-    free_image(tmp);
-}
-/* --- End minimal Graphics Gems code --- */
-
 // Helper to write scaled PNG
-int write_png_scale(char const *filename, int x, int y, int comp, const void *data, int stride_bytes, float scale, int isLinear) {
-    if (!filename || !data || x <= 0 || y <= 0 || comp <= 0) return -1;
-    if (!(scale > 0.0f)) {
-        fprintf(stderr, "write_png_scale: invalid scale %g\n", (double)scale);
-        return -1;
-    }
+int write_png_scale(const char *filename, int x, int y, int comp,
+					const void *data, int stride_bytes,
+					float scale, int isLinear) {
+	if (!filename || !data || x <= 0 || y <= 0 || comp <= 0 || scale <= 0.0f)
+		return -1;
+	/* If scale == 1, write directly */
+	if (fabsf(scale - 1.0f) < 1e-6f) {
+		int ok = stbi_write_png(filename, x, y, comp, data, stride_bytes);
+		return ok ? 0 : -1;
+	}
 
-    // If scale == 1.0, call stbi_write_png directly using provided stride
-    if (fabsf(scale - 1.0f) < 1e-9f) {
-        // Note: stbi_write_png expects row stride in bytes; pass stride_bytes
-        int ok = stbi_write_png(filename, x, y, comp, data, stride_bytes);
-        return ok ? 0 : -1;
-    }
+	/* Compute new size */
+	int dst_w = (int)floor((double)x * (double)scale + 0.5);
+	int dst_h = (int)floor((double)y * (double)scale + 0.5);
+	if (dst_w <= 0 || dst_h <= 0) {
+		fprintf(stderr, "write_png_scale: invalid scaled size %d×%d\n", dst_w, dst_h);
+		return -1;
+	}
 
-    // Compute destination size: round to nearest integer
-    int dst_w = (int)floor((double)x * (double)scale + 0.5);
-    int dst_h = (int)floor((double)y * (double)scale + 0.5);
+	/* Choose filter */
+	double (*filterf)(double) = isLinear ? triangle_filter : box_filter;
+	double fwidth = isLinear ? 1.0 : 0.5;
 
-    if (dst_w <= 0 || dst_h <= 0) {
-        fprintf(stderr, "write_png_scale: resulting dimensions invalid %d x %d\n", dst_w, dst_h);
-        return -1;
-    }
+	/* Wrap source buffer directly without copying */
+	Image src;
+	src.xsize = x;
+	src.ysize = y;
+	src.components = comp;
+	src.span = stride_bytes > 0 ? stride_bytes : x * comp;
+	src.data = (Pixel *)data; /* non-owning pointer */
 
-    // Allocate interleaved destination buffer: row stride = dst_w * comp
-    size_t dst_row_bytes = (size_t)dst_w * (size_t)comp;
-    size_t dst_buf_size = dst_row_bytes * (size_t)dst_h;
-    uint8_t *dst_buf = (uint8_t *)malloc(dst_buf_size);
-    if (!dst_buf) {
-        fprintf(stderr, "write_png_scale: out of memory\n");
-        return -1;
-    }
-    memset(dst_buf, 0, dst_buf_size);
+	/* Allocate destination image */
+	Image *dst = new_image(dst_w, dst_h, comp);
+	if (!dst) {
+		fprintf(stderr, "write_png_scale: out of memory allocating dst image\n");
+		return -1;
+	}
 
-    // Filter selection
-    double (*filterf)() = NULL;
-    double fwidth = 0.0;
-    if (isLinear) {
-        // tent / triangle (bilinear-like)
-        filterf = triangle_filter;
-        fwidth = 1.0; // triangle_support
-    } else {
-        // box (nearest / pixel)
-        filterf = box_filter;
-        fwidth = 0.5; // box_support
-    }
+	/* Perform scaling */
+	if (zoom(dst, &src, filterf, fwidth) != 0) {
+		fprintf(stderr, "write_png_scale: zoom() failed\n");
+		free_image(dst);
+		return -1;
+	}
 
-    // For each component, extract channel, resample with zoom(), then interleave
-    for (int c = 0; c < comp; ++c) {
-        // build source single-channel buffer (x * y), copying from interleaved 'data' with stride
-        Pixel *src_pixels = (Pixel *)malloc((size_t)x * (size_t)y);
-        if (!src_pixels) {
-            fprintf(stderr, "write_png_scale: out of memory (src_pixels)\n");
-            free(dst_buf);
-            return -1;
-        }
-
-        // Copy channel c into src_pixels row by row, using stride_bytes
-        const uint8_t *in_row_ptr = (const uint8_t *)data;
-        for (int row = 0; row < y; ++row) {
-            const uint8_t *p = in_row_ptr + (size_t)row * (size_t)stride_bytes;
-            for (int col = 0; col < x; ++col) {
-                src_pixels[row * x + col] = p[col * comp + c];
-            }
-        }
-
-        // Create Image wrappers
-        Image src_img;
-        src_img.xsize = x;
-        src_img.ysize = y;
-        src_img.span  = x;
-        src_img.data  = src_pixels;
-
-        Image *dst_img = new_image(dst_w, dst_h);
-        if (!dst_img) {
-            fprintf(stderr, "write_png_scale: new_image failed\n");
-            free(src_pixels);
-            free(dst_buf);
-            return -1;
-        }
-
-        // Call Graphics Gems zoom() to resample
-        zoom(dst_img, &src_img, filterf, fwidth);
-
-        // Copy dst_img->data into interleaved dst_buf for component c
-        for (int row = 0; row < dst_h; ++row) {
-            uint8_t *out_row = dst_buf + (size_t)row * dst_row_bytes;
-            Pixel *src_row = dst_img->data + (size_t)row * dst_img->span;
-            for (int col = 0; col < dst_w; ++col) {
-                out_row[col * comp + c] = src_row[col];
-            }
-        }
-
-        // cleanup
-        free_image(dst_img); // frees dst_img->data and the struct inside new_image/free_image
-        free(src_pixels);
-    }
-
-    // Finally, write PNG
-    int ok = stbi_write_png(filename, dst_w, dst_h, comp, dst_buf, (int)dst_row_bytes);
-    free(dst_buf);
-    if (!ok) {
-        fprintf(stderr, "write_png_scale: stbi_write_png failed\n");
-        return -1;
-    }
-    return ok;
+	/* Write scaled PNG */
+	int ret = stbi_write_png(filename, dst_w, dst_h, comp, dst->data, dst->span);
+	free_image(dst);
+	return ret;
 }
 
+// Enumeration of predefined color lookup tables
+typedef enum {
+	LUT_NONE = 0,
+	LUT_GRAY,
+	LUT_RED,
+	LUT_GREEN,
+	LUT_BLUE,
+	LUT_CYAN,
+	LUT_YELLOW,
+	LUT_BLUEGREEN,
+	LUT_REDYELLOW,
+	LUT_MAX
+} color_lut_t;
+
+// Optional: LUT names for parsing from strings or CLI
+static const char *LUT_NAMES[LUT_MAX] = {
+	"none", "gray", "red", "green", "blue",
+	"cyan", "yellow", "bluegreen", "redyellow"};
 
 // --------------------------- Types -------------------------------------
 // Image-wide options (defaults applied unless per-tile flags override)
 typedef struct {
-	int isRadiological;		 // 1 = radiological (default), 0 = neurological
-	int isLabel;			 // 1 = draw labels by default
-	int interpolationOrder; //0=nearest, 1= linear, [future 2=Mitchell]
-	float scale; // zoom factor
-	float overlayRGBA[4];	 // overlay color + opacity (0..1) default {1,0,0,0.5}
-	float baseRGBA[4];		 // base tint + opacity (alpha currently unused for base) default {1,1,1,1}
-	float backgroundRGBA[4]; // background color + alpha default {0,0,0,0.5}
+	int isRadiological;		// 1 = radiological (default), 0 = neurological
+	int isLabel;			// 1 = draw labels by default
+	int interpolationOrder; // 0=nearest, 1= linear, [future 2=Mitchell]
+	float scale;			// zoom factor
+	float cal_min, cal_max, cal_min2, cal_max2;
+	float overlayRGBA[4]; // overlay color + opacity (0..1) default {1,0,0,0.5}
+	float RGBA[4];		  // base tint + opacity (alpha currently unused for base) default {1,1,1,1}
+	float RGBA2[4];		  // background color + alpha default {0,0,0,0.5}
+	color_lut_t LUT2;	  // new overlay color lookup table
+	color_lut_t LUT;	  // new base color lookup table
 } image_options_t;
 
 // tile description produced by parsing the argv
 typedef struct {
-	char axis;	   // 'x','y','z' or 'N' for newline/separator
+	char axis;		 // 'x','y','z' or 'N' for newline/separator
 	long long value; // numeric slice index (signed integer index)
-	size_t w;	   // tile pixel width (computed from nim dims)
-	size_t h;	   // tile pixel height (computed from nim dims)
-	size_t x_off;  // x offset in row (filled during layout)
-	size_t row;	   // row index (filled during layout)
+	size_t w;		 // tile pixel width (computed from nim dims)
+	size_t h;		 // tile pixel height (computed from nim dims)
+	size_t x_off;	 // x offset in row (filled during layout)
+	size_t row;		 // row index (filled during layout)
 } tile_t;
 
 // layout summary returned from layout_tiles
@@ -519,41 +228,44 @@ static int ensure_tile_capacity(tile_t **tiles, size_t *cap, size_t need) {
 
 // append a single tile for given axis and fractional value (in [0,1])
 static int append_tile_for_axis_value(tile_t **tiles_ptr, size_t *n_ptr, size_t *cap_ptr,
-																		const nifti_image *nim, char axis, double frac) {
+									  const nifti_image *nim, char axis, double frac) {
 	tile_t *tiles = *tiles_ptr;
 	size_t n = *n_ptr;
 	size_t cap = *cap_ptr;
 
 	if (ensure_tile_capacity(&tiles, &cap, n + 1) != 0)
-			return -1;
+		return -1;
 
 	size_t w = 0, h = 0;
 	long long nx = nim->nx, ny = nim->ny, nz = nim->nz;
 	long long value = 0;
 
 	if (axis == 'x') {
-			w = (size_t)ny;
-			h = (size_t)nz;
-			value = (long long)llround(frac * (nx - 1));
+		w = (size_t)ny;
+		h = (size_t)nz;
+		value = (long long)llround(frac * (nx - 1));
 	} else if (axis == 'y') {
-			w = (size_t)nx;
-			h = (size_t)nz;
-			value = (long long)llround(frac * (ny - 1));
+		w = (size_t)nx;
+		h = (size_t)nz;
+		value = (long long)llround(frac * (ny - 1));
 	} else if (axis == 'z') {
-			w = (size_t)nx;
-			h = (size_t)ny;
-			value = (long long)llround(frac * (nz - 1));
+		w = (size_t)nx;
+		h = (size_t)ny;
+		value = (long long)llround(frac * (nz - 1));
 	} else
-			return -1;
+		return -1;
 
 	// FSL-style: negative fraction means absolute slice number
 	if (frac < 0.0)
-			value = (long long)llround(fabs(frac));
+		value = (long long)llround(fabs(frac));
 
 	// Clamp to valid range
-	if (axis == 'x') value = clamp_ll(value, 0, nx - 1);
-	if (axis == 'y') value = clamp_ll(value, 0, ny - 1);
-	if (axis == 'z') value = clamp_ll(value, 0, nz - 1);
+	if (axis == 'x')
+		value = clamp_ll(value, 0, nx - 1);
+	if (axis == 'y')
+		value = clamp_ll(value, 0, ny - 1);
+	if (axis == 'z')
+		value = clamp_ll(value, 0, nz - 1);
 
 	tiles[n].axis = axis;
 	tiles[n].value = value;
@@ -589,6 +301,17 @@ static int append_separator(tile_t **tiles_ptr, size_t *n_ptr, size_t *cap_ptr) 
 	return 0;
 }
 
+/* helper: find LUT enum by name (case-insensitive). Returns -1 if not found. */
+static int find_lut_by_name(const char *name) {
+	if (!name)
+		return -1;
+	for (int k = 0; k < LUT_MAX; ++k) {
+		if (strcasecmp(name, LUT_NAMES[k]) == 0)
+			return k;
+	}
+	return -1;
+}
+
 // ------------------- Stage 1: parse_args_build_tiles --------------------
 // parse_args_build_tiles: builds tiles AND updates image-wide options in *opts
 static int parse_args_build_tiles(const nifti_image *nim,
@@ -611,40 +334,112 @@ static int parse_args_build_tiles(const nifti_image *nim,
 		}
 
 		// ---------- Global color options (can appear anywhere) ----------
-		if (!strcmp(tok, "-o")) { // overlayRGBA: -o R G B A
-			if (i + 4 >= argc) { fprintf(stderr, "parse_args: -o requires 4 numeric args\n"); free(tiles); return -1; }
-			if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2]) || !is_number_token(argv[i + 3]) || !is_number_token(argv[i + 4])) {
-				fprintf(stderr, "parse_args: -o expects numeric args\n"); free(tiles); return -1;
+		/* Parse -c / -C: base or overlay LUT/RGBA */
+		if ((!strcmp(tok, "-c")) || (!strcmp(tok, "-C"))) {
+			int isOverlay = (tok[1] == 'C'); // uppercase = overlay (LUT2/RGBA2)
+			color_lut_t *lut_field = isOverlay ? &opts->LUT2 : &opts->LUT;
+			float *rgba_field = isOverlay ? opts->RGBA2 : opts->RGBA;
+
+			if (i + 1 >= argc) {
+				fprintf(stderr, "parse_args: %s requires arguments\n", tok);
+				free(tiles);
+				return -1;
 			}
-			opts->overlayRGBA[0] = fminf(fmaxf((float)strtod(argv[i + 1], NULL), 0.0f), 1.0f);
-			opts->overlayRGBA[1] = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
-			opts->overlayRGBA[2] = fminf(fmaxf((float)strtod(argv[i + 3], NULL), 0.0f), 1.0f);
-			opts->overlayRGBA[3] = fminf(fmaxf((float)strtod(argv[i + 4], NULL), 0.0f), 1.0f);
+
+			/* numeric RGBA: expect 4 numbers */
+			if (is_number_token(argv[i + 1])) {
+				if (i + 4 >= argc) {
+					fprintf(stderr, "parse_args: %s requires 4 numeric args\n", tok);
+					free(tiles);
+					return -1;
+				}
+				if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2]) ||
+					!is_number_token(argv[i + 3]) || !is_number_token(argv[i + 4])) {
+					fprintf(stderr, "parse_args: %s expects numeric args\n", tok);
+					free(tiles);
+					return -1;
+				}
+
+				rgba_field[0] = fminf(fmaxf((float)strtod(argv[i + 1], NULL), 0.0f), 1.0f);
+				rgba_field[1] = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
+				rgba_field[2] = fminf(fmaxf((float)strtod(argv[i + 3], NULL), 0.0f), 1.0f);
+				rgba_field[3] = fminf(fmaxf((float)strtod(argv[i + 4], NULL), 0.0f), 1.0f);
+				*lut_field = LUT_NONE;
+
+				i += 5;
+				continue;
+			}
+
+			/* named LUT form: -c <name> [alpha] */
+			int lut_id = find_lut_by_name(argv[i + 1]);
+			if (lut_id < 0) {
+				fprintf(stderr, "parse_args: unknown LUT name '%s'\n", argv[i + 1]);
+				free(tiles);
+				return -1;
+			}
+			*lut_field = (color_lut_t)lut_id;
+
+			/* optional alpha after name */
+			float alpha = 1.0f;
+			if (i + 2 < argc && is_number_token(argv[i + 2])) {
+				alpha = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
+				i += 3;
+			} else {
+				i += 2;
+			}
+			rgba_field[3] = alpha;
+			continue;
+		}
+		if (!strcmp(tok, "-b")) { // RGBA2: -b R G B A
+			if (i + 4 >= argc) {
+				fprintf(stderr, "parse_args: -b requires 4 numeric args\n");
+				free(tiles);
+				return -1;
+			}
+			if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2]) || !is_number_token(argv[i + 3]) || !is_number_token(argv[i + 4])) {
+				fprintf(stderr, "parse_args: -b expects numeric args\n");
+				free(tiles);
+				return -1;
+			}
+			opts->RGBA2[0] = fminf(fmaxf((float)strtod(argv[i + 1], NULL), 0.0f), 1.0f);
+			opts->RGBA2[1] = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
+			opts->RGBA2[2] = fminf(fmaxf((float)strtod(argv[i + 3], NULL), 0.0f), 1.0f);
+			opts->RGBA2[3] = fminf(fmaxf((float)strtod(argv[i + 4], NULL), 0.0f), 1.0f);
 			i += 5;
 			continue;
 		}
-		if (!strcmp(tok, "-c")) { // baseRGBA: -c R G B A
-			if (i + 4 >= argc) { fprintf(stderr, "parse_args: -c requires 4 numeric args\n"); free(tiles); return -1; }
-			if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2]) || !is_number_token(argv[i + 3]) || !is_number_token(argv[i + 4])) {
-				fprintf(stderr, "parse_args: -c expects numeric args\n"); free(tiles); return -1;
+		/* Calibration range: -t <min> <max> */
+		if ((!strcmp(tok, "-t")) || (!strcmp(tok, "-T"))) {
+			/* need two more args: argv[i+1], argv[i+2] */
+			if (i + 2 >= argc) {
+				fprintf(stderr, "parse_args: %s requires two numeric arguments (min max)\n", tok);
+				free(tiles);
+				return -1;
 			}
-			opts->baseRGBA[0] = fminf(fmaxf((float)strtod(argv[i + 1], NULL), 0.0f), 1.0f);
-			opts->baseRGBA[1] = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
-			opts->baseRGBA[2] = fminf(fmaxf((float)strtod(argv[i + 3], NULL), 0.0f), 1.0f);
-			opts->baseRGBA[3] = fminf(fmaxf((float)strtod(argv[i + 4], NULL), 0.0f), 1.0f);
-			i += 5;
-			continue;
-		}
-		if (!strcmp(tok, "-b")) { // backgroundRGBA: -b R G B A
-			if (i + 4 >= argc) { fprintf(stderr, "parse_args: -b requires 4 numeric args\n"); free(tiles); return -1; }
-			if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2]) || !is_number_token(argv[i + 3]) || !is_number_token(argv[i + 4])) {
-				fprintf(stderr, "parse_args: -b expects numeric args\n"); free(tiles); return -1;
+			if (!is_number_token(argv[i + 1]) || !is_number_token(argv[i + 2])) {
+				fprintf(stderr, "parse_args: %s expects two numeric args\n", tok);
+				free(tiles);
+				return -1;
 			}
-			opts->backgroundRGBA[0] = fminf(fmaxf((float)strtod(argv[i + 1], NULL), 0.0f), 1.0f);
-			opts->backgroundRGBA[1] = fminf(fmaxf((float)strtod(argv[i + 2], NULL), 0.0f), 1.0f);
-			opts->backgroundRGBA[2] = fminf(fmaxf((float)strtod(argv[i + 3], NULL), 0.0f), 1.0f);
-			opts->backgroundRGBA[3] = fminf(fmaxf((float)strtod(argv[i + 4], NULL), 0.0f), 1.0f);
-			i += 5;
+
+			float mn = (float)strtod(argv[i + 1], NULL);
+			float mx = (float)strtod(argv[i + 2], NULL);
+
+			if (mn >= mx) {
+				fprintf(stderr, "parse_args: invalid range for %s: min >= max (%.3f >= %.3f)\n", tok, mn, mx);
+				free(tiles);
+				return -1;
+			}
+
+			if (!strcmp(tok, "-T")) {
+				opts->cal_min2 = mn;
+				opts->cal_max2 = mx;
+			} else {
+				opts->cal_min = mn;
+				opts->cal_max = mx;
+			}
+
+			i += 3;
 			continue;
 		}
 
@@ -674,8 +469,8 @@ static int parse_args_build_tiles(const nifti_image *nim,
 		}
 		// -s <float> : global scale factor (must be positive)
 		if (!strcmp(tok, "-s")) {
-			if (i + 1 < argc && is_number_token(argv[i+1])) {
-				double v = strtod(argv[i+1], NULL);
+			if (i + 1 < argc && is_number_token(argv[i + 1])) {
+				double v = strtod(argv[i + 1], NULL);
 				if (!(isfinite(v) && v > 0.0)) {
 					fprintf(stderr, "parse_args: -s requires a positive finite number\n");
 					free(tiles);
@@ -709,31 +504,58 @@ static int parse_args_build_tiles(const nifti_image *nim,
 
 			if (flag == 'r') {
 				// row separator
-				if (append_separator(&tiles, &n, &cap) != 0) { free(tiles); return -1; }
+				if (append_separator(&tiles, &n, &cap) != 0) {
+					free(tiles);
+					return -1;
+				}
 				++i;
 				continue;
 			}
 
 			// ALIASES: -a and -m expand into tile lists
 			if (flag == 'a') {
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', 0.5) != 0) { free(tiles); return -1; }
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', 0.5) != 0) { free(tiles); return -1; }
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', 0.5) != 0) { free(tiles); return -1; }
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', 0.5) != 0) {
+					free(tiles);
+					return -1;
+				}
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', 0.5) != 0) {
+					free(tiles);
+					return -1;
+				}
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', 0.5) != 0) {
+					free(tiles);
+					return -1;
+				}
 				++i;
 				continue;
 			}
 			if (flag == 'm') {
 				double vals[3] = {0.25, 0.5, 0.75};
 				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', vals[k]) != 0) { free(tiles); return -1; }
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', vals[k]) != 0) {
+						free(tiles);
+						return -1;
+					}
 				}
-				if (append_separator(&tiles, &n, &cap) != 0) { free(tiles); return -1; }
-				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', vals[k]) != 0) { free(tiles); return -1; }
+				if (append_separator(&tiles, &n, &cap) != 0) {
+					free(tiles);
+					return -1;
 				}
-				if (append_separator(&tiles, &n, &cap) != 0) { free(tiles); return -1; }
 				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', vals[k]) != 0) { free(tiles); return -1; }
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', vals[k]) != 0) {
+						free(tiles);
+						return -1;
+					}
+				}
+				if (append_separator(&tiles, &n, &cap) != 0) {
+					free(tiles);
+					return -1;
+				}
+				for (int k = 0; k < 3; ++k) {
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', vals[k]) != 0) {
+						free(tiles);
+						return -1;
+					}
 				}
 				++i;
 				continue;
@@ -749,7 +571,10 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			int found_any = 0;
 			while (j < argc && is_number_token(argv[j])) {
 				double val = strtod(argv[j], NULL);
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, flag, val) != 0) { free(tiles); return -1; }
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, flag, val) != 0) {
+					free(tiles);
+					return -1;
+				}
 				found_any = 1;
 				++j;
 			}
@@ -884,98 +709,6 @@ static int layout_tiles(tile_t *tiles, size_t n_tiles, layout_t *out) {
 	return 0;
 }
 
-// Returns tinted RGB for base nim using baseRGBA tint (RGB components 0..1)
-static inline void get_base_rgb(float v, float cal_min, float cal_max,
-								const float baseRGBA[4],
-								uint8_t *r, uint8_t *g, uint8_t *b) {
-	uint8_t u = float_to_u8(v, cal_min, cal_max); // 0..255
-	float rr = baseRGBA[0] * u;
-	float gg = baseRGBA[1] * u;
-	float bb = baseRGBA[2] * u;
-	if (rr < 0.0f)
-		rr = 0.0f;
-	if (rr > 255.0f)
-		rr = 255.0f;
-	if (gg < 0.0f)
-		gg = 0.0f;
-	if (gg > 255.0f)
-		gg = 255.0f;
-	if (bb < 0.0f)
-		bb = 0.0f;
-	if (bb > 255.0f)
-		bb = 255.0f;
-	*r = (uint8_t)(rr + 0.5f);
-	*g = (uint8_t)(gg + 0.5f);
-	*b = (uint8_t)(bb + 0.5f);
-}
-
-// Returns blended RGB (base tinted + overlay) using overlayRGBA (overlay color + alpha).
-// If overlay intensity is zero, returns base directly.
-static inline void get_blended_rgb(float v_base, float cal_min, float cal_max,
-								   float v_overlay, float cal_min2, float cal_max2,
-								   const float baseRGBA[4],
-								   const float overlayRGBA[4],
-								   uint8_t *r, uint8_t *g, uint8_t *b) {
-	// compute base tinted color first
-	uint8_t ub = float_to_u8(v_base, cal_min, cal_max);
-
-	float base_r = baseRGBA[0] * ub;
-	float base_g = baseRGBA[1] * ub;
-	float base_b = baseRGBA[2] * ub;
-
-	// overlay intensity (0..255)
-	uint8_t uov = float_to_u8(v_overlay, cal_min2, cal_max2);
-	if (uov == 0) {
-		// no overlay contribution — return base tinted color
-		if (base_r < 0.0f)
-			base_r = 0.0f;
-		if (base_r > 255.0f)
-			base_r = 255.0f;
-		if (base_g < 0.0f)
-			base_g = 0.0f;
-		if (base_g > 255.0f)
-			base_g = 255.0f;
-		if (base_b < 0.0f)
-			base_b = 0.0f;
-		if (base_b > 255.0f)
-			base_b = 255.0f;
-		*r = (uint8_t)(base_r + 0.5f);
-		*g = (uint8_t)(base_g + 0.5f);
-		*b = (uint8_t)(base_b + 0.5f);
-		return;
-	}
-
-	float t2 = (float)uov / 255.0f; // overlay intensity 0..1
-	float alpha = overlayRGBA[3];	// overlay opacity 0..1
-
-	// overlay color scaled by its intensity
-	float overlay_r = overlayRGBA[0] * t2 * 255.0f;
-	float overlay_g = overlayRGBA[1] * t2 * 255.0f;
-	float overlay_b = overlayRGBA[2] * t2 * 255.0f;
-
-	// composite: out = (1 - alpha) * base + alpha * overlay
-	float out_r = (1.0f - alpha) * base_r + alpha * overlay_r;
-	float out_g = (1.0f - alpha) * base_g + alpha * overlay_g;
-	float out_b = (1.0f - alpha) * base_b + alpha * overlay_b;
-
-	if (out_r < 0.0f)
-		out_r = 0.0f;
-	if (out_r > 255.0f)
-		out_r = 255.0f;
-	if (out_g < 0.0f)
-		out_g = 0.0f;
-	if (out_g > 255.0f)
-		out_g = 255.0f;
-	if (out_b < 0.0f)
-		out_b = 0.0f;
-	if (out_b > 255.0f)
-		out_b = 255.0f;
-
-	*r = (uint8_t)(out_r + 0.5f);
-	*g = (uint8_t)(out_g + 0.5f);
-	*b = (uint8_t)(out_b + 0.5f);
-}
-
 // ------------------- Small mapping & pixel helper -----------------------
 
 // Map local tile coordinates (xx,yy) into image voxel indices (xi,yi,zi)
@@ -998,36 +731,195 @@ static inline void map_tile_coords(char axis, long long slice_idx, size_t xx, si
 	}
 }
 
-// Process one voxel (data_idx) and write the pixel at dst_x,dst_y
-static inline void process_and_write_pixel(uint8_t *rgb, size_t row_bytes, size_t W, size_t H,
-										  size_t dst_x, size_t dst_y,
-										  const float *data, const float *data2,
-										  size_t data_idx,
-										  int have_nim2,
-										  float cal_min, float cal_max,
-										  float cal_min2, float cal_max2,
-										  const float baseRGBA[4], const float overlayRGBA[4]) {
-	uint8_t r, g, b;
-	if (have_nim2) {
-		float v = data[data_idx];
-		float v2 = data2[data_idx];
-		get_blended_rgb(v, cal_min, cal_max, v2, cal_min2, cal_max2, baseRGBA, overlayRGBA, &r, &g, &b);
-	} else {
-		float v = data[data_idx];
-		get_base_rgb(v, cal_min, cal_max, baseRGBA, &r, &g, &b);
-	}
-	write_pixel_rgb(rgb, row_bytes, W, H, dst_x, dst_y, r, g, b);
+// ------------------- Stage 3: render_and_write_png ----------------------
+// ---------- LUT types + helpers (drop-in) ----------
+#include <stdint.h>
+
+typedef uint32_t lut_entry_t;	// packed 0xRRGGBBAA
+typedef lut_entry_t lut_t[256]; // LUT table type
+
+// pack/unpack macros: store bytes in order R(31..24) G(23..16) B(15..8) A(7..0)
+#define LUT_PACK(r, g, b, a) ((uint32_t)(((uint32_t)(r) << 24) | ((uint32_t)(g) << 16) | ((uint32_t)(b) << 8) | ((uint32_t)(a))))
+#define LUT_R(e) ((uint8_t)(((e) >> 24) & 0xFF))
+#define LUT_G(e) ((uint8_t)(((e) >> 16) & 0xFF))
+#define LUT_B(e) ((uint8_t)(((e) >> 8) & 0xFF))
+#define LUT_A(e) ((uint8_t)(((e)) & 0xFF))
+
+static inline uint8_t clamp_u8_int(int v) {
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+	return (uint8_t)v;
+}
+static inline uint8_t f_to_u8_scaled(float f) {
+	if (f <= 0.0f)
+		return 0;
+	if (f >= 1.0f)
+		return 255;
+	return (uint8_t)(f * 255.0f + 0.5f);
 }
 
-// ------------------- Stage 3: render_and_write_png ----------------------
-// Render all tiles into an RGB buffer and write PNG using stbi_write_png.
-// - nim: nifti image (assumed float data). Uses nim->cal_min and nim->cal_max if present, otherwise computes min/max.
-// - tiles: tiles array with tile->row and tile->x_off filled by layout_tiles
-// - n_tiles: number of tiles
-// - layout: layout_t produced by layout_tiles
-// - out_png_path: output filename
-//
-// Returns 0 on success, non-zero on failure.
+static void build_lut(lut_t lut,
+					  const float RGBA0_in[4],
+					  const float RGBA255_in[4],
+					  uint8_t a,
+					  color_lut_t whichLUT) {
+	// Define some RGBA constants (alpha ignored here)
+	static const float BLACK[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	static const float WHITE[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	static const float RED[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+	static const float GREEN[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+	static const float BLUE[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+	static const float CYAN[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+	static const float YELLOW[4] = {1.0f, 1.0f, 0.0f, 1.0f};
+
+	const float *RGBA0 = RGBA0_in;
+	const float *RGBA255 = RGBA255_in;
+
+	switch (whichLUT) {
+	case LUT_GRAY:
+		RGBA0 = BLACK;
+		RGBA255 = WHITE;
+		break;
+	case LUT_RED:
+		RGBA0 = BLACK;
+		RGBA255 = RED;
+		break;
+	case LUT_GREEN:
+		RGBA0 = BLACK;
+		RGBA255 = GREEN;
+		break;
+	case LUT_BLUE:
+		RGBA0 = BLACK;
+		RGBA255 = BLUE;
+		break;
+	case LUT_CYAN:
+		RGBA0 = BLACK;
+		RGBA255 = CYAN;
+		break;
+	case LUT_YELLOW:
+		RGBA0 = BLACK;
+		RGBA255 = YELLOW;
+		break;
+	case LUT_BLUEGREEN:
+		RGBA0 = BLUE;
+		RGBA255 = GREEN;
+		break;
+	case LUT_REDYELLOW:
+		RGBA0 = RED;
+		RGBA255 = YELLOW;
+		break;
+	default:
+		/* LUT_NONE or unrecognized, use inputs as-is */
+		break;
+	}
+
+	/* Interpolate linearly from RGBA0 → RGBA255, constant alpha 'a' */
+	float r0 = fminf(fmaxf(RGBA0[0], 0.0f), 1.0f);
+	float g0 = fminf(fmaxf(RGBA0[1], 0.0f), 1.0f);
+	float b0 = fminf(fmaxf(RGBA0[2], 0.0f), 1.0f);
+
+	float r1 = fminf(fmaxf(RGBA255[0], 0.0f), 1.0f);
+	float g1 = fminf(fmaxf(RGBA255[1], 0.0f), 1.0f);
+	float b1 = fminf(fmaxf(RGBA255[2], 0.0f), 1.0f);
+
+	for (int u = 0; u < 256; ++u) {
+		float t = (float)u / 255.0f;
+		float R = r0 + (r1 - r0) * t;
+		float G = g0 + (g1 - g0) * t;
+		float B = b0 + (b1 - b0) * t;
+
+		uint8_t rr = (uint8_t)(R * 255.0f + 0.5f);
+		uint8_t gg = (uint8_t)(G * 255.0f + 0.5f);
+		uint8_t bb = (uint8_t)(B * 255.0f + 0.5f);
+
+		lut[u] = LUT_PACK(rr, gg, bb, a);
+	}
+}
+
+// Build a base LUT: for intensity u (0..255) base color = RGBA.rgb * u
+// RGBA components expected in 0..1. Alpha for base entries set to 255 (opaque).
+static void build_base_lut(lut_t lut, const float RGBA[4]) {
+	float br = RGBA[0];
+	float bg = RGBA[1];
+	float bb = RGBA[2];
+	uint8_t a = 255;
+	for (int u = 0; u < 256; ++u) {
+		int r = (int)floorf(br * (float)u + 0.5f);
+		int g = (int)floorf(bg * (float)u + 0.5f);
+		int b = (int)floorf(bb * (float)u + 0.5f);
+		lut[u] = LUT_PACK(clamp_u8_int(r), clamp_u8_int(g), clamp_u8_int(b), a);
+	}
+}
+
+// Build an overlay LUT: for intensity u (0..255) overlay color = overlayRGBA.rgb * u
+// overlayRGBA[3] (alpha) converted to 0..255 and stored in A channel for composition.
+static void build_overlay_lut(lut_t lut, const float overlayRGBA[4]) {
+	float or_ = overlayRGBA[0];
+	float og_ = overlayRGBA[1];
+	float ob_ = overlayRGBA[2];
+	uint8_t a = f_to_u8_scaled(overlayRGBA[3]); // global overlay opacity
+	for (int u = 0; u < 256; ++u) {
+		int r = (int)floorf(or_ * (float)u + 0.5f);
+		int g = (int)floorf(og_ * (float)u + 0.5f);
+		int b = (int)floorf(ob_ * (float)u + 0.5f);
+		lut[u] = LUT_PACK(clamp_u8_int(r), clamp_u8_int(g), clamp_u8_int(b), a);
+	}
+}
+
+// Fast getters using the LUTs
+static inline void get_base_rgb_from_lut(float v, float cal_min, float cal_max,
+										 const lut_t base_lut,
+										 uint8_t *r, uint8_t *g, uint8_t *b) {
+	uint8_t u = float_to_u8((double)v, (double)cal_min, (double)cal_max);
+	uint32_t e = base_lut[u];
+	*r = LUT_R(e);
+	*g = LUT_G(e);
+	*b = LUT_B(e);
+}
+
+// Fast blend: base from base_lut, overlay from overlay_lut. overlay_lut alpha channel used.
+// If overlay intensity maps to 0 => return base directly.
+static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float cal_max,
+											 float v_overlay, float cal_min2, float cal_max2,
+											 const lut_t base_lut,
+											 const lut_t overlay_lut,
+											 uint8_t *r, uint8_t *g, uint8_t *b) {
+	uint8_t ub = float_to_u8((double)v_base, (double)cal_min, (double)cal_max);
+	uint32_t be = base_lut[ub];
+	uint8_t br = LUT_R(be), bg = LUT_G(be), bb = LUT_B(be);
+
+	uint8_t uov = float_to_u8((double)v_overlay, (double)cal_min2, (double)cal_max2);
+	if (uov == 0) {
+		*r = br;
+		*g = bg;
+		*b = bb;
+		return;
+	}
+
+	uint32_t oe = overlay_lut[uov];
+	uint8_t or_ = LUT_R(oe), og_ = LUT_G(oe), ob_ = LUT_B(oe);
+	uint8_t alpha = LUT_A(oe); // 0..255
+
+	if (alpha == 0) {
+		*r = br;
+		*g = bg;
+		*b = bb;
+		return;
+	}
+
+	// integer composite: out = ((255-alpha)*base + alpha*overlay)/255
+	int out_r = ((255 - (int)alpha) * (int)br + (int)alpha * (int)or_ + 127) / 255;
+	int out_g = ((255 - (int)alpha) * (int)bg + (int)alpha * (int)og_ + 127) / 255;
+	int out_b = ((255 - (int)alpha) * (int)bb + (int)alpha * (int)ob_ + 127) / 255;
+
+	*r = (uint8_t)clamp_u8_int(out_r);
+	*g = (uint8_t)clamp_u8_int(out_g);
+	*b = (uint8_t)clamp_u8_int(out_b);
+}
+
+// ---------- Replacement render_and_write_png() that builds LUTs and uses them ----------
 static int render_and_write_png(const nifti_image *nim,
 								nifti_image *nim2,
 								const tile_t *tiles,
@@ -1038,52 +930,58 @@ static int render_and_write_png(const nifti_image *nim,
 	if (!nim || !tiles || n_tiles == 0 || !layout || !out_png_path || !opts)
 		return -1;
 
-	// channels: RGB
 	const int channels = 3;
 	size_t W = layout->total_width;
 	size_t H = layout->total_height;
-	if (W == 0 || H == 0) { fprintf(stderr, "render: zero output dimension\n"); return -1; }
-
-	// determine calibration min/max (use nifti cal_min/cal_max if present; otherwise compute from data)
-	if (!(isfinite(nim->cal_min) && isfinite(nim->cal_max) && nim->cal_min < nim->cal_max)) {
-		fprintf(stderr, "render: nim cal_min and cal_max must be finite and cal_min < cal_max (%g %g)\n", nim->cal_min, nim->cal_max);
+	if (W == 0 || H == 0) {
+		fprintf(stderr, "render: zero output dimension\n");
 		return -1;
 	}
-	float cal_min = nim->cal_min;
-	float cal_max = nim->cal_max;
 
-	/* initialize overlay cal range to main image's range by default */
-	float cal_min2 = nim->cal_min;
-	float cal_max2 = nim->cal_max;
+	// check calibration
+	if (!(isfinite(opts->cal_min) && isfinite(opts->cal_max) && opts->cal_min < opts->cal_max)) {
+		fprintf(stderr, "render: nim cal_min and cal_max must be finite and cal_min < cal_max (%g %g)\n",
+				opts->cal_min, opts->cal_max);
+		return -1;
+	}
+	float cal_min = opts->cal_min;
+	float cal_max = opts->cal_max;
+
+	float cal_min2 = opts->cal_min2;
+	float cal_max2 = opts->cal_max2;
 
 	int have_nim2 = 0;
 	float *data2 = NULL;
 	if (nim2) {
-		if (!(isfinite(nim2->cal_min) && isfinite(nim2->cal_max) && nim2->cal_min < nim2->cal_max)) {
-			fprintf(stderr, "render: overlay (nim2) cal_min and cal_max must be finite and cal_min < cal_max (%g %g)\n", nim2->cal_min, nim2->cal_max);
+		if (!(isfinite(opts->cal_min2) && isfinite(opts->cal_min2) && opts->cal_min2 < opts->cal_max2)) {
+			fprintf(stderr, "render: overlay (nim2) cal_min and cal_max must be finite and cal_min < cal_max (%g %g)\n",
+					opts->cal_min2, opts->cal_max2);
 			return -1;
 		}
 		if ((nim2->nx != nim->nx) || (nim2->ny != nim->ny) || (nim2->nz != nim->nz)) {
 			fprintf(stderr, "render: overlay dimensions do not match\n");
 			return -1;
 		}
-		if (!nim2->data) { fprintf(stderr, "render: overlay (nim2) data pointer is NULL\n"); return -1; }
-		cal_min2 = nim2->cal_min;
-		cal_max2 = nim2->cal_max;
+		if (!nim2->data) {
+			fprintf(stderr, "render: overlay (nim2) data pointer is NULL\n");
+			return -1;
+		}
 		data2 = (float *)nim2->data;
 		have_nim2 = 1;
 	}
 
-	// allocate RGB buffer: row-major, H rows of W pixels, each pixel channels bytes
+	// allocate RGB buffer and fill with background color
 	size_t row_bytes = W * channels;
 	size_t buf_size = row_bytes * H;
 	uint8_t *rgb = (uint8_t *)calloc(1, buf_size);
-	if (!rgb) { fprintf(stderr, "render: out of memory\n"); return -1; }
+	if (!rgb) {
+		fprintf(stderr, "render: out of memory\n");
+		return -1;
+	}
 
-	// Fill the image buffer with the background color from opts->backgroundRGBA
-	uint8_t bg_r = (uint8_t)(opts->backgroundRGBA[0] * 255.0f + 0.5f);
-	uint8_t bg_g = (uint8_t)(opts->backgroundRGBA[1] * 255.0f + 0.5f);
-	uint8_t bg_b = (uint8_t)(opts->backgroundRGBA[2] * 255.0f + 0.5f);
+	uint8_t bg_r = (uint8_t)(opts->RGBA2[0] * 255.0f + 0.5f);
+	uint8_t bg_g = (uint8_t)(opts->RGBA2[1] * 255.0f + 0.5f);
+	uint8_t bg_b = (uint8_t)(opts->RGBA2[2] * 255.0f + 0.5f);
 	for (size_t y = 0; y < H; ++y) {
 		uint8_t *row = rgb + y * row_bytes;
 		for (size_t x = 0; x < W; ++x) {
@@ -1094,51 +992,66 @@ static int render_and_write_png(const nifti_image *nim,
 		}
 	}
 
-	// Inspect data as float* for now. If your images are another datatype, dispatch appropriately.
+	// data pointer for nim
 	float *data = (float *)nim->data;
-	if (!data) { free(rgb); fprintf(stderr, "render: nim->data is NULL\n"); return -1; }
+	if (!data) {
+		free(rgb);
+		fprintf(stderr, "render: nim->data is NULL\n");
+		return -1;
+	}
 
-	// axis mapping
+	// Build LUTs from opts->RGBA and opts->overlayRGBA (simple builder)
+	lut_t base_lut;
+	lut_t overlay_lut;
+	const float RGBA0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	build_lut(base_lut, RGBA0, opts->RGBA, 255, opts->LUT);
+	build_lut(overlay_lut, RGBA0, opts->overlayRGBA, (uint8_t)(opts->overlayRGBA[3] * 255.0), opts->LUT2);
+
+	// iterate tiles and rasterize each tile's slice into the appropriate rectangle
 	long long nx = nim->nx, ny = nim->ny, nz = nim->nz;
 	size_t slice_size = (size_t)nx * (size_t)ny;
 
-	// iterate tiles and rasterize each tile's slice into the appropriate rectangle
 	for (size_t ti = 0; ti < n_tiles; ++ti) {
 		const tile_t *t = &tiles[ti];
-		if (t->axis == 'N') continue; // separator tile
+		if (t->axis == 'N')
+			continue;
 
-		// where to place this tile
 		size_t row = t->row;
-		if (row == (size_t)-1 || row >= layout->rows) continue;
+		if (row == (size_t)-1 || row >= layout->rows)
+			continue;
 		size_t base_x = t->x_off;
 		size_t base_y = layout->row_y_offsets[row];
 
-		// slice index (already stored as integer)
 		long long slice_idx = clamp_ll(t->value, 0, (t->axis == 'x' ? nx - 1 : (t->axis == 'y' ? ny - 1 : nz - 1)));
 
-		// iterate over tile pixels, mapping to image voxel indices
 		for (size_t yy = 0; yy < t->h; ++yy) {
 			for (size_t xx = 0; xx < t->w; ++xx) {
 				long long xi, yi, zi;
 				map_tile_coords(t->axis, slice_idx, xx, yy, nx, ny, nz, &xi, &yi, &zi);
 
-				// bounds check (only upper bounds necessary because xi/yi/zi are unsigned-constructed)
 				if (xi < 0 || xi >= nx || yi < 0 || yi >= ny || zi < 0 || zi >= nz)
 					continue;
 
-				size_t data_idx = (size_t)xi + (size_t)yi * (size_t)nx + (size_t)zi * (size_t)slice_size;
+				size_t data_idx = (size_t)xi + (size_t)yi * (size_t)nx + (size_t)zi * slice_size;
 
-				// compute destination pixel coords (radiological flips horizontally)
 				size_t dst_x = opts->isRadiological ? (base_x + (t->w - 1 - xx)) : (base_x + xx);
 				size_t dst_y = base_y + (t->h - 1 - yy);
 
-				// process pixel and write
-				process_and_write_pixel(rgb, row_bytes, W, H, dst_x, dst_y, data, data2, data_idx, have_nim2,
-										cal_min, cal_max, cal_min2, cal_max2, opts->baseRGBA, opts->overlayRGBA);
+				uint8_t rr, gg, bb;
+				if (have_nim2) {
+					float v = data[data_idx];
+					float v2 = data2[data_idx];
+					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2,
+											  base_lut, overlay_lut, &rr, &gg, &bb);
+				} else {
+					float v = data[data_idx];
+					get_base_rgb_from_lut(v, cal_min, cal_max, base_lut, &rr, &gg, &bb);
+				}
+				write_pixel_rgb(rgb, row_bytes, W, H, dst_x, dst_y, rr, gg, bb);
 			}
 		}
 
-		// optionally burn labels L/R at left/right margin if requested
+		// optionally draw labels
 		if ((opts->isLabel) && (t->axis != 'x')) {
 			size_t inset = 2;
 			size_t lab_y = base_y + (t->h - 2 - 5 + 1); // base_y + t->h - 6
@@ -1147,26 +1060,17 @@ static int render_and_write_png(const nifti_image *nim,
 				burn_label_rgb(rgb, W, H, base_x + inset, lab_y, left_label);
 				char right_label = opts->isRadiological ? 'L' : 'R';
 				if (t->w >= 7) {
-					size_t px = base_x + t->w - inset - 5; // 5 px label width
+					size_t px = base_x + t->w - inset - 5;
 					burn_label_rgb(rgb, W, H, px, lab_y, right_label);
 				}
 			}
 		}
 	}
 
-	// write PNG
-	int ok = 0;
-
-	if ((opts->scale > 0.0) && (opts->scale != 1.0))
-		ok = write_png_scale(out_png_path, (int)W, (int)H, channels, rgb, (int)row_bytes, opts->scale, opts->interpolationOrder);
-	else
-		ok = stbi_write_png(out_png_path, (int)W, (int)H, channels, rgb, (int)row_bytes);
+	// write PNG (with optional scaling)
+	int ret = write_png_scale(out_png_path, (int)W, (int)H, channels, rgb, (int)row_bytes, opts->scale, opts->interpolationOrder);
 	free(rgb);
-	if (!ok) {
-		fprintf(stderr, "render: stbi_write_png failed\n");
-		return -1;
-	}
-	return 0;
+	return ret;
 }
 
 // ------------------- Public entry: nim2png ---------------------------
@@ -1186,12 +1090,28 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	opts.isLabel = 1;
 	opts.interpolationOrder = 1;
 	opts.scale = 1.0;
-	opts.overlayRGBA[0] = 1.0f; opts.overlayRGBA[1] = 0.0f; opts.overlayRGBA[2] = 0.0f; opts.overlayRGBA[3] = 0.5f;
-	opts.baseRGBA[0] = 1.0f; opts.baseRGBA[1] = 1.0f; opts.baseRGBA[2] = 1.0f; opts.baseRGBA[3] = 1.0f;
-	opts.backgroundRGBA[0] = 0.0f; opts.backgroundRGBA[1] = 0.0f; opts.backgroundRGBA[2] = 0.0f; opts.backgroundRGBA[3] = 1.0f;
-
+	opts.LUT2 = LUT_NONE;
+	opts.LUT = LUT_NONE;
+	opts.overlayRGBA[0] = 1.0f;
+	opts.overlayRGBA[1] = 0.0f;
+	opts.overlayRGBA[2] = 0.0f;
+	opts.overlayRGBA[3] = 0.5f;
+	opts.RGBA[0] = 1.0f;
+	opts.RGBA[1] = 1.0f;
+	opts.RGBA[2] = 1.0f;
+	opts.RGBA[3] = 1.0f;
+	opts.RGBA2[0] = 0.0f;
+	opts.RGBA2[1] = 0.0f;
+	opts.RGBA2[2] = 0.0f;
+	opts.RGBA2[3] = 1.0f;
+	opts.cal_min = nim->cal_min;
+	opts.cal_max = nim->cal_max;
+	if (nim2) {
+		opts.cal_min2 = nim2->cal_min;
+		opts.cal_max2 = nim2->cal_max;
+	}
 	if (parse_args_build_tiles(nim, argc, argv, &tiles, &n_tiles, &opts) != 0) {
-		fprintf(stderr, "nim2png_refactored: failed to parse args\n");
+		fprintf(stderr, "-bitmap failed to parse args (e.g. niimath nifti.nii -bitmap -a all.png\n");
 		return -1;
 	}
 
@@ -1199,7 +1119,7 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	layout_t layout;
 	memset(&layout, 0, sizeof(layout));
 	if (layout_tiles(tiles, n_tiles, &layout) != 0) {
-		fprintf(stderr, "nim2png_refactored: failed to layout tiles\n");
+		fprintf(stderr, "-bitmap failed to layout tiles\n");
 		free(tiles);
 		return -1;
 	}

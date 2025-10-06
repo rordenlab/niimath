@@ -1378,7 +1378,7 @@ staticx int nifti_otsu(nifti_image *nim, int mode, int makeBinary) { // binarize
 	// makeBinary: -1 replace dark with darkest, 0 = replace dark with 0, 1 = binary (0 or 1)
 	flt darkThresh, midThresh, brightThresh;
 	flt threshold = otsu_thresholds(nim, mode, &darkThresh, &midThresh, &brightThresh);
-	printfx("Otsu %g %g %g\n", darkThresh, midThresh, brightThresh);
+	// printfx("Otsu %g %g %g\n", darkThresh, midThresh, brightThresh);
 	// apply otsu
 	if (makeBinary == 1)
 		return nifti_binarize(nim, threshold);
@@ -5638,9 +5638,18 @@ int main64(int argc, char *argv[]) {
 					printfx("unable to read %s\n", argv[ac]); // e.g. volume size might differ
 					goto fail;
 				}
+				int isEdge = 0;
+				for (int j = ac + 1; j < argc; ++j) { // skip final filename
+						if (argv[j] && !strcmp(argv[j], "-e")) {
+								isEdge = 1;
+								break;
+						}
+				}
 				ok = nifti_ras(nim2);
-				// ok = nifti_otsu(nim2, 5, 0);
-				// ok = nifti_dog(nim2, 2.0, 3.2, 0);
+				if (isEdge) {
+					ok = nifti_otsu(nim2, 5, 0);
+					ok = nifti_dog(nim2, 2.0, 3.2, 0);
+				}
 				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
 					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
 					goto fail;
