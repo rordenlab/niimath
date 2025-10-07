@@ -48,7 +48,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 all:
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(LDFLAGS) -flto -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
 #issue30: static build 
 static:
@@ -61,10 +61,6 @@ tiny:
 # tiny without nii2mesh
 nano:
 	$(CNAME) $(CFLAGS) $(UFLAGS) $(LDFLAGS) $(LDFLAGS) -o niimath
-
-# quick and dirty
-debugx:
-	$(CNAME) $(CFLAGS) $(MFLAGS) $(UFLAGS) $(ZFLAGS) $(LDFLAGS) $(LDFLAGS) -o niimath
 
 # debug: CFLAGS = -O0 -g
 # debug: LDFLAGS =

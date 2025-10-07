@@ -19,6 +19,7 @@ niimath AIR.nii.gz -bitmap -m -r -a outer.png
 niimath ~/Desktop/fslmean -bitmap ~/Desktop/fslt -m -T 4 7  t4_7.png
 niimath ~/Desktop/fslmean -bitmap ~/Desktop/fslt -m -e  edge.png 
 niimath ~/Desktop/fslmean -bitmap ~/Desktop/fslt -x 0.25 -x 0.5 -r -y 0.5 -z 0.5  bmp.png
+niimath fslmean -bitmap fslt  -c gray -T 2 7 -s 3 -C redyellow 0.5 -N -a redyell.png
 ```
 
 - The last argument following `-bitmap` is the output PNG filename.
@@ -36,12 +37,13 @@ These options build a tiled layout of slices (sagittal/coronal/axial).
   - Multiple values allowed after a single `-x`
 - `-y <val> [<val> ...]` : coronal slices (same semantics as `-x`)
 - `-z <val> [<val> ...]` : axial slices (same semantics as `-x`)
+- `X`, `Y`, `Z` act like their lowercase counterparts but show white cross lines marking the position of other tiles.
+- `-o <val> [<val> ...]` : optimal (largest) slices (same semantics as `-x`)
 - `-r` : row separator — forces following tiles onto a new row
 - `-a` : alias — adds three slices (middle of x,y,z): equivalent to `-x 0.5 -y 0.5 -z 0.5`
 - `-m` : mosaic alias — builds a 3×3 mosaic:
   equivalent to `-x 0.25 0.5 0.75 -n -y 0.25 0.5 0.75 -n -z 0.25 0.5 0.75`
   (where `-n` here is a separator within the alias expansion; note `-n` may be used elsewhere)
-- `-N` internal tile separator 'N' is used in implementation (not a user flag)
 
 ---
 
@@ -53,6 +55,7 @@ These are image-wide and may appear anywhere in the `-bitmap` argument list.
   `isRadiological = 1` means radiological (left appears on image right).
 - `-u [0|1]` : draw left/right labels (default `1`). Omit argument to set to `0`.
 - `-n [0|1]` : interpolation order: `0 = nearest`, `1 = linear` (default `1`). If alone, `-n` sets `0`.
+- `-N [0|1]` : turn negative colormap on or off.
 - `-s <scale>` : output scale factor (float > 0). Example `-s 1.5`.
 - `-t <min> <max>` : set base image calibration range (cal_min, cal_max).
 - `-T <min> <max>` : set overlay image calibration range (cal_min2, cal_max2).
@@ -65,7 +68,7 @@ These are image-wide and may appear anywhere in the `-bitmap` argument list.
 You can either pass a numeric RGBA quadruple (R G B A, values `0..1`) or a named LUT with optional alpha.
 
 Available named LUTs:
-- `none`, `gray`, `red`, `green`, `blue`, `cyan`, `yellow`, `bluegreen`, `redyellow`
+- `none`, `gray`, `red`, `green`, `blue`, `cyan`, `yellow`, `bluegreen`, `redyellow`, `viridis`, `magma`, `inferno`, `plasma`
 
 **Base (tint) color / LUT**
 - `-c R G B A` : numeric base tint (applies multiplicatively to grayscale intensities)
@@ -130,3 +133,9 @@ niimath main.nii -bitmap overlay.nii -T 0 200 -C cyan 0.4 out.png
 
 This README documents behavior of the `niimath` `-bitmap` exporter implemented by you. Portions of the scaling code are derived from Graphics Gems (resampling algorithm); `stb_image_write` is used to write PNG files.
 
+## Alternatives
+
+- Python and Matlab NIfTI-Image-Converter
+ [nii2png](https://github.com/alexlaurence/NIfTI-Image-Converter).
+- [FSL](https://fsl.fmrib.ox.ac.uk/fsl/docs/)  includes a utility `slicer` for generating images.
+- [med2image](https://github.com/FNNDSC/med2image) is a Python script for generating NG/JPG bitmaps from DICOM/NIfTI volumes.

@@ -5619,15 +5619,18 @@ int main64(int argc, char *argv[]) {
 		} else if (!strcmp(argv[ac], "-bitmap")) {
 			ok = nifti_ras(nim);
 			flt mn, mx;
-			// Compute robust range for main image
-			nifti_robust_range(nim, &mn, &mx, 0);
-			nim->cal_min = mn;
-			nim->cal_max = mx;
 			ac++;
 			nifti_image *nim2 = NULL;
 			// If next argument exists and is NOT a flag (doesn't start with '-'),
 			// and it's not the last argument (which should be the output bitmap filename),
 			// then treat it as an overlay filename.
+			int isEdge = 0;
+			for (int j = ac; j < argc; ++j) { // skip final filename
+					if (argv[j] && !strcmp(argv[j], "-e")) {
+							isEdge = 1;
+							break;
+					}
+			}
 			if (ac + 1 < argc && argv[ac][0] != '-') {
 				nim2 = nifti_image_read2(argv[ac], 1);
 				if (!nim2) {
@@ -5637,13 +5640,6 @@ int main64(int argc, char *argv[]) {
 				if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
 					printfx("unable to read %s\n", argv[ac]); // e.g. volume size might differ
 					goto fail;
-				}
-				int isEdge = 0;
-				for (int j = ac + 1; j < argc; ++j) { // skip final filename
-						if (argv[j] && !strcmp(argv[j], "-e")) {
-								isEdge = 1;
-								break;
-						}
 				}
 				ok = nifti_ras(nim2);
 				if (isEdge) {
@@ -5655,10 +5651,19 @@ int main64(int argc, char *argv[]) {
 					goto fail;
 				}
 				nifti_robust_range(nim2, &mn, &mx, 0);
-				nim2->cal_min = mn;
+				nim2->cal_min = mn + FLT_EPSILON;
 				nim2->cal_max = mx;
 				ac++; // consume overlay argument
+			} else if (isEdge) {
+					//only background image: apply edge to that image
+					ok = nifti_otsu(nim, 5, 0);
+					ok = nifti_dog(nim, 2.0, 3.2, 0);
 			}
+			// Compute robust range for main image
+			nifti_robust_range(nim, &mn, &mx, 0);
+			nim->cal_min = mn;
+			nim->cal_max = mx;
+
 			int new_argc = argc - ac;
 			char **new_argv = argv + ac;
 			ok = nim2png(nim, nim2, new_argc, (const char **)new_argv, fout);

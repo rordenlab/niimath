@@ -77,19 +77,24 @@ typedef enum {
 	LUT_YELLOW,
 	LUT_BLUEGREEN,
 	LUT_REDYELLOW,
+	LUT_VIRIDIS,
+	LUT_INFERNO,
+	LUT_MAGMA,
+	LUT_PLASMA,
 	LUT_MAX
 } color_lut_t;
 
 // Optional: LUT names for parsing from strings or CLI
 static const char *LUT_NAMES[LUT_MAX] = {
 	"none", "gray", "red", "green", "blue",
-	"cyan", "yellow", "bluegreen", "redyellow"};
+	"cyan", "yellow", "bluegreen", "redyellow", "viridis", "inferno", "magma", "plasma"};
 
 // --------------------------- Types -------------------------------------
 // Image-wide options (defaults applied unless per-tile flags override)
 typedef struct {
-	int isRadiological;		// 1 = radiological (default), 0 = neurological
-	int isLabel;			// 1 = draw labels by default
+	int isRadiological; // 1 = radiological (default), 0 = neurological
+	int isLabel;		// 1 = draw labels by default
+	int isNegativeColorMap;
 	int interpolationOrder; // 0=nearest, 1= linear, [future 2=Mitchell]
 	float scale;			// zoom factor
 	float cal_min, cal_max, cal_min2, cal_max2;
@@ -108,6 +113,7 @@ typedef struct {
 	size_t h;		 // tile pixel height (computed from nim dims)
 	size_t x_off;	 // x offset in row (filled during layout)
 	size_t row;		 // row index (filled during layout)
+	int isCrossLines;
 } tile_t;
 
 // layout summary returned from layout_tiles
@@ -228,7 +234,7 @@ static int ensure_tile_capacity(tile_t **tiles, size_t *cap, size_t need) {
 
 // append a single tile for given axis and fractional value (in [0,1])
 static int append_tile_for_axis_value(tile_t **tiles_ptr, size_t *n_ptr, size_t *cap_ptr,
-									  const nifti_image *nim, char axis, double frac) {
+									  const nifti_image *nim, char axis, double frac, int isCrossLines) {
 	tile_t *tiles = *tiles_ptr;
 	size_t n = *n_ptr;
 	size_t cap = *cap_ptr;
@@ -269,6 +275,7 @@ static int append_tile_for_axis_value(tile_t **tiles_ptr, size_t *n_ptr, size_t 
 
 	tiles[n].axis = axis;
 	tiles[n].value = value;
+	tiles[n].isCrossLines = isCrossLines;
 	tiles[n].w = w;
 	tiles[n].h = h;
 	tiles[n].x_off = 0;
@@ -334,6 +341,18 @@ static int parse_args_build_tiles(const nifti_image *nim,
 		}
 
 		// ---------- Global color options (can appear anywhere) ----------
+		// -N [0|1] or just -N (no arg -> set to 1)
+		if (!strcmp(tok, "-N")) {
+			if (i + 1 < argc && is_number_token(argv[i + 1])) {
+				opts->isNegativeColorMap = atoi(argv[i + 1]) ? 1 : 0;
+				i += 2;
+			} else {
+				// shorthand: -N alone -> enable negative color map
+				opts->isNegativeColorMap = 1;
+				++i;
+			}
+			continue;
+		}
 		/* Parse -c / -C: base or overlay LUT/RGBA */
 		if ((!strcmp(tok, "-c")) || (!strcmp(tok, "-C"))) {
 			int isOverlay = (tok[1] == 'C'); // uppercase = overlay (LUT2/RGBA2)
@@ -345,7 +364,6 @@ static int parse_args_build_tiles(const nifti_image *nim,
 				free(tiles);
 				return -1;
 			}
-
 			/* numeric RGBA: expect 4 numbers */
 			if (is_number_token(argv[i + 1])) {
 				if (i + 4 >= argc) {
@@ -497,11 +515,14 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			}
 			continue;
 		}
-
+		int isCrossLines = 0;
 		// ---------- Tile-related tokens ----------
 		if (tok[0] == '-' && tok[1] != '\0') {
 			char flag = tok[1];
-
+			if (flag == 'X' || flag == 'Y' || flag == 'Z') {
+				isCrossLines = 1;
+				flag = tolower(flag);
+			}
 			if (flag == 'r') {
 				// row separator
 				if (append_separator(&tiles, &n, &cap) != 0) {
@@ -514,15 +535,15 @@ static int parse_args_build_tiles(const nifti_image *nim,
 
 			// ALIASES: -a and -m expand into tile lists
 			if (flag == 'a') {
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', 0.5) != 0) {
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', 0.5, isCrossLines) != 0) {
 					free(tiles);
 					return -1;
 				}
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', 0.5) != 0) {
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', 0.5, isCrossLines) != 0) {
 					free(tiles);
 					return -1;
 				}
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', 0.5) != 0) {
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', 0.5, isCrossLines) != 0) {
 					free(tiles);
 					return -1;
 				}
@@ -532,7 +553,7 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			if (flag == 'm') {
 				double vals[3] = {0.25, 0.5, 0.75};
 				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', vals[k]) != 0) {
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'x', vals[k], isCrossLines) != 0) {
 						free(tiles);
 						return -1;
 					}
@@ -542,7 +563,7 @@ static int parse_args_build_tiles(const nifti_image *nim,
 					return -1;
 				}
 				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', vals[k]) != 0) {
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'y', vals[k], isCrossLines) != 0) {
 						free(tiles);
 						return -1;
 					}
@@ -552,7 +573,7 @@ static int parse_args_build_tiles(const nifti_image *nim,
 					return -1;
 				}
 				for (int k = 0; k < 3; ++k) {
-					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', vals[k]) != 0) {
+					if (append_tile_for_axis_value(&tiles, &n, &cap, nim, 'z', vals[k], isCrossLines) != 0) {
 						free(tiles);
 						return -1;
 					}
@@ -560,7 +581,23 @@ static int parse_args_build_tiles(const nifti_image *nim,
 				++i;
 				continue;
 			}
+			if (flag == 'o') {
+				// Determine voxel dimensions
+				double nx = nim->nx;
+				double ny = nim->ny;
+				double nz = nim->nz;
 
+				// Compute in-plane areas for each axis
+				double area_x = fabs(ny * nz); // sagittal: y–z plane
+				double area_y = fabs(nx * nz); // coronal: x–z plane
+				double area_z = fabs(nx * ny); // axial: x–y plane
+				flag = 'x';
+				if ((area_y > area_x) && (area_y > area_z)) {
+					flag = 'y';
+				} else if ((area_z > area_x) && (area_z > area_y)) {
+					flag = 'z';
+				}
+			}
 			// axis flags: x,y,z collect numeric args
 			if (flag != 'x' && flag != 'y' && flag != 'z') {
 				++i;
@@ -571,7 +608,7 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			int found_any = 0;
 			while (j < argc && is_number_token(argv[j])) {
 				double val = strtod(argv[j], NULL);
-				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, flag, val) != 0) {
+				if (append_tile_for_axis_value(&tiles, &n, &cap, nim, flag, val, isCrossLines) != 0) {
 					free(tiles);
 					return -1;
 				}
@@ -733,7 +770,6 @@ static inline void map_tile_coords(char axis, long long slice_idx, size_t xx, si
 
 // ------------------- Stage 3: render_and_write_png ----------------------
 // ---------- LUT types + helpers (drop-in) ----------
-#include <stdint.h>
 
 typedef uint32_t lut_entry_t;	// packed 0xRRGGBBAA
 typedef lut_entry_t lut_t[256]; // LUT table type
@@ -752,19 +788,81 @@ static inline uint8_t clamp_u8_int(int v) {
 		return 255;
 	return (uint8_t)v;
 }
-static inline uint8_t f_to_u8_scaled(float f) {
-	if (f <= 0.0f)
-		return 0;
-	if (f >= 1.0f)
-		return 255;
-	return (uint8_t)(f * 255.0f + 0.5f);
-}
 
 static void build_lut(lut_t lut,
 					  const float RGBA0_in[4],
 					  const float RGBA255_in[4],
 					  uint8_t a,
 					  color_lut_t whichLUT) {
+	if (whichLUT == LUT_PLASMA || whichLUT == LUT_MAGMA || whichLUT == LUT_INFERNO || whichLUT == LUT_VIRIDIS) {
+		/* --- PLASMA (fitted) --- */
+		static const float plasma_R_coeffs[5] = {-4.82727553e-01f, 1.01534158e+00f, -9.08892060e-01f, 1.08043146e+00f, 6.12119843e-02f};
+		static const float plasma_G_coeffs[5] = {-1.58245180e+00f, 3.26813002e+00f, -1.65150322e+00f, 1.86627404e-01f, 1.96796774e-02f};
+		static const float plasma_B_coeffs[5] = {5.36338814e-01f, -1.02081633e+00f, 1.80382334e-02f, 4.30347618e-01f, 5.33572002e-01f};
+
+		/* --- MAGMA (fitted) --- */
+		static const float magma_R_coeffs[5] = {1.689417474714e+00f, -5.471495047641e+00f, 4.282408899801e+00f, 4.656519398970e-01f, -1.189895149846e-03f};
+		static const float magma_G_coeffs[5] = {-2.336446198991e+00f, 5.430202008705e+00f, -2.896679494516e+00f, 8.157159254022e-01f, -9.312217129325e-03f};
+		static const float magma_B_coeffs[5] = {7.454982027343e-01f, 3.885001753071e+00f, -7.488009034435e+00f, 3.709778066293e+00f, -5.099515131401e-02f};
+
+		/* --- INFERNO (fitted) --- */
+		static const float inferno_R_coeffs[5] = {9.283142715074e-01f, -2.319138388432e+00f, 1.913749123488e+00f, 3.403179719649e-01f, -8.344912439033e-03f};
+		static const float inferno_G_coeffs[5] = {-6.861301782570e-01f, 1.485422391111e+00f, -7.792130192751e-01f, 2.619663903219e-01f, 3.894052053399e-03f};
+		static const float inferno_B_coeffs[5] = {-1.619801618701e-01f, 1.076632861093e+00f, -2.660968833288e+00f, 2.007936604717e+00f, -2.597743648680e-02f};
+		// viridis
+		static const float viridis_R_coeffs[5] = {-4.17491528e+00f, 1.12224507e+01f, -7.48458801e+00f, 1.22910649e+00f, 2.35627699e-01f};
+		static const float viridis_G_coeffs[5] = {-1.21256605e+00f, 2.25725461e+00f, -1.72980184e+00f, 1.58312791e+00f, 1.64777731e-03f};
+		static const float viridis_B_coeffs[5] = {9.01900199e-01f, -1.62765043e+00f, -5.49789252e-01f, 9.66747911e-01f, 3.57845291e-01f};
+		const float *cr, *cg, *cb;
+		if (whichLUT == LUT_PLASMA) {
+			cr = plasma_R_coeffs;
+			cg = plasma_G_coeffs;
+			cb = plasma_B_coeffs;
+		} else if (whichLUT == LUT_MAGMA) {
+			cr = magma_R_coeffs;
+			cg = magma_G_coeffs;
+			cb = magma_B_coeffs;
+		} else if (whichLUT == LUT_INFERNO) {
+			cr = inferno_R_coeffs;
+			cg = inferno_G_coeffs;
+			cb = inferno_B_coeffs;
+		} else {
+			cr = viridis_R_coeffs;
+			cg = viridis_G_coeffs;
+			cb = viridis_B_coeffs;
+		}
+
+		for (int u = 0; u < 256; ++u) {
+			float t = (float)u / 255.0f;
+
+			/* Horner's method for degree-4: (((c0*t + c1)*t + c2)*t + c3)*t + c4 */
+			float R = (((cr[0] * t + cr[1]) * t + cr[2]) * t + cr[3]) * t + cr[4];
+			float G = (((cg[0] * t + cg[1]) * t + cg[2]) * t + cg[3]) * t + cg[4];
+			float B = (((cb[0] * t + cb[1]) * t + cb[2]) * t + cb[3]) * t + cb[4];
+
+			/* clamp to [0,1] */
+			if (R < 0.0f)
+				R = 0.0f;
+			else if (R > 1.0f)
+				R = 1.0f;
+			if (G < 0.0f)
+				G = 0.0f;
+			else if (G > 1.0f)
+				G = 1.0f;
+			if (B < 0.0f)
+				B = 0.0f;
+			else if (B > 1.0f)
+				B = 1.0f;
+
+			uint8_t rr = (uint8_t)(R * 255.0f + 0.5f);
+			uint8_t gg = (uint8_t)(G * 255.0f + 0.5f);
+			uint8_t bb = (uint8_t)(B * 255.0f + 0.5f);
+
+			lut[u] = LUT_PACK(rr, gg, bb, a);
+		}
+		return;
+	}
+
 	// Define some RGBA constants (alpha ignored here)
 	static const float BLACK[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 	static const float WHITE[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -810,6 +908,7 @@ static void build_lut(lut_t lut,
 		RGBA0 = RED;
 		RGBA255 = YELLOW;
 		break;
+	case LUT_NONE:
 	default:
 		/* LUT_NONE or unrecognized, use inputs as-is */
 		break;
@@ -838,36 +937,6 @@ static void build_lut(lut_t lut,
 	}
 }
 
-// Build a base LUT: for intensity u (0..255) base color = RGBA.rgb * u
-// RGBA components expected in 0..1. Alpha for base entries set to 255 (opaque).
-static void build_base_lut(lut_t lut, const float RGBA[4]) {
-	float br = RGBA[0];
-	float bg = RGBA[1];
-	float bb = RGBA[2];
-	uint8_t a = 255;
-	for (int u = 0; u < 256; ++u) {
-		int r = (int)floorf(br * (float)u + 0.5f);
-		int g = (int)floorf(bg * (float)u + 0.5f);
-		int b = (int)floorf(bb * (float)u + 0.5f);
-		lut[u] = LUT_PACK(clamp_u8_int(r), clamp_u8_int(g), clamp_u8_int(b), a);
-	}
-}
-
-// Build an overlay LUT: for intensity u (0..255) overlay color = overlayRGBA.rgb * u
-// overlayRGBA[3] (alpha) converted to 0..255 and stored in A channel for composition.
-static void build_overlay_lut(lut_t lut, const float overlayRGBA[4]) {
-	float or_ = overlayRGBA[0];
-	float og_ = overlayRGBA[1];
-	float ob_ = overlayRGBA[2];
-	uint8_t a = f_to_u8_scaled(overlayRGBA[3]); // global overlay opacity
-	for (int u = 0; u < 256; ++u) {
-		int r = (int)floorf(or_ * (float)u + 0.5f);
-		int g = (int)floorf(og_ * (float)u + 0.5f);
-		int b = (int)floorf(ob_ * (float)u + 0.5f);
-		lut[u] = LUT_PACK(clamp_u8_int(r), clamp_u8_int(g), clamp_u8_int(b), a);
-	}
-}
-
 // Fast getters using the LUTs
 static inline void get_base_rgb_from_lut(float v, float cal_min, float cal_max,
 										 const lut_t base_lut,
@@ -884,14 +953,22 @@ static inline void get_base_rgb_from_lut(float v, float cal_min, float cal_max,
 static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float cal_max,
 											 float v_overlay, float cal_min2, float cal_max2,
 											 const lut_t base_lut,
+											 const lut_t negative_overlay_lut,
 											 const lut_t overlay_lut,
-											 uint8_t *r, uint8_t *g, uint8_t *b) {
+											 uint8_t *r, uint8_t *g, uint8_t *b,
+											 const int isNegativeColorMap) {
 	uint8_t ub = float_to_u8((double)v_base, (double)cal_min, (double)cal_max);
 	uint32_t be = base_lut[ub];
 	uint8_t br = LUT_R(be), bg = LUT_G(be), bb = LUT_B(be);
 
 	uint8_t uov = float_to_u8((double)v_overlay, (double)cal_min2, (double)cal_max2);
-	if (uov == 0) {
+	float v_overlay2 = v_overlay;
+	if ((v_overlay < 0.0) && (isNegativeColorMap) && (cal_min2 > 0)) {
+		uov = float_to_u8((double)-v_overlay, (double)cal_min2, (double)cal_max2);
+		v_overlay2 = -v_overlay;
+	}
+	if (v_overlay2 < cal_min2) {
+		// if (uov == 0) {
 		*r = br;
 		*g = bg;
 		*b = bb;
@@ -899,6 +976,9 @@ static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float 
 	}
 
 	uint32_t oe = overlay_lut[uov];
+	if ((v_overlay < 0.0) && (isNegativeColorMap) && (cal_min2 > 0)) {
+		oe = negative_overlay_lut[uov];
+	}
 	uint8_t or_ = LUT_R(oe), og_ = LUT_G(oe), ob_ = LUT_B(oe);
 	uint8_t alpha = LUT_A(oe); // 0..255
 
@@ -1003,9 +1083,11 @@ static int render_and_write_png(const nifti_image *nim,
 	// Build LUTs from opts->RGBA and opts->overlayRGBA (simple builder)
 	lut_t base_lut;
 	lut_t overlay_lut;
+	lut_t negative_overlay_lut;
 	const float RGBA0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 	build_lut(base_lut, RGBA0, opts->RGBA, 255, opts->LUT);
 	build_lut(overlay_lut, RGBA0, opts->overlayRGBA, (uint8_t)(opts->overlayRGBA[3] * 255.0), opts->LUT2);
+	build_lut(negative_overlay_lut, RGBA0, opts->overlayRGBA, (uint8_t)(opts->overlayRGBA[3] * 255.0), LUT_BLUEGREEN);
 
 	// iterate tiles and rasterize each tile's slice into the appropriate rectangle
 	long long nx = nim->nx, ny = nim->ny, nz = nim->nz;
@@ -1033,8 +1115,15 @@ static int render_and_write_png(const nifti_image *nim,
 					continue;
 
 				size_t data_idx = (size_t)xi + (size_t)yi * (size_t)nx + (size_t)zi * slice_size;
-
-				size_t dst_x = opts->isRadiological ? (base_x + (t->w - 1 - xx)) : (base_x + xx);
+				size_t dst_x;
+				if (t->axis == 'x') {
+					// Flip sagittal slices: lowest x-indices on the left
+					dst_x = base_x + xx;
+				} else {
+					// Keep current radiological vs neurological behavior for other planes
+					dst_x = opts->isRadiological ? (base_x + (t->w - 1 - xx)) : (base_x + xx);
+				}
+				// size_t dst_x = opts->isRadiological ? (base_x + (t->w - 1 - xx)) : (base_x + xx);
 				size_t dst_y = base_y + (t->h - 1 - yy);
 
 				uint8_t rr, gg, bb;
@@ -1042,13 +1131,101 @@ static int render_and_write_png(const nifti_image *nim,
 					float v = data[data_idx];
 					float v2 = data2[data_idx];
 					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2,
-											  base_lut, overlay_lut, &rr, &gg, &bb);
+											  base_lut, negative_overlay_lut, overlay_lut, &rr, &gg, &bb, opts->isNegativeColorMap);
 				} else {
 					float v = data[data_idx];
 					get_base_rgb_from_lut(v, cal_min, cal_max, base_lut, &rr, &gg, &bb);
 				}
 				write_pixel_rgb(rgb, row_bytes, W, H, dst_x, dst_y, rr, gg, bb);
 			}
+		}
+
+		// draw cross-lines for this tile if requested
+		if (t->isCrossLines) {
+			for (size_t ot_i = 0; ot_i < n_tiles; ++ot_i) {
+				const tile_t *ot = &tiles[ot_i];
+				if (ot == t)
+					continue;
+				if (ot->axis == 'N')
+					continue;
+				if (ot->axis == t->axis)
+					continue; // only other axes
+				if (ot->isCrossLines)
+					continue; // only if other tile marked
+
+				// clamp other tile's slice into valid range for its axis
+				long long ov = clamp_ll(ot->value,
+										0,
+										(ot->axis == 'x' ? nx - 1 : (ot->axis == 'y' ? ny - 1 : nz - 1)));
+
+				// determine whether this other tile fixes an xx (vertical) or yy (horizontal) coord
+				int draw_vertical = 0, draw_horizontal = 0;
+				size_t local_x = 0, local_y = 0;
+
+				if (t->axis == 'x') {
+					// local xx -> yi, local yy -> zi
+					if (ot->axis == 'y') {
+						draw_vertical = 1;
+						local_x = (size_t)ov;
+					} else if (ot->axis == 'z') {
+						draw_horizontal = 1;
+						local_y = (size_t)ov;
+					}
+				} else if (t->axis == 'y') {
+					// local xx -> xi, local yy -> zi
+					if (ot->axis == 'x') {
+						draw_vertical = 1;
+						local_x = (size_t)ov;
+					} else if (ot->axis == 'z') {
+						draw_horizontal = 1;
+						local_y = (size_t)ov;
+					}
+				} else { // t->axis == 'z'
+					// local xx -> xi, local yy -> yi
+					if (ot->axis == 'x') {
+						draw_vertical = 1;
+						local_x = (size_t)ov;
+					} else if (ot->axis == 'y') {
+						draw_horizontal = 1;
+						local_y = (size_t)ov;
+					}
+				}
+
+				// draw vertical line at local_x
+				if (draw_vertical && local_x < t->w) {
+					// compute dst_x using same radiological rule as pixel rasterization
+					size_t dst_x;
+					if (t->axis == 'x') {
+						dst_x = base_x + local_x;
+					} else {
+						dst_x = opts->isRadiological ? (base_x + (t->w - 1 - local_x)) : (base_x + local_x);
+					}
+					// draw down the tile height
+					for (size_t yy2 = 0; yy2 < t->h; ++yy2) {
+						size_t dst_y = base_y + (t->h - 1 - yy2);
+						// bounds check (defensive)
+						if (dst_x >= W || dst_y >= H)
+							continue;
+						write_pixel_rgb(rgb, row_bytes, W, H, dst_x, dst_y, 255, 255, 255);
+					}
+				}
+
+				// draw horizontal line at local_y
+				if (draw_horizontal && local_y < t->h) {
+					size_t dst_y = base_y + (t->h - 1 - local_y);
+					for (size_t xx2 = 0; xx2 < t->w; ++xx2) {
+						size_t dst_x;
+						if (t->axis == 'x') {
+							dst_x = base_x + xx2;
+						} else {
+							dst_x = opts->isRadiological ? (base_x + (t->w - 1 - xx2)) : (base_x + xx2);
+						}
+						if (dst_x >= W || dst_y >= H)
+							continue;
+						write_pixel_rgb(rgb, row_bytes, W, H, dst_x, dst_y, 255, 255, 255);
+					}
+				}
+			} // end other-tile loop
 		}
 
 		// optionally draw labels
@@ -1088,6 +1265,7 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	image_options_t opts;
 	opts.isRadiological = 1;
 	opts.isLabel = 1;
+	opts.isNegativeColorMap = 0;
 	opts.interpolationOrder = 1;
 	opts.scale = 1.0;
 	opts.LUT2 = LUT_NONE;
