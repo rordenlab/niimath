@@ -119,11 +119,9 @@ set(PROGRAMS niimath)
 option(BUILD_BMP "Build bitmap output and include filter.c bmp.c" ON)
 
 if(BUILD_BMP)
-    message(STATUS "Bitmap support: ON (adding filter.c, bmp.c and -DHAVE_BMP)")
+    message(STATUS "Bitmap support: ON (adding filter.c, bmp.c, spng.c, and -DHAVE_BMP)")
     add_definitions(-DHAVE_BMP)
-    # Append the bitmap sources to the NIIMATH_SRCS variable after it's created.
-    # If you prefer to insert before NIIMATH_SRCS is set, instead add these filenames in that set().
-    set(BMP_SRCS filter.c bmp.c)
+    set(BMP_SRCS filter.c bmp.c spng.c)
 else()
     message(STATUS "Bitmap support: OFF")
     set(BMP_SRCS "")  # empty so appending is safe

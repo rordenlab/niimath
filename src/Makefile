@@ -22,9 +22,13 @@ TFILES= -DHAVE_TENSOR tensor.c
 #Marching Cubes flag
 # MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c MarchingCubes.c radixsort.c fdr.c
 MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
-#Bitmap ceation
-BMPFLAGS= -DHAVE_BMP filter.c bmp.c
+#Bitmap ceation: either stb_image or spng, the latter creates more compact PNGs, requires ZFLAGS
+BMPFLAGS= -DHAVE_BMP filter.c bmp.c spng.c
 
+#run "STB=1 make" for STB instead of libspng bitmaps
+ifeq "$(STB)" "1"
+	BMPFLAGS= -DHAVE_BMP filter.c bmp.c  -DHAVE_STB
+endif
 ifeq ($(CXX),g++)
 	CFLAGS += -std=gnu99
 endif

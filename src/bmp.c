@@ -4,15 +4,101 @@
 //
 // Based on your file. Reference version: :contentReference[oaicite:1]{index=1}
 
+#include "filter.h"
 #include <math.h>
 #include <nifti2_io.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "filter.h"
-#include "stb_image_write.h"
+
+// The tool can either of two PNG ligraries:
+// STB stands alone
+// SPNG uses zlib with better compression
+
+#ifdef HAVE_STB
+	#define STB_IMAGE_WRITE_IMPLEMENTATION
+	#include "stb_image_write.h"
+#else
+
+#include "spng.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int stbi_write_png(const char *filename, int x, int y, int comp, const void *data, int stride_bytes) {
+	// Basic argument validation (same semantics as stb)
+	if (!filename || !data || x <= 0 || y <= 0 || comp < 1 || comp > 4)
+		return 0;
+	// Require tightly-packed rows; minimal shim does not copy/pad rows.
+	if ((size_t)stride_bytes != (size_t)x * (size_t)comp) {
+		fprintf(stderr, "stbi_write_png shim (minimal): requires stride_bytes == x * comp\n");
+		return 0;
+	}
+	// Create encoder context
+	spng_ctx *enc = spng_ctx_new(SPNG_CTX_ENCODER);
+	if (!enc) {
+		fprintf(stderr, "stbi_write_png shim: spng_ctx_new failed\n");
+		return 0;
+	}
+	spng_set_option(enc, SPNG_ENCODE_TO_BUFFER, 1);
+	struct spng_ihdr ihdr;
+	memset(&ihdr, 0, sizeof(ihdr));
+	ihdr.width = (uint32_t)x;
+	ihdr.height = (uint32_t)y;
+	ihdr.bit_depth = 8;
+	switch (comp) {
+	case 1:
+		ihdr.color_type = SPNG_COLOR_TYPE_GRAYSCALE;
+		break;
+	case 2:
+		ihdr.color_type = SPNG_COLOR_TYPE_GRAYSCALE_ALPHA;
+		break;
+	case 3:
+		ihdr.color_type = SPNG_COLOR_TYPE_TRUECOLOR;
+		break;
+	case 4:
+	default:
+		ihdr.color_type = SPNG_COLOR_TYPE_TRUECOLOR_ALPHA;
+		break;
+	}
+	int ret = spng_set_ihdr(enc, &ihdr);
+	if (ret != 0) {
+		fprintf(stderr, "stbi_write_png shim: spng_set_ihdr failed (%d): %s\n", ret, spng_strerror(ret));
+		spng_ctx_free(enc);
+		return 0;
+	}
+	size_t img_size = (size_t)stride_bytes * (size_t)y;
+	// Encode once according to IHDR
+	ret = spng_encode_image(enc, data, img_size, SPNG_FMT_PNG, SPNG_ENCODE_FINALIZE);
+	if (ret != 0) {
+		fprintf(stderr, "stbi_write_png shim: spng_encode_image failed (%d): %s\n", ret, spng_strerror(ret));
+		spng_ctx_free(enc);
+		return 0;
+	}
+	size_t png_size = 0;
+	void *png_buf = spng_get_png_buffer(enc, &png_size, &ret);
+	if (!png_buf || ret != 0) {
+		fprintf(stderr, "stbi_write_png shim: spng_get_png_buffer failed (%d): %s\n", ret, spng_strerror(ret));
+		spng_ctx_free(enc);
+		return 0;
+	}
+	FILE *f = fopen(filename, "wb");
+	if (!f) {
+		fprintf(stderr, "stbi_write_png shim: fopen failed for %s\n", filename);
+		free(png_buf);
+		spng_ctx_free(enc);
+		return 0;
+	}
+	size_t wrote = fwrite(png_buf, 1, png_size, f);
+	fclose(f);
+	// free libspng buffer and context
+	free(png_buf);
+	spng_ctx_free(enc);
+	return (wrote == png_size) ? 1 : 0;
+}
+
+#endif
 
 // Helper to write scaled PNG
 int write_png_scale(const char *filename, int x, int y, int comp,
