@@ -1,22 +1,25 @@
 {
   "name": "@niivue/niimath",
   "version": "1.0.1",
+  "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     }
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "bun run esbuild.config.js",
-    "makeTiny": "make -C ../src",
+    "build": "bun run esbuild.config.ts",
+    "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
-    "parseHelpText": "bun run scripts/parseNiimathHelp.js",
-    "prebuild": "bun run makeTiny && bun run parseHelpText && bun run makeWasm && bun run scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
-    "dev": "bun run server.js",
-    "demo": "bun run build && bun run dev",
+    "parseHelpText": "bun run scripts/parseNiimathHelp.ts",
+    "generateTypes": "bun run scripts/generateTypeDefinitions.ts",
+    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js",
+    "dev": "bun run build && bun run server.ts",
     "pub": "bun run build && npm publish --access public"
   },
   "keywords": [
@@ -34,6 +37,8 @@
     "dist/"
   ],
   "devDependencies": {
-    "esbuild": "^0.23.1"
+    "@types/bun": "^1.3.0",
+    "esbuild": "^0.23.1",
+    "typescript": "^5.7.2"
   }
 }

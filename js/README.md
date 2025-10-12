@@ -61,8 +61,7 @@ The mesh option has multiple sub-options:
 To install `@niivue/niimath` in your project, run the following command:
 
 ```bash
-# TODO: publish to npm
-# npm install @niivue/niimath
+npm install @niivue/niimath # or bun install @niivue/niimath
 ```
 
 ### To install a local build of the library
@@ -77,7 +76,7 @@ cd js
 To install a local build of the library, run the following command:
 
 ```bash
-npm run build
+bun run build
 ```
 
 Then, install the library using the following command:
@@ -93,6 +92,8 @@ npm install /path/to/niivue-niimath.tgz
 ```
 
 ## Development
+
+Install [Bun](https://bun.com/docs/installation)
 
 First `cd` into the `js` directory of the `niimath` repository.
 
@@ -128,16 +129,6 @@ bun run dev
 ```
 
 This will start a development server at `http://localhost:3000` with automatic page reloading when source files change.
-
-### Test using a simple demo
-
-To test that the `@niivue/niimath` library is working correctly, you can run the following command:
-
-```bash
-bun run demo
-```
-
-This will build the library and start the development server.
 
 
 

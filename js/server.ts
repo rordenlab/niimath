@@ -2,9 +2,16 @@ import { watch } from 'fs';
 import { resolve, extname } from 'path';
 
 const PORT = 3000;
-const clients = new Set();
 
-const mimeTypes = {
+// Define types for HMR clients
+interface HMRClient {
+  send: (data: string) => void;
+}
+
+const clients = new Set<HMRClient>();
+
+// MIME type mapping
+const mimeTypes: Record<string, string> = {
   '.html': 'text/html',
   '.js': 'text/javascript',
   '.css': 'text/css',
@@ -18,7 +25,7 @@ const mimeTypes = {
 };
 
 // Inject HMR client script into HTML files
-function injectHMRScript(html) {
+function injectHMRScript(html: string): string {
   const hmrScript = `
   <script>
     // Hot Module Reloading client
@@ -40,18 +47,18 @@ function injectHMRScript(html) {
 // Create the HTTP server
 const server = Bun.serve({
   port: PORT,
-  async fetch(req) {
+  async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
     // SSE endpoint for HMR
     if (url.pathname === '/__hmr') {
       const stream = new ReadableStream({
-        start(controller) {
+        start(controller: ReadableStreamDefaultController<Uint8Array>) {
           const encoder = new TextEncoder();
 
           // Add client to the set
-          const client = {
-            send: (data) => {
+          const client: HMRClient = {
+            send: (data: string) => {
               controller.enqueue(encoder.encode(`data: ${data}\n\n`));
             }
           };
@@ -108,14 +115,14 @@ const server = Bun.serve({
 });
 
 // Watch for file changes
-const watchPaths = ['./src', './dist', './index.html'];
+const watchPaths: string[] = ['./src', './dist', './index.html'];
 
-watchPaths.forEach((path) => {
-  watch(path, { recursive: true }, (eventType, filename) => {
+watchPaths.forEach((path: string) => {
+  watch(path, { recursive: true }, (eventType: string, filename: string | null) => {
     if (filename) {
       console.log(`[HMR] File changed: ${filename}`);
       // Notify all connected clients
-      clients.forEach((client) => {
+      clients.forEach((client: HMRClient) => {
         try {
           client.send('reload');
         } catch (err) {
