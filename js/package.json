@@ -11,7 +11,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "node esbuild.config.js",
-    "makeTiny": "make tiny -C ../src",
+    "makeTiny": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
     "parseHelpText": "node scripts/parseNiimathHelp.js",
     "prebuild": "npm run makeTiny && npm run parseHelpText && npm run makeWasm && node scripts/pre-build.js -i src/niimath.js -o src/niimath.js",

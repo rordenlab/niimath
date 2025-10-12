@@ -1,4 +1,12 @@
 {
+  "bandpass": {
+    "args": [
+      "hp",
+      "lp",
+      "tr"
+    ],
+    "help": "Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)"
+  },
   "bptfm": {
     "args": [
       "hp",
@@ -41,6 +49,32 @@
     ],
     "help": "conform to axial slice with dx*dy*dzmm size and dx*dy*dz voxels. f_high bright clamping (0.98 for top 2%). Linear (1) or nearest-neighbor (0)"
   },
+  "reslice": {
+    "args": [
+      "target"
+    ],
+    "help": "reslice to match image 'target' using linear interpolation"
+  },
+  "reslice_nn": {
+    "args": [
+      "target"
+    ],
+    "help": "reslice to match image 'target' using nearest neighbor interpolation"
+  },
+  "reslice_mask": {
+    "args": [
+      "mask"
+    ],
+    "help": "reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity"
+  },
+  "close": {
+    "args": [
+      "thr",
+      "dx1",
+      "dx2"
+    ],
+    "help": "morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)"
+  },
   "crop": {
     "args": [
       "tmin",
@@ -62,17 +96,27 @@
     "args": [],
     "help": "remove average signal across volumes (requires 4D input)"
   },
+  "dilate": {
+    "args": [
+      "thr",
+      "dx"
+    ],
+    "help": "morphological bilate binarizes with `thr`, grows up to distance `dx`"
+  },
   "edt": {
     "args": [],
     "help": "estimate Euler Distance Transform (distance field). Assumes isotropic input"
   },
-  "close": {
+  "edginess": {
+    "args": [],
+    "help": "compute scalar field of local vector contrast (Euclidean distance between each voxel and its neighbors; useful for RGB or multi-channel data)"
+  },
+  "erode": {
     "args": [
       "thr",
-      "dx1",
-      "dx2"
+      "dx"
     ],
-    "help": "morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)"
+    "help": "morphological erode binarizes with `thr`, shrinks within distance `dx`"
   },
   "floor": {
     "args": [],
@@ -201,6 +245,14 @@
   "round": {
     "args": [],
     "help": "round voxels to the nearest integer"
+  },
+  "scale01": {
+    "args": [],
+    "help": "linearly rescale intensities to the range 0–1 using global min/max"
+  },
+  "sedt": {
+    "args": [],
+    "help": "estimate signed Euler Distance Transform (distance field). Assumes isotropic input"
   },
   "sobel": {
     "args": [],
@@ -622,6 +674,10 @@
   "Tstd": {
     "args": [],
     "help": "standard deviation across time"
+  },
+  "Tsum": {
+    "args": [],
+    "help": "sum across time"
   },
   "Tmax": {
     "args": [],

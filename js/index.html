@@ -5,60 +5,126 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Niimath WASM Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 20px auto;
+      padding: 20px;
+    }
+    .section {
+      margin: 20px 0;
+      padding: 15px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+    }
+    .section h2 {
+      margin-top: 0;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      margin: 10px 0;
+      box-sizing: border-box;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      cursor: pointer;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    #outputImage {
+      max-width: 100%;
+      margin-top: 20px;
+      border: 1px solid #ddd;
+    }
+    .code {
+      background-color: #f4f4f4;
+      padding: 10px;
+      border-radius: 3px;
+      font-family: monospace;
+      margin: 10px 0;
+    }
+  </style>
 </head>
 
 <body>
   <h1>Niimath WASM Demo</h1>
   <input type="file" id="fileInput">
-  <button id="processButton" disabled>Process Image</button>
   <p id="status">Please select a NIfTI image file to process.</p>
-  <a id="downloadLink" style="display: none;">Download Processed Image</a>
+
+  <div class="section">
+    <h2>Option 1: Standard Processing (Sobel)</h2>
+    <button id="processButton" disabled>Process with Sobel Filter</button>
+    <a id="downloadLink" style="display: none;">Download Processed Image</a>
+  </div>
+
+  <div class="section">
+    <h2>Option 2: Bitmap PNG Output</h2>
+    <div class="code">niimath &lt;input&gt; -bitmap -o 0.5 -c inferno optimal.png</div>
+    <label for="bitmapCommand">Custom Command (arguments after input file):</label>
+    <input type="text" id="bitmapCommand" value="-bitmap -o 0.5 -c inferno" placeholder="Enter niimath arguments">
+    <button id="bitmapButton" disabled>Generate PNG with Bitmap</button>
+    <a id="downloadLinkPng" style="display: none;">Download PNG Image</a>
+    <div id="imageContainer" style="display: none;">
+      <h3>Output Image:</h3>
+      <img id="outputImage" alt="Output PNG">
+    </div>
+  </div>
 
   <script type="module">
     import { Niimath } from './dist/index.js';
     const niimath = new Niimath();
     const fileInput = document.getElementById('fileInput');
     const processButton = document.getElementById('processButton');
+    const bitmapButton = document.getElementById('bitmapButton');
+    const bitmapCommand = document.getElementById('bitmapCommand');
     const status = document.getElementById('status');
     const downloadLink = document.getElementById('downloadLink');
+    const downloadLinkPng = document.getElementById('downloadLinkPng');
+    const imageContainer = document.getElementById('imageContainer');
+    const outputImage = document.getElementById('outputImage');
 
     let selectedFile = null;
+    let isInitialized = false;
 
     fileInput.addEventListener('change', async (event) => {
       selectedFile = event.target.files[0];
       if (selectedFile) {
         processButton.disabled = false;
+        bitmapButton.disabled = false;
         status.textContent = `Selected file: ${selectedFile.name}`;
       } else {
         processButton.disabled = true;
+        bitmapButton.disabled = true;
         status.textContent = 'Please select a NIfTI image file to process.';
       }
     });
 
+    async function ensureInitialized() {
+      if (!isInitialized) {
+        console.log('Initializing niimath wasm...');
+        status.textContent = 'Initializing...';
+        await niimath.init();
+        isInitialized = true;
+        console.log('niimath wasm initialized.');
+      }
+    }
+
     processButton.addEventListener('click', async () => {
       if (!selectedFile) return;
 
-      status.textContent = 'Processing...';
+      status.textContent = 'Processing with Sobel filter...';
       processButton.disabled = true;
+      downloadLink.style.display = 'none';
 
       try {
-        console.log('Initializing niimath wasm...');
-        await niimath.init();
-        console.log('niimath wasm initialized.');
+        await ensureInitialized();
 
         const t0 = performance.now();
-
-        // test the -mesh command and mesh output
-        // const outName = 'out.mz3';
-        // const outFile = await niimath.image(selectedFile)
-        // .mesh({
-        //   i: 'm', // 'm' for medium
-        //   b: 1, // fill bubbles
-        //   v: 0 // not verbose
-        // })
-        // .run(outName)
-        // const t1 = performance.now();
-        // console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
 
         // test with a volume output
         const outName = 'out.nii.gz';
@@ -83,6 +149,67 @@
         status.textContent = 'Processing failed. Please check the console for details.';
       } finally {
         processButton.disabled = false;
+      }
+    });
+
+    bitmapButton.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      status.textContent = 'Generating PNG with bitmap...';
+      bitmapButton.disabled = true;
+      downloadLinkPng.style.display = 'none';
+      imageContainer.style.display = 'none';
+
+      try {
+        await ensureInitialized();
+
+        const t0 = performance.now();
+
+        // Parse the command string into arguments
+        const commandArgs = bitmapCommand.value.trim().split(/\s+/);
+        
+        const outName = 'optimal.png';
+        
+        // Build the command by directly posting to worker
+        // We need to use the worker directly since bitmap isn't in the operators
+        const args = [selectedFile.name, ...commandArgs, outName];
+        
+        const outFile = await new Promise((resolve, reject) => {
+          niimath.worker.onmessage = (e) => {
+            if (e.data.type === 'error') {
+              reject(new Error(e.data.message));
+            } else {
+              const { blob, exitCode } = e.data;
+              if (exitCode === 0) {
+                resolve(blob);
+              } else {
+                reject(new Error(`niimath processing failed with exit code ${exitCode}`));
+              }
+            }
+          };
+          niimath.worker.postMessage({ blob: selectedFile, cmd: args, outName: outName });
+        });
+
+        const t1 = performance.now();
+        console.log("niimath wasm took " + (t1 - t0) + " milliseconds.")
+
+        // Create a download link for the PNG file
+        const url = URL.createObjectURL(outFile);
+        downloadLinkPng.href = url;
+        downloadLinkPng.download = outName;
+        downloadLinkPng.style.display = 'block';
+        downloadLinkPng.textContent = 'Download PNG Image';
+
+        // Display the PNG image
+        outputImage.src = url;
+        imageContainer.style.display = 'block';
+
+        status.textContent = 'PNG generation complete!';
+      } catch (error) {
+        console.error('Processing failed:', error);
+        status.textContent = 'Processing failed. Please check the console for details.';
+      } finally {
+        bitmapButton.disabled = false;
       }
     });
   </script>
