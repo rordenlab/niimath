@@ -10,13 +10,14 @@
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "node esbuild.config.js",
+    "build": "bun run esbuild.config.js",
     "makeTiny": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
-    "parseHelpText": "node scripts/parseNiimathHelp.js",
-    "prebuild": "npm run makeTiny && npm run parseHelpText && npm run makeWasm && node scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
-    "demo": "npm run build && npx http-server .",
-    "pub": "npm run build && npm publish --access public"
+    "parseHelpText": "bun run scripts/parseNiimathHelp.js",
+    "prebuild": "bun run makeTiny && bun run parseHelpText && bun run makeWasm && bun run scripts/pre-build.js -i src/niimath.js -o src/niimath.js",
+    "dev": "bun run server.js",
+    "demo": "bun run build && bun run dev",
+    "pub": "bun run build && npm publish --access public"
   },
   "keywords": [
     "niivue",

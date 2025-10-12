@@ -104,28 +104,40 @@ cd js
 To install the dependencies, run the following command:
 
 ```bash
-npm install
+bun install
 ```
 
 To build the library, run the following command
 
 ```bash
-npm run build
+bun run build
 ```
 
 To run the tests, run the following command:
 
 ```bash
-npm run test
+bun run test
 ```
+
+### Development server with Hot Module Reloading
+
+To start the development server with hot module reloading:
+
+```bash
+bun run dev
+```
+
+This will start a development server at `http://localhost:3000` with automatic page reloading when source files change.
 
 ### Test using a simple demo
 
 To test that the `@niivue/niimath` library is working correctly, you can run the following command:
 
 ```bash
-npm run demo
+bun run demo
 ```
+
+This will build the library and start the development server.
 
 
 

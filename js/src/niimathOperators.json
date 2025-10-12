@@ -7,6 +7,119 @@
     ],
     "help": "Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)"
   },
+  "bitmap": {
+    "args": [
+      "output.png"
+    ],
+    "help": "create PNG bitmap from NIfTI volume"
+  },
+  "a": {
+    "args": [],
+    "help": "axial, coronal, sagittal at midpoint (0.5)"
+  },
+  "m": {
+    "args": [],
+    "help": "mosaic view with slices at 0.25, 0.5, 0.75 for each axis"
+  },
+  "o": {
+    "args": [],
+    "help": "automatically select largest plane orientation"
+  },
+  "x": {
+    "args": [
+      "val1"
+    ],
+    "help": "sagittal slice(s) at specified position(s)"
+  },
+  "y": {
+    "args": [
+      "val1"
+    ],
+    "help": "coronal slice(s) at specified position(s)"
+  },
+  "z": {
+    "args": [
+      "val1"
+    ],
+    "help": "axial slice(s) at specified position(s)"
+  },
+  "X": {
+    "args": [
+      "vals"
+    ],
+    "help": "same as -x/-y/-z but draw crosshairs from other axes"
+  },
+  "r": {
+    "args": [],
+    "help": "insert row separator between slice groups"
+  },
+  "f": {
+    "args": [],
+    "help": "flip left-right (0=neurological/default=1 radiological)"
+  },
+  "u": {
+    "args": [],
+    "help": "show L/R labels (default=1)"
+  },
+  "n": {
+    "args": [],
+    "help": "interpolation (0=nearest neighbor, 1=linear)"
+  },
+  "s": {
+    "args": [
+      "sigma"
+    ],
+    "help": "create a gauss kernel of sigma mm and perform mean filtering"
+  },
+  "t": {
+    "args": [
+      "min",
+      "max"
+    ],
+    "help": "intensity range for base image"
+  },
+  "T": {
+    "args": [
+      "min",
+      "max"
+    ],
+    "help": "intensity range for overlay image"
+  },
+  "c": {
+    "args": [
+      "R",
+      "G",
+      "B",
+      "A"
+    ],
+    "help": "base image RGBA tint (values 0.0-1.0)"
+  },
+  "C": {
+    "args": [
+      "R",
+      "G",
+      "B",
+      "A"
+    ],
+    "help": "overlay RGBA color (values 0.0-1.0)"
+  },
+  "b": {
+    "args": [
+      "R",
+      "G",
+      "B",
+      "A"
+    ],
+    "help": "background RGBA color (values 0.0-1.0)"
+  },
+  "N": {
+    "args": [],
+    "help": "use negative colormap for overlay (blue-green for negative values)"
+  },
+  "e": {
+    "args": [],
+    "help": "apply edge detection to overlay"
+  },
   "bptfm": {
     "args": [
       "hp",
@@ -443,12 +556,6 @@
       "mean"
     ],
     "help": "(-I i ip.c) intensity normalisation, global 4D mean)"
-  },
-  "s": {
-    "args": [
-      "sigma"
-    ],
-    "help": "create a gauss kernel of sigma mm and perform mean filtering"
   },
   "exp": {
     "args": [],
