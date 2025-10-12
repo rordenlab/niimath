@@ -8,6 +8,7 @@ function parseHelpText(helpText) {
 
   let currentKernel = false;
   let currentMesh = false;
+  let currentBitmap = false;
 
   lines.forEach(line => {
     // Handle kernel operations
@@ -52,6 +53,7 @@ function parseHelpText(helpText) {
       } else if (command === '-mesh') {
         // Special handling for the mesh option
         currentMesh = true;
+        currentBitmap = false;
         methodDefinitions.mesh = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText,
@@ -65,13 +67,31 @@ function parseHelpText(helpText) {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
+      } else if (command === '-bitmap') {
+        // Special handling for the bitmap option
+        currentBitmap = true;
+        currentMesh = false;
+        methodDefinitions.bitmap = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText,
+          subOperations: {}
+        };
+        // check if this is a valid bitmap suboption (which is indented in the help text)
+      } else if (currentBitmap && leadingChars === nSpaces && command.startsWith('-')) {
+        // Handling sub-options of the bitmap command
+        const subKey = command.replace(/^-+/, ''); // Remove leading dashes
+        methodDefinitions.bitmap.subOperations[subKey] = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText
+        };
       } else {
-        // General case for non-kernel and non-mesh operations
+        // General case for non-kernel, non-mesh, and non-bitmap operations
         methodDefinitions[key] = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
         currentMesh = false; // Stop handling mesh sub-options if another main option is encountered
+        currentBitmap = false; // Stop handling bitmap sub-options if another main option is encountered
       }
     }
 
