@@ -267,6 +267,41 @@ int show_help( void ) {
 #ifdef HAVE_BUTTERWORTH
 	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");
 #endif
+#ifdef HAVE_BMP
+	printf("\n");
+	printf(" The bitmap option creates PNG images from NIfTI volumes:\n");
+	printf(" -bitmap [overlay] [opts] <output.png> : create PNG bitmap from NIfTI volume\n");
+	printf("    Slice selection (values: 0.0-1.0 for fractional position, or negative for absolute slice):\n");
+	printf("       -a                   : axial, coronal, sagittal at midpoint (0.5)\n");
+	printf("       -m                   : mosaic view with slices at 0.25, 0.5, 0.75 for each axis\n");
+	printf("       -o                   : automatically select largest plane orientation\n");
+	printf("       -x <val1> [val2...]  : sagittal slice(s) at specified position(s)\n");
+	printf("       -y <val1> [val2...]  : coronal slice(s) at specified position(s)\n");
+	printf("       -z <val1> [val2...]  : axial slice(s) at specified position(s)\n");
+	printf("       -X/-Y/-Z <vals>      : same as -x/-y/-z but draw crosshairs from other axes\n");
+	printf("       -r                   : insert row separator between slice groups\n");
+	printf("    Display options:\n");
+	printf("       -f [0|1]             : flip left-right (0=neurological/default=1 radiological)\n");
+	printf("       -u [0|1]             : show L/R labels (default=1)\n");
+	printf("       -n [0|1]             : interpolation (0=nearest neighbor, 1=linear)\n");
+	printf("       -s <scale>           : scale factor for output image size\n");
+	printf("    Color and intensity:\n");
+	printf("       -t <min> <max>       : intensity range for base image\n");
+	printf("       -T <min> <max>       : intensity range for overlay image\n");
+	printf("       -c <lut> [alpha]     : base image color lookup table\n");
+	printf("       -c <R> <G> <B> <A>   : base image RGBA tint (values 0.0-1.0)\n");
+	printf("       -C <lut> [alpha]     : overlay color lookup table\n");
+	printf("       -C <R> <G> <B> <A>   : overlay RGBA color (values 0.0-1.0)\n");
+	printf("       -b <R> <G> <B> <A>   : background RGBA color (values 0.0-1.0)\n");
+	printf("       -N [0|1]             : use negative colormap for overlay (blue-green for negative values)\n");
+	printf("       -e                   : apply edge detection to overlay\n");
+	printf("    Available color lookup tables (LUTs): gray, red, green, blue, cyan, yellow,\n");
+	printf("                                          bluegreen, redyellow, viridis, inferno, magma, plasma\n");
+	printf("    Examples:\n");
+	printf("       niimath T1.nii -bitmap -a output.png\n");
+	printf("       niimath T1.nii -bitmap fmri.nii -C red 0.5 -z 0.5 overlay.png\n");
+	printf("       niimath T1.nii -bitmap -m -c viridis mosaic.png\n");
+#endif
 	printf(" -bptfm <hp> <lp>         : Same as bptf but does not remove mean (emulates fslmaths < 5.0.7)\n");
 #ifdef NII2MESH
 	printf(" -bwlabel <conn>          : Connected component labelling for non-zero voxels (conn sets neighbors: 6, 18, 26) \n");
