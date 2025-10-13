@@ -128,7 +128,7 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		thresh = (int)(0.25*nBin); //nBin / 2;
 		double max = P[thresh]+P[((thresh+1)*nBin)+nBin-1];
 		//exhaustively search
-		for (int i = 0; i < (nBin-1); i++) {
+		for (uint32_t i = 0; i < (uint32_t)(nBin - 1); i++) {
 			double v = P[i]+P[((i+1)*nBin)+nBin-1];
 			if (v > max) {
 				thresh = i;
