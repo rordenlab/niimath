@@ -11,20 +11,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+  #define strcasecmp  _stricmp
+  #define strncasecmp _strnicmp
+#endif
 
 // The tool can either of two PNG ligraries:
-// STB stands alone
+// STB stands alone, you must provide stb_image_write.h/stb_image.h
 // SPNG uses zlib with better compression
-
 #ifdef HAVE_STB
 	#define STB_IMAGE_WRITE_IMPLEMENTATION
 	#include "stb_image_write.h"
 #else
 
 #include "spng.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 int stbi_write_png(const char *filename, int x, int y, int comp, const void *data, int stride_bytes) {
 	// Basic argument validation (same semantics as stb)
