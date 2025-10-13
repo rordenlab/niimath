@@ -92,7 +92,7 @@ To read the WASM specific README, please click [here](./js/README.md). The rest 
 
 ## Usage
 
-niimath provides the same commands as [fslmaths](https://mandymejia.com/fsl-maths-commands/), so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. You can also modify your environment variables to unleash advanced features:
+niimath provides the same commands as fslmaths, so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. You can also modify your environment variables to unleash advanced features:
 
  - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export NIFTI_GZ` or `export NIFTI` from the command line or profile to select between compressed (smaller) or uncompressed (faster) results. Windows users can use `set` instead of `export`.
  - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded compresson.
