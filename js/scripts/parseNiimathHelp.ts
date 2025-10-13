@@ -1,19 +1,38 @@
-const { exec } = require('child_process');
-const fs = require('fs');
+import { exec } from 'child_process';
+import fs from 'fs';
+
+// Define types for the parsed operators
+interface SubOperation {
+  args: string[];
+  help: string;
+}
+
+interface OperatorDefinition {
+  args: string[];
+  help: string;
+  subOperations?: Record<string, SubOperation>;
+}
+
+interface KernelOperatorDefinition {
+  subOperations: Record<string, SubOperation>;
+}
+
+type MethodDefinitions = Record<string, OperatorDefinition | KernelOperatorDefinition>;
 
 // Function to parse the niimath help text
-function parseHelpText(helpText) {
+function parseHelpText(helpText: string): MethodDefinitions {
   const lines = helpText.split('\n');
-  const methodDefinitions = {};
+  const methodDefinitions: MethodDefinitions = {};
 
   let currentKernel = false;
   let currentMesh = false;
+  let currentBitmap = false;
 
-  lines.forEach(line => {
+  lines.forEach((line: string) => {
     // Handle kernel operations
     if (line.includes('Kernel operations')) {
       currentKernel = true;
-      methodDefinitions.kernel = { subOperations: {} };
+      methodDefinitions.kernel = { subOperations: {} } as KernelOperatorDefinition;
       return;
     }
 
@@ -43,7 +62,8 @@ function parseHelpText(helpText) {
             const subOpName = subOpMatch[1].trim();
             const subArgsString = subOpMatch[2].trim();
             const subArgs = subArgsString.split(/\s+/).filter(arg => arg.startsWith('<') && arg.endsWith('>'));
-            methodDefinitions.kernel.subOperations[subOpName] = {
+            const kernelDef = methodDefinitions.kernel as KernelOperatorDefinition;
+            kernelDef.subOperations[subOpName] = {
               args: subArgs.map(arg => arg.replace(/[<>]/g, '')),
               help: helpText
             };
@@ -52,26 +72,47 @@ function parseHelpText(helpText) {
       } else if (command === '-mesh') {
         // Special handling for the mesh option
         currentMesh = true;
+        currentBitmap = false;
         methodDefinitions.mesh = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText,
           subOperations: {}
-        };
+        } as OperatorDefinition;
         // check if this is a valid mesh suboption (which is indented in the help text)
       } else if (currentMesh && leadingChars === nSpaces && command.startsWith('-')) {
         // Handling sub-options of the mesh command
         const subKey = command.replace(/^-+/, ''); // Remove leading dashes
-        methodDefinitions.mesh.subOperations[subKey] = {
+        const meshDef = methodDefinitions.mesh as OperatorDefinition;
+        meshDef.subOperations![subKey] = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText
+        };
+      } else if (command === '-bitmap') {
+        // Special handling for the bitmap option
+        currentBitmap = true;
+        currentMesh = false;
+        methodDefinitions.bitmap = {
+          args: args.map(arg => arg.replace(/[<>]/g, '')),
+          help: helpText,
+          subOperations: {}
+        } as OperatorDefinition;
+        // check if this is a valid bitmap suboption (which is indented in the help text)
+      } else if (currentBitmap && leadingChars === nSpaces && command.startsWith('-')) {
+        // Handling sub-options of the bitmap command
+        const subKey = command.replace(/^-+/, ''); // Remove leading dashes
+        const bitmapDef = methodDefinitions.bitmap as OperatorDefinition;
+        bitmapDef.subOperations![subKey] = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
       } else {
-        // General case for non-kernel and non-mesh operations
+        // General case for non-kernel, non-mesh, and non-bitmap operations
         methodDefinitions[key] = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
-        };
+        } as OperatorDefinition;
         currentMesh = false; // Stop handling mesh sub-options if another main option is encountered
+        currentBitmap = false; // Stop handling bitmap sub-options if another main option is encountered
       }
     }
 
@@ -85,11 +126,11 @@ function parseHelpText(helpText) {
 }
 
 // Function to execute niimath and parse its output
-function generateMethodDefinitions() {
+function generateMethodDefinitions(): Promise<MethodDefinitions> {
   return new Promise((resolve, reject) => {
     exec('../src/niimath', (error, stdout, stderr) => {
       if (error) {
-        reject(`Error executing niimath: ${error.message}`);
+        reject(new Error(`Error executing niimath: ${error.message}`));
         return;
       }
 
@@ -104,7 +145,7 @@ function generateMethodDefinitions() {
 }
 
 // Main function to generate and save the method definitions
-async function main() {
+async function main(): Promise<void> {
   try {
     const methodDefinitions = await generateMethodDefinitions();
     const jsonString = JSON.stringify(methodDefinitions, null, 2);

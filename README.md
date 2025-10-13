@@ -130,6 +130,7 @@ niimath has a few features not provided by fslmaths:
  - `qform <code>`          : set qform code
  - `sform <code>`          : set sform code
  - `--compare <ref>`       : report if images are identical, terminates without saving new image\n");
+ - `--bitmap -a name.png`  : mimic fsl slicer (see [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap))
  - `filename.nii`          : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
 
 ## Identical Versus Equivalent Results
@@ -203,6 +204,10 @@ niimath bet.nii.gz -mesh -i d darkIsolevel.gii
 niimath bet.nii.gz -mesh -i m medIsolevel.gii
 niimath bet.nii.gz -mesh -i b brightIsolevel.gii
 ```
+
+## Creating bitmaps
+
+You can use the `--bitmap` option to visualize the results of any operations. This option has arguments inspired by fsl's slicer, but introduces new features. The [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap) provides examples and documentation.
 
 ## WebAssembly
 
