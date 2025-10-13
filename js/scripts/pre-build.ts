@@ -1,8 +1,12 @@
-const fs = require('fs');
+import fs from 'fs';
 
-function getArgs() {
-    const args = {};
-    process.argv.slice(2).forEach((arg, index, array) => {
+interface Args {
+    [key: string]: string | undefined;
+}
+
+function getArgs(): Args {
+    const args: Args = {};
+    process.argv.slice(2).forEach((arg: string, index: number, array: string[]) => {
         if (arg.startsWith('-')) {
             args[arg] = array[index + 1];
         }
@@ -20,7 +24,7 @@ if (!inputFilePath || !outputFilePath) {
     process.exit(1);
 }
 
-fs.readFile(inputFilePath, 'utf8', (err, data) => {
+fs.readFile(inputFilePath, 'utf8', (err: NodeJS.ErrnoException | null, data: string) => {
     if (err) {
         console.error('Error reading the input file:', err);
         return;
@@ -29,7 +33,7 @@ fs.readFile(inputFilePath, 'utf8', (err, data) => {
     // Replace all occurrences of "args=[]" with "args"
     const modifiedData = data.replace(/args=\[\]/g, 'args');
 
-    fs.writeFile(outputFilePath, modifiedData, 'utf8', (err) => {
+    fs.writeFile(outputFilePath, modifiedData, 'utf8', (err: NodeJS.ErrnoException | null) => {
         if (err) {
             console.error('Error writing to the output file:', err);
             return;
