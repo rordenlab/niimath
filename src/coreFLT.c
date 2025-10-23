@@ -5647,7 +5647,7 @@ int main64(int argc, char *argv[]) {
 					ok = nifti_dog(nim2, 2.0, 3.2, 0);
 				}
 				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
-					printfx("overlay dimensions do not match %ld×%ld×%ld != %ld×%ld×%ld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
 					goto fail;
 				}
 				nifti_robust_range(nim2, &mn, &mx, 0);

@@ -189,6 +189,8 @@ typedef struct {
 	float RGBA2[4];		  // background color + alpha default {0,0,0,0.5}
 	color_lut_t LUT2;	  // new overlay color lookup table
 	color_lut_t LUT;	  // new base color lookup table
+	int colorbar_height;
+	int overlay_zero_baseline;
 } image_options_t;
 
 // tile description produced by parsing the argv
@@ -439,6 +441,12 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			}
 			continue;
 		}
+		// -j : zero-baseline overlay colorbar / mapping (map overlay range from 0..max)
+		if (!strcmp(tok, "-j")) {
+			opts->overlay_zero_baseline = 1;
+			++i;
+			continue;
+		}
 		/* Parse -c / -C: base or overlay LUT/RGBA */
 		if ((!strcmp(tok, "-c")) || (!strcmp(tok, "-C"))) {
 			int isOverlay = (tok[1] == 'C'); // uppercase = overlay (LUT2/RGBA2)
@@ -570,6 +578,23 @@ static int parse_args_build_tiles(const nifti_image *nim,
 				++i;
 			}
 			continue;
+		}
+		// -g <int> : gradient colorbar of specified height (pixels)
+		if (!strcmp(tok, "-g")) {
+				if (i + 1 >= argc || !is_number_token(argv[i + 1])) {
+						fprintf(stderr, "parse_args: -g requires an integer pixel height\n");
+						free(tiles);
+						return -1;
+				}
+				int h = atoi(argv[i + 1]);
+				if (h < 0) {
+						fprintf(stderr, "parse_args: -g requires a non-negative integer\n");
+						free(tiles);
+						return -1;
+				}
+				opts->colorbar_height = h;
+				i += 2;
+				continue;
 		}
 		// -s <float> : global scale factor (must be positive)
 		if (!strcmp(tok, "-s")) {
@@ -1037,7 +1062,7 @@ static inline void get_base_rgb_from_lut(float v, float cal_min, float cal_max,
 // Fast blend: base from base_lut, overlay from overlay_lut. overlay_lut alpha channel used.
 // If overlay intensity maps to 0 => return base directly.
 static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float cal_max,
-											 float v_overlay, float cal_min2, float cal_max2,
+											 float v_overlay, float cal_min2_lut, float cal_min2, float cal_max2,
 											 const lut_t base_lut,
 											 const lut_t negative_overlay_lut,
 											 const lut_t overlay_lut,
@@ -1047,10 +1072,12 @@ static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float 
 	uint32_t be = base_lut[ub];
 	uint8_t br = LUT_R(be), bg = LUT_G(be), bb = LUT_B(be);
 
-	uint8_t uov = float_to_u8((double)v_overlay, (double)cal_min2, (double)cal_max2);
+	uint8_t uov = 0;
+	if (v_overlay >= cal_min2)
+		uov = float_to_u8((double)v_overlay, (double)cal_min2_lut, (double)cal_max2);
 	float v_overlay2 = v_overlay;
-	if ((v_overlay < 0.0) && (isNegativeColorMap) && (cal_min2 > 0)) {
-		uov = float_to_u8((double)-v_overlay, (double)cal_min2, (double)cal_max2);
+	if ((v_overlay < 0.0) && (isNegativeColorMap) && (cal_min2 > 0) && (-v_overlay >= cal_min2)) {
+		uov = float_to_u8((double)-v_overlay, (double)cal_min2_lut, (double)cal_max2);
 		v_overlay2 = -v_overlay;
 	}
 	if (v_overlay2 < cal_min2) {
@@ -1099,6 +1126,9 @@ static int render_and_write_png(const nifti_image *nim,
 	const int channels = 3;
 	size_t W = layout->total_width;
 	size_t H = layout->total_height;
+	if (opts->colorbar_height > 0) {
+		H += (size_t)opts->colorbar_height;
+	}
 	if (W == 0 || H == 0) {
 		fprintf(stderr, "render: zero output dimension\n");
 		return -1;
@@ -1115,7 +1145,10 @@ static int render_and_write_png(const nifti_image *nim,
 
 	float cal_min2 = opts->cal_min2;
 	float cal_max2 = opts->cal_max2;
-
+	float cal_min2_lut = cal_min2;
+	if (opts->overlay_zero_baseline && (cal_min2 > 0.0f)) {
+		cal_min2_lut = 0.0f;
+	}
 	int have_nim2 = 0;
 	float *data2 = NULL;
 	if (nim2) {
@@ -1216,7 +1249,7 @@ static int render_and_write_png(const nifti_image *nim,
 				if (have_nim2) {
 					float v = data[data_idx];
 					float v2 = data2[data_idx];
-					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2,
+					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2_lut, cal_min2, cal_max2,
 											  base_lut, negative_overlay_lut, overlay_lut, &rr, &gg, &bb, opts->isNegativeColorMap);
 				} else {
 					float v = data[data_idx];
@@ -1329,7 +1362,77 @@ static int render_and_write_png(const nifti_image *nim,
 			}
 		}
 	}
+	/* ----------------- draw appended colorbar(s) if requested ----------------- */
+	int cb_h = opts->colorbar_height;
+	if (cb_h > 0) {
+			/* Compute starting Y for the bar region */
+			size_t bar_top = H - (size_t)cb_h; // H already includes the appended rows
 
+			/* Decide which LUT(s) to use:
+				 - If overlay present (have_nim2): use overlay_lut (and negative_overlay_lut if negative colormap)
+				 - Else: use base_lut
+			*/
+			int draw_two = 0;
+			const lut_t *left_lut = NULL;
+			const lut_t *right_lut = NULL;
+			if (have_nim2) {
+					if (opts->isNegativeColorMap && cb_h > 0) {
+							draw_two = 1;
+							left_lut = &negative_overlay_lut;
+							right_lut = &overlay_lut;
+					} else {
+							draw_two = 0;
+							left_lut = &overlay_lut;
+							right_lut = NULL;
+					}
+			} else {
+					draw_two = 0;
+					left_lut = &base_lut;
+					right_lut = NULL;
+			}
+
+			/* Helper lambda-like: set colorbar pixels for a given x range and LUT */
+			for (size_t x = 0; x < W; ++x) {
+					/* choose which LUT to sample */
+					const lut_t *lutp = left_lut;
+					size_t local_x = x;
+					size_t half = (size_t)(W / 2);
+					if (draw_two) {
+							if (x < half) {
+									lutp = left_lut;
+									local_x = x; /* left region */
+							} else {
+									lutp = right_lut;
+									local_x = x - half; /* right region mapping */
+							}
+					}
+					/* Map horizontal position to LUT index [0..255] */
+					size_t region_width = draw_two ? (x < half ? half : (W - half)) : W;
+					if (region_width == 0) region_width = 1;
+					/* compute u in [0..255], left->right maps low->high */
+					float frac = ((local_x) / (region_width > 1.0 ? (region_width - 1.0) : 1.0));
+					if (cal_min2_lut < cal_min2) {
+						float start = cal_min2 / cal_max2;
+						float end = 1.0f;
+						/* lerp from [0,1] → [start,end]: */
+						frac = start + frac * (end - start);
+					}
+					int u = (int)(frac * 255.0);
+					if (u < 0) u = 0;
+					if (u > 255) u = 255;
+					uint32_t e = (*lutp)[u];
+					uint8_t cr = LUT_R(e);
+					uint8_t cg = LUT_G(e);
+					uint8_t cb = LUT_B(e);
+
+					/* fill the vertical strip of height cb_h */
+					for (size_t yy = 0; yy < (size_t)cb_h; ++yy) {
+							size_t dst_y = bar_top + yy;
+							if (dst_y >= H) continue;
+							write_pixel_rgb(rgb, row_bytes, W, H, x, dst_y, cr, cg, cb);
+					}
+			}
+	}
 	// write PNG (with optional scaling)
 	int ret = write_png_scale(out_png_path, (int)W, (int)H, channels, rgb, (int)row_bytes, opts->scale, opts->interpolationOrder);
 	free(rgb);
@@ -1370,6 +1473,8 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	opts.RGBA2[3] = 1.0f;
 	opts.cal_min = nim->cal_min;
 	opts.cal_max = nim->cal_max;
+	opts.colorbar_height = 0;
+	opts.overlay_zero_baseline = 0;
 	if (nim2) {
 		opts.cal_min2 = nim2->cal_min;
 		opts.cal_max2 = nim2->cal_max;
