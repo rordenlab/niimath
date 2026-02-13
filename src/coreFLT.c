@@ -2891,7 +2891,7 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -2943,8 +2943,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; // wrapped anterior-posterior
-						// if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
-						if (inf32[vx] == NAN)
+						// if ((inf32[vx] == 0.0) || isnanx(inf32[vx]))
+						if (isnanx(inf32[vx]))
 							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
@@ -2980,7 +2980,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; // wrapped anterior-posterior
-						if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((inf32[vx] == 0.0) || isnanx(inf32[vx]))
 							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
@@ -3023,7 +3023,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3049,7 +3049,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt mx = inf32[i];
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] <= mx) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] <= mx) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3075,7 +3075,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					i++;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3102,7 +3102,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt wt = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3134,7 +3134,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					flt wtNeg = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3174,7 +3174,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					// flt wt = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3203,7 +3203,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						continue;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] != 0.0) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] != 0.0) || isnanx(inf32[vx]))
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -4124,69 +4124,87 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 		return 1;
 	}
 	flt *f32 = (flt *)nim->data;
+	size_t n = nim->nvox;
 	if (op == exp1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = exp(f32[i]);
 	} else if (op == log1) {
-		for (size_t i = 0; i < nim->nvox; i++) {
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i) {
 			if (f32[i] <= 0.0)
 				f32[i] = 0.0;
 			else
 				f32[i] = log(f32[i]);
 		}
 	} else if (op == floor1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = floor(f32[i]);
 	} else if (op == round1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = round(f32[i]);
 	} else if (op == ceil1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = ceil(f32[i]);
 	} else if (op == trunc1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = trunc(f32[i]);
 	} else if (op == sin1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = sin(f32[i]);
 	} else if (op == cos1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = cos(f32[i]);
 	} else if (op == tan1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = tan(f32[i]);
 	} else if (op == asin1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = asin(f32[i]);
 	} else if (op == acos1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = acos(f32[i]);
 	} else if (op == atan1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = atan(f32[i]);
 	} else if (op == sqr1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = f32[i] * f32[i]; //<- pow(a,x) uses flt for x
 	} else if (op == sqrt1) {
 		nifti_sqrt(f32, nim->nvox);
 	} else if (op == recip1) { // https://stackoverflow.com/questions/10606483/sse-reciprocal-if-not-zero
-		for (size_t i = 0; i < nim->nvox; i++) {
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i) {
 			if (f32[i] == 0.0f)
 				continue;
 			f32[i] = 1.0 / f32[i];
 		}
 	} else if (op == abs1) {
-		for (size_t i = 0; i < nim->nvox; i++)
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i)
 			f32[i] = fabs(f32[i]);
 	} else if (op == bin1) {
-		for (size_t i = 0; i < nim->nvox; i++) {
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i) {
 			if (f32[i] > 0)
 				f32[i] = 1.0f;
 			else
 				f32[i] = 0.0f;
 		}
 	} else if (op == binv1) {
-		for (size_t i = 0; i < nim->nvox; i++) {
+		#pragma omp parallel for schedule(static)
+		for (size_t i = 0; i < n; ++i) {
 			if (f32[i] > 0)
 				f32[i] = 0.0f;
 			else
