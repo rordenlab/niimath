@@ -4,6 +4,8 @@ CNAME=gcc
 UFLAGS= niimath.c core.c core32.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -lm
 #experimental conform feature
 UFLAGS+= conform.c -DHAVE_CONFORM
+#Bias field correction (from AFNI 3dUnifize, public domain)
+UFLAGS+= unifize.c
 UFLAGS64= -DHAVE_64BITS core64.c
 
 

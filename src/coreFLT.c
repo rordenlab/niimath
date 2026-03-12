@@ -80,6 +80,7 @@
 #include "conform.h"
 #endif
 
+#include "unifize.h"
 #include <stdbool.h>
 // #define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 // #ifdef TFCE //we now use in-built tfce function
@@ -5260,6 +5261,26 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	exit(0);
 } // nifti_compare()
 
+// unifize wrapper: always processes in float internally
+staticx int nifti_unifize(nifti_image *nim) {
+	if (nim->datatype != DT_CALC) return 1;
+	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
+	size_t nvox3D = (size_t)nx * ny * nz;
+#ifdef DT32
+	return unifize_image((float *)nim->data, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+#else
+	float *tmp = (float *)malloc(nvox3D * sizeof(float));
+	if (!tmp) return 1;
+	double *dd = (double *)nim->data;
+	for (size_t i = 0; i < nvox3D; i++) tmp[i] = (float)dd[i];
+	int ret = unifize_image(tmp, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+	if (ret == 0)
+		for (size_t i = 0; i < nvox3D; i++) dd[i] = (double)tmp[i];
+	free(tmp);
+	return ret;
+#endif
+}
+
 #ifdef DT32
 int main32(int argc, char *argv[]) {
 #else
@@ -5872,7 +5893,9 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			double dx = strtod(argv[ac], &end);
 			ok = nifti_erode(nim, iso, dx);
-		} else if (!strcmp(argv[ac], "-edt"))
+		} else if (!strcmp(argv[ac], "-unifize"))
+			ok = nifti_unifize(nim);
+		else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-scale01"))
 			ok = nifti_scale01(nim);
