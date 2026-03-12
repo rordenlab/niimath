@@ -19,9 +19,13 @@ GFILES= -DHAVE_FORMATS base64.c
 BFLAGS= -DHAVE_BUTTERWORTH bw.c
 #Tensor decomposition
 TFILES= -DHAVE_TENSOR tensor.c
-#Marching Cubes flag
-# MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c MarchingCubes.c radixsort.c fdr.c
+#Marching Cubes flag: run "MC=1 make" for new MarchingCubes instead of classic oldcubes
 MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
+
+#run "MC=1 make" for new MarchingCubes algorithm (handles ambiguities)
+ifeq "$(MC)" "1"
+	MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c MarchingCubes.c
+endif
 #Bitmap ceation: either stb_image or spng, the latter creates more compact PNGs, requires ZFLAGS
 BMPFLAGS= -DHAVE_BMP filter.c bmp.c spng.c
 

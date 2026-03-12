@@ -606,7 +606,7 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	h.NFACE = ntri;
 	h.NVERT = npt;
 	h.NSKIP = 0;
-	if (!&littleEndianPlatform)
+	if (!littleEndianPlatform())
 		swap_4bytes(3, &h.NFACE);
 	FILE *fp;
 #ifdef HAVE_ZLIB
@@ -624,7 +624,7 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 			return EXIT_FAILURE;
 		fwrite(&h, sizeof(struct mz3hdr), 1, fp);
 	}
-	if (!&littleEndianPlatform) {
+	if (!littleEndianPlatform()) {
 		vec3i *trisSwap = (vec3i *)malloc(ntri * sizeof(vec3i));
 		for (int i = 0; i < ntri; i++)
 			trisSwap[i] = tris[i];
@@ -633,10 +633,9 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 		if (isGz)
 			gzwrite(fgz, trisSwap, ntri * sizeof(vec3i));
 		else
-#else
-		fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
 #endif
-			free(trisSwap);
+			fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
+		free(trisSwap);
 	} else {
 #ifdef HAVE_ZLIB
 		if (isGz)
@@ -648,7 +647,7 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (!&littleEndianPlatform)
+	if (!littleEndianPlatform())
 		swap_4bytes(npt * 3, pts32);
 #ifdef HAVE_ZLIB
 	if (isGz) {
@@ -683,7 +682,7 @@ static int save_freesurfer(const char *fnm, vec3i *tris, vec3d *pts, int ntri, i
 	fwrite(s, strlen(s), 1, fp);
 	int32_t VertexCount = npt;
 	int32_t FaceCount = ntri;
-	if (&littleEndianPlatform) {
+	if (littleEndianPlatform()) {
 		swap_4bytes(1, &VertexCount);
 		swap_4bytes(1, &FaceCount);
 	}
@@ -692,11 +691,11 @@ static int save_freesurfer(const char *fnm, vec3i *tris, vec3d *pts, int ntri, i
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(npt * 3, pts32);
 	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
 	free(pts32);
-	if (&littleEndianPlatform) {
+	if (littleEndianPlatform()) {
 		vec3i *trisSwap = (vec3i *)malloc(ntri * sizeof(vec3i));
 		for (int i = 0; i < ntri; i++)
 			trisSwap[i] = tris[i];
@@ -808,7 +807,7 @@ static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	if (fp == NULL)
 		return EXIT_FAILURE;
 	fputs("ply\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("format binary_little_endian 1.0\n", fp);
 	else
 		fputs("format binary_big_endian 1.0\n", fp);
@@ -874,7 +873,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	else
 #endif
 		fputs("               Encoding=\"Base64Binary\"\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("               Endian=\"LittleEndian\"\n", fp);
 	else
 		fputs("               Endian=\"BigEndian\"\n", fp);
@@ -916,7 +915,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	else
 #endif
 		fputs("               Encoding=\"Base64Binary\"\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("               Endian=\"LittleEndian\"\n", fp);
 	else
 		fputs("               Endian=\"BigEndian\"\n", fp);
@@ -975,7 +974,7 @@ static int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(3 * npt, pts32);
 	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
 	free(pts32);
@@ -989,7 +988,7 @@ static int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 		tris4[i].y = tris[i].y;
 		tris4[i].z = tris[i].z;
 	}
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(4 * ntri, tris4);
 	fwrite(tris4, ntri * sizeof(vec4i), 1, fp);
 	free(tris4);

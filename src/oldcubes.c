@@ -485,8 +485,15 @@ int marchingCubes(float * img, short dim[3], int lo[3], int hi[3], int originalM
 				grid.val[7] = img[zy+x+NX+NXY];
 				grid.p000 = setVec3d(x  ,y  ,z  );
 				if ((npt + 30) > ptsCapacity) {
-					ptsCapacity = round (ptsCapacity * 1.5);
-					pts = (vec3d *)realloc(pts,ptsCapacity*sizeof(vec3d));
+					int newCapacity = round (ptsCapacity * 1.5);
+					vec3d *tmp = (vec3d *)realloc(pts, newCapacity*sizeof(vec3d));
+					if (tmp == NULL) {
+						free(pts);
+						printf("marching cubes: out of memory\n");
+						return EXIT_FAILURE;
+					}
+					pts = tmp;
+					ptsCapacity = newCapacity;
 				}
 				vec3d *ptsn = &pts[npt];
 				npt += PolygoniseCube(grid,isolevel,ptsn);

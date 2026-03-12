@@ -626,22 +626,16 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		if (idt == DT_INT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = clamp_i32(round((i16[i] * scl) + inter));
-			free(nim->data);
-			nim->data = dat;
 			ok = 0;
 		}
 		if (idt == DT_UINT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = clamp_i32(round((u8[i] * scl) + inter));
-			free(nim->data);
-			nim->data = dat;
 			ok = 0;
 		}
 		if (idt == DT_INT8) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = clamp_i32(round((i8[i] * scl) + inter));
-			free(nim->data);
-			nim->data = dat;
 			ok = 0;
 		}
 		if (ok == 0) {

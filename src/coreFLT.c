@@ -343,6 +343,7 @@ staticx inline void transposeXZ(flt *img3Din, flt *img3Dout, int *nxp, int ny, i
 }
 
 staticx flt vx(flt *f, int p, int q) {
+	if (p == q) return INFINITY;
 	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
 	if (isnanx(ret))
 		ret = INFINITY;
@@ -532,7 +533,7 @@ staticx int nifti_sedt(nifti_image *nim) {
 		return ok;
 	flt *img = (flt *)nim->data;
 	flt *imgEDT = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
-	memcpy(imgEDT, img, nvox3D * sizeof(float));
+	memcpy(imgEDT, img, nvox3D * sizeof(flt));
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] > 0.0)
 			img[i] = 0;
@@ -633,7 +634,7 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -682,7 +683,7 @@ staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -715,7 +716,7 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -1283,6 +1284,7 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 				} // x
 			} // y
 		} // z
+		_mm_free(vxs2);
 	} // v
 	flt fill = 0.0;
 	if (!isZeroFill)
