@@ -2,7 +2,7 @@
 #include <float.h> //FLT_EPSILON
 #include <limits.h>
 #include <math.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

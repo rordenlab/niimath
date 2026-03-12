@@ -32,7 +32,7 @@
 #define SIMD
 #define xmemcpy memcpy
 #define staticx static
-#include <nifti2_io.h>
+#include "nifti_io.h"
 
 #ifdef EMSCRIPTEN
 #define _mm_malloc(size, alignment) malloc(size)

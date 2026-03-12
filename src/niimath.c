@@ -3,10 +3,10 @@
  *
  * compile example (consider -pedantic or -Wall):
  *
- * gcc -O3 -lm -lz -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib
+ * gcc -O3 -lm -lz -o niimath niimath.c nifti_io.c
  *
  * OpenMP (parallel threading)
- *  gcc-9  -fopenmp -lm  -I./darwin ./darwin/libz.a -DHAVE_ZLIB -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
+ *  gcc-9  -fopenmp -lm -DHAVE_ZLIB -o niimath niimath.c nifti_io.c -lz
  *
  *----------------------------------------------------------------------
  */
@@ -18,7 +18,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
+#ifdef HAVE_ZLIB
+  #include <zlib.h>
+#endif
 #include "core32.h" //all 32-bit functions
 #ifdef HAVE_64BITS
 	#include "core64.h" //all 64-bit functions

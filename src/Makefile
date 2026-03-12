@@ -1,7 +1,7 @@
 # Regular use, set compiler name, compiler flags, openmp flags zlib flags
 CNAME=gcc
 #universal flags always included
-UFLAGS= niimath.c core.c core32.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -lm
+UFLAGS= niimath.c core.c core32.c nifti_io.c -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -lm
 #experimental conform feature
 UFLAGS+= conform.c -DHAVE_CONFORM
 #Bias field correction (from AFNI 3dUnifize, public domain)

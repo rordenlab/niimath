@@ -6,7 +6,7 @@
 #endif
 
 #include <stdbool.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
 
 int toRAS(nifti_image *nim);
 int conform(nifti_image *nim);

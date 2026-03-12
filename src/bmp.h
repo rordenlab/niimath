@@ -1,7 +1,7 @@
 #ifndef BMPGEN_H
 #define BMPGEN_H
 
-#include <nifti2_io.h>
+#include "nifti_io.h"
 #include <stdint.h>
 
 /**

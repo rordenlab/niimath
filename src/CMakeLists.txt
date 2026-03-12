@@ -45,6 +45,7 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     ADD_DEFINITIONS(-DHAVE_CONFORM)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} unifize.c)
 
     option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
     if(USE_CLASSIC_CUBES)
@@ -131,14 +132,10 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     core32.c
-    niftilib/nifti2_io.c
-    znzlib/znzlib.c
+    nifti_io.c
     ${ADDITIONAL_SRCS}
-    ${BMP_SRCS} 
+    ${BMP_SRCS}
 )
-
-include_directories(niftilib)
-include_directories(znzlib)
 add_executable(niimath ${NIIMATH_SRCS})
 
 set(ZLIB_IMPLEMENTATION "Miniz" CACHE STRING "Choose zlib implementation.")

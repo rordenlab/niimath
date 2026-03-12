@@ -23,11 +23,11 @@ cd "$(dirname "$0")"
 
 mkdir ${APP_DIR}
 # Compile x86
-gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -lm -lz  -target x86_64-apple-macos10.12 -mmacosx-version-min=10.12 -o niimathX86
+gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_CONFORM -DHAVE_BMP niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c -lm -lz  -target x86_64-apple-macos10.12 -mmacosx-version-min=10.12 -o niimathX86
 strip ./niimathX86
 
 # Compile ARM
-gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -lm -lz  -target arm64-apple-macos11 -mmacosx-version-min=11.0 -o niimathARM
+gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_CONFORM -DHAVE_BMP niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c -lm -lz  -target arm64-apple-macos11 -mmacosx-version-min=11.0 -o niimathARM
 strip ./niimathARM
 
 # Create the universal binary

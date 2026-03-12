@@ -40,7 +40,7 @@ static uint8_t *compute_automask(const float *data, int nvox) {
 		if (data[i] > 0.0f) npos++;
 	if (npos < 100) return mask;
 	float *vals = (float *)malloc(npos * sizeof(float));
-	if (!vals) return mask;
+	if (!vals) { free(mask); return NULL; }
 	for (int i = 0, j = 0; i < nvox; i++)
 		if (data[i] > 0.0f) vals[j++] = data[i];
 	qsort(vals, npos, sizeof(float), cmp_float);

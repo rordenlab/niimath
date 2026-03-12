@@ -1,7 +1,9 @@
 
 The following files are from different authors and have their own licenses
 
-niftilib (updated to support NIfTI 2) and znzlib are public domain
+NIfTI I/O code (nifti_io.c/nifti_io.h, consolidated from niftilib and znzlib) is public domain,
+based on work by Robert W Cox, Mark Jenkinson, Rick Reynolds, and Chris Rorden.
+Original sources:
   https://nifti.nimh.nih.gov/pub/dist/src/nifti2/
   http://sourceforge.net/projects/niftilib/files/latest/download
 
@@ -22,6 +24,10 @@ On January 7, 2020 Matthew Webster said that direct copies of the fslmaths text 
 This code was written without access to fslmaths routines, and is largely based on reverse engineering. Over the years, the fsl team has done an outstanding job of describing their algorithms on the jiscmail website. In a couple instances, no public data was available to describe the algorithms, and Taylor Hanayik from the FSL group was gracious enough to write psuedo-code that allowed accurate emulation of the fslmaths functions.
 
 The project can optionally be compiled with tensor decomposition code by Daniel Glen (2004). This was developed at the US National Institutes of Health and is not copyrighted but is provided with permission from the author.
+  https://github.com/afni/afni
+
+The project includes unifize.c for bias field correction, adapted from AFNI's 3dUnifize.
+This code is public domain and was developed at the US National Institutes of Health.
   https://github.com/afni/afni
 
 The rest of the code was written by Chris Rorden (2020) and is distributed using the 2-Clause BSD license. 

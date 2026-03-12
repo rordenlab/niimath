@@ -52,6 +52,7 @@ mkdir build && cd build && cmake .. && make
   - **core32.c** — `#define DT32` + `#include "coreFLT.c"` → float32 with SSE 4-wide SIMD
   - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
+- **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
 
 ### Mesh code (nii2mesh — unique to niimath, not in FSL)
 - **meshify.c** — Main mesh pipeline: smoothing → marching cubes → vertex welding → degenerate removal → export
@@ -72,8 +73,7 @@ mkdir build && cd build && cmake .. && make
 - **base64.c** — Base64 encoding for GIfTI export
 
 ### External/vendored libraries
-- **niftilib/** — NIfTI 1/2 format I/O (public domain, ~9.5k lines)
-- **znzlib/** — zlib wrapper for compressed NIfTI
+- **nifti_io.c/nifti_io.h** — Consolidated NIfTI 1/2 format I/O with integrated zlib wrapper (public domain, ~1.9k lines; replaces niftilib and znzlib)
 - **spng.c** — PNG encoder library (~7k lines)
 - **sse2neon.h** — SSE→NEON SIMD translation for ARM (~228k)
 
@@ -82,7 +82,7 @@ mkdir build && cd build && cmake .. && make
 - Heap allocations use `calloc()`/`malloc()` paired with `free()`
 - SIMD-aligned allocations: `_mm_malloc(size, 64)` / `_mm_free()`
 - Kernel arrays: 4-int-per-voxel layout (offset, x, y, weight) with 64-byte alignment
-- NIfTI images: managed by `nifti_image_free()` from niftilib
+- NIfTI images: managed by `nifti_image_free()` from nifti_io
 - MarchingCubes.c: constructor/destructor pattern (`MarchingCubes()`/`FreeMarchingCubes()`) with `clean_all()` helper
 
 ## Testing & Benchmarking

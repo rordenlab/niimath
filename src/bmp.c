@@ -6,7 +6,7 @@
 
 #include "filter.h"
 #include <math.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

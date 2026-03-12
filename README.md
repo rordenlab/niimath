@@ -72,7 +72,7 @@ Advanced users using the `Makefile` may want to run `CF=1 OMP=1 make -j` to make
 For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
 
 ```
-cl /Feniimath niimath.c core.c tensor.c bwlabel.c bw.c core32.c core64.c fdr.c meshify.c MarchingCubes.c quadric.c base64.c radixsort.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -DNII2MESH
+cl /Feniimath niimath.c core.c tensor.c bwlabel.c bw.c core32.c core64.c fdr.c meshify.c MarchingCubes.c quadric.c base64.c radixsort.c unifize.c nifti_io.c -DNII2MESH
 ```
 
 Simply running `make` in the `src` folder should compile niimath on Linux. This should work regardless of if you use the Clang/LLVM or gcc compiler. However, the resulting executable will only work with specific versions of Linux. If you want to make a universal Linux release you can use [holy-build-box](https://github.com/FooBarWidget/holy-build-box). Be aware that this uses an old version of the gcc compiler (4.8.5), so the resulting performance may not be optimized for your system.
