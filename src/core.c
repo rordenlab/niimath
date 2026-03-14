@@ -197,17 +197,23 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	//nim->dim[0] = 3;
 	//nim->dim[4] = 1;
 	int isGz = 0;
+	int isZst = 0;
 	int isNifti2 = 0;
 	if ((value != NULL) && strstr(value, nii2Key))
 		isNifti2 = 1; //NIFTI2_GZ, NIFTI2_PAIR_GZ, NIFTI_GZ, NIFTI_PAIR_GZ
+#ifdef HAVE_ZSTD
+	if ((value != NULL) && strstr(value, "ZST"))
+		isZst = 1; //NIFTI_ZST, NIFTI2_ZST
+#endif
 #ifdef HAVE_ZLIB // if compression is requested, make sure of suffix
-	if ((value == NULL) || strstr(value, gzKey))
+	if (!isZst && ((value == NULL) || strstr(value, gzKey)))
 		isGz = 1; //NIFTI2_GZ, NIFTI2_PAIR_GZ, NIFTI_GZ, NIFTI_PAIR_GZ
 	if (gzMode == GZ_FALSE)
 		isGz = 0;
 	if (gzMode == GZ_TRUE)
 		isGz = 1;
 #endif
+	char extzst[5] = ".zst";
 	if ((value != NULL) && strstr(value, pairKey)) {
 		strcat(hname, exthdr);
 		strcat(iname, extimg);
@@ -225,7 +231,10 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 			nim->nifti_type = NIFTI_FTYPE_NIFTI2_1;
 		else
 			nim->nifti_type = NIFTI_FTYPE_NIFTI1_1;
-		if (isGz) {
+		if (isZst) {
+			strcat(hname, extzst);
+			strcat(iname, extzst);
+		} else if (isGz) {
 			strcat(hname, extgz);
 			strcat(iname, extgz);
 		}

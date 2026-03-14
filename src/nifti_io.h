@@ -458,7 +458,7 @@ void         nifti_image_infodump(const nifti_image *nim);
 char        *nifti_find_file_extension(const char *name);
 int          nifti_set_filenames(nifti_image *nim, const char *prefix,
                                  int check, int set_byte_order);
-int          nifti_is_gzfile(const char *fname);
+int          nifti_is_gzfile(const char *fname); /* 0=none, 1=gzip(.gz), 2=zstd(.zst) */
 void         nifti_datatype_sizes(int datatype, int *nbyper, int *swapsize);
 int          nifti_short_order(void);
 int          nifti_compiled_with_zlib(void);

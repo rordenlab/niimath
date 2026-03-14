@@ -21,22 +21,135 @@
 #ifdef HAVE_ZLIB
   #include <zlib.h>
 #endif
+#ifdef HAVE_ZSTD
+  #include <zstd.h>
+#endif
 
 /* compile-time flags from Makefile */
 /* FSLSTYLE, PIGZ, REJECT_COMPLEX are set externally */
 
 /*========== Internal file I/O abstraction (replaces znzlib) ==========*/
 
-/* A minimal file handle that wraps FILE* and optionally gzFile */
+/* Compression types for NIIFILE */
+#define NII_COMPRESS_NONE 0
+#define NII_COMPRESS_GZ   1
+#define NII_COMPRESS_ZST  2
+
+/* A minimal file handle that wraps FILE* and optionally gzFile.
+   For zstd: decompresses to tmpfile on open, compresses from tmpfile on close.
+   All intermediate I/O goes through the standard FILE* path. */
 typedef struct {
    FILE  *nzfptr;
 #ifdef HAVE_ZLIB
    gzFile zfptr;
 #endif
-   int    withz;
+   int    withz;        /* NII_COMPRESS_NONE, NII_COMPRESS_GZ, or NII_COMPRESS_ZST */
+#ifdef HAVE_ZSTD
+   char  *zst_fname;    /* target filename for zstd write (deferred compression) */
+#endif
 } *NIIFILE;
 
 #define ZNZ_MAX_BLOCK_SIZE (1<<30)
+
+/* Detect compression type from filename extension */
+static int nii_compression_type(const char *fname)
+{
+   if (!fname) return NII_COMPRESS_NONE;
+   int len = (int)strlen(fname);
+#ifdef HAVE_ZSTD
+   if (len >= 4 && (strcmp(fname + len - 4, ".zst") == 0 ||
+                    strcmp(fname + len - 4, ".ZST") == 0))
+      return NII_COMPRESS_ZST;
+#endif
+#ifdef HAVE_ZLIB
+   if (len >= 3 && (strcmp(fname + len - 3, ".gz") == 0 ||
+                    strcmp(fname + len - 3, ".GZ") == 0))
+      return NII_COMPRESS_GZ;
+#endif
+   return NII_COMPRESS_NONE;
+}
+
+#ifdef HAVE_ZSTD
+/* Decompress a .zst file into a tmpfile, return the tmpfile handle */
+static FILE *zst_decompress_to_tmpfile(const char *path)
+{
+   FILE *fin = fopen(path, "rb");
+   if (!fin) return NULL;
+   fseek(fin, 0, SEEK_END);
+   long csize = ftell(fin);
+   fseek(fin, 0, SEEK_SET);
+   if (csize <= 0) { fclose(fin); return NULL; }
+
+   char *cbuf = (char *)malloc(csize);
+   if (!cbuf) { fclose(fin); return NULL; }
+   if (fread(cbuf, 1, csize, fin) != (size_t)csize) { free(cbuf); fclose(fin); return NULL; }
+   fclose(fin);
+
+   unsigned long long dsize = ZSTD_getFrameContentSize(cbuf, csize);
+   if (dsize == ZSTD_CONTENTSIZE_ERROR) {
+      fprintf(stderr, "** zstd: corrupt frame in '%s'\n", path);
+      free(cbuf); return NULL;
+   }
+   if (dsize == ZSTD_CONTENTSIZE_UNKNOWN)
+      dsize = (unsigned long long)csize * 8; /* estimate; will retry if too small */
+
+   char *dbuf = (char *)malloc(dsize);
+   if (!dbuf) { free(cbuf); return NULL; }
+
+   size_t result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
+   /* If buffer was too small (unknown size case), retry with larger buffer */
+   while (ZSTD_isError(result) && ZSTD_getErrorCode(result) == ZSTD_error_dstSize_tooSmall && dsize < (unsigned long long)csize * 256) {
+      dsize *= 2;
+      char *newbuf = (char *)realloc(dbuf, dsize);
+      if (!newbuf) { free(dbuf); free(cbuf); return NULL; }
+      dbuf = newbuf;
+      result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
+   }
+   free(cbuf);
+   if (ZSTD_isError(result)) {
+      fprintf(stderr, "** zstd decompression error: %s\n", ZSTD_getErrorName(result));
+      free(dbuf); return NULL;
+   }
+
+   FILE *tmpf = tmpfile();
+   if (!tmpf) { free(dbuf); return NULL; }
+   fwrite(dbuf, 1, result, tmpf);
+   free(dbuf);
+   rewind(tmpf);
+   return tmpf;
+}
+
+/* Compress tmpfile contents to a .zst file */
+static int zst_compress_from_tmpfile(FILE *tmpf, const char *path)
+{
+   fseek(tmpf, 0, SEEK_END);
+   long dsize = ftell(tmpf);
+   fseek(tmpf, 0, SEEK_SET);
+   if (dsize <= 0) return -1;
+
+   char *dbuf = (char *)malloc(dsize);
+   if (!dbuf) return -1;
+   if (fread(dbuf, 1, dsize, tmpf) != (size_t)dsize) { free(dbuf); return -1; }
+
+   size_t cbound = ZSTD_compressBound(dsize);
+   char *cbuf = (char *)malloc(cbound);
+   if (!cbuf) { free(dbuf); return -1; }
+
+   size_t csize = ZSTD_compress(cbuf, cbound, dbuf, dsize, 3); /* level 3: fast */
+   free(dbuf);
+   if (ZSTD_isError(csize)) {
+      fprintf(stderr, "** zstd compression error: %s\n", ZSTD_getErrorName(csize));
+      free(cbuf); return -1;
+   }
+
+   FILE *fout = fopen(path, "wb");
+   if (!fout) { free(cbuf); return -1; }
+   fwrite(cbuf, 1, csize, fout);
+   fclose(fout);
+   free(cbuf);
+   return 0;
+}
+#endif /* HAVE_ZSTD */
 
 static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
 {
@@ -50,9 +163,25 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
       return f;
    }
 
+#ifdef HAVE_ZSTD
+   if (nii_compression_type(path) == NII_COMPRESS_ZST) {
+      f->withz = NII_COMPRESS_ZST;
+      if (mode[0] == 'r') {
+         f->nzfptr = zst_decompress_to_tmpfile(path);
+         if (!f->nzfptr) { free(f); return NULL; }
+      } else {
+         /* Deferred write: buffer to tmpfile, compress on close */
+         f->zst_fname = nifti_strdup(path);
+         f->nzfptr = tmpfile();
+         if (!f->nzfptr || !f->zst_fname) { free(f->zst_fname); free(f); return NULL; }
+      }
+      return f;
+   }
+#endif
+
 #ifdef HAVE_ZLIB
-   if (use_gz) {
-      f->withz = 1;
+   if (use_gz == 1) {
+      f->withz = NII_COMPRESS_GZ;
       f->zfptr = gzopen(path, mode);
       if (!f->zfptr) { free(f); return NULL; }
       return f;
@@ -70,6 +199,22 @@ static int nii_close(NIIFILE *fp)
 {
    int ret = 0;
    if (!fp || !*fp) return 0;
+#ifdef HAVE_ZSTD
+   if ((*fp)->withz == NII_COMPRESS_ZST && (*fp)->zst_fname) {
+      /* Deferred zstd write: compress tmpfile contents to target */
+      ret = zst_compress_from_tmpfile((*fp)->nzfptr, (*fp)->zst_fname);
+      fclose((*fp)->nzfptr);
+      free((*fp)->zst_fname);
+      free(*fp); *fp = NULL;
+      return ret;
+   }
+   if ((*fp)->withz == NII_COMPRESS_ZST) {
+      /* zstd read: just close the tmpfile */
+      if ((*fp)->nzfptr) fclose((*fp)->nzfptr);
+      free(*fp); *fp = NULL;
+      return 0;
+   }
+#endif
 #ifdef HAVE_ZLIB
    if ((*fp)->zfptr) { ret = gzclose((*fp)->zfptr); }
    else
@@ -498,10 +643,14 @@ static int make_uppercase(char *str)
 
 /*========== File name utilities ==========*/
 
+/* Returns compression type: 0=none, 1=gzip, 2=zstd */
 int nifti_is_gzfile(const char *fname)
 {
    if (!fname) return 0;
    int len = (int)strlen(fname);
+#ifdef HAVE_ZSTD
+   if (len >= 4 && fileext_compare(fname + len - 4, ".zst") == 0) return 2;
+#endif
    if (len < 3) return 0;
    if (fileext_compare(fname + len - 3, ".gz") == 0) {
 #ifdef HAVE_ZLIB
@@ -516,13 +665,14 @@ int nifti_is_gzfile(const char *fname)
 char *nifti_find_file_extension(const char *name)
 {
    const char *ext;
-   char extcopy[8];
+   char extcopy[10];
    int len;
-   char extnii[8] = ".nii";
-   char exthdr[8] = ".hdr";
-   char extimg[8] = ".img";
-   char extnia[8] = ".nia";
-   char extgz[4]  = ".gz";
+   char extnii[10] = ".nii";
+   char exthdr[10] = ".hdr";
+   char extimg[10] = ".img";
+   char extnia[10] = ".nia";
+   char extgz[5]  = ".gz";
+   char extzst[5] = ".zst";
    char *elist[4] = { NULL, NULL, NULL, NULL };
 
    elist[0] = extnii; elist[1] = exthdr; elist[2] = extimg; elist[3] = extnia;
@@ -532,7 +682,7 @@ char *nifti_find_file_extension(const char *name)
    if (len < 4) return NULL;
 
    ext = name + len - 4;
-   strcpy(extcopy, ext);
+   strncpy(extcopy, ext, 9); extcopy[9] = '\0';
    make_lowercase(extcopy);  /* always allow uppercase extensions */
 
    if (compare_strlist(extcopy, elist, 4) >= 0) {
@@ -541,14 +691,38 @@ char *nifti_find_file_extension(const char *name)
    }
 
 #ifdef HAVE_ZLIB
-   if (len < 7) return NULL;
-   ext = name + len - 7;
-   strcpy(extcopy, ext);
-   make_lowercase(extcopy);
-   strcat(elist[0], extgz); strcat(elist[1], extgz); strcat(elist[2], extgz);
-   if (compare_strlist(extcopy, elist, 3) >= 0) {
-      if (is_mixedcase(ext)) return NULL;
-      return (char *)ext;
+   if (len >= 7) {
+      char gzlist[3][10];
+      char *gzp[3];
+      strcpy(gzlist[0], ".nii"); strcat(gzlist[0], extgz);
+      strcpy(gzlist[1], ".hdr"); strcat(gzlist[1], extgz);
+      strcpy(gzlist[2], ".img"); strcat(gzlist[2], extgz);
+      gzp[0] = gzlist[0]; gzp[1] = gzlist[1]; gzp[2] = gzlist[2];
+      ext = name + len - 7;
+      strncpy(extcopy, ext, 9); extcopy[9] = '\0';
+      make_lowercase(extcopy);
+      if (compare_strlist(extcopy, gzp, 3) >= 0) {
+         if (is_mixedcase(ext)) return NULL;
+         return (char *)ext;
+      }
+   }
+#endif
+
+#ifdef HAVE_ZSTD
+   if (len >= 8) {
+      char zstlist[3][10];
+      char *zstp[3];
+      strcpy(zstlist[0], ".nii"); strcat(zstlist[0], extzst);
+      strcpy(zstlist[1], ".hdr"); strcat(zstlist[1], extzst);
+      strcpy(zstlist[2], ".img"); strcat(zstlist[2], extzst);
+      zstp[0] = zstlist[0]; zstp[1] = zstlist[1]; zstp[2] = zstlist[2];
+      ext = name + len - 8;
+      strncpy(extcopy, ext, 9); extcopy[9] = '\0';
+      make_lowercase(extcopy);
+      if (compare_strlist(extcopy, zstp, 3) >= 0) {
+         if (is_mixedcase(ext)) return NULL;
+         return (char *)ext;
+      }
    }
 #endif
 
@@ -584,6 +758,7 @@ static char *nifti_findhdrname(const char *fname)
    const char *ext;
    char elist[2][5] = { ".hdr", ".nii" };
    char extzip[4] = ".gz";
+   char extzst[5] = ".zst";
    int efirst = 1;
    int eisupper = 0;
 
@@ -604,10 +779,11 @@ static char *nifti_findhdrname(const char *fname)
    }
 
    if (eisupper) {
-      make_uppercase(elist[0]); make_uppercase(elist[1]); make_uppercase(extzip);
+      make_uppercase(elist[0]); make_uppercase(elist[1]);
+      make_uppercase(extzip); make_uppercase(extzst);
    }
 
-   hdrname = (char *)calloc(1, strlen(basename) + 8);
+   hdrname = (char *)calloc(1, strlen(basename) + 12);
    if (!hdrname) { free(basename); return NULL; }
 
    strcpy(hdrname, basename);
@@ -633,6 +809,10 @@ static char *nifti_findhdrname(const char *fname)
    strcat(hdrname, extzip);
    if (nifti_fileexists(hdrname)) { free(basename); return hdrname; }
 #endif
+#ifdef HAVE_ZSTD
+   strcpy(hdrname, basename); strcat(hdrname, elist[efirst]); strcat(hdrname, extzst);
+   if (nifti_fileexists(hdrname)) { free(basename); return hdrname; }
+#endif
 
    efirst = 1 - efirst;
    strcpy(hdrname, basename);
@@ -640,6 +820,10 @@ static char *nifti_findhdrname(const char *fname)
    if (nifti_fileexists(hdrname)) { free(basename); return hdrname; }
 #ifdef HAVE_ZLIB
    strcat(hdrname, extzip);
+   if (nifti_fileexists(hdrname)) { free(basename); return hdrname; }
+#endif
+#ifdef HAVE_ZSTD
+   strcpy(hdrname, basename); strcat(hdrname, elist[efirst]); strcat(hdrname, extzst);
    if (nifti_fileexists(hdrname)) { free(basename); return hdrname; }
 #endif
 
@@ -653,17 +837,19 @@ static char *nifti_findimgname(const char *fname, int nifti_type)
    char *basename, *imgname;
    char elist[2][5] = { ".nii", ".img" };
    char extzip[4] = ".gz";
+   char extzst[5] = ".zst";
    const char *ext;
    int first;
 
    if (!nifti_validfilename(fname)) return NULL;
    basename = nifti_makebasename(fname);
-   imgname = (char *)calloc(1, strlen(basename) + 8);
+   imgname = (char *)calloc(1, strlen(basename) + 12);
    if (!imgname) { free(basename); return NULL; }
 
    ext = nifti_find_file_extension(fname);
    if (ext && is_uppercase(ext)) {
-      make_uppercase(elist[0]); make_uppercase(elist[1]); make_uppercase(extzip);
+      make_uppercase(elist[0]); make_uppercase(elist[1]);
+      make_uppercase(extzip); make_uppercase(extzst);
    }
 
    if (nifti_type == NIFTI_FTYPE_NIFTI1_1 || nifti_type == NIFTI_FTYPE_NIFTI2_1)
@@ -678,6 +864,10 @@ static char *nifti_findimgname(const char *fname, int nifti_type)
    strcat(imgname, extzip);
    if (nifti_fileexists(imgname)) { free(basename); return imgname; }
 #endif
+#ifdef HAVE_ZSTD
+   strcpy(imgname, basename); strcat(imgname, elist[first]); strcat(imgname, extzst);
+   if (nifti_fileexists(imgname)) { free(basename); return imgname; }
+#endif
 
    strcpy(imgname, basename);
    strcat(imgname, elist[1 - first]);
@@ -686,28 +876,34 @@ static char *nifti_findimgname(const char *fname, int nifti_type)
    strcat(imgname, extzip);
    if (nifti_fileexists(imgname)) { free(basename); return imgname; }
 #endif
+#ifdef HAVE_ZSTD
+   strcpy(imgname, basename); strcat(imgname, elist[1 - first]); strcat(imgname, extzst);
+   if (nifti_fileexists(imgname)) { free(basename); return imgname; }
+#endif
 
    free(basename);
    free(imgname);
    return NULL;
 }
 
+/* comp: 0=none, 1=gzip(.gz), 2=zstd(.zst) */
 static char *nifti_makehdrname(const char *prefix, int nifti_type, int check, int comp)
 {
    char *iname;
    const char *ext;
    char extnii[5] = ".nii", exthdr[5] = ".hdr", extimg[5] = ".img";
    char extgz[5] = ".gz";
+   char extzst[5] = ".zst";
 
    if (!nifti_validfilename(prefix)) return NULL;
-   iname = (char *)calloc(1, strlen(prefix) + 8);
+   iname = (char *)calloc(1, strlen(prefix) + 12);
    if (!iname) return NULL;
    strcpy(iname, prefix);
 
    if ((ext = nifti_find_file_extension(iname)) != NULL) {
       if (is_uppercase(ext)) {
          make_uppercase(extnii); make_uppercase(exthdr);
-         make_uppercase(extimg); make_uppercase(extgz);
+         make_uppercase(extimg); make_uppercase(extgz); make_uppercase(extzst);
       }
       if (strncmp(ext, extimg, 4) == 0)
          memcpy(&(iname[strlen(iname) - strlen(ext)]), exthdr, 4);
@@ -717,30 +913,34 @@ static char *nifti_makehdrname(const char *prefix, int nifti_type, int check, in
       strcat(iname, exthdr);
 
 #ifdef HAVE_ZLIB
-   if (comp && (!ext || !strstr(iname, extgz))) strcat(iname, extgz);
-#else
-   (void)comp;
+   if (comp == 1 && (!ext || !strstr(iname, extgz))) strcat(iname, extgz);
 #endif
+#ifdef HAVE_ZSTD
+   if (comp == 2 && (!ext || !strstr(iname, extzst))) strcat(iname, extzst);
+#endif
+   if (comp == 0) { /* no-op */ }
    if (check && nifti_fileexists(iname)) { free(iname); return NULL; }
    return iname;
 }
 
+/* comp: 0=none, 1=gzip(.gz), 2=zstd(.zst) */
 static char *nifti_makeimgname(const char *prefix, int nifti_type, int check, int comp)
 {
    char *iname;
    const char *ext;
    char extnii[5] = ".nii", exthdr[5] = ".hdr", extimg[5] = ".img";
    char extgz[5] = ".gz";
+   char extzst[5] = ".zst";
 
    if (!nifti_validfilename(prefix)) return NULL;
-   iname = (char *)calloc(1, strlen(prefix) + 8);
+   iname = (char *)calloc(1, strlen(prefix) + 12);
    if (!iname) return NULL;
    strcpy(iname, prefix);
 
    if ((ext = nifti_find_file_extension(iname)) != NULL) {
       if (is_uppercase(ext)) {
          make_uppercase(extnii); make_uppercase(exthdr);
-         make_uppercase(extimg); make_uppercase(extgz);
+         make_uppercase(extimg); make_uppercase(extgz); make_uppercase(extzst);
       }
       if (strncmp(ext, exthdr, 4) == 0)
          memcpy(&(iname[strlen(iname) - strlen(ext)]), extimg, 4);
@@ -750,10 +950,12 @@ static char *nifti_makeimgname(const char *prefix, int nifti_type, int check, in
       strcat(iname, extimg);
 
 #ifdef HAVE_ZLIB
-   if (comp && (!ext || !strstr(iname, extgz))) strcat(iname, extgz);
-#else
-   (void)comp;
+   if (comp == 1 && (!ext || !strstr(iname, extgz))) strcat(iname, extgz);
 #endif
+#ifdef HAVE_ZSTD
+   if (comp == 2 && (!ext || !strstr(iname, extzst))) strcat(iname, extzst);
+#endif
+   if (comp == 0) { /* no-op */ }
    if (check && nifti_fileexists(iname)) { free(iname); return NULL; }
    return iname;
 }
@@ -1836,7 +2038,7 @@ void nifti_image_write(nifti_image *nim)
 #ifdef PIGZ
 #ifdef HAVE_ZLIB
       if ((nim->nifti_type == NIFTI_FTYPE_NIFTI1_1 || nim->nifti_type == NIFTI_FTYPE_NIFTI2_1)
-          && nifti_is_gzfile(nim->fname)) {
+          && nifti_is_gzfile(nim->fname) == 1) {
          const char *val = getenv("AFNI_COMPRESSOR");
          if (val && strstr(val, "PIGZ")) {
             void *hdr = (nver == 2) ? (void *)&n2hdr : (void *)&n1hdr;

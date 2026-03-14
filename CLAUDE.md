@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-niimath is an open-source clone of FSL's `fslmaths` — a general-purpose NIfTI image calculator for neuroimaging. It extends fslmaths with mesh generation features (nii2mesh), additional filters, and cross-platform support (Linux, macOS, Windows, WebAssembly).
+niimath is an open-source clone of FSL's `fslmaths` — a general-purpose NIfTI image calculator for neuroimaging. It extends fslmaths with mesh generation features (nii2mesh), additional filters, zstd compression (.nii.zst), and cross-platform support (Linux, macOS, Windows, WebAssembly).
 
 **Repository:** `rordenlab/niimath` (BSD-2-Clause license)
 
@@ -18,8 +18,8 @@ make static             # Static binary
 ```
 
 ### Prerequisites
-- **macOS**: `brew install libomp` (required for allineate OpenMP parallelization)
-- **Linux**: OpenMP support is built-in with gcc (`-fopenmp`)
+- **macOS**: `brew install libomp zstd` (libomp for allineate OpenMP, zstd for .nii.zst support)
+- **Linux**: `apt install libzstd-dev` (or equivalent; OpenMP is built-in with gcc)
 
 ### Build variants
 ```bash
@@ -27,6 +27,7 @@ make tiny               # Minimal terminal build (emulates WASM constraints)
 make nano               # Without mesh (nii2mesh) functions
 MESH=0 make             # Disable mesh support
 AL=0 make               # Disable allineate registration
+ZSTD=0 make             # Disable zstd (.nii.zst) compression support
 OMP=1 make              # Enable OpenMP for core ops (requires gcc-9 on macOS)
 CF=1 make               # CloudFlare accelerated zlib
 MC=1 make               # Use new MarchingCubes algorithm (handles ambiguities)
@@ -48,6 +49,7 @@ mkdir build && cd build && cmake .. && make
 - `HAVE_TENSOR` — tensor decomposition
 - `HAVE_CONFORM` — image conforming to standard space
 - `HAVE_ALLINEATE` — affine image registration (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
+- `HAVE_ZSTD` — zstd compression support for .nii.zst files (auto-detected; set `FSLOUTPUTTYPE=NIFTI_ZST` to write)
 - `FSLSTYLE` — FSL-compatible behavior mode
 
 ## Source Architecture
@@ -81,7 +83,7 @@ mkdir build && cd build && cmake .. && make
 - **base64.c** — Base64 encoding for GIfTI export
 
 ### External/vendored libraries
-- **nifti_io.c/nifti_io.h** — Consolidated NIfTI 1/2 format I/O with integrated zlib wrapper (public domain, ~1.9k lines; replaces niftilib and znzlib)
+- **nifti_io.c/nifti_io.h** — Consolidated NIfTI 1/2 format I/O with integrated zlib and optional zstd wrapper (public domain, ~2k lines; replaces niftilib and znzlib)
 - **spng.c** — PNG encoder library (~7k lines)
 - **sse2neon.h** — SSE→NEON SIMD translation for ARM (~228k)
 
