@@ -8,7 +8,17 @@ UFLAGS+= conform.c -DHAVE_CONFORM
 UFLAGS+= unifize.c
 UFLAGS64= -DHAVE_64BITS core64.c
 #Affine registration (from AFNI 3dAllineate, public domain)
-AFLAGS= -DHAVE_ALLINEATE allineate.c powell_newuoa.c
+AFASTMATH= -ffast-math -fno-finite-math-only
+UNAME_S_AL := $(shell uname -s)
+ifeq ($(UNAME_S_AL),Darwin)
+AOMPFLAGS= -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
+AOMPLINK= -L/opt/homebrew/opt/libomp/lib -lomp
+else
+AOMPFLAGS= -fopenmp
+AOMPLINK= -fopenmp
+endif
+AFLAGS= -DHAVE_ALLINEATE $(AOMPLINK)
+ALOBJS= allineate.o powell_newuoa.o
 
 
 #Zlib flags
@@ -55,6 +65,8 @@ endif
 #run "AL=0 make" for compile without allineate registration
 ifeq "$(AL)" "0"
 	AFLAGS=
+	ALOBJS=
+	AOMPLINK=
 endif
 
 UNAME_S := $(shell uname -s)
@@ -64,13 +76,25 @@ ifeq ($(UNAME_S),Darwin)
 	LDFLAGS =
 endif
 
-all:
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(AFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+all: $(ALOBJS)
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
-#issue30: static build 
+allineate.o: allineate.c allineate.h
+	$(CNAME) $(CFLAGS) $(AFASTMATH) $(AOMPFLAGS) -c allineate.c -o allineate.o
+
+powell_newuoa.o: powell_newuoa.c
+	$(CNAME) $(CFLAGS) $(AFASTMATH) $(AOMPFLAGS) -c powell_newuoa.c -o powell_newuoa.o
+
+#allineate source files for non-default targets (compiled directly, not as separate .o)
+ALSRC=
+ifneq "$(AL)" "0"
+ALSRC= allineate.c powell_newuoa.c
+endif
+
+#issue30: static build
 static:
-	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(AFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(LDFLAGS) -flto -o niimath
-	
+	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(AFLAGS) $(AOMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(AOMPLINK) $(LDFLAGS) -flto -o niimath
+
 # tiny: terminal executable to emulate WASM
 tiny:
 	$(CNAME) $(CFLAGS) $(MFLAGS) $(UFLAGS) $(LDFLAGS) $(LDFLAGS) $(ZFLAGS) $(BMPFLAGS) -o niimath
@@ -79,19 +103,17 @@ tiny:
 nano:
 	$(CNAME) $(CFLAGS) $(UFLAGS) $(LDFLAGS) $(LDFLAGS) -o niimath
 
-# debug: CFLAGS = -O0 -g
-# debug: LDFLAGS =
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
-	$(CNAME) $(CFLAGS) $(MFLAGS) $(AFLAGS) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(MFLAGS) $(AFLAGS) $(AOMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(AOMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(MFLAGS) $(AFLAGS) $(UFLAGS) $(ZFLAGS) $(LDFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(MFLAGS) $(AFLAGS) $(AOMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(AOMPLINK) $(LDFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(MFLAGS) $(AFLAGS) $(UFLAGS) $(ZFLAGS) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(MFLAGS) $(AFLAGS) $(AOMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(AOMPLINK) $(LDFLAGS) -o niimath
 
 wasm:
 	emcc -O3 $(MFLAGS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o ../js/src/niimath.js

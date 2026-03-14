@@ -58,14 +58,20 @@ static int calfun_(integer *n, doublereal *x, doublereal *fun);
 static void xreduce(int n, double *x);
 
 /*---------------------------------------------------------------------------*/
-/* Static variables replacing AO_* macros (no OpenMP)                        */
+/* Static variables replacing AO_* macros (thread-local for OpenMP safety)   */
 /*---------------------------------------------------------------------------*/
 
-static int scalx = 0;
+#ifdef _OPENMP
+#define PNL_TLOCAL __thread
+#else
+#define PNL_TLOCAL
+#endif
 
-static double *sxmin_arr = NULL; static int sxmin_arr_len = 0;
-static double *sxsiz_arr = NULL; static int sxsiz_arr_len = 0;
-static double *sx_arr = NULL; static int sx_arr_len = 0;
+static PNL_TLOCAL int scalx = 0;
+
+static PNL_TLOCAL double *sxmin_arr = NULL; static PNL_TLOCAL int sxmin_arr_len = 0;
+static PNL_TLOCAL double *sxsiz_arr = NULL; static PNL_TLOCAL int sxsiz_arr_len = 0;
+static PNL_TLOCAL double *sx_arr = NULL; static PNL_TLOCAL int sx_arr_len = 0;
 
 #define AO_RESIZE_1D(name, sz) \
     do { if(name##_len < (sz)) { free(name); \
@@ -2141,7 +2147,7 @@ L160:
 
 /*---------------------------------------------------------------------------*/
 
-static int verb = 0 ;
+static PNL_TLOCAL int verb = 0 ;
 void powell_set_verbose( int v )
 {  if( verb == v ) return ;
    verb = v;
@@ -2171,7 +2177,7 @@ void powell_set_verbose( int v )
 
 /*! Pointer to user-supplied function that does actual work in calfun_(). */
 
-static double (*userfun)( int n , double *x ) = NULL ;
+static PNL_TLOCAL double (*userfun)( int n , double *x ) = NULL ;
 #define SET_USERFUN(uu) userfun = uu
 #define GET_USERFUN     userfun
 
@@ -2201,7 +2207,7 @@ static void xreduce( int n , double *x )
 /*! Function called by newuoa_();
     goal is to minimize this as a function of x[0..n-1] */
 
-static int calfun_err=0 ;
+static PNL_TLOCAL int calfun_err=0 ;
 
 static int calfun_(integer *n, doublereal *x, doublereal *fun)
 {
@@ -2257,8 +2263,8 @@ static int calfun_(integer *n, doublereal *x, doublereal *fun)
 
 /*---------------------------------------------------------------------------*/
 
-static float mfac = 2.0f ;   /* default number of      */
-static float afac = 3.0f ;   /* sample points is 2*n+3 */
+static PNL_TLOCAL float mfac = 2.0f ;   /* default number of      */
+static PNL_TLOCAL float afac = 3.0f ;   /* sample points is 2*n+3 */
 
 void powell_set_mfac( float mm , float aa )
 {
@@ -2286,7 +2292,7 @@ int powell_newuoa( int ndim , double *x ,
 {
    integer n , npt , icode , maxfun ;
    doublereal rhobeg , rhoend ;
-   static double *w = NULL ; static int w_len = 0 ;
+   static PNL_TLOCAL double *w = NULL ; static PNL_TLOCAL int w_len = 0 ;
 
    /* check inputs */
 
@@ -2322,7 +2328,7 @@ int powell_newuoa( int ndim , double *x ,
 
 /*---------------------------------------------------------------------------*/
 
-static int con_meth = SC_BOX ;
+static PNL_TLOCAL int con_meth = SC_BOX ;
 
 static void powell_newuoa_set_con_box (void){ con_meth = SC_BOX ; }
 static void powell_newuoa_set_con_ball(void){ con_meth = SC_BALL; }
@@ -2346,8 +2352,8 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    integer n , npt , icode , maxfun , ncall=0 ;
    doublereal rhobeg , rhoend ;
    int ii ;
-   static double *x01 = NULL ; static int x01_len = 0 ;
-   static double *w = NULL ; static int w_len = 0 ;
+   static PNL_TLOCAL double *x01 = NULL ; static PNL_TLOCAL int x01_len = 0 ;
+   static PNL_TLOCAL double *w = NULL ; static PNL_TLOCAL int w_len = 0 ;
 
    /* check inputs */
 
@@ -2389,10 +2395,10 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    /*-- do a random search for the best starting vector? --*/
 
    if( nrand > 0 ){
-     static double *xbest = NULL ; static int xbest_len = 0 ;
-     static double *xtest = NULL ; static int xtest_len = 0 ;
+     static PNL_TLOCAL double *xbest = NULL ; static PNL_TLOCAL int xbest_len = 0 ;
+     static PNL_TLOCAL double *xtest = NULL ; static PNL_TLOCAL int xtest_len = 0 ;
      double fbest , ftest ; int qq ;
-     static int seed=1 ;
+     static PNL_TLOCAL int seed=1 ;
      if( seed ){ srand48((long)time(NULL)); seed=0; }
      do { if(xbest_len < (ndim)) { free(xbest); xbest = (double*)calloc((size_t)(ndim),sizeof(double)); xbest_len = (ndim); } } while(0) ;
      do { if(xtest_len < (ndim)) { free(xtest); xtest = (double*)calloc((size_t)(ndim),sizeof(double)); xtest_len = (ndim); } } while(0) ;

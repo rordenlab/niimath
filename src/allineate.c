@@ -11,8 +11,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "nifti_io.h"
 #include "allineate.h"
+
+/* Thread-local storage qualifier for OpenMP safety */
+#ifdef _OPENMP
+#define AL_TLOCAL __thread
+#else
+#define AL_TLOCAL
+#endif
 
 /* Convert nifti_dmat44 (double) to mat44 (float) */
 static mat44 dmat44_to_mat44(nifti_dmat44 d) {
@@ -199,6 +209,14 @@ static GA_setup *gstup = NULL;  /* current setup for optimizer callback */
 
 static int aff_use_before = 0, aff_use_after = 0;
 static mat44 aff_before, aff_after;
+
+/* Thread-local workspace for cost function evaluation (avoids per-call malloc) */
+static AL_TLOCAL float *tl_avm = NULL;
+static AL_TLOCAL int    tl_avm_len = 0;
+static AL_TLOCAL float *tl_wpar = NULL;
+static AL_TLOCAL int    tl_wpar_len = 0;
+static AL_TLOCAL float *tl_wbuf = NULL;  /* holds imw,jmw,kmw contiguously */
+static AL_TLOCAL int    tl_wbuf_len = 0;
 
 /* These are fixed for our minimal affine-only use case */
 #define AL_MATORDER MATORDER_SDU
@@ -882,10 +900,10 @@ static void free_GA_BLOK_set(GA_BLOK_set *gbs)
 /* Shannon entropy function */
 #define SHANENT(z) (((z) <= 0.0f) ? 0.0f : (z)*logf(z))
 
-/* Static global 2D histogram state */
-static float *al_xc = NULL, *al_yc = NULL, *al_xyc = NULL;
-static float al_nww = 0.0f;
-static int al_nbin = 0, al_nbp = 0, al_nbm = 0;
+/* Static 2D histogram state (thread-local for OpenMP safety) */
+static AL_TLOCAL float *al_xc = NULL, *al_yc = NULL, *al_xyc = NULL;
+static AL_TLOCAL float al_nww = 0.0f;
+static AL_TLOCAL int al_nbin = 0, al_nbp = 0, al_nbm = 0;
 static double al_hpow = 0.33333333333;
 
 #undef  XYC
@@ -1230,7 +1248,7 @@ static void al_wfunc_affine(int npar, float *wpar,
                             int npt, float *xi, float *yi, float *zi,
                                      float *xo, float *yo, float *zo)
 {
-    static mat44 gam;
+    static AL_TLOCAL mat44 gam;
     int ii;
 
     if (npar > 0 && wpar != NULL)
@@ -1258,6 +1276,116 @@ static void al_interp(float *far, int nx, int ny, int nz,
     }
 }
 
+/*--- Fused incremental warp + interpolation for all-voxels case ---*/
+/* When processing all base voxels in order, the affine warp is separable:
+   xo = m[0][0]*i + (m[0][1]*j + m[0][2]*k + m[0][3])
+   We compute the row base once per (j,k), then step by m[*][0] per voxel.
+   This eliminates intermediate coordinate arrays and the chunking overhead. */
+static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int anz,
+                                  int bnx, int bny, int bnz, int interp_code,
+                                  float *avm)
+{
+    int nxy_b = bnx * bny;
+    int nxy_a = anx * any;
+    float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
+    int anx1 = anx - 1, any1 = any - 1, anz1 = anz - 1;
+    /* Matrix row vectors: step per i, step per j, step per k, offset */
+    float mx0 = gam.m[0][0], mx1 = gam.m[0][1], mx2 = gam.m[0][2], mx3 = gam.m[0][3];
+    float my0 = gam.m[1][0], my1 = gam.m[1][1], my2 = gam.m[1][2], my3 = gam.m[1][3];
+    float mz0 = gam.m[2][0], mz1 = gam.m[2][1], mz2 = gam.m[2][2], mz3 = gam.m[2][3];
+
+    int npt_total = bnx * bny * bnz;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(npt_total > 100000)
+#endif
+    for (int kk = 0; kk < bnz; kk++) {
+        float bk_x = mx2 * kk + mx3;
+        float bk_y = my2 * kk + my3;
+        float bk_z = mz2 * kk + mz3;
+        int out_base_k = kk * nxy_b;
+
+        for (int jj = 0; jj < bny; jj++) {
+            float bj_x = mx1 * jj + bk_x;
+            float bj_y = my1 * jj + bk_y;
+            float bj_z = mz1 * jj + bk_z;
+            int out_base = out_base_k + jj * bnx;
+
+            for (int ii = 0; ii < bnx; ii++) {
+                float xx = mx0 * ii + bj_x;
+                float yy = my0 * ii + bj_y;
+                float zz = mz0 * ii + bj_z;
+                int idx = out_base + ii;
+
+                /* Bounds check */
+                if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+                    zz < -0.499f || zz > nzh) {
+                    avm[idx] = AL_OUTVAL;
+                    continue;
+                }
+
+                if (interp_code == AL_INTERP_LINEAR) {
+                    float ix = floorf(xx), fx = xx - ix;
+                    float jy = floorf(yy), fy = yy - jy;
+                    float kz = floorf(zz), fz = zz - kz;
+                    int ix_00 = (int)ix, ix_p1 = ix_00 + 1;
+                    int jy_00 = (int)jy, jy_p1 = jy_00 + 1;
+                    int kz_00 = (int)kz, kz_p1 = kz_00 + 1;
+                    CLIP(ix_00, anx1); CLIP(ix_p1, anx1);
+                    CLIP(jy_00, any1); CLIP(jy_p1, any1);
+                    CLIP(kz_00, anz1); CLIP(kz_p1, anz1);
+                    float wt_00 = 1.0f - fx, wt_p1 = fx;
+#undef  XINTF
+#define XINTF(j,k) wt_00*aim[(ix_00)+(j)*anx+(k)*nxy_a]+wt_p1*aim[(ix_p1)+(j)*anx+(k)*nxy_a]
+                    float f_j00_k00 = XINTF(jy_00, kz_00);
+                    float f_jp1_k00 = XINTF(jy_p1, kz_00);
+                    float f_j00_kp1 = XINTF(jy_00, kz_p1);
+                    float f_jp1_kp1 = XINTF(jy_p1, kz_p1);
+                    float wt_y0 = 1.0f - fy, wt_y1 = fy;
+                    float f_k00 = wt_y0 * f_j00_k00 + wt_y1 * f_jp1_k00;
+                    float f_kp1 = wt_y0 * f_j00_kp1 + wt_y1 * f_jp1_kp1;
+                    avm[idx] = (1.0f - fz) * f_k00 + fz * f_kp1;
+                } else { /* AL_INTERP_CUBIC */
+                    int cix = (int)floorf(xx); float cfx = xx - cix;
+                    int cjy = (int)floorf(yy); float cfy = yy - cjy;
+                    int ckz = (int)floorf(zz); float cfz = zz - ckz;
+                    if (ISTINY(cfx) && ISTINY(cfy) && ISTINY(cfz)) {
+                        CLIP(cix, anx1); CLIP(cjy, any1); CLIP(ckz, anz1);
+                        avm[idx] = aim[cix + cjy * anx + ckz * nxy_a];
+                        continue;
+                    }
+                    int cix_m1 = cix-1, cix_00 = cix, cix_p1 = cix+1, cix_p2 = cix+2;
+                    CLIP(cix_m1, anx1); CLIP(cix_00, anx1); CLIP(cix_p1, anx1); CLIP(cix_p2, anx1);
+                    int cjy_m1 = cjy-1, cjy_00 = cjy, cjy_p1 = cjy+1, cjy_p2 = cjy+2;
+                    CLIP(cjy_m1, any1); CLIP(cjy_00, any1); CLIP(cjy_p1, any1); CLIP(cjy_p2, any1);
+                    int ckz_m1 = ckz-1, ckz_00 = ckz, ckz_p1 = ckz+1, ckz_p2 = ckz+2;
+                    CLIP(ckz_m1, anz1); CLIP(ckz_00, anz1); CLIP(ckz_p1, anz1); CLIP(ckz_p2, anz1);
+                    float cwx_m1 = P_M1(cfx), cwx_00 = P_00(cfx), cwx_p1 = P_P1(cfx), cwx_p2 = P_P2(cfx);
+#undef  XINTC
+#define XINTC(j,k) cwx_m1*aim[(cix_m1)+(j)*anx+(k)*nxy_a]+cwx_00*aim[(cix_00)+(j)*anx+(k)*nxy_a]\
+                   +cwx_p1*aim[(cix_p1)+(j)*anx+(k)*nxy_a]+cwx_p2*aim[(cix_p2)+(j)*anx+(k)*nxy_a]
+                    float f_jm1_km1=XINTC(cjy_m1,ckz_m1), f_j00_km1=XINTC(cjy_00,ckz_m1);
+                    float f_jp1_km1=XINTC(cjy_p1,ckz_m1), f_jp2_km1=XINTC(cjy_p2,ckz_m1);
+                    float f_jm1_k00=XINTC(cjy_m1,ckz_00), f_j00_k00=XINTC(cjy_00,ckz_00);
+                    float f_jp1_k00=XINTC(cjy_p1,ckz_00), f_jp2_k00=XINTC(cjy_p2,ckz_00);
+                    float f_jm1_kp1=XINTC(cjy_m1,ckz_p1), f_j00_kp1=XINTC(cjy_00,ckz_p1);
+                    float f_jp1_kp1=XINTC(cjy_p1,ckz_p1), f_jp2_kp1=XINTC(cjy_p2,ckz_p1);
+                    float f_jm1_kp2=XINTC(cjy_m1,ckz_p2), f_j00_kp2=XINTC(cjy_00,ckz_p2);
+                    float f_jp1_kp2=XINTC(cjy_p1,ckz_p2), f_jp2_kp2=XINTC(cjy_p2,ckz_p2);
+                    float cwy_m1=P_M1(cfy), cwy_00=P_00(cfy), cwy_p1=P_P1(cfy), cwy_p2=P_P2(cfy);
+                    float f_km1 = cwy_m1*f_jm1_km1+cwy_00*f_j00_km1+cwy_p1*f_jp1_km1+cwy_p2*f_jp2_km1;
+                    float f_k00 = cwy_m1*f_jm1_k00+cwy_00*f_j00_k00+cwy_p1*f_jp1_k00+cwy_p2*f_jp2_k00;
+                    float f_kp1 = cwy_m1*f_jm1_kp1+cwy_00*f_j00_kp1+cwy_p1*f_jp1_kp1+cwy_p2*f_jp2_kp1;
+                    float f_kp2 = cwy_m1*f_jm1_kp2+cwy_00*f_j00_kp2+cwy_p1*f_jp1_kp2+cwy_p2*f_jp2_kp2;
+                    float cwz_m1=P_M1(cfz), cwz_00=P_00(cfz), cwz_p1=P_P1(cfz), cwz_p2=P_P2(cfz);
+                    avm[idx] = P_FACTOR * (cwz_m1*f_km1 + cwz_00*f_k00 + cwz_p1*f_kp1 + cwz_p2*f_kp2);
+                }
+            }
+        }
+    }
+}
+#undef XINTF
+#undef XINTC
+
 /*--- Get warped target values at control points (or all points) ---*/
 static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
 {
@@ -1268,7 +1396,13 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
     float *aim;
 
     npar = gstup->wfunc_numpar;
-    wpar = (float *)calloc(npar, sizeof(float));
+    /* Reuse thread-local wpar buffer */
+    if (tl_wpar_len < npar) {
+        free(tl_wpar);
+        tl_wpar = (float *)malloc(npar * sizeof(float));
+        tl_wpar_len = npar;
+    }
+    wpar = tl_wpar;
     if (!wpar) return;
     nper = NPER;
 
@@ -1288,6 +1422,27 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
             wpar[ii] = gstup->wfunc_param[ii].val_out;
     }
 
+    /* Fast path: all voxels in order — use fused incremental warp+interp */
+    if (gstup->im_ar == NULL && mpar != NULL &&
+        gstup->wfunc == al_wfunc_affine &&
+        (gstup->interp_code == AL_INTERP_LINEAR || gstup->interp_code == AL_INTERP_CUBIC)) {
+        /* GA_setup_affine already applies aff_before/aff_after internally */
+        mat44 gam = GA_setup_affine(npar, wpar);
+        aim = (gstup->ajims != NULL) ? gstup->ajims : gstup->ajim;
+        GA_warp_interp_fused(gam, aim, gstup->anx, gstup->any, gstup->anz,
+                              gstup->bnx, gstup->bny, gstup->bnz,
+                              gstup->interp_code, avm);
+        /* Clip for cubic */
+        if (gstup->interp_code == AL_INTERP_CUBIC) {
+            npt = gstup->bnx * gstup->bny * gstup->bnz;
+            float bb = gstup->ajbot, tt = gstup->ajtop;
+            for (pp = 0; pp < npt; pp++)
+                if (avm[pp] < bb) avm[pp] = bb;
+                else if (avm[pp] > tt) avm[pp] = tt;
+        }
+        return;
+    }
+
     /* Space for control points */
     if (mpar == NULL || gstup->im_ar == NULL) {
         npt = gstup->bnx * gstup->bny * gstup->bnz;
@@ -1300,13 +1455,20 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
         nall = (nper < npt) ? nper : npt;
     }
 
-    imw = (float *)calloc(nall, sizeof(float));
-    jmw = (float *)calloc(nall, sizeof(float));
-    kmw = (float *)calloc(nall, sizeof(float));
-    if (!imw || !jmw || !kmw || (imf && (!imf || !jmf || !kmf))) {
-        free(imf); free(jmf); free(kmf); free(imw); free(jmw); free(kmw);
-        free(wpar); return;
+    /* Reuse thread-local warp buffer (holds imw,jmw,kmw contiguously) */
+    if (tl_wbuf_len < nall * 3) {
+        free(tl_wbuf);
+        tl_wbuf = (float *)malloc(nall * 3 * sizeof(float));
+        tl_wbuf_len = nall * 3;
     }
+    int alloc_ijk = (mpar == NULL || gstup->im_ar == NULL);
+    if (!tl_wbuf || (alloc_ijk && (!imf || !jmf || !kmf))) {
+        if (alloc_ijk) { free(imf); free(jmf); free(kmf); }
+        return;
+    }
+    imw = tl_wbuf;
+    jmw = tl_wbuf + nall;
+    kmw = tl_wbuf + nall * 2;
 
     nx = gstup->bnx; ny = gstup->bny; nxy = nx * ny;
 
@@ -1341,11 +1503,10 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
                   gstup->interp_code, npp, imw, jmw, kmw, avm + pp);
     }
 
-    free(kmw); free(jmw); free(imw);
+    /* imw/jmw/kmw and wpar are thread-local — not freed per call */
     if (mpar == NULL || gstup->im_ar == NULL) {
         free(kmf); free(jmf); free(imf);
     }
-    free(wpar);
 
     /* Clip interpolated values to source range */
     if (gstup->interp_code == AL_INTERP_CUBIC) {
@@ -1526,22 +1687,26 @@ static double GA_scalar_fitter(int npar, double *mpar)
 {
     double val;
     float *avm, *bvm, *wvm;
+    int npt = gstup->npt_match;
 
-    avm = (float *)calloc(gstup->npt_match, sizeof(float));
+    /* Reuse thread-local buffer instead of per-call malloc/free */
+    if (tl_avm_len < npt) {
+        free(tl_avm);
+        tl_avm = (float *)malloc(npt * sizeof(float));
+        tl_avm_len = npt;
+    }
+    avm = tl_avm;
     if (!avm) return (double)AL_BIGVAL;
+    memset(avm, 0, npt * sizeof(float));
 
     GA_get_warped_values(npar, mpar, avm);
 
     bvm = gstup->bvm;
     wvm = gstup->wvm;
 
-    if (gstup->need_hist_setup) {
-        /* Just set flag to 0; histogram will be built inside costfun */
-        gstup->need_hist_setup = 0;
-    }
+    /* need_hist_setup is read-only here; actual histogram rebuild happens in costfun */
 
     val = GA_scalar_costfun(gstup->match_code, gstup->npt_match, avm, bvm, wvm);
-    free(avm);
     return val;
 }
 
@@ -1795,38 +1960,90 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     twof = 1 << nfr;
     myunif_reset(3456789);
 
+    int ntotal = ngtot + nrand;
     fprintf(stderr, " + Coarse search: %d grid + %d random trials\n", ngtot, nrand);
 
-    for (ii = 0; ii < nrand + ngtot; ii++) {
+    /* Pre-generate all starting parameter sets (sequential — uses RNG) */
+    double *all_wpar = (double *)malloc(ntotal * nfr * sizeof(double));
+    int *all_isrand = (int *)malloc(ntotal * sizeof(int));
+    for (ii = 0; ii < ntotal; ii++) {
+        double *wp = all_wpar + ii * nfr;
         if (ii < ngtot) {
             double kp;
-            val = 0.5 / (ngrid + 1.0); ss = ii;
+            double gval = 0.5 / (ngrid + 1.0);
+            int s = ii;
             for (qq = 0; qq < nfr; qq++) {
-                kk = ss % ngrid; ss = ss / ngrid;
+                kk = s % ngrid; s = s / ngrid;
                 kp = (kk == 0) ? 0.5 : (kk + 1.0);
-                wpar[qq] = 0.5 + kp * val;
+                wp[qq] = 0.5 + kp * gval;
             }
+            all_isrand[ii] = 0;
         } else {
-            for (qq = 0; qq < nfr; qq++) wpar[qq] = 0.5 * (1.05 + 0.90 * myunif());
+            for (qq = 0; qq < nfr; qq++) wp[qq] = 0.5 * (1.05 + 0.90 * myunif());
+            all_isrand[ii] = 1;
+        }
+    }
+
+    /* Ensure blokset is pre-created before parallel region */
+    if (stup->blokset == NULL) {
+        float rad = stup->blokrad, mrad;
+        if (stup->smooth_code > 0 && stup->smooth_radius_base > 0.0f)
+            rad = sqrtf(rad * rad + stup->smooth_radius_base * stup->smooth_radius_base);
+        mrad = 1.2345f * (stup->base_di + stup->base_dj + stup->base_dk);
+        if (rad < mrad) rad = mrad;
+        stup->blokset = create_GA_BLOK_set(
+            stup->bnx, stup->bny, stup->bnz,
+            stup->base_di, stup->base_dj, stup->base_dk,
+            stup->npt_match, stup->im_ar, stup->jm_ar, stup->km_ar,
+            stup->bloktype, rad, stup->blokmin, 1.0f, 0);
+    }
+
+    /* Evaluate all grid+random × reflections in parallel */
+    {
+        long ntasks = (long)ntotal * twof;
+        double *tvals = (double *)malloc(ntasks * sizeof(double));
+        double *tpars = (double *)malloc(ntasks * nfr * sizeof(double));
+        int *tisrand = (int *)malloc(ntasks * sizeof(int));
+
+        /* Pre-generate all reflected parameter sets */
+        for (long idx = 0; idx < ntasks; idx++) {
+            int ti = (int)(idx / twof);
+            int ts = (int)(idx % twof);
+            double *wp = all_wpar + ti * nfr;
+            double *sp = tpars + idx * nfr;
+            for (qq = 0; qq < nfr; qq++)
+                sp[qq] = (ts & (1 << qq)) ? 1.0 - wp[qq] : wp[qq];
+            tisrand[idx] = all_isrand[ti];
         }
 
-        for (ss = 0; ss < twof; ss++) {
-            for (qq = 0; qq < nfr; qq++)
-                spar[qq] = (ss & (1 << qq)) ? 1.0 - wpar[qq] : wpar[qq];
-            val = GA_scalar_fitter(nfr, spar);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 16)
+#endif
+        for (long idx = 0; idx < ntasks; idx++) {
+            double *sp = tpars + idx * nfr;
+            tvals[idx] = GA_scalar_fitter(nfr, sp);
+        }
+
+        /* Insert results into top-K (sequential — fast) */
+        for (long idx = 0; idx < ntasks; idx++) {
+            val = tvals[idx];
+            double *sp = tpars + idx * nfr;
             for (kk = 0; kk < NKEEP; kk++) {
                 if (val < kval[kk]) {
                     for (jj = NKEEP - 2; jj >= kk; jj--) {
                         memcpy(kpar[jj + 1], kpar[jj], sizeof(double) * nfr);
                         kval[jj + 1] = kval[jj]; rval[jj + 1] = rval[jj];
                     }
-                    memcpy(kpar[kk], spar, sizeof(double) * nfr);
-                    kval[kk] = val; rval[kk] = (ii >= ngtot);
+                    memcpy(kpar[kk], sp, sizeof(double) * nfr);
+                    kval[kk] = val; rval[kk] = tisrand[idx];
                     break;
                 }
             }
         }
+
+        free(tisrand); free(tpars); free(tvals);
     }
+    free(all_isrand); free(all_wpar);
 
     for (ngood = kk = 0; kk < NKEEP && kval[kk] < AL_BIGVAL; kk++, ngood++) ;
     if (ngood < 1) {
@@ -1846,10 +2063,30 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     stup->interp_code = AL_INTERP_LINEAR;
     maxstep = 11 * nfr + 17;
     fprintf(stderr, " + Refining %d candidate parameter sets\n", ngood);
+
+    /* Pre-create blokset before parallel region (avoids lazy-init race) */
+    if (stup->blokset == NULL) {
+        float rad2 = stup->blokrad, mrad2;
+        if (stup->smooth_code > 0 && stup->smooth_radius_base > 0.0f)
+            rad2 = sqrtf(rad2 * rad2 + stup->smooth_radius_base * stup->smooth_radius_base);
+        mrad2 = 1.2345f * (stup->base_di + stup->base_dj + stup->base_dk);
+        if (rad2 < mrad2) rad2 = mrad2;
+        stup->blokset = create_GA_BLOK_set(
+            stup->bnx, stup->bny, stup->bnz,
+            stup->base_di, stup->base_dj, stup->base_dk,
+            stup->npt_match, stup->im_ar, stup->jm_ar, stup->km_ar,
+            stup->bloktype, rad2, stup->blokmin, 1.0f, 0);
+    }
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] >= AL_BIGVAL) continue;
         powell_newuoa(nfr, kpar[kk], 0.05, 0.001, maxstep, GA_scalar_fitter);
         kval[kk] = GA_scalar_fitter(nfr, kpar[kk]);
+    }
+    for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] < vbest) { vbest = kval[kk]; jj = kk; }
     }
     stup->vbest = (float)vbest;
@@ -2165,6 +2402,11 @@ static float *nii_to_float(nifti_image *nim)
 
 int nii_allineate(nifti_image *source, nifti_image *base)
 {
+#ifdef _OPENMP
+    /* Limit thread count to balance speed vs memory (each thread ~1-2MB workspace + stack) */
+    int maxthreads = omp_get_max_threads();
+    if (maxthreads > 8) omp_set_num_threads(8);
+#endif
     GA_setup stup;
     GA_param params[12];
     float *bsim, *ajim;   /* base and source float data */
@@ -2414,14 +2656,16 @@ int nii_allineate(nifti_image *source, nifti_image *base)
         }
     }
 
-    /* ========== FINE PASS ========== */
+    /* ========== FINE PASS (two-stage: reduced then full resolution) ========== */
     fprintf(stderr, " + *** Fine pass begins ***\n");
 
-    stup.interp_code = AL_INTERP_CUBIC;
+    /* Stage 1: Reduced resolution with linear interpolation */
+    stup.interp_code = AL_INTERP_LINEAR;
     stup.smooth_code = 0;
     stup.smooth_radius_base = 0.0f;
     stup.smooth_radius_targ = 0.0f;
-    stup.npt_match = nvox_base;
+    stup.npt_match = nvox_base / 4;
+    if (stup.npt_match < 9999) stup.npt_match = 9999;
 
     al_scalar_setup(&stup, 0, 0);
     powell_set_mfac(0.0f, 0.0f);
@@ -2455,10 +2699,24 @@ int nii_allineate(nifti_image *source, nifti_image *base)
         fprintf(stderr, " + Best coarse cost = %f (set #%d)\n", cbest, kb + 1);
     }
 
-    /* Final optimization */
+    /* Fine optimization stage 1: reduced resolution */
     rad = 0.0444;
-    nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
-    fprintf(stderr, " + Fine cost = %f (%d evaluations)\n", stup.vbest, nfunc);
+    nfunc = al_scalar_optim(&stup, rad, 0.002, 3333);
+    fprintf(stderr, " + Fine cost (stage 1, %dpt linear) = %f (%d evaluations)\n",
+            stup.npt_match, stup.vbest, nfunc);
+
+    /* Stage 2: Full resolution with cubic interpolation */
+    for (jj = 0; jj < stup.wfunc_numpar; jj++)
+        stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
+
+    stup.interp_code = AL_INTERP_CUBIC;
+    stup.npt_match = nvox_base;
+    al_scalar_setup(&stup, 0, 0);
+
+    rad = 0.0222;
+    nfunc = al_scalar_optim(&stup, rad, 0.001, 3333);
+    fprintf(stderr, " + Fine cost (stage 2, full cubic) = %f (%d evaluations)\n",
+            stup.vbest, nfunc);
 
     /* --- 11. +ZZ refinal: zero micho weights, re-optimize with pure lpc --- */
     for (jj = 0; jj < stup.wfunc_numpar; jj++)
@@ -2564,6 +2822,10 @@ int nii_allineate(nifti_image *source, nifti_image *base)
     if (smask) free(smask);
     if (stup.bwght) free(stup.bwght);
     clear_2Dhist();
+    /* Free thread-local workspace buffers */
+    free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
+    free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
+    free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
 
     fprintf(stderr, " + Registration complete\n");
     return 0;
