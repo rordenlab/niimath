@@ -320,6 +320,9 @@ int show_help( void ) {
 	printf(" -reslice_mask <mask>     : reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity\n");
 
 #endif
+#ifdef HAVE_ALLINEATE
+	printf(" -allineate <base>        : affine registration to match 'base' using lpc+ZZ cost (from AFNI 3dAllineate)\n");
+#endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");

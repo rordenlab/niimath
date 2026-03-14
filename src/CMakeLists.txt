@@ -46,6 +46,8 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     ADD_DEFINITIONS(-DHAVE_CONFORM)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} unifize.c)
+    ADD_DEFINITIONS(-DHAVE_ALLINEATE)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c)
 
     option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
     if(USE_CLASSIC_CUBES)

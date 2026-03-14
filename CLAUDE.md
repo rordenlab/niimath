@@ -42,6 +42,7 @@ mkdir build && cd build && cmake .. && make
 - `HAVE_BUTTERWORTH` — bandpass temporal filtering
 - `HAVE_TENSOR` — tensor decomposition
 - `HAVE_CONFORM` — image conforming to standard space
+- `HAVE_ALLINEATE` — affine image registration (allineate.c + powell_newuoa.c)
 - `FSLSTYLE` — FSL-compatible behavior mode
 
 ## Source Architecture
@@ -53,6 +54,8 @@ mkdir build && cd build && cmake .. && make
   - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
 - **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
+- **allineate.c** (~2.5k lines) — Affine (12 DOF) image registration with lpc+ZZ cost function, twopass coarse-to-fine optimization (adapted from AFNI 3dAllineate, public domain)
+- **powell_newuoa.c** (~2.8k lines) — Powell's NEWUOA derivative-free optimizer (f2c translation, used by allineate)
 
 ### Mesh code (nii2mesh — unique to niimath, not in FSL)
 - **meshify.c** — Main mesh pipeline: smoothing → marching cubes → vertex welding → degenerate removal → export
@@ -124,6 +127,7 @@ cd src && make sanitize    # Builds with -fsanitize=address
 - **Division by zero** — `add_x/y/z/c_vertex()` (MarchingCubes.c), `vx()` in EDT (coreFLT.c)
 - **Uninitialized fields** — TTriangle structs in quadric.c (switched to calloc)
 - **Dead code** — unreachable `return 1.0` in `calculate_error()` (quadric.c), duplicate `loopi` macro
+- **Allineate registration** — added affine image registration via `-allineate` flag (adapted from AFNI 3dAllineate, public domain; uses lpc+ZZ cost, twopass optimization, NEWUOA optimizer)
 
 **Remaining priority areas:**
 1. **NULL checks** — ~22 malloc/calloc calls in mesh code lack NULL checks (pre-existing)

@@ -24,7 +24,7 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-3dUnifize and tensor are from the AFNI team of Robert W. Cox, et al. and are provided by consent and as allowed by the National Institutes of Health Public Domain Notice found with the AFNI code.
+3dUnifize, 3dAllineate, and tensor are from the AFNI team of Robert W. Cox, et al. and are provided by consent and as allowed by the National Institutes of Health Public Domain Notice found with the AFNI code.
 
 The PolygoniseCube function comes from Cory Bloyd's public domain Marching Cubes Example Program described here http://paulbourke.net/geometry/polygonise/
 

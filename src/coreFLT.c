@@ -81,6 +81,9 @@
 #endif
 
 #include "unifize.h"
+#ifdef HAVE_ALLINEATE
+#include "allineate.h"
+#endif
 #include <stdbool.h>
 // #define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 // #ifdef TFCE //we now use in-built tfce function
@@ -5281,6 +5284,29 @@ staticx int nifti_unifize(nifti_image *nim) {
 #endif
 }
 
+#ifdef HAVE_ALLINEATE
+staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile) {
+#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("allineate: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	nifti_image *base = nifti_image_read(basefile, 1);
+	if (!base) {
+		printfx("** failed to read base image from '%s'\n", basefile);
+		return 1;
+	}
+	int ok = nii_allineate(nim, base);
+	nifti_image_free(base);
+	return ok;
+#else
+	(void)basefile;
+	printfx("'-dt double' does not support allineate\n");
+	return 1;
+#endif
+}
+#endif
+
 #ifdef DT32
 int main32(int argc, char *argv[]) {
 #else
@@ -5895,6 +5921,16 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_erode(nim, iso, dx);
 		} else if (!strcmp(argv[ac], "-unifize"))
 			ok = nifti_unifize(nim);
+#ifdef HAVE_ALLINEATE
+		else if (!strcmp(argv[ac], "-allineate")) {
+			ac++;
+			if (ac >= argc) {
+				printfx("-allineate requires a base image argument\n");
+				goto fail;
+			}
+			ok = nifti_allineate_wrap(nim, argv[ac]);
+		}
+#endif
 		else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-scale01"))
