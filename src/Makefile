@@ -52,6 +52,11 @@ ifeq "$(MESH)" "0"
 	MFLAGS=
 endif
 
+#run "AL=0 make" for compile without allineate registration
+ifeq "$(AL)" "0"
+	AFLAGS=
+endif
+
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)

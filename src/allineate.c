@@ -190,7 +190,6 @@ extern int powell_newuoa_con(int ndim, double *x, double *xbot, double *xtop,
                              int nrand, double rstart, double rend,
                              int maxcall, double (*ufunc)(int, double *));
 extern void powell_set_mfac(float mm, float aa);
-extern void powell_set_verbose(int v);
 
 /*==========================================================================*/
 /*========================== GLOBAL STATE =================================*/
@@ -1497,20 +1496,6 @@ static double GA_scalar_costfun(int meth, int npt,
 
     switch (meth) {
         default:
-        case GA_MATCH_PEARSON_SCALAR:
-            val = (double)al_pearson_corr_wt(npt, avm, bvm, wvm);
-            val = 1.0 - fabs(val);
-            break;
-
-        case GA_MATCH_PEARSON_LOCALS: /* LPC (signed) */
-            val = (double)GA_pearson_local(npt, avm, bvm, wvm);
-            break;
-
-        case GA_MATCH_PEARSON_LOCALA: /* LPA */
-            val = (double)GA_pearson_local(npt, avm, bvm, wvm);
-            val = 1.0 - fabs(val);
-            break;
-
         case GA_MATCH_LPC_MICHO_SCALAR: { /* lpc+ZZ */
             val = (double)GA_pearson_local(npt, avm, bvm, wvm);
             if (gstup->micho_hel != 0.0 || gstup->micho_mi  != 0.0 ||
@@ -2109,6 +2094,24 @@ static void al_setup_befafter(mat44 base_cmat, mat44 base_imat,
     aff_use_before = 1;
     aff_use_after  = 1;
 }
+
+/* Clean up internal macros before the public API section */
+#undef FAR
+#undef CLIP
+#undef ISTINY
+#undef P_M1
+#undef P_00
+#undef P_P1
+#undef P_P2
+#undef P_FACTOR
+#undef FAS
+#undef SHANENT
+#undef XYC
+#undef WAY_BIG
+#undef GOODVAL
+#undef RANGVAL
+#undef WV
+#undef SETPAR
 
 /*==========================================================================*/
 /*================ SECTION 11: PUBLIC FUNCTION nii_allineate() ============*/
