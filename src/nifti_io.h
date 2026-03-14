@@ -413,9 +413,9 @@ typedef struct {
 
 /* Check NIfTI version from magic field */
 #define NIFTI_VERSION(h) \
-   ( (h).magic[0]=='n' && (h).magic[3]=='\0' && \
+   (( (h).magic[0]=='n' && (h).magic[3]=='\0' && \
      ((h).magic[1]=='i' || (h).magic[1]=='+') && \
-     ((h).magic[2]>='1' && (h).magic[2]<='9') ) ? (h).magic[2]-'0' : 0
+     ((h).magic[2]>='1' && (h).magic[2]<='9') ) ? (h).magic[2]-'0' : 0)
 
 /* Check if single file (.nii) */
 #define NIFTI_ONEFILE(h) ((h).magic[1] == '+')
