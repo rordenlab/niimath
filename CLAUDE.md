@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-niimath is an open-source clone of FSL's `fslmaths` — a general-purpose NIfTI image calculator for neuroimaging. It extends fslmaths with mesh generation features (nii2mesh), additional filters, zstd compression (.nii.zst), and cross-platform support (Linux, macOS, Windows, WebAssembly).
+niimath is an open-source clone of FSL's `fslmaths` — a general-purpose NIfTI image calculator for neuroimaging. It extends fslmaths with mesh generation features (nii2mesh), additional filters, defacing (`-deface`), zstd compression (.nii.zst), and cross-platform support (Linux, macOS, Windows, WebAssembly).
 
 **Repository:** `rordenlab/niimath` (BSD-2-Clause license)
 
@@ -48,7 +48,7 @@ mkdir build && cd build && cmake .. && make
 - `HAVE_BUTTERWORTH` — bandpass temporal filtering
 - `HAVE_TENSOR` — tensor decomposition
 - `HAVE_CONFORM` — image conforming to standard space
-- `HAVE_ALLINEATE` — affine image registration (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
+- `HAVE_ALLINEATE` — affine image registration and defacing (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
 - `HAVE_ZSTD` — zstd compression support for .nii.zst files (auto-detected; set `FSLOUTPUTTYPE=NIFTI_ZST` to write)
 - `FSLSTYLE` — FSL-compatible behavior mode
 
@@ -61,7 +61,7 @@ mkdir build && cd build && cmake .. && make
   - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
 - **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
-- **allineate.c** (~2.7k lines) — Affine (12 DOF) image registration with lpc+ZZ cost function, twopass coarse-to-fine optimization (adapted from AFNI 3dAllineate, public domain). OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
+- **allineate.c** (~2.9k lines) — Affine (12 DOF) image registration and defacing. Supports lpc+ZZ, lpa+ZZ, and Hellinger cost functions with twopass coarse-to-fine optimization (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by both `nii_allineate()` and `nii_deface()`. Defacing registers a template to the input, warps a mask to input space, and zeros masked voxels. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
 - **powell_newuoa.c** (~2.8k lines) — Powell's NEWUOA derivative-free optimizer (f2c translation, used by allineate). Thread-safe statics via `__thread` for parallel use.
 
 ### Mesh code (nii2mesh — unique to niimath, not in FSL)
@@ -134,8 +134,9 @@ cd src && make sanitize    # Builds with -fsanitize=address
 - **Division by zero** — `add_x/y/z/c_vertex()` (MarchingCubes.c), `vx()` in EDT (coreFLT.c)
 - **Uninitialized fields** — TTriangle structs in quadric.c (switched to calloc)
 - **Dead code** — unreachable `return 1.0` in `calculate_error()` (quadric.c), duplicate `loopi` macro
-- **Allineate registration** — added affine image registration via `-allineate` flag (adapted from AFNI 3dAllineate, public domain; uses lpc+ZZ cost, twopass optimization, NEWUOA optimizer)
+- **Allineate registration** — added affine image registration via `-allineate` flag (adapted from AFNI 3dAllineate, public domain; uses lpc+ZZ cost, twopass optimization, NEWUOA optimizer). Also supports lpa+ZZ and Hellinger cost functions (used by deface variants).
 - **Allineate optimization** — 2.0-2.3x wall-clock speedup (23-28s → 11-12s on test data). See validate/README.md for detailed benchmarks.
+- **Defacing** — added `-deface`, `-deface-epi`, and `-deface-hel` commands for face removal using template-based affine registration. Three cost modes: lpa+ZZ (cross-modal, default), lpc+ZZ (structural-to-EPI), Hellinger (fast). Refactored registration core into `al_register()` helper shared by allineate and deface.
 
 **Remaining priority areas:**
 1. **NULL checks** — ~22 malloc/calloc calls in mesh code lack NULL checks (pre-existing)
@@ -143,6 +144,8 @@ cd src && make sanitize    # Builds with -fsanitize=address
 3. **Buffer overflows** — fixed-size buffers in save_mesh() (768-char filename limit)
 
 ### Allineate optimization details
+
+Note: The registration core (`al_register()`) is shared between `-allineate` and `-deface`/`-deface-epi`/`-deface-hel`. All optimizations below apply to both code paths.
 
 **Completed optimizations (2.0-2.3x speedup, quality maintained or improved):**
 - **OpenMP parallel coarse search**: Pre-generate all grid+random parameter sets, evaluate 7K+ reflections in parallel. Thread-safe via `__thread` histogram statics, warp matrix, and powell_newuoa.c statics.

@@ -322,6 +322,9 @@ int show_help( void ) {
 #endif
 #ifdef HAVE_ALLINEATE
 	printf(" -allineate <base>        : affine registration to match 'base' using lpc+ZZ cost (from AFNI 3dAllineate)\n");
+	printf(" -deface <tmpl> <mask>    : deface using affine registration of template; lpa+ZZ cost (cross-modal)\n");
+	printf(" -deface-epi <tmpl> <mask>: deface EPI using affine registration of template; lpc+ZZ cost\n");
+	printf(" -deface-hel <tmpl> <mask>: deface using Hellinger cost (fast, cross-modal)\n");
 #endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");

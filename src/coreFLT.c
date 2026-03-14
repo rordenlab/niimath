@@ -5305,6 +5305,34 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile) {
 	return 1;
 #endif
 }
+
+staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, int cost_mode) {
+#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("deface: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
+	if (!tmpl) {
+		printfx("** failed to read template image from '%s'\n", tmplfile);
+		return 1;
+	}
+	nifti_image *mask = nifti_image_read(maskfile, 1);
+	if (!mask) {
+		printfx("** failed to read mask image from '%s'\n", maskfile);
+		nifti_image_free(tmpl);
+		return 1;
+	}
+	int ok = nii_deface(nim, tmpl, mask, cost_mode);
+	nifti_image_free(tmpl);
+	nifti_image_free(mask);
+	return ok;
+#else
+	(void)tmplfile; (void)maskfile; (void)cost_mode;
+	printfx("'-dt double' does not support deface\n");
+	return 1;
+#endif
+}
 #endif
 
 #ifdef DT32
@@ -5929,6 +5957,19 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			}
 			ok = nifti_allineate_wrap(nim, argv[ac]);
+		}
+		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-deface-epi") || !strcmp(argv[ac], "-deface-hel")) {
+			int cost_mode = 0; /* 0=lpa+ZZ, 1=lpc+ZZ, 2=Hellinger */
+			if (!strcmp(argv[ac], "-deface-epi")) cost_mode = 1;
+			else if (!strcmp(argv[ac], "-deface-hel")) cost_mode = 2;
+			ac++;
+			if (ac + 1 >= argc) {
+				printfx("%s requires template and mask arguments\n", argv[ac - 1]);
+				goto fail;
+			}
+			char *tmpl_file = argv[ac]; ac++;
+			char *mask_file = argv[ac];
+			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, cost_mode);
 		}
 #endif
 		else if (!strcmp(argv[ac], "-edt"))

@@ -1518,7 +1518,8 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
 }
 
 /*--- Local Pearson correlation using BLOKs ---*/
-static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm)
+/* use_abs: 0 = signed (lpc), 1 = absolute (lpa) */
+static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm, int use_abs)
 {
     GA_BLOK_set *gbs;
     int nblok, nelm, *elm, dd, ii, jj;
@@ -1581,7 +1582,7 @@ static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm)
         else if (pcor < -CMAX) pcor = -CMAX;
         pcor = logf((1.0f + pcor) / (1.0f - pcor));  /* 2*arctanh */
         pabs = fabsf(pcor);
-        psum += ws * pcor * pabs;
+        psum += use_abs ? ws * pabs * pabs : ws * pcor * pabs;
         wss  += ws;
     }
 
@@ -1656,9 +1657,18 @@ static double GA_scalar_costfun(int meth, int npt,
     double val = 0.0;
 
     switch (meth) {
+        case GA_MATCH_HELLINGER_SCALAR: { /* Hellinger only (fast, cross-modal) */
+            float_quad hmc;
+            hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
+                                   gstup->bsbot, gstup->bsclip, bvm, wvm);
+            val = -(double)hmc.a; /* aligned → hmc.a > 0 → val negative → good for min */
+        } break;
+
         default:
-        case GA_MATCH_LPC_MICHO_SCALAR: { /* lpc+ZZ */
-            val = (double)GA_pearson_local(npt, avm, bvm, wvm);
+        case GA_MATCH_LPC_MICHO_SCALAR: /* lpc+ZZ (signed) */
+        case GA_MATCH_LPA_MICHO_SCALAR: { /* lpa+ZZ (absolute) */
+            int use_abs = (meth == GA_MATCH_LPA_MICHO_SCALAR);
+            val = (double)GA_pearson_local(npt, avm, bvm, wvm, use_abs);
             if (gstup->micho_hel != 0.0 || gstup->micho_mi  != 0.0 ||
                 gstup->micho_nmi != 0.0 || gstup->micho_crA != 0.0) {
                 float_quad hmc;
@@ -2400,18 +2410,23 @@ static float *nii_to_float(nifti_image *nim)
     return fdata;
 }
 
-int nii_allineate(nifti_image *source, nifti_image *base)
+/* Internal: run affine registration, return 12 warp parameters.
+   source: moving image, base: fixed/reference image.
+   match_code: GA_MATCH_LPC_MICHO_SCALAR (lpc+ZZ) or GA_MATCH_LPA_MICHO_SCALAR (lpa+ZZ).
+   wpar_out[12]: filled with optimized affine parameters on success.
+   Returns 0 on success, nonzero on error. */
+static int al_register(nifti_image *source, nifti_image *base,
+                       int match_code, float wpar_out[12])
 {
 #ifdef _OPENMP
-    /* Limit thread count to balance speed vs memory (each thread ~1-2MB workspace + stack) */
     int maxthreads = omp_get_max_threads();
     if (maxthreads > 8) omp_set_num_threads(8);
 #endif
     GA_setup stup;
     GA_param params[12];
-    float *bsim, *ajim;   /* base and source float data */
-    float *wght;           /* autoweight */
-    unsigned char *smask;  /* source automask */
+    float *bsim, *ajim;
+    float *wght;
+    unsigned char *smask;
     int bnx, bny, bnz, anx, any, anz;
     float bdx, bdy, bdz, adx, ady, adz;
     mat44 base_cmat, base_imat, targ_cmat, targ_imat;
@@ -2509,8 +2524,8 @@ int nii_allineate(nifti_image *source, nifti_image *base)
         }
     }
 
-    /* --- 6. Configure lpc+ZZ --- */
-    stup.match_code = GA_MATCH_LPC_MICHO_SCALAR;
+    /* --- 6. Configure cost function --- */
+    stup.match_code = match_code;
     stup.micho_mi  = 0.2;
     stup.micho_nmi = 0.2;
     stup.micho_crA = 0.4;
@@ -2718,96 +2733,43 @@ int nii_allineate(nifti_image *source, nifti_image *base)
     fprintf(stderr, " + Fine cost (stage 2, full cubic) = %f (%d evaluations)\n",
             stup.vbest, nfunc);
 
-    /* --- 11. +ZZ refinal: zero micho weights, re-optimize with pure lpc --- */
-    for (jj = 0; jj < stup.wfunc_numpar; jj++)
-        stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
-    stup.need_hist_setup = 1;
+    /* --- +ZZ refinal: zero micho weights, re-optimize with pure local correlation --- */
+    /* Skip refinal for Hellinger-only (no micho weights to zero) */
+    if (match_code != GA_MATCH_HELLINGER_SCALAR) {
+        for (jj = 0; jj < stup.wfunc_numpar; jj++)
+            stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
+        stup.need_hist_setup = 1;
 
-    /* Zero micho weights for final pure-lpc pass */
-    double save_mi  = stup.micho_mi;
-    double save_nmi = stup.micho_nmi;
-    double save_crA = stup.micho_crA;
-    double save_hel = stup.micho_hel;
-    double save_ov  = stup.micho_ov;
-    stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
+        double save_mi  = stup.micho_mi;
+        double save_nmi = stup.micho_nmi;
+        double save_crA = stup.micho_crA;
+        double save_hel = stup.micho_hel;
+        double save_ov  = stup.micho_ov;
+        stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
 
-    fprintf(stderr, " + +ZZ refinal (pure lpc)\n");
-    rad = 0.0666;
-    powell_set_mfac(4.0f, 4.0f);
-    nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
-    fprintf(stderr, " + Refinal cost = %f (%d evaluations)\n", stup.vbest, nfunc);
+        fprintf(stderr, " + +ZZ refinal (pure %s)\n",
+                match_code == GA_MATCH_LPA_MICHO_SCALAR ? "lpa" : "lpc");
+        rad = 0.0666;
+        powell_set_mfac(4.0f, 4.0f);
+        nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
+        fprintf(stderr, " + Refinal cost = %f (%d evaluations)\n", stup.vbest, nfunc);
 
-    /* Restore micho weights */
-    stup.micho_mi  = save_mi;
-    stup.micho_nmi = save_nmi;
-    stup.micho_crA = save_crA;
-    stup.micho_hel = save_hel;
-    stup.micho_ov  = save_ov;
-
-    /* --- 12. Apply final warp --- */
-    fprintf(stderr, " + Applying final warp with cubic interpolation\n");
-    {
-        float wpar[12];
-        for (jj = 0; jj < 12; jj++)
-            wpar[jj] = stup.wfunc_param[jj].val_out;
-
-        fprintf(stderr, " + Final parameters:");
-        for (jj = 0; jj < 12; jj++) fprintf(stderr, " %.4f", wpar[jj]);
-        fprintf(stderr, "\n");
-
-        float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
-                                          ajim, anx, any, anz,
-                                          bnx, bny, bnz, AL_INTERP_CUBIC);
-        if (warped == NULL) {
-            fprintf(stderr, "allineate: failed to warp image\n");
-            free(bsim); free(ajim);
-            if (wght) free(wght);
-            if (smask) free(smask);
-            if (stup.bmask) free(stup.bmask);
-            if (stup.bsims) free(stup.bsims);
-            if (stup.ajims) free(stup.ajims);
-            if (stup.bvm) free(stup.bvm);
-            if (stup.wvm) free(stup.wvm);
-            if (stup.im_ar) free(stup.im_ar);
-            if (stup.jm_ar) free(stup.jm_ar);
-            if (stup.km_ar) free(stup.km_ar);
-            if (stup.blokset) free_GA_BLOK_set(stup.blokset);
-            clear_2Dhist();
-            return 1;
-        }
-
-        /* --- 13. Replace source->data with warped result, update dims/transforms --- */
-        free(source->data);
-        source->data = warped;
-        source->datatype = DT_FLOAT32;
-        source->nbyper = sizeof(float);
-        source->scl_slope = 0.0f;
-        source->scl_inter = 0.0f;
-        source->nx = bnx; source->ny = bny; source->nz = bnz;
-        source->dx = base->dx; source->dy = base->dy; source->dz = base->dz;
-        source->dim[1] = bnx; source->dim[2] = bny; source->dim[3] = bnz;
-        source->pixdim[1] = base->pixdim[1];
-        source->pixdim[2] = base->pixdim[2];
-        source->pixdim[3] = base->pixdim[3];
-        source->nvox = (size_t)bnx * bny * bnz;
-        source->nbyper = sizeof(float);
-        source->datatype = DT_FLOAT32;
-        /* Copy sform from base */
-        source->sform_code = base->sform_code;
-        source->sto_xyz = base->sto_xyz;
-        source->sto_ijk = base->sto_ijk;
-        source->qform_code = base->qform_code;
-        source->qto_xyz = base->qto_xyz;
-        source->qto_ijk = base->qto_ijk;
-        source->quatern_b = base->quatern_b;
-        source->quatern_c = base->quatern_c;
-        source->quatern_d = base->quatern_d;
-        source->qoffset_x = base->qoffset_x;
-        source->qoffset_y = base->qoffset_y;
-        source->qoffset_z = base->qoffset_z;
+        stup.micho_mi  = save_mi;
+        stup.micho_nmi = save_nmi;
+        stup.micho_crA = save_crA;
+        stup.micho_hel = save_hel;
+        stup.micho_ov  = save_ov;
     }
 
-    /* --- 14. Cleanup --- */
+    /* --- Extract final parameters --- */
+    for (jj = 0; jj < 12; jj++)
+        wpar_out[jj] = stup.wfunc_param[jj].val_out;
+
+    fprintf(stderr, " + Final parameters:");
+    for (jj = 0; jj < 12; jj++) fprintf(stderr, " %.4f", wpar_out[jj]);
+    fprintf(stderr, "\n");
+
+    /* --- Cleanup --- */
     free(bsim);
     free(ajim);
     if (stup.bmask) free(stup.bmask);
@@ -2822,11 +2784,153 @@ int nii_allineate(nifti_image *source, nifti_image *base)
     if (smask) free(smask);
     if (stup.bwght) free(stup.bwght);
     clear_2Dhist();
-    /* Free thread-local workspace buffers */
     free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
     free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
     free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
 
     fprintf(stderr, " + Registration complete\n");
+    return 0;
+}
+
+int nii_allineate(nifti_image *source, nifti_image *base)
+{
+    if (source == NULL || base == NULL) {
+        fprintf(stderr, "allineate: NULL input image\n");
+        return 1;
+    }
+
+    float wpar[12];
+    int ok = al_register(source, base, GA_MATCH_LPC_MICHO_SCALAR, wpar);
+    if (ok) return ok;
+
+    /* Extract source float data for warping */
+    float *ajim = nii_to_float(source);
+    if (!ajim) {
+        fprintf(stderr, "allineate: failed to extract source data for warp\n");
+        return 1;
+    }
+
+    int anx = source->nx, any = source->ny, anz = source->nz;
+    int bnx = base->nx, bny = base->ny, bnz = base->nz;
+
+    /* Apply final warp with cubic interpolation */
+    fprintf(stderr, " + Applying final warp with cubic interpolation\n");
+    float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
+                                      ajim, anx, any, anz,
+                                      bnx, bny, bnz, AL_INTERP_CUBIC);
+    free(ajim);
+    if (warped == NULL) {
+        fprintf(stderr, "allineate: failed to warp image\n");
+        return 1;
+    }
+
+    /* Replace source->data with warped result, update dims/transforms */
+    free(source->data);
+    source->data = warped;
+    source->datatype = DT_FLOAT32;
+    source->nbyper = sizeof(float);
+    source->scl_slope = 0.0f;
+    source->scl_inter = 0.0f;
+    source->nx = bnx; source->ny = bny; source->nz = bnz;
+    source->dx = base->dx; source->dy = base->dy; source->dz = base->dz;
+    source->dim[1] = bnx; source->dim[2] = bny; source->dim[3] = bnz;
+    source->pixdim[1] = base->pixdim[1];
+    source->pixdim[2] = base->pixdim[2];
+    source->pixdim[3] = base->pixdim[3];
+    source->nvox = (size_t)bnx * bny * bnz;
+    source->sform_code = base->sform_code;
+    source->sto_xyz = base->sto_xyz;
+    source->sto_ijk = base->sto_ijk;
+    source->qform_code = base->qform_code;
+    source->qto_xyz = base->qto_xyz;
+    source->qto_ijk = base->qto_ijk;
+    source->quatern_b = base->quatern_b;
+    source->quatern_c = base->quatern_c;
+    source->quatern_d = base->quatern_d;
+    source->qoffset_x = base->qoffset_x;
+    source->qoffset_y = base->qoffset_y;
+    source->qoffset_z = base->qoffset_z;
+
+    return 0;
+}
+
+/* Deface: register template to input, warp mask to input space, zero masked voxels.
+   input: the image to deface (modified in-place, stays in its own space)
+   tmpl: template image (moving image for registration)
+   mask: mask in template space (non-zero = keep, zero = remove face)
+   cost_mode: 0 = lpa+ZZ (cross-modal), 1 = lpc+ZZ (structural-to-EPI), 2 = Hellinger (fast)
+   Returns 0 on success, nonzero on error. */
+int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, int cost_mode)
+{
+    if (input == NULL || tmpl == NULL || mask == NULL) {
+        fprintf(stderr, "deface: NULL input image\n");
+        return 1;
+    }
+    if (input->datatype != DT_FLOAT32) {
+        fprintf(stderr, "deface: input must be DT_FLOAT32 (got %d)\n", input->datatype);
+        return 1;
+    }
+
+    int match_code;
+    const char *cost_name;
+    if (cost_mode == 2) {
+        match_code = GA_MATCH_HELLINGER_SCALAR;
+        cost_name = "Hellinger";
+    } else if (cost_mode == 1) {
+        match_code = GA_MATCH_LPC_MICHO_SCALAR;
+        cost_name = "lpc+ZZ";
+    } else {
+        match_code = GA_MATCH_LPA_MICHO_SCALAR;
+        cost_name = "lpa+ZZ";
+    }
+    fprintf(stderr, " + Deface: registering template to input using %s\n", cost_name);
+
+    /* Register template (moving) to input (fixed) */
+    float wpar[12];
+    int ok = al_register(tmpl, input, match_code, wpar);
+    if (ok) {
+        fprintf(stderr, "deface: registration failed\n");
+        return 1;
+    }
+
+    /* Warp mask to input space using the same transform with linear interpolation */
+    float *mask_data = nii_to_float(mask);
+    if (!mask_data) {
+        fprintf(stderr, "deface: failed to extract mask data\n");
+        return 1;
+    }
+
+    int mnx = mask->nx, mny = mask->ny, mnz = mask->nz;
+    int inx = input->nx, iny = input->ny, inz = input->nz;
+    int nvox = inx * iny * inz;
+
+    fprintf(stderr, " + Warping mask to input space\n");
+    float *warped_mask = al_scalar_warpone(12, wpar, al_wfunc_affine,
+                                           mask_data, mnx, mny, mnz,
+                                           inx, iny, inz, AL_INTERP_LINEAR);
+    free(mask_data);
+    if (warped_mask == NULL) {
+        fprintf(stderr, "deface: failed to warp mask\n");
+        return 1;
+    }
+
+    /* Find minimum value in input image */
+    float *idata = (float *)input->data;
+    float min_val = idata[0];
+    for (int i = 1; i < nvox; i++)
+        if (idata[i] < min_val) min_val = idata[i];
+
+    /* Apply mask: zero out voxels where warped mask < 0.5 */
+    int nmasked = 0;
+    for (int i = 0; i < nvox; i++) {
+        if (warped_mask[i] < 0.5f) {
+            idata[i] = min_val;
+            nmasked++;
+        }
+    }
+
+    free(warped_mask);
+    fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%)\n",
+            nmasked, nvox, 100.0f * nmasked / nvox);
     return 0;
 }

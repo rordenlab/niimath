@@ -22,5 +22,6 @@ niimath/_dist_ver.py
 _skbuild/niimath/_dist_ver.py
 # Test data and benchmark outputs
 /benchmark/
+/deface/
 /mesh/
 /validate/
