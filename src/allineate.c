@@ -2,9 +2,12 @@
    Original by RW Cox, National Institutes of Health.
    Ported to standalone NIfTI by the niimath project.
 
-   This file implements affine (12 DOF) registration with lpc+ZZ cost function,
-   twopass coarse-to-fine optimization, autoweight, source automask, and cubic
-   output interpolation. The Powell/NEWUOA optimizer is in a separate file. */
+   This file implements affine (12 DOF) registration with four cost functions:
+   lpc+ZZ (signed local Pearson, cross-modal), lpa+ZZ (absolute local Pearson),
+   Hellinger (histogram-based, default), and global Pearson (ls, within-modality).
+   Features twopass coarse-to-fine optimization, autoweight, source automask with
+   noise fill (-source_automask), TOHD bloks, and cubic output interpolation.
+   The Powell/NEWUOA optimizer is in a separate file. */
 
 #include <math.h>
 #include <stdio.h>
@@ -59,6 +62,15 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
 #define GA_MATCH_HELLINGER_SCALAR      7
 #define GA_MATCH_LPC_MICHO_SCALAR     13
 #define GA_MATCH_LPA_MICHO_SCALAR     14
+
+/* Test if method uses BLOK-based local correlation */
+#define METH_USES_BLOKS(m) ((m) == GA_MATCH_LPC_MICHO_SCALAR || \
+                            (m) == GA_MATCH_LPA_MICHO_SCALAR)
+
+/* Test if method is LPA variant */
+#define METH_IS_LPA(m) ((m) == GA_MATCH_LPA_MICHO_SCALAR)
+
+#define DEFAULT_TBEST_LPA 17
 
 /* Interpolation codes */
 #define AL_INTERP_NN      0
@@ -152,6 +164,7 @@ typedef struct {
     int anx, any, anz;     /* source dimensions */
     float adx, ady, adz;   /* source voxel sizes */
     float ajbot, ajtop, ajclip;
+    float ajmin, ajmax;    /* original data range (for cubic overshoot clamping) */
     unsigned char *ajmask;  /* source mask */
     int najmask;
 
@@ -187,6 +200,11 @@ typedef struct {
     /* micho (lpc+ZZ) parameters */
     double micho_mi, micho_nmi, micho_crA, micho_hel, micho_ov;
     int micho_zfinal;
+
+    /* source automask noise fill (AFNI's -source_automask) */
+    int ajmask_ranfill;       /* if nonzero, fill outside ajmask with noise */
+    float aj_ubot, aj_usiz;   /* noise range: ubot + usiz*(u1+u2) */
+    float *ajim_orig;          /* backup of original source data before noise fill */
 } GA_setup;
 
 /* For qsort_floatint */
@@ -270,38 +288,6 @@ static void qsort_floatint(int n, float *a, int *b)
     qsort(fi, n, sizeof(float_int), floatint_compare);
     for (i = 0; i < n; i++) { a[i] = fi[i].a; if (b != NULL) b[i] = fi[i].b; }
     free(fi);
-}
-
-/* Rank-order a float array, ties get average rank. Output overwrites input. */
-static void rank_order_float(int n, float *a)
-{
-    int ii, ns, n1, ib;
-    int   *b;
-    float *c;
-    float cs;
-
-    if (a == NULL || n < 1) return;
-    if (n == 1) { a[0] = 0.0f; return; }
-
-    b = (int *)  malloc(sizeof(int)   * n);
-    c = (float *)malloc(sizeof(float) * n);
-    if (b == NULL || c == NULL) { free(b); free(c); return; }
-
-    for (ii = 0; ii < n; ii++) c[ii] = b[ii] = ii;
-    qsort_floatint(n, a, b);
-
-    n1 = n - 1;
-    for (ii = 0; ii < n1; ii++) {
-        if (a[ii] == a[ii + 1]) {
-            cs = 2 * ii + 1;
-            ns = 2;
-            ib = ii; ii++;
-            while (ii < n1 && a[ii] == a[ii + 1]) { ii++; ns++; cs += ii; }
-            for (cs /= ns; ib <= ii; ib++) c[ib] = cs;
-        }
-    }
-    for (ii = 0; ii < n; ii++) a[b[ii]] = c[ii];
-    free(c); free(b);
 }
 
 /* Column norm of mat44 */
@@ -1006,12 +992,9 @@ static al_float_pair al_clipate(int n, const float *ar)
     al_float_pair rr = { 1.0f, 0.0f }; /* invalid by default */
     if (n < 666 || ar == NULL) return rr;
 
-    /* Check if all values are non-negative */
-    float mn = ar[0];
-    for (int ii = 1; ii < n; ii++)
-        if (ar[ii] < mn) mn = ar[ii];
-
-    if (mn < 0.0f) return rr; /* negative values: no clipping */
+    /* Compute clip levels from positive values (al_cliplevel handles this).
+       Do NOT bail out for images with some negative values — negative values
+       are simply ignored by the clipping computation, as in AFNI's clipate. */
 
     float cbot = al_cliplevel(n, ar, 0.345f);
     float ctop = al_quantile(n, ar, 0.966f);
@@ -1056,13 +1039,18 @@ static void clear_2Dhist(void)
     al_nbin = al_nbp = al_nbm = 0; al_nww = 0.0f;
 }
 
-/* Build 2D histogram with linear spread (LINHIST mode from AFNI) */
+/* Build 2D histogram with CLEQWD edge-bin mode (matching AFNI's xyclip path).
+   xbot/xtop and ybot/ytop are CLEQWD clip ranges. Values outside the clip
+   range are binned into edge bins (0 and nbm) rather than excluded, keeping
+   all data points in the histogram while concentrating resolution on the
+   informative intensity range. */
 static void build_2Dhist(int n, float xbot, float xtop, float *x,
                                 float ybot, float ytop, float *y, float *w)
 {
     int ii, jj, kk, ngood;
-    float xb, xi, yb, yi, xx, yy, x1, y1, ww;
+    float xi, yi, xx, yy, x1, y1, ww;
     unsigned char *good;
+    float xdbot, xdtop, ydbot, ydtop; /* actual data range */
 
     if (n <= 9 || x == NULL || y == NULL) return;
 
@@ -1073,37 +1061,28 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
     for (ii = 0; ii < n; ii++)
         good[ii] = GOODVAL(x[ii]) && GOODVAL(y[ii]);
 
-    /* Find range if not specified */
-    if (xbot >= xtop) {
-        xbot = WAY_BIG; xtop = -WAY_BIG;
-        for (ii = 0; ii < n; ii++)
-            if (good[ii]) {
-                if (x[ii] > xtop) xtop = x[ii];
-                else if (x[ii] < xbot) xbot = x[ii];
-            }
+    /* Find actual data range */
+    xdbot = WAY_BIG; xdtop = -WAY_BIG;
+    ydbot = WAY_BIG; ydtop = -WAY_BIG;
+    for (ii = 0; ii < n; ii++) {
+        if (!good[ii]) continue;
+        if (x[ii] > xdtop) xdtop = x[ii];
+        if (x[ii] < xdbot) xdbot = x[ii];
+        if (y[ii] > ydtop) ydtop = y[ii];
+        if (y[ii] < ydbot) ydbot = y[ii];
     }
-    if (xbot >= xtop) { free(good); return; }
+    if (xdbot >= xdtop || ydbot >= ydtop) { free(good); return; }
 
-    if (ybot >= ytop) {
-        ybot = WAY_BIG; ytop = -WAY_BIG;
-        for (ii = 0; ii < n; ii++)
-            if (good[ii]) {
-                if (y[ii] > ytop) ytop = y[ii];
-                else if (y[ii] < ybot) ybot = y[ii];
-            }
-    }
-    if (ybot >= ytop) { free(good); return; }
-
-    /* Count good values in range */
+    /* Count good values in actual data range */
     memset(good, 0, n);
     for (ngood = ii = 0; ii < n; ii++) {
-        if (RANGVAL(x[ii], xbot, xtop) && RANGVAL(y[ii], ybot, ytop) && WW(ii) > 0.0f) {
+        if (RANGVAL(x[ii], xdbot, xdtop) && RANGVAL(y[ii], ydbot, ydtop) && WW(ii) > 0.0f) {
             good[ii] = 1; ngood++;
         }
     }
     if (ngood == 0) { free(good); return; }
 
-    /* Compute number of bins */
+    /* Compute number of bins from total n (matches AFNI) */
     al_nbin = (int)pow((double)n, al_hpow);
     if (al_nbin > 255) al_nbin = 255;
     else if (al_nbin < 3) al_nbin = 3;
@@ -1116,24 +1095,62 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
     if (!al_xc || !al_yc || !al_xyc) { clear_2Dhist(); free(good); return; }
     al_nww = 0.0f;
 
-    /* Equal-size bins with linear spread */
-    xb = xbot; xi = al_nbm / (xtop - xbot);
-    yb = ybot; yi = al_nbm / (ytop - ybot);
-    for (ii = 0; ii < n; ii++) {
-        if (!good[ii]) continue;
-        xx = (x[ii] - xb) * xi;
-        jj = (int)xx; xx = xx - jj; x1 = 1.0f - xx;
-        yy = (y[ii] - yb) * yi;
-        kk = (int)yy; yy = yy - kk; y1 = 1.0f - yy;
-        ww = WW(ii); al_nww += ww;
+    /* Determine if CLEQWD clipping is active and data extends beyond clips */
+    int xyclip = (xbot < xtop) &&
+                 (xdbot < xbot) && (xbot < xtop) && (xtop < xdtop) &&
+                 (ydbot < ybot) && (ybot < ytop) && (ytop < ydtop);
 
-        al_xc[jj] += x1 * ww; al_xc[jj + 1] += xx * ww;
-        al_yc[kk] += y1 * ww; al_yc[kk + 1] += yy * ww;
+    if (xyclip) {
+        /* CLEQWD edge-bin mode (AFNI's xyclip path):
+           values below clip go to bin 0, above clip go to bin nbm,
+           clip range is divided into bins 1..nbm-1 with linear spread */
+        xi = (al_nbin - 2.000001f) / (xtop - xbot);
+        yi = (al_nbin - 2.000001f) / (ytop - ybot);
+        for (ii = 0; ii < n; ii++) {
+            if (!good[ii]) continue;
+            /* X binning with edge bins */
+            xx = x[ii];
+            if (xx < xbot) { jj = 0; xx = 0.0f; }
+            else if (xx > xtop) { jj = al_nbm; xx = 1.0f; }
+            else { xx = 1.0f + (xx - xbot) * xi; jj = (int)xx; xx = xx - jj; }
+            /* Y binning with edge bins */
+            yy = y[ii];
+            if (yy < ybot) { kk = 0; yy = 0.0f; }
+            else if (yy > ytop) { kk = al_nbm; yy = 1.0f; }
+            else { yy = 1.0f + (yy - ybot) * yi; kk = (int)yy; yy = yy - kk; }
 
-        XYC(jj,     kk    ) += x1 * (y1 * ww);
-        XYC(jj + 1, kk    ) += xx * (y1 * ww);
-        XYC(jj,     kk + 1) += x1 * (yy * ww);
-        XYC(jj + 1, kk + 1) += xx * (yy * ww);
+            x1 = 1.0f - xx; y1 = 1.0f - yy;
+            ww = WW(ii); al_nww += ww;
+
+            al_xc[jj] += x1 * ww; al_xc[jj + 1] += xx * ww;
+            al_yc[kk] += y1 * ww; al_yc[kk + 1] += yy * ww;
+
+            XYC(jj,     kk    ) += x1 * (y1 * ww);
+            XYC(jj + 1, kk    ) += xx * (y1 * ww);
+            XYC(jj,     kk + 1) += x1 * (yy * ww);
+            XYC(jj + 1, kk + 1) += xx * (yy * ww);
+        }
+    } else {
+        /* Equal-size bins with linear spread (no CLEQWD or data within clip) */
+        float xb = xdbot, yb = ydbot;
+        xi = al_nbm / (xdtop - xdbot);
+        yi = al_nbm / (ydtop - ydbot);
+        for (ii = 0; ii < n; ii++) {
+            if (!good[ii]) continue;
+            xx = (x[ii] - xb) * xi;
+            jj = (int)xx; xx = xx - jj; x1 = 1.0f - xx;
+            yy = (y[ii] - yb) * yi;
+            kk = (int)yy; yy = yy - kk; y1 = 1.0f - yy;
+            ww = WW(ii); al_nww += ww;
+
+            al_xc[jj] += x1 * ww; al_xc[jj + 1] += xx * ww;
+            al_yc[kk] += y1 * ww; al_yc[kk + 1] += yy * ww;
+
+            XYC(jj,     kk    ) += x1 * (y1 * ww);
+            XYC(jj + 1, kk    ) += xx * (y1 * ww);
+            XYC(jj,     kk + 1) += x1 * (yy * ww);
+            XYC(jj + 1, kk + 1) += xx * (yy * ww);
+        }
     }
     free(good);
 }
@@ -1621,7 +1638,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
     if (tl_wpar_len < npar) {
         free(tl_wpar);
         tl_wpar = (float *)malloc(npar * sizeof(float));
-        tl_wpar_len = npar;
+        tl_wpar_len = tl_wpar ? npar : 0;  /* only update length on success */
     }
     wpar = tl_wpar;
     if (!wpar) return;
@@ -1680,7 +1697,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
     if (tl_wbuf_len < nall * 3) {
         free(tl_wbuf);
         tl_wbuf = (float *)malloc(nall * 3 * sizeof(float));
-        tl_wbuf_len = nall * 3;
+        tl_wbuf_len = tl_wbuf ? nall * 3 : 0;  /* only update length on success */
     }
     int alloc_ijk = (mpar == NULL || gstup->im_ar == NULL);
     if (!tl_wbuf || (alloc_ijk && (!imf || !jmf || !kmf))) {
@@ -1729,36 +1746,41 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
         free(kmf); free(jmf); free(imf);
     }
 
-    /* Clip interpolated values to source range */
+    /* Clip interpolated values to original source data range (not CLEQWD range) */
     if (gstup->interp_code == AL_INTERP_CUBIC) {
-        float bb = gstup->ajbot, tt = gstup->ajtop;
+        float bb = gstup->ajmin, tt = gstup->ajmax;
         for (pp = 0; pp < npt; pp++)
             if (avm[pp] < bb) avm[pp] = bb;
             else if (avm[pp] > tt) avm[pp] = tt;
     }
 }
 
+/*--- Ensure blokset is created (avoids lazy-init race in parallel regions) ---*/
+static void al_ensure_blokset(GA_setup *stup)
+{
+    if (stup->blokset != NULL) return;
+    float rad = stup->blokrad, mrad;
+    if (stup->smooth_code > 0 && stup->smooth_radius_base > 0.0f)
+        rad = sqrtf(rad * rad + stup->smooth_radius_base * stup->smooth_radius_base);
+    mrad = 1.2345f * (stup->base_di + stup->base_dj + stup->base_dk);
+    if (rad < mrad) rad = mrad;
+    stup->blokset = create_GA_BLOK_set(
+        stup->bnx, stup->bny, stup->bnz,
+        stup->base_di, stup->base_dj, stup->base_dk,
+        stup->npt_match, stup->im_ar, stup->jm_ar, stup->km_ar,
+        stup->bloktype, rad, stup->blokmin, 1.0f, 0);
+}
+
 /*--- Local Pearson correlation using BLOKs ---*/
-/* use_abs: 0 = signed (lpc), 1 = absolute (lpa) */
-static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm, int use_abs)
+/* Returns signed local correlation (always signed; LPA applies 1-|val| externally) */
+static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm)
 {
     GA_BLOK_set *gbs;
     int nblok, nelm, *elm, dd, ii, jj;
     float xv, yv, xy, xm, ym, vv, ww, ws, wss, pcor, wt, psum = 0.0f, pabs;
 
-    if (gstup->blokset == NULL) {
-        float rad = gstup->blokrad, mrad;
-        if (gstup->smooth_code > 0 && gstup->smooth_radius_base > 0.0f)
-            rad = sqrtf(rad * rad + gstup->smooth_radius_base * gstup->smooth_radius_base);
-        mrad = 1.2345f * (gstup->base_di + gstup->base_dj + gstup->base_dk);
-        if (rad < mrad) rad = mrad;
-        gstup->blokset = create_GA_BLOK_set(
-            gstup->bnx, gstup->bny, gstup->bnz,
-            gstup->base_di, gstup->base_dj, gstup->base_dk,
-            gstup->npt_match, gstup->im_ar, gstup->jm_ar, gstup->km_ar,
-            gstup->bloktype, rad, gstup->blokmin, 1.0f, 0);
-        if (gstup->blokset == NULL) return AL_BIGVAL;
-    }
+    al_ensure_blokset(gstup);
+    if (gstup->blokset == NULL) return AL_BIGVAL;
 
     gbs   = gstup->blokset;
     nblok = gbs->num;
@@ -1803,7 +1825,7 @@ static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm, int u
         else if (pcor < -CMAX) pcor = -CMAX;
         pcor = logf((1.0f + pcor) / (1.0f - pcor));  /* 2*arctanh */
         pabs = fabsf(pcor);
-        psum += use_abs ? ws * pabs * pabs : ws * pcor * pabs;
+        psum += ws * pcor * pabs;  /* signed: emphasize large values */
         wss  += ws;
     }
 
@@ -1836,6 +1858,7 @@ static float GA_get_warped_overlap_fraction(void)
     imf = (float *)malloc(sizeof(float) * nqq);
     jmf = (float *)malloc(sizeof(float) * nqq);
     kmf = (float *)malloc(sizeof(float) * nqq);
+    if (!imf || !jmf || !kmf) { free(imf); free(jmf); free(kmf); return 1.0f; }
 
     for (pp = qq = 0; pp < npt; pp++) {
         if (bsar[pp]) {
@@ -1847,6 +1870,10 @@ static float GA_get_warped_overlap_fraction(void)
     imw = (float *)malloc(sizeof(float) * nqq);
     jmw = (float *)malloc(sizeof(float) * nqq);
     kmw = (float *)malloc(sizeof(float) * nqq);
+    if (!imw || !jmw || !kmw) {
+        free(imf); free(jmf); free(kmf);
+        free(imw); free(jmw); free(kmw); return 1.0f;
+    }
 
     gstup->wfunc(npar, NULL, nqq, imf, jmf, kmf, imw, jmw, kmw);
     free(kmf); free(jmf); free(imf);
@@ -1924,9 +1951,10 @@ static double GA_scalar_costfun(int meth, int npt,
 
         default:
         case GA_MATCH_LPC_MICHO_SCALAR: /* lpc+ZZ (signed) */
-        case GA_MATCH_LPA_MICHO_SCALAR: { /* lpa+ZZ (absolute) */
-            int use_abs = (meth == GA_MATCH_LPA_MICHO_SCALAR);
-            val = (double)GA_pearson_local(npt, avm, bvm, wvm, use_abs);
+        case GA_MATCH_LPA_MICHO_SCALAR: { /* lpa+ZZ: 1 - |lpc| */
+            val = (double)GA_pearson_local(npt, avm, bvm, wvm);
+            if (METH_IS_LPA(meth))
+                val = 1.0 - fabs(val);  /* LPA: absolute, lower=better */
             if (gstup->micho_hel != 0.0 || gstup->micho_mi  != 0.0 ||
                 gstup->micho_nmi != 0.0 || gstup->micho_crA != 0.0) {
                 float_quad hmc;
@@ -1961,7 +1989,7 @@ static double GA_scalar_fitter(int npar, double *mpar)
     if (tl_avm_len < npt) {
         free(tl_avm);
         tl_avm = (float *)malloc(npt * sizeof(float));
-        tl_avm_len = npt;
+        tl_avm_len = tl_avm ? npt : 0;  /* only update length on success */
     }
     avm = tl_avm;
     if (!avm) return (double)AL_BIGVAL;
@@ -1992,7 +2020,7 @@ static void GA_param_setup(GA_setup *stup)
 }
 
 /*--- Setup matching: control points, base/weight values ---*/
-static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
+static void al_scalar_setup(GA_setup *stup)
 {
     int qq, ii, jj, kk, mm, nx, ny, nz, nxy, nmatch;
     float *bsar;
@@ -2024,6 +2052,23 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
         if (stup->ajims) { free(stup->ajims); stup->ajims = NULL; }
     }
 
+    /* Source automask noise fill: replace non-mask voxels with random noise
+       AFTER smoothing, matching AFNI's -source_automask behavior.
+       This prevents background from contaminating local correlations. */
+    if (stup->ajmask != NULL && stup->ajmask_ranfill && stup->aj_usiz > 0.0f) {
+        float *af = (stup->ajims != NULL) ? stup->ajims : stup->ajim;
+        unsigned char *mmm = stup->ajmask;
+        int nvox = stup->anx * stup->any * stup->anz;
+        float ubot = stup->aj_ubot, usiz = stup->aj_usiz;
+        myunif_reset(1234567890);  /* deterministic noise */
+        for (ii = 0; ii < nvox; ii++) {
+            if (!mmm[ii]) {
+                float u1 = myunif(), u2 = myunif();
+                af[ii] = ubot + usiz * (u1 + u2);
+            }
+        }
+    }
+
     /* Get min/max and CLEQWD clip levels for source image */
     {
         float *src = (stup->ajims != NULL) ? stup->ajims : stup->ajim;
@@ -2033,6 +2078,8 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
             if (src[ii] < stup->ajbot) stup->ajbot = src[ii];
             if (src[ii] > stup->ajtop) stup->ajtop = src[ii];
         }
+        stup->ajmin = stup->ajbot;  /* preserve original data range */
+        stup->ajmax = stup->ajtop;
         stup->ajclip = stup->ajtop;
         /* Apply CLEQWD clipping for histogram-based cost functions */
         if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
@@ -2083,7 +2130,12 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
         stup->im_ar = (float *)malloc(sizeof(float) * nmatch);
         stup->jm_ar = (float *)malloc(sizeof(float) * nmatch);
         stup->km_ar = (float *)malloc(sizeof(float) * nmatch);
-        if (!stup->im_ar || !stup->jm_ar || !stup->km_ar) return;
+        if (!stup->im_ar || !stup->jm_ar || !stup->km_ar) {
+            free(stup->im_ar); stup->im_ar = NULL;
+            free(stup->jm_ar); stup->jm_ar = NULL;
+            free(stup->km_ar); stup->km_ar = NULL;
+            return;
+        }
         { int nvox_t = nx * ny * nz;
           for (mm = qq = 0; qq < nmatch && mm < nvox_t; mm++) {
             if (mask == NULL || mask[mm]) {
@@ -2102,7 +2154,12 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
         stup->im_ar = (float *)malloc(sizeof(float) * nmatch);
         stup->jm_ar = (float *)malloc(sizeof(float) * nmatch);
         stup->km_ar = (float *)malloc(sizeof(float) * nmatch);
-        if (!stup->im_ar || !stup->jm_ar || !stup->km_ar) return;
+        if (!stup->im_ar || !stup->jm_ar || !stup->km_ar) {
+            free(stup->im_ar); stup->im_ar = NULL;
+            free(stup->jm_ar); stup->jm_ar = NULL;
+            free(stup->km_ar); stup->km_ar = NULL;
+            return;
+        }
         mm = (nx / 2) + (ny / 2) * nx + (nz / 2) * nxy;
         for (qq = 0; qq < nmatch; mm = (mm + dm) % nvox)
             if (mask == NULL || mask[mm]) {
@@ -2194,7 +2251,7 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
 static void al_scalar_ransetup(GA_setup *stup, int nrand)
 {
 #define NKEEP (3*PARAM_MAXTRIAL+1)
-    double *wpar, *spar, val, vbest, *bpar;
+    double val, vbest, *bpar;
     double *kpar[NKEEP], kval[NKEEP];
     int ii, qq, ss, nfr, kk, jj, ngrid, ngtot, ngood, twof, maxstep;
     int ival[NKEEP], rval[NKEEP];
@@ -2223,15 +2280,12 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     int icod = stup->interp_code;
     stup->interp_code = AL_INTERP_LINEAR;
 
-    wpar = (double *)calloc(nfr, sizeof(double));
-    spar = (double *)calloc(nfr, sizeof(double));
     for (kk = 0; kk < NKEEP; kk++)
         kpar[kk] = (double *)calloc(nfr, sizeof(double));
 
     /* Evaluate center of parameter space */
-    for (qq = 0; qq < nfr; qq++) wpar[qq] = 0.5;
-    val = GA_scalar_fitter(nfr, wpar);
-    memcpy(kpar[0], wpar, sizeof(double) * nfr);
+    for (qq = 0; qq < nfr; qq++) kpar[0][qq] = 0.5;
+    val = GA_scalar_fitter(nfr, kpar[0]);
     kval[0] = val; rval[0] = 0;
     for (kk = 1; kk < NKEEP; kk++) { rval[kk] = 0; kval[kk] = AL_BIGVAL; }
 
@@ -2262,19 +2316,7 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
         }
     }
 
-    /* Ensure blokset is pre-created before parallel region */
-    if (stup->blokset == NULL) {
-        float rad = stup->blokrad, mrad;
-        if (stup->smooth_code > 0 && stup->smooth_radius_base > 0.0f)
-            rad = sqrtf(rad * rad + stup->smooth_radius_base * stup->smooth_radius_base);
-        mrad = 1.2345f * (stup->base_di + stup->base_dj + stup->base_dk);
-        if (rad < mrad) rad = mrad;
-        stup->blokset = create_GA_BLOK_set(
-            stup->bnx, stup->bny, stup->bnz,
-            stup->base_di, stup->base_dj, stup->base_dk,
-            stup->npt_match, stup->im_ar, stup->jm_ar, stup->km_ar,
-            stup->bloktype, rad, stup->blokmin, 1.0f, 0);
-    }
+    al_ensure_blokset(stup);
 
     /* Evaluate all grid+random × reflections in parallel */
     {
@@ -2326,7 +2368,6 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     for (ngood = kk = 0; kk < NKEEP && kval[kk] < AL_BIGVAL; kk++, ngood++) ;
     if (ngood < 1) {
         fprintf(stderr, "allineate: no good starting locations found\n");
-        free(wpar); free(spar);
         for (kk = 0; kk < NKEEP; kk++) free(kpar[kk]);
         stup->interp_code = icod;
         return;
@@ -2342,19 +2383,7 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     maxstep = 11 * nfr + 17;
     fprintf(stderr, " + Refining %d candidate parameter sets\n", ngood);
 
-    /* Pre-create blokset before parallel region (avoids lazy-init race) */
-    if (stup->blokset == NULL) {
-        float rad2 = stup->blokrad, mrad2;
-        if (stup->smooth_code > 0 && stup->smooth_radius_base > 0.0f)
-            rad2 = sqrtf(rad2 * rad2 + stup->smooth_radius_base * stup->smooth_radius_base);
-        mrad2 = 1.2345f * (stup->base_di + stup->base_dj + stup->base_dk);
-        if (rad2 < mrad2) rad2 = mrad2;
-        stup->blokset = create_GA_BLOK_set(
-            stup->bnx, stup->bny, stup->bnz,
-            stup->base_di, stup->base_dj, stup->base_dk,
-            stup->npt_match, stup->im_ar, stup->jm_ar, stup->km_ar,
-            stup->bloktype, rad2, stup->blokmin, 1.0f, 0);
-    }
+    al_ensure_blokset(stup);
 
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic)
@@ -2422,7 +2451,6 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     }
     stup->wfunc_ntrial = nt;
 
-    free(wpar); free(spar);
     for (kk = 0; kk < NKEEP; kk++) free(kpar[kk]);
     stup->interp_code = icod;
 #undef NKEEP
@@ -2626,7 +2654,6 @@ static void al_setup_befafter(mat44 base_cmat, mat44 base_imat,
 #undef GOODVAL
 #undef RANGVAL
 #undef WV
-#undef SETPAR
 
 /*==========================================================================*/
 /*================ SECTION 11: PUBLIC FUNCTION nii_allineate() ============*/
@@ -2634,16 +2661,14 @@ static void al_setup_befafter(mat44 base_cmat, mat44 base_imat,
 
 /* Map AL_COST_* to internal GA_MATCH_* code and name string.
    default_code is used when opts.cost == AL_COST_LPC (for allineate) or AL_COST_LPA (for deface). */
-static void al_resolve_cost(int cost, int default_ga, int *match_out, const char **name_out)
+static void al_resolve_cost(int cost, int *match_out, const char **name_out)
 {
     switch (cost) {
-        case AL_COST_LPA:      *match_out = GA_MATCH_LPA_MICHO_SCALAR; *name_out = "lpa+ZZ"; return;
-        case AL_COST_LPC:      *match_out = GA_MATCH_LPC_MICHO_SCALAR; *name_out = "lpc+ZZ"; return;
-        case AL_COST_HELLINGER: *match_out = GA_MATCH_HELLINGER_SCALAR; *name_out = "Hellinger"; return;
+        case AL_COST_LPC:       *match_out = GA_MATCH_LPC_MICHO_SCALAR; *name_out = "lpc+ZZ"; return;
+        case AL_COST_LPA:       *match_out = GA_MATCH_LPA_MICHO_SCALAR; *name_out = "lpa+ZZ"; return;
         case AL_COST_PEARSON:   *match_out = GA_MATCH_PEARSON_SCALAR;   *name_out = "Pearson"; return;
-        default:                *match_out = default_ga;
-                                *name_out = (default_ga == GA_MATCH_LPA_MICHO_SCALAR) ? "lpa+ZZ" : "lpc+ZZ";
-                                return;
+        default:
+        case AL_COST_HELLINGER: *match_out = GA_MATCH_HELLINGER_SCALAR; *name_out = "Hellinger"; return;
     }
 }
 
@@ -2663,14 +2688,7 @@ static void al_center_of_mass(const float *data, int nx, int ny, int nz,
     else { *cx = (nx - 1) * 0.5; *cy = (ny - 1) * 0.5; *cz = (nz - 1) * 0.5; }
 }
 
-/* Apply mat44 to a 3-vector (xyz = M * ijk + offset) */
-static inline void al_mat44_vec(mat44 m, float x, float y, float z,
-                                 float *ox, float *oy, float *oz)
-{
-    *ox = m.m[0][0]*x + m.m[0][1]*y + m.m[0][2]*z + m.m[0][3];
-    *oy = m.m[1][0]*x + m.m[1][1]*y + m.m[1][2]*z + m.m[1][3];
-    *oz = m.m[2][0]*x + m.m[2][1]*y + m.m[2][2]*z + m.m[2][3];
-}
+/* al_mat44_vec removed: use mat44_vec() instead */
 
 /* Extract float data from NIfTI image. Returns malloc'd float array. */
 static float *nii_to_float(nifti_image *nim)
@@ -2718,14 +2736,31 @@ static float *nii_to_float(nifti_image *nim)
     return fdata;
 }
 
+/* Normalized distance between two parameter vectors (in [0..1] space) */
+static float param_dist(GA_setup *stup, float *p1, float *p2)
+{
+    float dmax = 0.0f;
+    int jj;
+    for (jj = 0; jj < stup->wfunc_numpar; jj++) {
+        if (stup->wfunc_param[jj].fixed) continue;
+        float s = stup->wfunc_param[jj].siz;
+        if (s <= 0.0f) continue;
+        float d = fabsf(p1[jj] - p2[jj]) / s;
+        if (d > dmax) dmax = d;
+    }
+    return dmax;
+}
+
 /* Internal: run affine registration, return 12 warp parameters.
    source: moving image, base: fixed/reference image.
    match_code: GA_MATCH_* code for cost function.
    do_cmass: if nonzero, compute center-of-mass shift as initial alignment.
+   do_src_automask: if nonzero, fill outside source automask with random noise.
    wpar_out[12]: filled with optimized affine parameters on success.
    Returns 0 on success, nonzero on error. */
 static int al_register(nifti_image *source, nifti_image *base,
-                       int match_code, int do_cmass, float wpar_out[12])
+                       int match_code, int do_cmass, int do_src_automask,
+                       float wpar_out[12])
 {
     GA_setup stup;
     GA_param params[12];
@@ -2790,8 +2825,13 @@ static int al_register(nifti_image *source, nifti_image *base,
     wght = al_autoweight(bsim, bnx, bny, bnz, bdx, bdy, bdz);
 
     /* --- 4. Compute source automask --- */
-    fprintf(stderr, " + Computing source automask\n");
     smask = al_automask(ajim, nvox_src);
+    if (smask) {
+        int nm = 0;
+        for (ii = 0; ii < nvox_src; ii++) if (smask[ii]) nm++;
+        fprintf(stderr, " + Source automask: %d of %d voxels (%.0f%%)\n",
+                nm, nvox_src, 100.0f * nm / nvox_src);
+    }
 
     /* --- 5. Set up GA_setup structure --- */
     memset(&stup, 0, sizeof(GA_setup));
@@ -2829,13 +2869,59 @@ static int al_register(nifti_image *source, nifti_image *base,
         }
     }
 
+    /* --- 5b. Source automask noise-fill setup (AFNI's -source_automask) --- */
+    stup.ajmask_ranfill = 0;
+    stup.aj_ubot = stup.aj_usiz = 0.0f;
+    stup.ajim_orig = NULL;
+    if (do_src_automask && smask) {
+        /* Compute noise range from 7th and 93rd percentiles of masked voxels */
+        int nm = 0;
+        for (ii = 0; ii < nvox_src; ii++) if (smask[ii]) nm++;
+        if (nm > 10) {
+            float *mvals = (float *)malloc(sizeof(float) * nm);
+            int pp = 0;
+            for (ii = 0; ii < nvox_src; ii++)
+                if (smask[ii]) mvals[pp++] = ajim[ii];
+            qsort(mvals, nm, sizeof(float), al_float_cmp);
+            float q07 = mvals[(int)(0.07f * (nm - 1))];
+            float q93 = mvals[(int)(0.93f * (nm - 1))];
+            free(mvals);
+            stup.aj_ubot = q07;
+            stup.aj_usiz = (q93 - q07) * 0.5f;
+            if (stup.aj_usiz > 0.0f) {
+                stup.ajmask_ranfill = 1;
+                /* Backup original source data before noise fill */
+                stup.ajim_orig = (float *)malloc(sizeof(float) * nvox_src);
+                if (stup.ajim_orig)
+                    memcpy(stup.ajim_orig, ajim, sizeof(float) * nvox_src);
+                fprintf(stderr, " + Source automask noise fill: range [%.1f, %.1f]\n",
+                        q07, q07 + 2.0f * stup.aj_usiz);
+            }
+        }
+    }
+
+    /* Warn if using lpc/lpa without source_automask */
+    if (!do_src_automask && METH_USES_BLOKS(match_code)) {
+        fprintf(stderr, " + WARNING: '-source_automask' is strongly recommended"
+                        " when using -lpc or -lpa\n");
+    }
+
     /* --- 6. Configure cost function --- */
     stup.match_code = match_code;
     if (match_code == GA_MATCH_PEARSON_SCALAR || match_code == GA_MATCH_HELLINGER_SCALAR) {
         /* Simple cost functions: no micho multi-cost weights */
         stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
         stup.micho_zfinal = 0;
+    } else if (METH_IS_LPA(match_code)) {
+        /* LPA-specific defaults (AFNI 27 May 2021) */
+        stup.micho_mi  = 0.0;
+        stup.micho_nmi = 0.2;
+        stup.micho_crA = 0.4;
+        stup.micho_hel = 0.4;
+        stup.micho_ov  = 0.4;
+        stup.micho_zfinal = 1; /* +ZZ */
     } else {
+        /* LPC defaults */
         stup.micho_mi  = 0.2;
         stup.micho_nmi = 0.2;
         stup.micho_crA = 0.4;
@@ -2857,8 +2943,6 @@ static int al_register(nifti_image *source, nifti_image *base,
     float xxx = 0.321f * (bnx - 1);
     float yyy = 0.321f * (bny - 1);
     float zzz = 0.321f * (bnz - 1);
-    float sm, sp;
-
     /* Transform to mm space for shift range */
     float xxx_m = 0.01f, yyy_m = 0.01f, zzz_m = 0.01f;
     for (ii = -1; ii <= 1; ii += 2)
@@ -2894,8 +2978,8 @@ static int al_register(nifti_image *source, nifti_image *base,
         al_center_of_mass(ajim, anx, any, anz, &axc, &ayc, &azc);
 
         float bx_mm, by_mm, bz_mm, ax_mm, ay_mm, az_mm;
-        al_mat44_vec(base_cmat, (float)bxc, (float)byc, (float)bzc, &bx_mm, &by_mm, &bz_mm);
-        al_mat44_vec(targ_cmat, (float)axc, (float)ayc, (float)azc, &ax_mm, &ay_mm, &az_mm);
+        mat44_vec(base_cmat, (float)bxc, (float)byc, (float)bzc, &bx_mm, &by_mm, &bz_mm);
+        mat44_vec(targ_cmat, (float)axc, (float)ayc, (float)azc, &ax_mm, &ay_mm, &az_mm);
 
         float cmx = ax_mm - bx_mm, cmy = ay_mm - by_mm, cmz = az_mm - bz_mm;
         fprintf(stderr, " + Center-of-mass shift: %.2f %.2f %.2f mm\n", cmx, cmy, cmz);
@@ -2926,24 +3010,49 @@ static int al_register(nifti_image *source, nifti_image *base,
     SETPAR(9,  "y/x-shear", -rval, rval, 0.0f);
     SETPAR(10, "z/x-shear", -rval, rval, 0.0f);
     SETPAR(11, "z/y-shear", -rval, rval, 0.0f);
+#undef SETPAR
 
-    /* --- 8. BLOK set params --- */
-    stup.bloktype = GA_BLOK_RHDD;
-    stup.blokrad  = 6.54321f * (stup.base_di + stup.base_dj + stup.base_dk) / 3.0f;
+    /* --- 8. BLOK set params (AFNI Jul 2021 defaults: TOHD, ~555 voxels/blok) --- */
+    stup.bloktype = GA_BLOK_TOHD;
+    { float vvv = stup.base_di * stup.base_dj * stup.base_dk;
+      /* TOHD volume factor = 4.0; auto-radius for ~555 voxels per blok */
+      stup.blokrad = cbrtf(555.0f * vvv / 4.0f);
+    }
     stup.blokmin  = 0; /* auto */
     stup.blokset  = NULL;
 
     /* ========== COARSE PASS (twopass) ========== */
     fprintf(stderr, " + *** Coarse pass begins ***\n");
 
+    /* LPA gets more twobest candidates (AFNI 27 May 2021) */
+    int tbest = 5;
+    if (METH_IS_LPA(match_code) && tbest < DEFAULT_TBEST_LPA)
+        tbest = DEFAULT_TBEST_LPA;
+
+    /* Compute dxyz_top for BLOK smoothing floor */
+    float dxyz_top = bdx;
+    if (bdy > dxyz_top) dxyz_top = bdy;
+    if (bdz > dxyz_top) dxyz_top = bdz;
+    if (adx > dxyz_top) dxyz_top = adx;
+    if (ady > dxyz_top) dxyz_top = ady;
+    if (adz > dxyz_top) dxyz_top = adz;
+
+    /* BLOK methods need less coarse smoothing to preserve local structure */
+    float sm_rad = 0.0f;
+    if (METH_USES_BLOKS(match_code)) {
+        sm_rad = 2.222f;
+        if (dxyz_top > sm_rad) sm_rad = dxyz_top;
+    }
+
     int ntask = nvox_base;
     stup.interp_code = AL_INTERP_LINEAR;
     stup.npt_match   = ntask / 15;
     if (stup.npt_match < 9999) stup.npt_match = 9999;
     stup.smooth_code = GA_SMOOTH_GAUSSIAN;
-    stup.smooth_radius_base = stup.smooth_radius_targ = 7.777f;
+    stup.smooth_radius_base = stup.smooth_radius_targ =
+        (sm_rad > 0.0f) ? sm_rad : 7.777f;
 
-    al_scalar_setup(&stup, 1, 1);
+    al_scalar_setup(&stup);
 
     /* Temporarily freeze params beyond first 6 for coarse search */
     int nparam_free = 12;
@@ -2959,8 +3068,8 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     powell_set_mfac(1.0f, 3.0f);
 
-    int tbest = 5;
-    int nrand = 17 + 4 * tbest + 2 * tbest; /* extra for BLOK methods */
+    int nrand = 17 + 4 * tbest;
+    if (METH_USES_BLOKS(match_code)) nrand += 2 * tbest;
     if (nrand < 31) nrand = 31;
     al_scalar_ransetup(&stup, nrand);
 
@@ -2972,7 +3081,9 @@ static int al_register(nifti_image *source, nifti_image *base,
     int tb = tbest;
     if (tb > stup.wfunc_ntrial) tb = stup.wfunc_ntrial;
     float tfparm[PARAM_MAXTRIAL + 2][12];
+    float ffparm[PARAM_MAXTRIAL + 2][12];  /* scratch for sorting */
     float tfcost[PARAM_MAXTRIAL + 2];
+    int tfindx[PARAM_MAXTRIAL + 2];
     int tfdone;
 
     for (int ib = 0; ib < tb; ib++)
@@ -2995,7 +3106,7 @@ static int al_register(nifti_image *source, nifti_image *base,
         stup.smooth_radius_targ *= 0.7777f;
         stup.npt_match = (int)(stup.npt_match * 1.5);
 
-        al_scalar_setup(&stup, 0, 0);
+        al_scalar_setup(&stup);
 
         for (int ib = 0; ib < tfdone; ib++) {
             for (jj = 0; jj < stup.wfunc_numpar; jj++)
@@ -3005,73 +3116,82 @@ static int al_register(nifti_image *source, nifti_image *base,
                 tfparm[ib][jj] = stup.wfunc_param[jj].val_out;
             tfcost[ib] = stup.vbest;
         }
+
+        /* Sort by cost and deduplicate close parameter sets */
+        if (tfdone > 2) {
+            /* Copy into ffparm for sorting */
+            for (int ib = 0; ib < tfdone; ib++) {
+                memcpy(ffparm[ib], tfparm[ib], sizeof(float) * 12);
+                tfindx[ib] = ib;
+            }
+            qsort_floatint(tfdone, tfcost, tfindx);
+            for (int ib = 0; ib < tfdone; ib++)
+                memcpy(tfparm[ib], ffparm[tfindx[ib]], sizeof(float) * 12);
+
+            /* Cast out parameter sets too close to the best */
+#define CTHRESH 0.02f
+            for (int ib = 1; ib < tfdone; ib++) {
+                float pdist = param_dist(&stup, tfparm[0], tfparm[ib]);
+                if (tfdone > 2 && pdist < CTHRESH) {
+                    for (int jb = ib + 1; jb < tfdone; jb++) {
+                        memcpy(tfparm[jb - 1], tfparm[jb], sizeof(float) * 12);
+                        tfcost[jb - 1] = tfcost[jb];
+                    }
+                    tfdone--;
+                    ib--;  /* re-check the entry shifted into this position */
+                }
+            }
+#undef CTHRESH
+        }
     }
 
-    /* ========== FINE PASS (two-stage: reduced then full resolution) ========== */
+    /* ========== FINE PASS ========== */
     fprintf(stderr, " + *** Fine pass begins ***\n");
 
-    /* Stage 1: Reduced resolution with linear interpolation */
-    stup.interp_code = AL_INTERP_LINEAR;
+    /* Fine pass: full resolution, cubic interpolation, no smoothing */
+    stup.interp_code = AL_INTERP_CUBIC;
     stup.smooth_code = 0;
     stup.smooth_radius_base = 0.0f;
     stup.smooth_radius_targ = 0.0f;
-    stup.npt_match = nvox_base / 4;
-    if (stup.npt_match < 9999) stup.npt_match = 9999;
+    stup.npt_match = nvox_base;
 
-    al_scalar_setup(&stup, 0, 0);
+    al_scalar_setup(&stup);
     powell_set_mfac(0.0f, 0.0f);
 
-    /* Pick best from coarse */
+    /* Refine all candidates at full cubic resolution then pick the best */
     {
         int kb = 0;
         float cbest = 1.e+33f;
-        GA_param_setup(&stup);
-        gstup = &stup;
+        int num_rtb = 99;
+
+        rad = (tfdone > 2) ? 0.0333 : 0.0444;
 
         for (int ib = 0; ib < tfdone; ib++) {
             for (jj = 0; jj < stup.wfunc_numpar; jj++)
                 stup.wfunc_param[jj].val_init = tfparm[ib][jj];
-            /* Evaluate cost */
-            double *wpar = (double *)calloc(stup.wfunc_numfree, sizeof(double));
-            for (ii = jj = 0; jj < stup.wfunc_numpar; jj++) {
-                if (!stup.wfunc_param[jj].fixed) {
-                    wpar[ii] = (stup.wfunc_param[jj].val_init - stup.wfunc_param[jj].min)
-                               / stup.wfunc_param[jj].siz;
-                    if (wpar[ii] < 0.0 || wpar[ii] > 1.0) wpar[ii] = PRED01(wpar[ii]);
-                    ii++;
-                }
-            }
-            double cost = GA_scalar_fitter(stup.wfunc_numfree, wpar);
-            free(wpar);
-            if (cost < cbest) { cbest = (float)cost; kb = ib; }
+
+            /* Refine each candidate at full cubic resolution */
+            int rtb_calls = (ib == tfdone - 1) ? 2 * num_rtb : num_rtb;
+            nfunc = al_scalar_optim(&stup, rad, 0.01 * rad, rtb_calls);
+
+            for (jj = 0; jj < stup.wfunc_numpar; jj++)
+                ffparm[ib][jj] = stup.wfunc_param[jj].val_out;
+            float cost = stup.vbest;
+            if (cost < cbest) { cbest = cost; kb = ib; }
         }
         for (jj = 0; jj < stup.wfunc_numpar; jj++)
-            stup.wfunc_param[jj].val_init = tfparm[kb][jj];
-        fprintf(stderr, " + Best coarse cost = %f (set #%d)\n", cbest, kb + 1);
+            stup.wfunc_param[jj].val_init = ffparm[kb][jj];
+        fprintf(stderr, " + Best fine cost = %f (set #%d of %d)\n", cbest, kb + 1, tfdone);
     }
 
-    /* Fine optimization stage 1: reduced resolution */
-    rad = 0.0444;
-    nfunc = al_scalar_optim(&stup, rad, 0.002, 3333);
-    fprintf(stderr, " + Fine cost (stage 1, %dpt linear) = %f (%d evaluations)\n",
-            stup.npt_match, stup.vbest, nfunc);
-
-    /* Stage 2: Full resolution with cubic interpolation */
-    for (jj = 0; jj < stup.wfunc_numpar; jj++)
-        stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
-
-    stup.interp_code = AL_INTERP_CUBIC;
-    stup.npt_match = nvox_base;
-    al_scalar_setup(&stup, 0, 0);
-
-    rad = 0.0222;
-    nfunc = al_scalar_optim(&stup, rad, 0.001, 3333);
-    fprintf(stderr, " + Fine cost (stage 2, full cubic) = %f (%d evaluations)\n",
+    /* Final optimization: full resolution, cubic interpolation */
+    rad = 0.0333;
+    nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
+    fprintf(stderr, " + Fine cost (full cubic) = %f (%d evaluations)\n",
             stup.vbest, nfunc);
 
     /* --- +ZZ refinal: zero micho weights, re-optimize with pure local correlation --- */
-    /* Skip refinal for simple cost functions (no micho weights to zero) */
-    if (match_code != GA_MATCH_HELLINGER_SCALAR && match_code != GA_MATCH_PEARSON_SCALAR) {
+    if (METH_USES_BLOKS(match_code) && stup.micho_zfinal) {
         for (jj = 0; jj < stup.wfunc_numpar; jj++)
             stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
         stup.need_hist_setup = 1;
@@ -3084,7 +3204,7 @@ static int al_register(nifti_image *source, nifti_image *base,
         stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
 
         fprintf(stderr, " + +ZZ refinal (pure %s)\n",
-                match_code == GA_MATCH_LPA_MICHO_SCALAR ? "lpa" : "lpc");
+                METH_IS_LPA(match_code) ? "lpa" : "lpc");
         rad = 0.0666;
         powell_set_mfac(4.0f, 4.0f);
         nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
@@ -3106,6 +3226,11 @@ static int al_register(nifti_image *source, nifti_image *base,
     fprintf(stderr, "\n");
 
     /* --- Cleanup --- */
+    /* Restore original source data if noise-filled, before freeing */
+    if (stup.ajim_orig) {
+        memcpy(ajim, stup.ajim_orig, sizeof(float) * nvox_src);
+        free(stup.ajim_orig);
+    }
     free(bsim);
     free(ajim);
     if (stup.bmask) free(stup.bmask);
@@ -3119,16 +3244,17 @@ static int al_register(nifti_image *source, nifti_image *base,
     if (stup.blokset) free_GA_BLOK_set(stup.blokset);
     if (smask) free(smask);
     if (stup.bwght) free(stup.bwght);
-    clear_2Dhist();
     /* Free thread-local buffers for all threads (not just the main thread) */
 #ifdef _OPENMP
     #pragma omp parallel
     {
+        clear_2Dhist();  /* each thread has its own AL_TLOCAL histogram */
         free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
         free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
         free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
     }
 #else
+    clear_2Dhist();
     free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
     free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
     free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
@@ -3148,12 +3274,13 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
 
     int match_code;
     const char *cost_name;
-    al_resolve_cost(opts.cost, GA_MATCH_LPC_MICHO_SCALAR, &match_code, &cost_name);
+    al_resolve_cost(opts.cost, &match_code, &cost_name);
     fprintf(stderr, " + Cost function: %s, cmass: %s\n", cost_name,
             opts.cmass ? "yes" : "no");
 
     float wpar[12];
-    int ok = al_register(source, base, match_code, opts.cmass, wpar);
+    int ok = al_register(source, base, match_code, opts.cmass,
+                         opts.source_automask, wpar);
     if (ok) return ok;
 
     /* Extract source float data for warping */
@@ -3166,18 +3293,21 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     int anx = source->nx, any = source->ny, anz = source->nz;
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
 
-    /* Apply final warp with cubic interpolation */
+    /* Apply final warp */
+    int final_ic = opts.final_interp;
+    const char *interp_name = (final_ic == AL_INTERP_NN) ? "nearest" :
+                              (final_ic == AL_INTERP_LINEAR) ? "linear" : "cubic";
     long elapsed_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
 #ifdef _OPENMP
     int nthreads = omp_get_max_threads();
     if (nthreads > 1)
-        fprintf(stderr, " + Applying final warp with cubic interpolation (%ldms, %d threads)\n", elapsed_ms, nthreads);
+        fprintf(stderr, " + Applying final warp with %s interpolation (%ldms, %d threads)\n", interp_name, elapsed_ms, nthreads);
     else
 #endif
-        fprintf(stderr, " + Applying final warp with cubic interpolation (%ldms)\n", elapsed_ms);
+        fprintf(stderr, " + Applying final warp with %s interpolation (%ldms)\n", interp_name, elapsed_ms);
     float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
                                       ajim, anx, any, anz,
-                                      bnx, bny, bnz, AL_INTERP_CUBIC);
+                                      bnx, bny, bnz, final_ic);
     free(ajim);
     if (warped == NULL) {
         fprintf(stderr, "allineate: failed to warp image\n");
@@ -3234,12 +3364,12 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
 
     int match_code;
     const char *cost_name;
-    al_resolve_cost(opts.cost, GA_MATCH_LPA_MICHO_SCALAR, &match_code, &cost_name);
+    al_resolve_cost(opts.cost, &match_code, &cost_name);
     fprintf(stderr, " + Deface: registering template to input using %s\n", cost_name);
 
     /* Register template (moving) to input (fixed) */
     float wpar[12];
-    int ok = al_register(tmpl, input, match_code, opts.cmass, wpar);
+    int ok = al_register(tmpl, input, match_code, opts.cmass, 0, wpar);
     if (ok) {
         fprintf(stderr, "deface: registration failed\n");
         return 1;

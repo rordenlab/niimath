@@ -322,10 +322,11 @@ int show_help( void ) {
 #endif
 #ifdef HAVE_ALLINEATE
 	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");
-	printf("                            opts: -cost XX (lpc,lpa,hel,ls) -cmass -nocmass\n");
-	printf(" -deface <tmpl> <mask> [opts] : deface using affine registration; default lpa+ZZ cost\n");
-	printf("                              opts: -cost XX (lpc,lpa,hel,ls) -cmass -nocmass\n");
-	printf("                              aliases: -deface-epi (lpc+ZZ), -deface-hel (Hellinger)\n");
+	printf("                            opts: -cost XX (hel,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
+	printf("                                  -nearest -linear -cubic (output interpolation, default: cubic)\n");
+	printf("                            default cost: Hellinger; use -source_automask with lpc/lpa\n");
+	printf(" -deface <tmpl> <mask> [opts] : deface using affine registration; default Hellinger cost\n");
+	printf("                              opts: -cost XX (hel,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
 #endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");

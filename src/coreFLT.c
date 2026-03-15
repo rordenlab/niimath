@@ -5950,11 +5950,8 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
 		}
-		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-deface-epi") || !strcmp(argv[ac], "-deface-hel")) {
-			al_opts df_opts = al_opts_default();
-			df_opts.cost = AL_COST_LPA; /* deface default: lpa+ZZ (cross-modal) */
-			if (!strcmp(argv[ac], "-deface-epi")) df_opts.cost = AL_COST_LPC;
-			else if (!strcmp(argv[ac], "-deface-hel")) df_opts.cost = AL_COST_HELLINGER;
+		else if (!strcmp(argv[ac], "-deface")) {
+			al_opts df_opts = al_opts_default(); /* default: Hellinger */
 			ac++;
 			if (ac + 1 >= argc) {
 				printfx("%s requires template and mask arguments\n", argv[ac - 1]);
