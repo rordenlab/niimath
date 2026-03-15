@@ -68,7 +68,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20251007"
+#define kMTHdate "v1.0.20260315"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -321,10 +321,11 @@ int show_help( void ) {
 
 #endif
 #ifdef HAVE_ALLINEATE
-	printf(" -allineate <base>        : affine registration to match 'base' using lpc+ZZ cost (from AFNI 3dAllineate)\n");
-	printf(" -deface <tmpl> <mask>    : deface using affine registration of template; lpa+ZZ cost (cross-modal)\n");
-	printf(" -deface-epi <tmpl> <mask>: deface EPI using affine registration of template; lpc+ZZ cost\n");
-	printf(" -deface-hel <tmpl> <mask>: deface using Hellinger cost (fast, cross-modal)\n");
+	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");
+	printf("                            opts: -cost XX (lpc,lpa,hel,ls) -cmass -nocmass\n");
+	printf(" -deface <tmpl> <mask> [opts] : deface using affine registration; default lpa+ZZ cost\n");
+	printf("                              opts: -cost XX (lpc,lpa,hel,ls) -cmass -nocmass\n");
+	printf("                              aliases: -deface-epi (lpc+ZZ), -deface-hel (Hellinger)\n");
 #endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
@@ -362,7 +363,7 @@ int show_help( void ) {
 	printf(" -qform <code>            : set qform_code\n");
 	printf(" -sform <code>            : set sform_code\n");
 	#if defined(_OPENMP)
-	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
+	printf(" -p <threads>             : set maximum number of parallel threads (0 = use all available)\n");
 	#else
 	printf(" -p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif

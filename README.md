@@ -34,7 +34,9 @@ You can get niimath using several methods:
 
 ## Compilation
 
-The easiest way to build niimath on a Unix computer is to use cmake:
+### CMake (recommended)
+
+The easiest way to build niimath on a Unix computer is to use cmake. OpenMP is enabled by default (used by affine registration and optionally by core operations):
 
 ```
 git clone https://github.com/rordenlab/niimath.git
@@ -42,7 +44,7 @@ cd niimath; mkdir build; cd build; cmake ..
 make
 ```
 
-If you want to enable OpenMP support on macOS, you have to install `libomp` first using `brew install libomp`, and then use `cmake -DOPENMP_XCODE=ON ..` to configure the project in the above commands.
+On macOS, OpenMP requires Homebrew's libomp: `brew install libomp`. To disable OpenMP, use `cmake -DUSE_OPENMP=OFF ..`. Optional zstd compression support is auto-detected; install with `brew install zstd` (macOS) or `apt install libzstd-dev` (Linux).
 
 Likewise, if you are compiling on Windows using cmake:
 
@@ -51,7 +53,10 @@ git clone https://github.com/rordenlab/niimath.git
 cd niimath & mkdir build & cd build & cmake ..
 cmake --build .
 ```
-Alternatively, you can compile the software by running the terminal command `make` from the project's `src` folder if you are running Linux (or execute `windows.bat` if you are running Windows):
+
+### Makefile (alternative)
+
+You can compile the software by running the terminal command `make` from the project's `src` folder. This works with both Clang/LLVM and gcc on Linux and macOS:
 
 ```
 git clone https://github.com/rordenlab/niimath.git
@@ -59,23 +64,31 @@ cd niimath/src
 make
 ```
 
+The default build includes OpenMP for all operations. On macOS this requires `brew install libomp`. To disable OpenMP, use `OMP=0 make`. Other Makefile options:
+
+```
+OMP=0 make             # Disable OpenMP
+CF=1 make              # CloudFlare accelerated zlib
+make debug             # Debug build (-g, no optimization)
+make sanitize          # AddressSanitizer build
+AL=0 make              # Disable allineate registration
+ZSTD=0 make            # Disable zstd compression support
+make wasm              # Emscripten/WebAssembly target
+```
+
 You can also compile this project to Web Assembly so it can be embedded in a web page, as shown in the [live demo](https://niivue.github.io/niivue-niimath/).
 
-```
-git clone https://github.com/rordenlab/niimath.git
-cd niimath/src
-make wasm
-```
+### Windows (command line)
 
-Advanced users using the `Makefile` may want to run `CF=1 OMP=1 make -j` to make a version that uses OpenMP (parallel processing) and the CloudFlare accelerated compression library. You may need to edit the `Makefile` for your compiler name. On MacOS, the default C compiler is Clang, which has [poor OpenMP](https://github.com/neurolabusc/simd) support. Therefore, MacOS users may want to install the gcc compiler (for example, `brew install gcc@9`).
-
-For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported) :
+For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported):
 
 ```
 cl /Feniimath niimath.c core.c tensor.c bwlabel.c bw.c core32.c core64.c fdr.c meshify.c MarchingCubes.c quadric.c base64.c radixsort.c unifize.c nifti_io.c -DNII2MESH
 ```
 
-Simply running `make` in the `src` folder should compile niimath on Linux. This should work regardless of if you use the Clang/LLVM or gcc compiler. However, the resulting executable will only work with specific versions of Linux. If you want to make a universal Linux release you can use [holy-build-box](https://github.com/FooBarWidget/holy-build-box). Be aware that this uses an old version of the gcc compiler (4.8.5), so the resulting performance may not be optimized for your system.
+### Linux universal binary
+
+Simply running `make` in the `src` folder should compile niimath on Linux. However, the resulting executable will only work with specific versions of Linux. If you want to make a universal Linux release you can use [holy-build-box](https://github.com/FooBarWidget/holy-build-box). Be aware that this uses an old version of the gcc compiler (4.8.5), so the resulting performance may not be optimized for your system.
 
 ```
 git clone https://github.com/rordenlab/niimath
@@ -94,7 +107,7 @@ To read the WASM specific README, please click [here](./js/README.md). The rest 
 
 niimath provides the same commands as fslmaths, so you can use it just as you would fslmaths. If you are brave, you can even rename it fslmaths and use it as a drop in replacement. You can also modify your environment variables to unleash advanced features:
 
- - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export NIFTI_GZ` or `export NIFTI` from the command line or profile to select between compressed (smaller) or uncompressed (faster) results. Windows users can use `set` instead of `export`.
+ - Just like fslmaths, it uses your [`FSLOUTPUTTYPE` Environment Variable ](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables) to determine output file format. Unix users can specify `export FSLOUTPUTTYPE=NIFTI_GZ`, `export FSLOUTPUTTYPE=NIFTI`, or `export FSLOUTPUTTYPE=NIFTI_ZST` (zstd compressed, requires zstd support) from the command line or profile. Windows users can use `set` instead of `export`.
  - To turn on parallel processing and threading, you can either set the environment variable `export AFNI_COMPRESSOR=PIGZ`. If the environment variable `AFNI_COMPRESSOR` does not exist, or is set to any value other than `PIGZ` you will get single threaded compresson.
 
 niimath has a few features not provided by fslmaths:
@@ -129,7 +142,13 @@ niimath has a few features not provided by fslmaths:
  - `mesh`                  : see separate section below
  - `qform <code>`          : set qform code
  - `sform <code>`          : set sform code
- - `--compare <ref>`       : report if images are identical, terminates without saving new image\n");
+ - `unifize`               : bias field correction (adapted from AFNI 3dUnifize)
+ - `allineate <base> [opts]`: affine registration to match 'base' (from AFNI 3dAllineate)
+   - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass`
+ - `deface <tmpl> <mask> [opts]`: deface using affine registration of template
+   - opts: `-cost XX` (lpa [default], hel, lpc, ls) `-cmass` `-nocmass`
+   - aliases: `-deface-epi` (lpc+ZZ), `-deface-hel` (Hellinger)
+ - `--compare <ref>`       : report if images are identical, terminates without saving new image
  - `--bitmap -a name.png`  : mimic fsl slicer (see [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap))
  - `filename.nii`          : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
 

@@ -11,9 +11,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+/* Wall-clock timer: returns seconds as double */
+static inline double al_wtime(void) {
+#ifdef _OPENMP
+    return omp_get_wtime();
+#elif defined(_WIN32)
+    return (double)clock() / CLOCKS_PER_SEC; /* fallback: CPU time on Windows without OpenMP */
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
 #include "nifti_io.h"
 #include "allineate.h"
 
@@ -40,22 +54,11 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
 #define AL_BIGVAL   1.e+38f
 #define AL_SMAGIC   208921148
 
-/* Cost function method codes */
+/* Cost function method codes (subset of AFNI's full list) */
 #define GA_MATCH_PEARSON_SCALAR        1
-#define GA_MATCH_SPEARMAN_SCALAR       2
-#define GA_MATCH_KULLBACK_SCALAR       3
-#define GA_MATCH_CORRATIO_SCALAR       4
-#define GA_MATCH_NORMUTIN_SCALAR       5
-#define GA_MATCH_JOINTENT_SCALAR       6
 #define GA_MATCH_HELLINGER_SCALAR      7
-#define GA_MATCH_CORRATIO_ADD          8
-#define GA_MATCH_CORRATIO_UNS          9
-#define GA_MATCH_PEARSON_SIGNED       10
-#define GA_MATCH_PEARSON_LOCALS       11
-#define GA_MATCH_PEARSON_LOCALA       12
 #define GA_MATCH_LPC_MICHO_SCALAR     13
 #define GA_MATCH_LPA_MICHO_SCALAR     14
-#define GA_MATCH_METHNUM_SCALAR       14
 
 /* Interpolation codes */
 #define AL_INTERP_NN      0
@@ -82,11 +85,11 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
 #define DELTA_AFTER   2
 
 #define FWHM_TO_SIGMA(f) ((f)/2.3548f)
-#define D2R (3.14159265358979f/180.0f)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+#define D2R ((float)(M_PI/180.0))
 
 #define CMAX 0.9999f /* max correlation magnitude to allow */
 
@@ -146,7 +149,6 @@ typedef struct {
     /* Source/target image */
     float *ajim;           /* source image data */
     float *ajims;          /* smoothed source */
-    float *ajimor;         /* original source (unused here) */
     int anx, any, anz;     /* source dimensions */
     float adx, ady, adz;   /* source voxel sizes */
     float ajbot, ajtop, ajclip;
@@ -894,6 +896,134 @@ static void free_GA_BLOK_set(GA_BLOK_set *gbs)
 }
 
 /*==========================================================================*/
+/*========== SECTION 6b: HISTOGRAM CLIP LEVELS (CLEQWD from AFNI) =========*/
+/*==========================================================================*/
+
+#undef  WAY_BIG
+#define WAY_BIG 1.e+10f
+
+/* Compute background clip level from positive values in an array.
+   Equivalent to AFNI's THD_cliplevel(im, mfrac).
+   Algorithm: histogram positive values, find iterative median-fraction threshold. */
+static float al_cliplevel(int n, const float *ar, float mfrac)
+{
+    if (n < 222 || ar == NULL) return 0.0f;
+    if (mfrac <= 0.0f || mfrac >= 0.99f) mfrac = 0.50f;
+
+    /* Find max of positive values and count them */
+    float amax = 0.0f;
+    int npos = 0;
+    for (int ii = 0; ii < n; ii++) {
+        if (ar[ii] > 0.0f) {
+            npos++;
+            if (ar[ii] > amax) amax = ar[ii];
+        }
+    }
+    if (npos <= 222 || amax <= 0.0f) return 0.0f;
+
+    /* Build histogram of positive values */
+    int nhist = 10000;
+    float sfac = (float)nhist / amax;
+    int *hist = (int *)calloc(nhist + 1, sizeof(int));
+    if (!hist) return 0.0f;
+    double dsum = 0.0;
+    for (int ii = 0; ii < n; ii++) {
+        if (ar[ii] > 0.0f) {
+            int kk = (int)(sfac * ar[ii] + 0.499f);
+            if (kk > nhist) kk = nhist;
+            hist[kk]++;
+            dsum += (double)kk * (double)kk;
+        }
+    }
+
+    /* Initial cut: RMS bin index halved */
+    int ib = (int)(0.5 * sqrt(dsum / npos) + 0.5);
+
+    /* Walk down from top, capturing ~65% of positive voxels */
+    int qq = (int)(0.65f * npos);
+    int kk = 0, ii;
+    for (ii = nhist; ii >= ib && kk < qq; ii--)
+        kk += hist[ii];
+    int ncut = ii;
+
+    /* Iterate: find median above cut, set new cut = mfrac * median */
+    for (int iter = 0; iter < 66; iter++) {
+        int nold = ncut;
+        /* Count voxels at or above cut */
+        npos = 0;
+        for (ii = ncut; ii <= nhist; ii++) npos += hist[ii];
+        int nhalf = npos / 2;
+        /* Find median bin */
+        kk = 0;
+        for (ii = ncut; ii <= nhist && kk < nhalf; ii++)
+            kk += hist[ii];
+        ncut = (int)(mfrac * ii);
+        if (ncut == nold) break;
+    }
+
+    free(hist);
+    return (float)ncut / sfac;
+}
+
+/* Float comparison for qsort */
+static int al_float_cmp(const void *a, const void *b)
+{
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+/* Compute the p-th quantile (0 <= p <= 1) of an array.
+   Uses qsort. Allocates a temporary copy. */
+static float al_quantile(int n, const float *ar, float p)
+{
+    if (n <= 0 || ar == NULL) return 0.0f;
+    if (p <= 0.0f) p = 0.0f;
+    if (p >= 1.0f) p = 1.0f;
+
+    float *tmp = (float *)malloc(n * sizeof(float));
+    if (!tmp) return 0.0f;
+    int nn = 0;
+    for (int ii = 0; ii < n; ii++)
+        if (ar[ii] < WAY_BIG) tmp[nn++] = ar[ii];
+    if (nn == 0) { free(tmp); return 0.0f; }
+
+    qsort(tmp, nn, sizeof(float), al_float_cmp);
+    int idx = (int)(p * (nn - 1));
+    float val = tmp[idx];
+    free(tmp);
+    return val;
+}
+
+/* Compute clip levels for histogram-based cost functions (CLEQWD mode).
+   Equivalent to AFNI's clipate() from thd_correlate.c.
+   For positive images: bot = THD_cliplevel(0.345), top = quantile(0.966),
+   capped at top = min(top, 4.321 * bot).
+   Returns bot in pair.a, top in pair.b. If a >= b, clipping is invalid. */
+typedef struct { float a, b; } al_float_pair;
+
+static al_float_pair al_clipate(int n, const float *ar)
+{
+    al_float_pair rr = { 1.0f, 0.0f }; /* invalid by default */
+    if (n < 666 || ar == NULL) return rr;
+
+    /* Check if all values are non-negative */
+    float mn = ar[0];
+    for (int ii = 1; ii < n; ii++)
+        if (ar[ii] < mn) mn = ar[ii];
+
+    if (mn < 0.0f) return rr; /* negative values: no clipping */
+
+    float cbot = al_cliplevel(n, ar, 0.345f);
+    float ctop = al_quantile(n, ar, 0.966f);
+    if (ctop > 4.321f * cbot) ctop = 4.321f * cbot;
+
+    if (cbot >= ctop) return rr; /* invalid */
+    rr.a = cbot;
+    rr.b = ctop;
+    return rr;
+}
+
+/*==========================================================================*/
 /*========== SECTION 7: 2D HISTOGRAM AND CORRELATION METRICS ==============*/
 /*==========================================================================*/
 
@@ -1280,7 +1410,78 @@ static void al_interp(float *far, int nx, int ny, int nz,
 /* When processing all base voxels in order, the affine warp is separable:
    xo = m[0][0]*i + (m[0][1]*j + m[0][2]*k + m[0][3])
    We compute the row base once per (j,k), then step by m[*][0] per voxel.
-   This eliminates intermediate coordinate arrays and the chunking overhead. */
+   This eliminates intermediate coordinate arrays and the chunking overhead.
+
+   For linear interpolation, a per-row safe-range pre-pass identifies the
+   interior voxels where all warped coordinates are guaranteed in-bounds.
+   The interior loop skips bounds checking and CLIP, replacing floorf() with
+   direct (int) casts. Edge voxels still use the full bounds-checked path. */
+
+/* Compute the i-range [i_lo, i_hi) where all three warped coordinates stay
+   inside [0.5, dim-1.5], guaranteeing (int)coord in [0, dim-2] and +1 in [1, dim-1].
+   Returns 0 if no valid range exists. */
+static inline int al_safe_irange(int bnx,
+    float bj_x, float mx0, float anx_safe,
+    float bj_y, float my0, float any_safe,
+    float bj_z, float mz0, float anz_safe,
+    int *i_lo_out, int *i_hi_out)
+{
+    float lo = 0.0f, hi = (float)(bnx - 1);
+    float bases[3] = {bj_x, bj_y, bj_z};
+    float steps[3] = {mx0, my0, mz0};
+    float highs[3] = {anx_safe, any_safe, anz_safe};
+
+    for (int a = 0; a < 3; a++) {
+        float b = bases[a], s = steps[a], h = highs[a];
+        if (s > 1e-12f) {
+            float t0 = (0.5f - b) / s, t1 = (h - b) / s;
+            if (t0 > lo) lo = t0;
+            if (t1 < hi) hi = t1;
+        } else if (s < -1e-12f) {
+            float t0 = (h - b) / s, t1 = (0.5f - b) / s;
+            if (t0 > lo) lo = t0;
+            if (t1 < hi) hi = t1;
+        } else {
+            if (b < 0.5f || b > h) return 0;
+        }
+    }
+    int ilo = (int)ceilf(lo);
+    int ihi = (int)floorf(hi) + 1;
+    if (ilo < 0) ilo = 0;
+    if (ihi > bnx) ihi = bnx;
+    if (ilo >= ihi) return 0;
+    *i_lo_out = ilo;
+    *i_hi_out = ihi;
+    return 1;
+}
+
+/* Linear interpolation for a single voxel with bounds check and CLIP */
+static inline float al_interp_linear_checked(
+    float xx, float yy, float zz,
+    float nxh, float nyh, float nzh,
+    int anx1, int any1, int anz1,
+    const float *aim, int anx, int nxy_a, int *oob)
+{
+    if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+        zz < -0.499f || zz > nzh) { *oob = 1; return 0.0f; }
+    *oob = 0;
+    float ix = floorf(xx), fx = xx - ix;
+    float jy = floorf(yy), fy = yy - jy;
+    float kz = floorf(zz), fz = zz - kz;
+    int ix_00 = (int)ix, ix_p1 = ix_00 + 1;
+    int jy_00 = (int)jy, jy_p1 = jy_00 + 1;
+    int kz_00 = (int)kz, kz_p1 = kz_00 + 1;
+    CLIP(ix_00, anx1); CLIP(ix_p1, anx1);
+    CLIP(jy_00, any1); CLIP(jy_p1, any1);
+    CLIP(kz_00, anz1); CLIP(kz_p1, anz1);
+    float w0 = 1.0f - fx, w1 = fx;
+#define XLINT(j,k) w0*aim[(ix_00)+(j)*anx+(k)*nxy_a]+w1*aim[(ix_p1)+(j)*anx+(k)*nxy_a]
+    float fk0 = (1.0f-fy)*XLINT(jy_00,kz_00) + fy*XLINT(jy_p1,kz_00);
+    float fk1 = (1.0f-fy)*XLINT(jy_00,kz_p1) + fy*XLINT(jy_p1,kz_p1);
+#undef XLINT
+    return (1.0f - fz) * fk0 + fz * fk1;
+}
+
 static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int anz,
                                   int bnx, int bny, int bnz, int interp_code,
                                   float *avm)
@@ -1289,7 +1490,10 @@ static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int an
     int nxy_a = anx * any;
     float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
     int anx1 = anx - 1, any1 = any - 1, anz1 = anz - 1;
-    /* Matrix row vectors: step per i, step per j, step per k, offset */
+    /* Safe upper bounds for interior range: coord <= this means (int)coord+1 <= dim-1 */
+    float anx_safe = (float)(anx - 2) + 0.999f;
+    float any_safe = (float)(any - 2) + 0.999f;
+    float anz_safe = (float)(anz - 2) + 0.999f;
     float mx0 = gam.m[0][0], mx1 = gam.m[0][1], mx2 = gam.m[0][2], mx3 = gam.m[0][3];
     float my0 = gam.m[1][0], my1 = gam.m[1][1], my2 = gam.m[1][2], my3 = gam.m[1][3];
     float mz0 = gam.m[2][0], mz1 = gam.m[2][1], mz2 = gam.m[2][2], mz3 = gam.m[2][3];
@@ -1310,41 +1514,60 @@ static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int an
             float bj_z = mz1 * jj + bk_z;
             int out_base = out_base_k + jj * bnx;
 
-            for (int ii = 0; ii < bnx; ii++) {
-                float xx = mx0 * ii + bj_x;
-                float yy = my0 * ii + bj_y;
-                float zz = mz0 * ii + bj_z;
-                int idx = out_base + ii;
+            if (interp_code == AL_INTERP_LINEAR) {
+                int i_lo = 0, i_hi = 0;
+                al_safe_irange(bnx, bj_x, mx0, anx_safe,
+                               bj_y, my0, any_safe, bj_z, mz0, anz_safe, &i_lo, &i_hi);
 
-                /* Bounds check */
-                if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
-                    zz < -0.499f || zz > nzh) {
-                    avm[idx] = AL_OUTVAL;
-                    continue;
+                /* Leading edge: bounds-checked */
+                for (int ii = 0; ii < i_lo; ii++) {
+                    int oob;
+                    float v = al_interp_linear_checked(
+                        mx0*ii+bj_x, my0*ii+bj_y, mz0*ii+bj_z,
+                        nxh, nyh, nzh, anx1, any1, anz1, aim, anx, nxy_a, &oob);
+                    avm[out_base+ii] = oob ? AL_OUTVAL : v;
                 }
 
-                if (interp_code == AL_INTERP_LINEAR) {
-                    float ix = floorf(xx), fx = xx - ix;
-                    float jy = floorf(yy), fy = yy - jy;
-                    float kz = floorf(zz), fz = zz - kz;
-                    int ix_00 = (int)ix, ix_p1 = ix_00 + 1;
-                    int jy_00 = (int)jy, jy_p1 = jy_00 + 1;
-                    int kz_00 = (int)kz, kz_p1 = kz_00 + 1;
-                    CLIP(ix_00, anx1); CLIP(ix_p1, anx1);
-                    CLIP(jy_00, any1); CLIP(jy_p1, any1);
-                    CLIP(kz_00, anz1); CLIP(kz_p1, anz1);
-                    float wt_00 = 1.0f - fx, wt_p1 = fx;
-#undef  XINTF
-#define XINTF(j,k) wt_00*aim[(ix_00)+(j)*anx+(k)*nxy_a]+wt_p1*aim[(ix_p1)+(j)*anx+(k)*nxy_a]
-                    float f_j00_k00 = XINTF(jy_00, kz_00);
-                    float f_jp1_k00 = XINTF(jy_p1, kz_00);
-                    float f_j00_kp1 = XINTF(jy_00, kz_p1);
-                    float f_jp1_kp1 = XINTF(jy_p1, kz_p1);
-                    float wt_y0 = 1.0f - fy, wt_y1 = fy;
-                    float f_k00 = wt_y0 * f_j00_k00 + wt_y1 * f_jp1_k00;
-                    float f_kp1 = wt_y0 * f_j00_kp1 + wt_y1 * f_jp1_kp1;
-                    avm[idx] = (1.0f - fz) * f_k00 + fz * f_kp1;
-                } else { /* AL_INTERP_CUBIC */
+                /* Interior: no bounds check, no CLIP, no floorf */
+                for (int ii = i_lo; ii < i_hi; ii++) {
+                    float xx = mx0 * ii + bj_x;
+                    float yy = my0 * ii + bj_y;
+                    float zz = mz0 * ii + bj_z;
+                    int ix0 = (int)xx; float fx = xx - ix0;
+                    int jy0 = (int)yy; float fy = yy - jy0;
+                    int kz0 = (int)zz; float fz = zz - kz0;
+                    float w0 = 1.0f - fx, w1 = fx;
+                    int a00 = ix0 + jy0*anx, a10 = ix0 + (jy0+1)*anx;
+                    int k0off = kz0*nxy_a, k1off = (kz0+1)*nxy_a;
+                    float f00 = w0*aim[a00+k0off] + w1*aim[a00+1+k0off];
+                    float f10 = w0*aim[a10+k0off] + w1*aim[a10+1+k0off];
+                    float f01 = w0*aim[a00+k1off] + w1*aim[a00+1+k1off];
+                    float f11 = w0*aim[a10+k1off] + w1*aim[a10+1+k1off];
+                    float wy0 = 1.0f - fy;
+                    avm[out_base+ii] = (1.0f-fz)*(wy0*f00 + fy*f10)
+                                           + fz *(wy0*f01 + fy*f11);
+                }
+
+                /* Trailing edge: bounds-checked */
+                for (int ii = i_hi; ii < bnx; ii++) {
+                    int oob;
+                    float v = al_interp_linear_checked(
+                        mx0*ii+bj_x, my0*ii+bj_y, mz0*ii+bj_z,
+                        nxh, nyh, nzh, anx1, any1, anz1, aim, anx, nxy_a, &oob);
+                    avm[out_base+ii] = oob ? AL_OUTVAL : v;
+                }
+            } else { /* AL_INTERP_CUBIC — original path, bounds-checked */
+                for (int ii = 0; ii < bnx; ii++) {
+                    float xx = mx0 * ii + bj_x;
+                    float yy = my0 * ii + bj_y;
+                    float zz = mz0 * ii + bj_z;
+                    int idx = out_base + ii;
+
+                    if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+                        zz < -0.499f || zz > nzh) {
+                        avm[idx] = AL_OUTVAL;
+                        continue;
+                    }
                     int cix = (int)floorf(xx); float cfx = xx - cix;
                     int cjy = (int)floorf(yy); float cfy = yy - cjy;
                     int ckz = (int)floorf(zz); float cfz = zz - ckz;
@@ -1360,7 +1583,6 @@ static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int an
                     int ckz_m1 = ckz-1, ckz_00 = ckz, ckz_p1 = ckz+1, ckz_p2 = ckz+2;
                     CLIP(ckz_m1, anz1); CLIP(ckz_00, anz1); CLIP(ckz_p1, anz1); CLIP(ckz_p2, anz1);
                     float cwx_m1 = P_M1(cfx), cwx_00 = P_00(cfx), cwx_p1 = P_P1(cfx), cwx_p2 = P_P2(cfx);
-#undef  XINTC
 #define XINTC(j,k) cwx_m1*aim[(cix_m1)+(j)*anx+(k)*nxy_a]+cwx_00*aim[(cix_00)+(j)*anx+(k)*nxy_a]\
                    +cwx_p1*aim[(cix_p1)+(j)*anx+(k)*nxy_a]+cwx_p2*aim[(cix_p2)+(j)*anx+(k)*nxy_a]
                     float f_jm1_km1=XINTC(cjy_m1,ckz_m1), f_j00_km1=XINTC(cjy_00,ckz_m1);
@@ -1378,13 +1600,12 @@ static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int an
                     float f_kp2 = cwy_m1*f_jm1_kp2+cwy_00*f_j00_kp2+cwy_p1*f_jp1_kp2+cwy_p2*f_jp2_kp2;
                     float cwz_m1=P_M1(cfz), cwz_00=P_00(cfz), cwz_p1=P_P1(cfz), cwz_p2=P_P2(cfz);
                     avm[idx] = P_FACTOR * (cwz_m1*f_km1 + cwz_00*f_k00 + cwz_p1*f_kp1 + cwz_p2*f_kp2);
+#undef XINTC
                 }
             }
         }
     }
 }
-#undef XINTF
-#undef XINTC
 
 /*--- Get warped target values at control points (or all points) ---*/
 static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
@@ -1651,12 +1872,49 @@ static float GA_get_warped_overlap_fraction(void)
 }
 
 /*--- Compute cost function ---*/
+/* Weighted global Pearson correlation: returns negative correlation (for minimization).
+   Two-pass algorithm: compute means, then variance/covariance.
+   Auto-vectorized by the compiler with -ffast-math. */
+static double GA_pearson_global(int npt, float *avm, float *bvm, float *wvm)
+{
+    double ws = 0.0, xm = 0.0, ym = 0.0;
+    double xv = 0.0, yv = 0.0, xy = 0.0;
+    int ii;
+
+    if (wvm != NULL) {
+        for (ii = 0; ii < npt; ii++) {
+            double w = (double)wvm[ii];
+            ws += w; xm += w * avm[ii]; ym += w * bvm[ii];
+        }
+        if (ws <= 0.0) return (double)AL_BIGVAL;
+        xm /= ws; ym /= ws;
+        for (ii = 0; ii < npt; ii++) {
+            double w = (double)wvm[ii], dx = (double)avm[ii] - xm, dy = (double)bvm[ii] - ym;
+            xv += w * dx * dx; yv += w * dy * dy; xy += w * dx * dy;
+        }
+    } else {
+        for (ii = 0; ii < npt; ii++) { xm += avm[ii]; ym += bvm[ii]; }
+        ws = npt; xm /= ws; ym /= ws;
+        for (ii = 0; ii < npt; ii++) {
+            double dx = (double)avm[ii] - xm, dy = (double)bvm[ii] - ym;
+            xv += dx * dx; yv += dy * dy; xy += dx * dy;
+        }
+    }
+
+    if (xv <= 0.0 || yv <= 0.0) return (double)AL_BIGVAL;
+    return -(xy / sqrt(xv * yv));
+}
+
 static double GA_scalar_costfun(int meth, int npt,
                                 float *avm, float *bvm, float *wvm)
 {
     double val = 0.0;
 
     switch (meth) {
+        case GA_MATCH_PEARSON_SCALAR: { /* Global Pearson (within-modality, fast) */
+            val = GA_pearson_global(npt, avm, bvm, wvm);
+        } break;
+
         case GA_MATCH_HELLINGER_SCALAR: { /* Hellinger only (fast, cross-modal) */
             float_quad hmc;
             hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
@@ -1688,7 +1946,7 @@ static double GA_scalar_costfun(int meth, int npt,
         } break;
     }
 
-    if (!isfinite(val)) val = (double)AL_BIGVAL;
+    if (fabs(val) > 1.e+37) val = (double)AL_BIGVAL; /* magnitude guard: safe under -ffast-math */
     return val;
 }
 
@@ -1766,7 +2024,7 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
         if (stup->ajims) { free(stup->ajims); stup->ajims = NULL; }
     }
 
-    /* Get min/max of source image */
+    /* Get min/max and CLEQWD clip levels for source image */
     {
         float *src = (stup->ajims != NULL) ? stup->ajims : stup->ajim;
         int nvox = stup->anx * stup->any * stup->anz;
@@ -1776,9 +2034,14 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
             if (src[ii] > stup->ajtop) stup->ajtop = src[ii];
         }
         stup->ajclip = stup->ajtop;
+        /* Apply CLEQWD clipping for histogram-based cost functions */
+        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+            al_float_pair cp = al_clipate(nvox, src);
+            if (cp.a < cp.b) { stup->ajbot = cp.a; stup->ajclip = cp.b; }
+        }
     }
 
-    /* Get min/max of base image */
+    /* Get min/max and CLEQWD clip levels for base image */
     {
         float *bas = (stup->bsims != NULL) ? stup->bsims : stup->bsim;
         int nvox = nx * ny * nz;
@@ -1788,6 +2051,11 @@ static void al_scalar_setup(GA_setup *stup, int new_base, int new_targ)
             if (bas[ii] > stup->bstop) stup->bstop = bas[ii];
         }
         stup->bsclip = stup->bstop;
+        /* Apply CLEQWD clipping for histogram-based cost functions */
+        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+            al_float_pair cp = al_clipate(nvox, bas);
+            if (cp.a < cp.b) { stup->bsbot = cp.a; stup->bsclip = cp.b; }
+        }
     }
 
     /* Determine number of matching points */
@@ -2364,13 +2632,53 @@ static void al_setup_befafter(mat44 base_cmat, mat44 base_imat,
 /*================ SECTION 11: PUBLIC FUNCTION nii_allineate() ============*/
 /*==========================================================================*/
 
+/* Map AL_COST_* to internal GA_MATCH_* code and name string.
+   default_code is used when opts.cost == AL_COST_LPC (for allineate) or AL_COST_LPA (for deface). */
+static void al_resolve_cost(int cost, int default_ga, int *match_out, const char **name_out)
+{
+    switch (cost) {
+        case AL_COST_LPA:      *match_out = GA_MATCH_LPA_MICHO_SCALAR; *name_out = "lpa+ZZ"; return;
+        case AL_COST_LPC:      *match_out = GA_MATCH_LPC_MICHO_SCALAR; *name_out = "lpc+ZZ"; return;
+        case AL_COST_HELLINGER: *match_out = GA_MATCH_HELLINGER_SCALAR; *name_out = "Hellinger"; return;
+        case AL_COST_PEARSON:   *match_out = GA_MATCH_PEARSON_SCALAR;   *name_out = "Pearson"; return;
+        default:                *match_out = default_ga;
+                                *name_out = (default_ga == GA_MATCH_LPA_MICHO_SCALAR) ? "lpa+ZZ" : "lpc+ZZ";
+                                return;
+    }
+}
+
+/* Compute intensity-weighted center of mass in voxel indices */
+static void al_center_of_mass(const float *data, int nx, int ny, int nz,
+                               double *cx, double *cy, double *cz)
+{
+    double ws = 0.0, xc = 0.0, yc = 0.0, zc = 0.0;
+    for (int kk = 0; kk < nz; kk++)
+        for (int jj = 0; jj < ny; jj++)
+            for (int ii = 0; ii < nx; ii++) {
+                double v = (double)data[ii + jj * nx + kk * nx * ny];
+                if (v <= 0.0) continue;
+                ws += v; xc += v * ii; yc += v * jj; zc += v * kk;
+            }
+    if (ws > 0.0) { *cx = xc / ws; *cy = yc / ws; *cz = zc / ws; }
+    else { *cx = (nx - 1) * 0.5; *cy = (ny - 1) * 0.5; *cz = (nz - 1) * 0.5; }
+}
+
+/* Apply mat44 to a 3-vector (xyz = M * ijk + offset) */
+static inline void al_mat44_vec(mat44 m, float x, float y, float z,
+                                 float *ox, float *oy, float *oz)
+{
+    *ox = m.m[0][0]*x + m.m[0][1]*y + m.m[0][2]*z + m.m[0][3];
+    *oy = m.m[1][0]*x + m.m[1][1]*y + m.m[1][2]*z + m.m[1][3];
+    *oz = m.m[2][0]*x + m.m[2][1]*y + m.m[2][2]*z + m.m[2][3];
+}
+
 /* Extract float data from NIfTI image. Returns malloc'd float array. */
 static float *nii_to_float(nifti_image *nim)
 {
-    int nvox, ii;
+    int ii;
     float *fdata;
     if (nim == NULL || nim->data == NULL) return NULL;
-    nvox = (int)(nim->nx * nim->ny * nim->nz);
+    int nvox = (int)((size_t)nim->nx * nim->ny * nim->nz);
     fdata = (float *)calloc(nvox, sizeof(float));
     if (!fdata) return NULL;
 
@@ -2400,8 +2708,8 @@ static float *nii_to_float(nifti_image *nim)
             break;
     }
 
-    /* Apply scl_slope/scl_inter if not already handled and if set */
-    if (nim->datatype != DT_INT16 && nim->scl_slope != 0.0f &&
+    /* Apply scl_slope/scl_inter if set */
+    if (nim->scl_slope != 0.0f &&
         !(nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)) {
         for (ii = 0; ii < nvox; ii++)
             fdata[ii] = fdata[ii] * nim->scl_slope + nim->scl_inter;
@@ -2412,16 +2720,13 @@ static float *nii_to_float(nifti_image *nim)
 
 /* Internal: run affine registration, return 12 warp parameters.
    source: moving image, base: fixed/reference image.
-   match_code: GA_MATCH_LPC_MICHO_SCALAR (lpc+ZZ) or GA_MATCH_LPA_MICHO_SCALAR (lpa+ZZ).
+   match_code: GA_MATCH_* code for cost function.
+   do_cmass: if nonzero, compute center-of-mass shift as initial alignment.
    wpar_out[12]: filled with optimized affine parameters on success.
    Returns 0 on success, nonzero on error. */
 static int al_register(nifti_image *source, nifti_image *base,
-                       int match_code, float wpar_out[12])
+                       int match_code, int do_cmass, float wpar_out[12])
 {
-#ifdef _OPENMP
-    int maxthreads = omp_get_max_threads();
-    if (maxthreads > 8) omp_set_num_threads(8);
-#endif
     GA_setup stup;
     GA_param params[12];
     float *bsim, *ajim;
@@ -2456,8 +2761,8 @@ static int al_register(nifti_image *source, nifti_image *base,
     ady = (float)fabs(source->dy); if (ady <= 0.0f) ady = 1.0f;
     adz = (float)fabs(source->dz); if (adz <= 0.0f) adz = 1.0f;
 
-    nvox_base = bnx * bny * bnz;
-    nvox_src  = anx * any * anz;
+    nvox_base = (int)((size_t)bnx * bny * bnz);
+    nvox_src  = (int)((size_t)anx * any * anz);
 
     /* --- 2. Get sform matrices --- */
     if (base->sform_code > 0)
@@ -2494,7 +2799,7 @@ static int al_register(nifti_image *source, nifti_image *base,
     stup.bsim = bsim;     stup.bsims = NULL;
     stup.bnx = bnx;       stup.bny = bny;       stup.bnz = bnz;
     stup.bdx = bdx;       stup.bdy = bdy;       stup.bdz = bdz;
-    stup.ajim = ajim;     stup.ajims = NULL;     stup.ajimor = NULL;
+    stup.ajim = ajim;     stup.ajims = NULL;
     stup.anx = anx;       stup.any = any;        stup.anz = anz;
     stup.adx = adx;       stup.ady = ady;        stup.adz = adz;
     stup.ajmask = smask;
@@ -2526,12 +2831,18 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     /* --- 6. Configure cost function --- */
     stup.match_code = match_code;
-    stup.micho_mi  = 0.2;
-    stup.micho_nmi = 0.2;
-    stup.micho_crA = 0.4;
-    stup.micho_hel = 0.4;
-    stup.micho_ov  = 0.4;
-    stup.micho_zfinal = 1; /* +ZZ */
+    if (match_code == GA_MATCH_PEARSON_SCALAR || match_code == GA_MATCH_HELLINGER_SCALAR) {
+        /* Simple cost functions: no micho multi-cost weights */
+        stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
+        stup.micho_zfinal = 0;
+    } else {
+        stup.micho_mi  = 0.2;
+        stup.micho_nmi = 0.2;
+        stup.micho_crA = 0.4;
+        stup.micho_hel = 0.4;
+        stup.micho_ov  = 0.4;
+        stup.micho_zfinal = 1; /* +ZZ */
+    }
 
     /* --- 7. Set up affine 12-param warp --- */
     stup.wfunc = al_wfunc_affine;
@@ -2575,6 +2886,31 @@ static int al_register(nifti_image *source, nifti_image *base,
     SETPAR(0, "x-shift", -xxx_m, xxx_m, 0.0f);
     SETPAR(1, "y-shift", -yyy_m, yyy_m, 0.0f);
     SETPAR(2, "z-shift", -zzz_m, zzz_m, 0.0f);
+
+    /* --- Center-of-mass initial shift --- */
+    if (do_cmass) {
+        double bxc, byc, bzc, axc, ayc, azc;
+        al_center_of_mass(bsim, bnx, bny, bnz, &bxc, &byc, &bzc);
+        al_center_of_mass(ajim, anx, any, anz, &axc, &ayc, &azc);
+
+        float bx_mm, by_mm, bz_mm, ax_mm, ay_mm, az_mm;
+        al_mat44_vec(base_cmat, (float)bxc, (float)byc, (float)bzc, &bx_mm, &by_mm, &bz_mm);
+        al_mat44_vec(targ_cmat, (float)axc, (float)ayc, (float)azc, &ax_mm, &ay_mm, &az_mm);
+
+        float cmx = ax_mm - bx_mm, cmy = ay_mm - by_mm, cmz = az_mm - bz_mm;
+        fprintf(stderr, " + Center-of-mass shift: %.2f %.2f %.2f mm\n", cmx, cmy, cmz);
+
+        /* Clamp to parameter range and set as initial value */
+        if (cmx < params[0].min) cmx = params[0].min;
+        if (cmx > params[0].max) cmx = params[0].max;
+        if (cmy < params[1].min) cmy = params[1].min;
+        if (cmy > params[1].max) cmy = params[1].max;
+        if (cmz < params[2].min) cmz = params[2].min;
+        if (cmz > params[2].max) cmz = params[2].max;
+        params[0].val_init = params[0].val_pinit = cmx;
+        params[1].val_init = params[1].val_pinit = cmy;
+        params[2].val_init = params[2].val_pinit = cmz;
+    }
 
     float rval = 30.0f;
     SETPAR(3, "z-angle", -rval, rval, 0.0f);
@@ -2734,8 +3070,8 @@ static int al_register(nifti_image *source, nifti_image *base,
             stup.vbest, nfunc);
 
     /* --- +ZZ refinal: zero micho weights, re-optimize with pure local correlation --- */
-    /* Skip refinal for Hellinger-only (no micho weights to zero) */
-    if (match_code != GA_MATCH_HELLINGER_SCALAR) {
+    /* Skip refinal for simple cost functions (no micho weights to zero) */
+    if (match_code != GA_MATCH_HELLINGER_SCALAR && match_code != GA_MATCH_PEARSON_SCALAR) {
         for (jj = 0; jj < stup.wfunc_numpar; jj++)
             stup.wfunc_param[jj].val_init = stup.wfunc_param[jj].val_out;
         stup.need_hist_setup = 1;
@@ -2784,23 +3120,40 @@ static int al_register(nifti_image *source, nifti_image *base,
     if (smask) free(smask);
     if (stup.bwght) free(stup.bwght);
     clear_2Dhist();
+    /* Free thread-local buffers for all threads (not just the main thread) */
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
+        free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
+        free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
+    }
+#else
     free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
     free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
     free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
+#endif
 
     fprintf(stderr, " + Registration complete\n");
     return 0;
 }
 
-int nii_allineate(nifti_image *source, nifti_image *base)
+int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
 {
+    double t_start = al_wtime();
     if (source == NULL || base == NULL) {
         fprintf(stderr, "allineate: NULL input image\n");
         return 1;
     }
 
+    int match_code;
+    const char *cost_name;
+    al_resolve_cost(opts.cost, GA_MATCH_LPC_MICHO_SCALAR, &match_code, &cost_name);
+    fprintf(stderr, " + Cost function: %s, cmass: %s\n", cost_name,
+            opts.cmass ? "yes" : "no");
+
     float wpar[12];
-    int ok = al_register(source, base, GA_MATCH_LPC_MICHO_SCALAR, wpar);
+    int ok = al_register(source, base, match_code, opts.cmass, wpar);
     if (ok) return ok;
 
     /* Extract source float data for warping */
@@ -2814,7 +3167,14 @@ int nii_allineate(nifti_image *source, nifti_image *base)
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
 
     /* Apply final warp with cubic interpolation */
-    fprintf(stderr, " + Applying final warp with cubic interpolation\n");
+    long elapsed_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
+#ifdef _OPENMP
+    int nthreads = omp_get_max_threads();
+    if (nthreads > 1)
+        fprintf(stderr, " + Applying final warp with cubic interpolation (%ldms, %d threads)\n", elapsed_ms, nthreads);
+    else
+#endif
+        fprintf(stderr, " + Applying final warp with cubic interpolation (%ldms)\n", elapsed_ms);
     float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
                                       ajim, anx, any, anz,
                                       bnx, bny, bnz, AL_INTERP_CUBIC);
@@ -2858,10 +3218,11 @@ int nii_allineate(nifti_image *source, nifti_image *base)
    input: the image to deface (modified in-place, stays in its own space)
    tmpl: template image (moving image for registration)
    mask: mask in template space (non-zero = keep, zero = remove face)
-   cost_mode: 0 = lpa+ZZ (cross-modal), 1 = lpc+ZZ (structural-to-EPI), 2 = Hellinger (fast)
+   opts: registration options (cost function, cmass)
    Returns 0 on success, nonzero on error. */
-int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, int cost_mode)
+int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts opts)
 {
+    double t_start = al_wtime();
     if (input == NULL || tmpl == NULL || mask == NULL) {
         fprintf(stderr, "deface: NULL input image\n");
         return 1;
@@ -2873,21 +3234,12 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, int cos
 
     int match_code;
     const char *cost_name;
-    if (cost_mode == 2) {
-        match_code = GA_MATCH_HELLINGER_SCALAR;
-        cost_name = "Hellinger";
-    } else if (cost_mode == 1) {
-        match_code = GA_MATCH_LPC_MICHO_SCALAR;
-        cost_name = "lpc+ZZ";
-    } else {
-        match_code = GA_MATCH_LPA_MICHO_SCALAR;
-        cost_name = "lpa+ZZ";
-    }
+    al_resolve_cost(opts.cost, GA_MATCH_LPA_MICHO_SCALAR, &match_code, &cost_name);
     fprintf(stderr, " + Deface: registering template to input using %s\n", cost_name);
 
     /* Register template (moving) to input (fixed) */
     float wpar[12];
-    int ok = al_register(tmpl, input, match_code, wpar);
+    int ok = al_register(tmpl, input, match_code, opts.cmass, wpar);
     if (ok) {
         fprintf(stderr, "deface: registration failed\n");
         return 1;
@@ -2930,7 +3282,15 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, int cos
     }
 
     free(warped_mask);
-    fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%)\n",
-            nmasked, nvox, 100.0f * nmasked / nvox);
+    long elapsed_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
+#ifdef _OPENMP
+    int nthreads = omp_get_max_threads();
+    if (nthreads > 1)
+        fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%; %ldms, %d threads)\n",
+                nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms, nthreads);
+    else
+#endif
+        fprintf(stderr, " + Deface complete: %d of %d voxels masked (%.1f%%; %ldms)\n",
+                nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms);
     return 0;
 }

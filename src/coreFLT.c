@@ -5285,7 +5285,7 @@ staticx int nifti_unifize(nifti_image *nim) {
 }
 
 #ifdef HAVE_ALLINEATE
-staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile) {
+staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts) {
 #ifdef DT32
 	if (nim->datatype != DT_FLOAT32) {
 		printfx("allineate: Unsupported datatype %d\n", nim->datatype);
@@ -5296,17 +5296,17 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile) {
 		printfx("** failed to read base image from '%s'\n", basefile);
 		return 1;
 	}
-	int ok = nii_allineate(nim, base);
+	int ok = nii_allineate(nim, base, opts);
 	nifti_image_free(base);
 	return ok;
 #else
-	(void)basefile;
+	(void)basefile; (void)opts;
 	printfx("'-dt double' does not support allineate\n");
 	return 1;
 #endif
 }
 
-staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, int cost_mode) {
+staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
 	if (nim->datatype != DT_FLOAT32) {
 		printfx("deface: Unsupported datatype %d\n", nim->datatype);
@@ -5323,12 +5323,12 @@ staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, 
 		nifti_image_free(tmpl);
 		return 1;
 	}
-	int ok = nii_deface(nim, tmpl, mask, cost_mode);
+	int ok = nii_deface(nim, tmpl, mask, opts);
 	nifti_image_free(tmpl);
 	nifti_image_free(mask);
 	return ok;
 #else
-	(void)tmplfile; (void)maskfile; (void)cost_mode;
+	(void)tmplfile; (void)maskfile; (void)opts;
 	printfx("'-dt double' does not support deface\n");
 	return 1;
 #endif
@@ -5441,18 +5441,6 @@ int main64(int argc, char *argv[]) {
 	argc = argc - 1;
 #if defined(_OPENMP)
 	const int maxNumThreads = omp_get_max_threads();
-	const char *key = "AFNI_COMPRESSOR";
-	char *value;
-	value = getenv(key);
-	// export AFNI_COMPRESSOR=PIGZ
-	char pigzKey[5] = "PIGZ";
-	if ((value != NULL) && (strstr(value, pigzKey))) {
-		omp_set_num_threads(maxNumThreads);
-		printfx("Using %d threads\n", maxNumThreads);
-	} else {
-		omp_set_num_threads(1);
-		// printfx("Single threaded\n");
-	}
 #endif
 
 	// read operations
@@ -5956,12 +5944,17 @@ int main64(int argc, char *argv[]) {
 				printfx("-allineate requires a base image argument\n");
 				goto fail;
 			}
-			ok = nifti_allineate_wrap(nim, argv[ac]);
+			char *al_basefile = argv[ac];
+			al_opts al_options = al_opts_default();
+			if (al_parse_subopts(&ac, argc, argv, &al_options, "-allineate"))
+				goto fail;
+			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
 		}
 		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-deface-epi") || !strcmp(argv[ac], "-deface-hel")) {
-			int cost_mode = 0; /* 0=lpa+ZZ, 1=lpc+ZZ, 2=Hellinger */
-			if (!strcmp(argv[ac], "-deface-epi")) cost_mode = 1;
-			else if (!strcmp(argv[ac], "-deface-hel")) cost_mode = 2;
+			al_opts df_opts = al_opts_default();
+			df_opts.cost = AL_COST_LPA; /* deface default: lpa+ZZ (cross-modal) */
+			if (!strcmp(argv[ac], "-deface-epi")) df_opts.cost = AL_COST_LPC;
+			else if (!strcmp(argv[ac], "-deface-hel")) df_opts.cost = AL_COST_HELLINGER;
 			ac++;
 			if (ac + 1 >= argc) {
 				printfx("%s requires template and mask arguments\n", argv[ac - 1]);
@@ -5969,7 +5962,9 @@ int main64(int argc, char *argv[]) {
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, cost_mode);
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, "-deface"))
+				goto fail;
+			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
 #endif
 		else if (!strcmp(argv[ac], "-edt"))

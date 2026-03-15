@@ -1,4 +1,6 @@
-# CLAUDE.md - niimath Project Guide
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -10,7 +12,7 @@ niimath is an open-source clone of FSL's `fslmaths` — a general-purpose NIfTI 
 
 ### Quick build (Makefile, recommended for development)
 ```bash
-cd src && make          # Standard optimized build (includes allineate with OpenMP)
+cd src && make          # Standard optimized build (OpenMP enabled by default)
 make debug              # Debug build (-g, no optimization)
 make sanitize           # AddressSanitizer build (leak/overflow detection)
 make verbose            # All warnings enabled
@@ -18,7 +20,7 @@ make static             # Static binary
 ```
 
 ### Prerequisites
-- **macOS**: `brew install libomp zstd` (libomp for allineate OpenMP, zstd for .nii.zst support)
+- **macOS**: `brew install libomp zstd` (libomp for OpenMP — enabled by default; zstd for .nii.zst support)
 - **Linux**: `apt install libzstd-dev` (or equivalent; OpenMP is built-in with gcc)
 
 ### Build variants
@@ -28,7 +30,7 @@ make nano               # Without mesh (nii2mesh) functions
 MESH=0 make             # Disable mesh support
 AL=0 make               # Disable allineate registration
 ZSTD=0 make             # Disable zstd (.nii.zst) compression support
-OMP=1 make              # Enable OpenMP for core ops (requires gcc-9 on macOS)
+OMP=0 make              # Disable OpenMP (single-threaded build)
 CF=1 make               # CloudFlare accelerated zlib
 MC=1 make               # Use new MarchingCubes algorithm (handles ambiguities)
 STB=1 make              # Use STB image library instead of libspng for bitmaps
@@ -38,6 +40,7 @@ make wasm               # Emscripten/WebAssembly target
 ### CMake build
 ```bash
 mkdir build && cd build && cmake .. && make
+cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 ```
 
 ### Key compile-time flags
@@ -61,7 +64,7 @@ mkdir build && cd build && cmake .. && make
   - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
 - **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
-- **allineate.c** (~2.9k lines) — Affine (12 DOF) image registration and defacing. Supports lpc+ZZ, lpa+ZZ, and Hellinger cost functions with twopass coarse-to-fine optimization (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by both `nii_allineate()` and `nii_deface()`. Defacing registers a template to the input, warps a mask to input space, and zeros masked voxels. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
+- **allineate.c** (~3.1k lines) — Affine (12 DOF) image registration and defacing. Supports Hellinger (default, matching AFNI), lpc+ZZ, lpa+ZZ, and Pearson (ls) cost functions, selectable via `-cost` flag; `-cmass`/`-nocmass` control center-of-mass initial alignment. CLEQWD histogram clipping (from AFNI's `clipate`/`THD_cliplevel`) focuses histogram bins on the informative intensity range for robust histogram-based cost functions. Twopass coarse-to-fine optimization (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by both `nii_allineate()` and `nii_deface()`. Options defined in `al_opts` struct in `allineate.h`. Reports wall-clock time and thread count on completion. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
 - **powell_newuoa.c** (~2.8k lines) — Powell's NEWUOA derivative-free optimizer (f2c translation, used by allineate). Thread-safe statics via `__thread` for parallel use.
 
 ### Mesh code (nii2mesh — unique to niimath, not in FSL)
@@ -122,56 +125,22 @@ cd src && make sanitize    # Builds with -fsanitize=address
 - `benchmark/New/` — niimath output for comparison
 - `mesh/` — Sample NIfTI (`bet.nii.gz`) and mesh output (`mesh.gii`)
 
-## Current Development Focus
+### CI
+- AppVeyor CI for cross-platform builds (see badge in README.md)
 
-### Phase 1: Bug fixing and major optimizations
-**Completed fixes:**
-- **Endianness bug** — `&littleEndianPlatform` (address, always true) → `littleEndianPlatform()` (12 call sites in meshify.c + MarchingCubes.c); also fixed `#ifdef` structural bug in save_mz3
-- **Double free** in `nifti_image_change_datatype()` DT_INT32 section (core.c)
-- **sizeof mismatch** — `sizeof(float)` vs `sizeof(flt)` in memcpy for 64-bit mode (4 locations in coreFLT.c)
-- **Memory leaks** — `vxs2` never freed in loop (coreFLT.c), MCB struct never freed in `FreeMarchingCubes()` (MarchingCubes.c)
-- **Unsafe realloc** — data loss on malloc failure in `add_triangle()`/`test_vertex_addition()` (MarchingCubes.c) and oldcubes.c
-- **Division by zero** — `add_x/y/z/c_vertex()` (MarchingCubes.c), `vx()` in EDT (coreFLT.c)
-- **Uninitialized fields** — TTriangle structs in quadric.c (switched to calloc)
-- **Dead code** — unreachable `return 1.0` in `calculate_error()` (quadric.c), duplicate `loopi` macro
-- **Allineate registration** — added affine image registration via `-allineate` flag (adapted from AFNI 3dAllineate, public domain; uses lpc+ZZ cost, twopass optimization, NEWUOA optimizer). Also supports lpa+ZZ and Hellinger cost functions (used by deface variants).
-- **Allineate optimization** — 2.0-2.3x wall-clock speedup (23-28s → 11-12s on test data). See validate/README.md for detailed benchmarks.
-- **Defacing** — added `-deface`, `-deface-epi`, and `-deface-hel` commands for face removal using template-based affine registration. Three cost modes: lpa+ZZ (cross-modal, default), lpc+ZZ (structural-to-EPI), Hellinger (fast). Refactored registration core into `al_register()` helper shared by allineate and deface.
+## Known Remaining Issues
 
-**Remaining priority areas:**
-1. **NULL checks** — ~22 malloc/calloc calls in mesh code lack NULL checks (pre-existing)
+1. **NULL checks** — ~22 malloc/calloc calls in mesh code lack NULL checks
 2. **File handle leaks** — save_mz3 doesn't close fp/fgz if malloc fails after fopen
 3. **Buffer overflows** — fixed-size buffers in save_mesh() (768-char filename limit)
 
-### Allineate optimization details
+## Optimization Constraints
 
-Note: The registration core (`al_register()`) is shared between `-allineate` and `-deface`/`-deface-epi`/`-deface-hel`. All optimizations below apply to both code paths.
-
-**Completed optimizations (2.0-2.3x speedup, quality maintained or improved):**
-- **OpenMP parallel coarse search**: Pre-generate all grid+random parameter sets, evaluate 7K+ reflections in parallel. Thread-safe via `__thread` histogram statics, warp matrix, and powell_newuoa.c statics.
-- **OpenMP parallel candidate refinement**: 46 candidates refined with independent NEWUOA runs in parallel.
-- **-ffast-math** for allineate.c + powell_newuoa.c (compiled as separate .o files, scoped to avoid affecting other translation units). `isfinite()` replaced with -ffast-math-safe magnitude guard.
-- **Thread-local buffer reuse**: avm, wpar, imw/jmw/kmw buffers allocated once per thread and reused across cost function evaluations (eliminates ~200K+ malloc/free per registration).
-- **Fused incremental warp+interpolation kernel**: For the all-voxels case (`im_ar == NULL`), replaces separate warp→interpolate pipeline with a single (k,j,i) loop. The affine warp becomes separable: per-row base computed once, then 3 adds per voxel instead of 12 multiplies. Eliminates intermediate coordinate arrays (~3MB/eval), chunking overhead, and mod/div coordinate generation. With OpenMP on k-slices for fine-pass parallelism.
-- **Two-stage fine pass**: Stage 1 optimizes at 1/4 resolution with linear interpolation (fast exploration), stage 2 refines at full resolution with cubic. Reduces total cubic evaluations by ~50% and improves quality (better exploration before cubic refinement).
-- **Thread count cap**: Limited to 8 (configurable via `OMP_NUM_THREADS`). Peak memory ~115MB (vs 50MB baseline, mainly OpenMP thread stacks).
-
-**Evaluated but not implemented (diminishing returns):**
-- **Apple Accelerate (vDSP/vImage/BLAS)**: No vDSP/vImage support for 3D volumetric interpolation (the core bottleneck at 45% of cost evaluation time). cblas_sgemm overhead exceeds benefit for 3×4 affine matrices. vDSP_vclip could replace cubic clipping loop but saves <0.1%. The fused incremental approach already reduces warp cost below what BLAS could offer.
-- **NEON SIMD for cubic interpolation**: Could vectorize Lagrange polynomial evaluation (4 points at a time) for ~1.3x on cubic = ~5-10% overall. Worthwhile but diminishing returns. Main challenge is NEON's lack of native gather; relies on spatial coherence of neighboring warped coordinates for cache sharing.
-- **Metal GPU compute**: The entire warp+interpolate+correlate pipeline (~90M FLOPs/eval) could run on Apple M-series GPU in <1ms per evaluation. This is the largest untapped opportunity (potentially 10x+ for fine pass) but requires significant integration work and introduces platform dependency. Best pursued as a dedicated GPU backend.
-- **Progressive resolution within NEWUOA**: Expose trust region radius via callback to dynamically adjust npt_match during optimization. Would avoid full-resolution evaluations early when NEWUOA is taking large steps. Requires modifying the f2c-translated optimizer internals.
-- **AMX co-processor**: Only accessible through Accelerate functions; not useful for the scatter-gather memory access patterns in interpolation.
-
-**Architectural constraints on further optimization:**
-- NEWUOA optimizer is inherently sequential (trust-region method: each iteration depends on previous). Cannot parallelize its iterations. The two-stage approach is the practical workaround.
-- The cost function hot path is 3D cubic interpolation (64 scattered array lookups per voxel). This is memory-bandwidth-limited on modern CPUs. SIMD helps with the arithmetic but not the memory access pattern.
-- Histogram scatter-add (for MI/NMI metrics) is inherently sequential per element due to bin collisions. Not a bottleneck at current bin counts (~97² bins).
-
-### General optimization notes
 - Voxel operations are already lean and SIMD-optimized; most are memory-bandwidth limited
-- OpenMP is available but **not the primary optimization target** for core ops — typical usage runs one subject per thread across many subjects
+- OpenMP is **not the primary optimization target** for core ops — typical usage runs one subject per thread across many subjects
 - CloudFlare zlib (`CF=1`) already provides major I/O speedup
+- Allineate: NEWUOA optimizer is inherently sequential (trust-region). The cost function hot path is 3D cubic interpolation (64 scattered array lookups per voxel), memory-bandwidth-limited. Two-stage fine pass (1/4 res linear → full res cubic) is the practical workaround for sequential constraint.
+- Allineate/deface compiled separately with `-ffast-math` and OpenMP, scoped to avoid affecting other translation units. `isfinite()` replaced with magnitude guard for -ffast-math safety.
 
 ## Code Conventions
 - C99 with extensive use of `#ifdef` for conditional compilation
