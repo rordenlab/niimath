@@ -1983,7 +1983,11 @@ static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
    fwrite(hdr, 1, hdrsize, pigzPipe);
    /* Write extensions via wrapper */
    NIIFILE wfp = (NIIFILE)calloc(1, sizeof(*wfp));
+#ifdef _MSC_VER
+   if (!wfp) { _pclose(pigzPipe); return -1; }
+#else
    if (!wfp) { pclose(pigzPipe); return -1; }
+#endif
    wfp->nzfptr = pigzPipe;
    if (nim->nifti_type != NIFTI_FTYPE_ANALYZE)
       nifti_write_extensions(wfp, nim);

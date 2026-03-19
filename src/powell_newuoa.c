@@ -10,6 +10,12 @@
 #include <float.h>
 #include <time.h>
 
+/* MSVC lacks POSIX srand48/drand48 */
+#ifdef _MSC_VER
+#define srand48(s) srand((unsigned int)(s))
+#define drand48()  ((double)rand() / (double)RAND_MAX)
+#endif
+
 /* Minimal f2c types */
 typedef long int integer;
 typedef double doublereal;
