@@ -97,8 +97,8 @@ static FILE *zst_decompress_to_tmpfile(const char *path)
    if (!dbuf) { free(cbuf); return NULL; }
 
    size_t result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
-   /* If buffer was too small (unknown size case), retry with larger buffer */
-   while (ZSTD_isError(result) && ZSTD_getErrorCode(result) == ZSTD_error_dstSize_tooSmall && dsize < (unsigned long long)csize * 256) {
+   /* If decompression failed and buffer might be too small, retry with larger buffer */
+   while (ZSTD_isError(result) && dsize < (unsigned long long)csize * 256) {
       dsize *= 2;
       char *newbuf = (char *)realloc(dbuf, dsize);
       if (!newbuf) { free(dbuf); free(cbuf); return NULL; }
