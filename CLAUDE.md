@@ -51,7 +51,8 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 - `HAVE_BUTTERWORTH` — bandpass temporal filtering
 - `HAVE_TENSOR` — tensor decomposition
 - `HAVE_CONFORM` — image conforming to standard space
-- `HAVE_ALLINEATE` — affine image registration and defacing (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
+- `HAVE_ALLINEATE` — affine image registration, defacing, and skull-stripping (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
+- `AL_LPC_MICHO` — enables lpc+ZZ/lpa+ZZ combined cost variant for allineate (default: pure lpc/lpa)
 - `HAVE_ZSTD` — zstd compression support for .nii.zst files (auto-detected; set `FSLOUTPUTTYPE=NIFTI_ZST` to write)
 - `FSLSTYLE` — FSL-compatible behavior mode
 
@@ -64,7 +65,7 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
   - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
 - **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
-- **allineate.c** (~3.5k lines) — Affine (12 DOF) image registration and defacing. Supports Hellinger (default), lpc+ZZ, lpa+ZZ (uses `1-|lpc|` formula), and Pearson (ls) cost functions, selectable via `-cost` flag; `-cmass`/`-nocmass` control center-of-mass initial alignment; `-source_automask` fills outside source brain mask with noise for robust cross-modal registration. CLEQWD edge-bin histogram mode (from AFNI's `clipate`/`THD_cliplevel`) concentrates bin resolution on the informative intensity range while keeping all data points. TOHD blok type (truncated octahedron, ~555 voxels/blok) for local Pearson correlation. LPA uses `tbest=17` and LPA-specific micho weights (`mi=0`). Twopass coarse-to-fine optimization with candidate deduplication and fine-pass refinement (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by both `nii_allineate()` and `nii_deface()`. Output interpolation selectable via `-nearest`/`-linear`/`-cubic` (default: cubic). Options defined in `al_opts` struct in `allineate.h` (cost, cmass, source_automask, final_interp). Reports wall-clock time and thread count on completion. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
+- **allineate.c** (~3.9k lines) — Affine image registration, defacing, and skull-stripping. Shared identically with the standalone `allineate/` project. Supports Hellinger (default), lpc, lpa, and Pearson (ls) cost functions via `-cost`; compile with `-DAL_LPC_MICHO` for lpc+ZZ/lpa+ZZ combined cost variant. Variable DOF via `-warp` (sho/3, shr/6, srs/9, aff/12; default: aff). Matching interpolation via `-interp` (NN, linear, cubic; default: linear). Output interpolation via `-final` or `-nearest`/`-linear`/`-cubic` (default: cubic for allineate, linear for deface/skullstrip via `AL_INTERP_DEFAULT`). `-cmass`/`-nocmass` control center-of-mass initial alignment; `-source_automask` fills outside source brain mask with noise for robust cross-modal registration. CLEQWD edge-bin histogram mode (from AFNI's `clipate`/`THD_cliplevel`). TOHD blok type (truncated octahedron, ~555 voxels/blok) for local Pearson correlation. 2x downsampling for coarse grid search. Twopass coarse-to-fine optimization with parallel candidate refinement (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by `nii_allineate()`, `nii_deface()`, and `-skullstrip`. Options defined in `al_opts` struct in `allineate.h` (cost, cmass, source_automask, interp, final_interp, warp, skullstrip). Reports wall-clock time and thread count on completion. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
 - **powell_newuoa.c** (~2.8k lines) — Powell's NEWUOA derivative-free optimizer (f2c translation, used by allineate). Thread-safe statics via `__thread` for parallel use.
 
 ### Mesh code (nii2mesh — unique to niimath, not in FSL)
@@ -139,8 +140,8 @@ cd src && make sanitize    # Builds with -fsanitize=address
 - Voxel operations are already lean and SIMD-optimized; most are memory-bandwidth limited
 - OpenMP is **not the primary optimization target** for core ops — typical usage runs one subject per thread across many subjects
 - CloudFlare zlib (`CF=1`) already provides major I/O speedup
-- Allineate: NEWUOA optimizer is inherently sequential (trust-region). The cost function hot path is 3D cubic interpolation (64 scattered array lookups per voxel), memory-bandwidth-limited. Two-stage fine pass (1/4 res linear → full res cubic) is the practical workaround for sequential constraint.
-- Allineate/deface compiled separately with `-ffast-math` and OpenMP, scoped to avoid affecting other translation units. `isfinite()` replaced with magnitude guard for -ffast-math safety.
+- Allineate: NEWUOA optimizer is inherently sequential (trust-region). The cost function hot path is 3D cubic interpolation (64 scattered array lookups per voxel), memory-bandwidth-limited. 2x downsampling for coarse grid search and interior-loop cubic optimization (no bounds checking for safe voxels) are the practical workarounds. Candidate refinement is parallelized across OpenMP threads.
+- Allineate/deface/skullstrip compiled separately with `-ffast-math` and OpenMP, scoped to avoid affecting other translation units. `isfinite()` replaced with magnitude guard for -ffast-math safety. Core files (`allineate.c`, `allineate.h`, `powell_newuoa.c`) are shared identically with the standalone `allineate/` project.
 
 ## Code Conventions
 - C99 with extensive use of `#ifdef` for conditional compilation

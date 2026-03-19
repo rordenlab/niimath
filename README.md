@@ -144,10 +144,13 @@ niimath has a few features not provided by fslmaths:
  - `sform <code>`          : set sform code
  - `unifize`               : bias field correction (adapted from AFNI 3dUnifize)
  - `allineate <base> [opts]`: affine registration to match 'base' (from AFNI 3dAllineate)
-   - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass`
+   - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass` `-source_automask`
+   - `-warp XX` (sho, shr, srs, aff [default]) `-interp XX` (NN, linear [default], cubic)
+   - `-final XX` (NN, linear, cubic [default]) or `-nearest` `-linear` `-cubic`
  - `deface <tmpl> <mask> [opts]`: deface using affine registration of template
-   - opts: `-cost XX` (lpa [default], hel, lpc, ls) `-cmass` `-nocmass`
-   - aliases: `-deface-epi` (lpc+ZZ), `-deface-hel` (Hellinger)
+   - opts: same as allineate (default final: linear)
+ - `skullstrip <tmpl> <mask> [opts]`: skull-strip using template registration
+   - opts: same as allineate (default final: linear)
  - `--compare <ref>`       : report if images are identical, terminates without saving new image
  - `--bitmap -a name.png`  : mimic fsl slicer (see [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap))
  - `filename.nii`          : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image

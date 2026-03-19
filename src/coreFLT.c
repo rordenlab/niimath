@@ -5287,10 +5287,6 @@ staticx int nifti_unifize(nifti_image *nim) {
 #ifdef HAVE_ALLINEATE
 staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts) {
 #ifdef DT32
-	if (nim->datatype != DT_FLOAT32) {
-		printfx("allineate: Unsupported datatype %d\n", nim->datatype);
-		return 1;
-	}
 	nifti_image *base = nifti_image_read(basefile, 1);
 	if (!base) {
 		printfx("** failed to read base image from '%s'\n", basefile);
@@ -5308,10 +5304,6 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts)
 
 staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
-	if (nim->datatype != DT_FLOAT32) {
-		printfx("deface: Unsupported datatype %d\n", nim->datatype);
-		return 1;
-	}
 	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
 	if (!tmpl) {
 		printfx("** failed to read template image from '%s'\n", tmplfile);
@@ -5950,16 +5942,20 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
 		}
-		else if (!strcmp(argv[ac], "-deface")) {
-			al_opts df_opts = al_opts_default(); /* default: Hellinger */
+		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-skullstrip")) {
+			int is_skullstrip = (argv[ac][1] == 's');
+			const char *cmd = argv[ac];
+			al_opts df_opts = al_opts_default();
 			ac++;
 			if (ac + 1 >= argc) {
-				printfx("%s requires template and mask arguments\n", argv[ac - 1]);
+				printfx("%s requires template and mask arguments\n", cmd);
 				goto fail;
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			if (al_parse_subopts(&ac, argc, argv, &df_opts, "-deface"))
+			if (is_skullstrip)
+				df_opts.skullstrip = mask_file;
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd))
 				goto fail;
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}

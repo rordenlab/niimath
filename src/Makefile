@@ -107,7 +107,7 @@ endif
 
 #issue30: static build
 static:
-	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
