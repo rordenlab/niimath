@@ -46,6 +46,8 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
     option(OPENMP_XCODE "Build with OpenMP support" OFF)
 endif()
 
+option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
+
 include(ExternalProject)
 
 set(DEPENDENCIES)
@@ -84,6 +86,7 @@ ExternalProject_Add(src
         -DUSE_STATIC_RUNTIME:BOOL=${USE_STATIC_RUNTIME}
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
+        -DENABLE_ZSTD:BOOL=${ENABLE_ZSTD}
         # forward static runtime and static linking
         -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}
         -DBUILD_SHARED_LIBS:BOOL=${BUILD_SHARED_LIBS}
