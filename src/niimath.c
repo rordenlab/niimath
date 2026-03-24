@@ -3,10 +3,10 @@
  *
  * compile example (consider -pedantic or -Wall):
  *
- * gcc -O3 -lm -lz -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib
+ * gcc -O3 -lm -lz -o niimath niimath.c nifti_io.c
  *
  * OpenMP (parallel threading)
- *  gcc-9  -fopenmp -lm  -I./darwin ./darwin/libz.a -DHAVE_ZLIB -o niimath niimath.c  niftilib/nifti1_io.c znzlib/znzlib.c -I./niftilib -I./znzlib
+ *  gcc-9  -fopenmp -lm -DHAVE_ZLIB -o niimath niimath.c nifti_io.c -lz
  *
  *----------------------------------------------------------------------
  */
@@ -18,7 +18,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
+#ifdef HAVE_ZLIB
+  #include <zlib.h>
+#endif
 #include "core32.h" //all 32-bit functions
 #ifdef HAVE_64BITS
 	#include "core64.h" //all 64-bit functions
@@ -65,7 +68,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20251007"
+#define kMTHdate "v1.0.20260315"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -317,6 +320,19 @@ int show_help( void ) {
 	printf(" -reslice_mask <mask>     : reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity\n");
 
 #endif
+#ifdef HAVE_ALLINEATE
+	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");
+	printf("                            opts: -cost XX (hel,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
+	printf("                                  -warp XX (sho,shr,srs,aff) transform type [default: aff]\n");
+	printf("                                  -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
+	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
+	printf("                                  -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                            default cost: Hellinger; use -source_automask with lpc/lpa\n");
+	printf(" -deface <tmpl> <mask> [opts] : deface using affine registration; default Hellinger cost\n");
+	printf("                              opts: same as -allineate [default final: linear]\n");
+	printf(" -skullstrip <tmpl> <mask> [opts] : skull-strip using template registration\n");
+	printf("                              opts: same as -allineate [default final: linear]\n");
+#endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");
 	printf(" -dehaze <mode>           : set dark voxels to zero (mode 1..5; higher yields more surviving voxels)\n");
@@ -353,7 +369,7 @@ int show_help( void ) {
 	printf(" -qform <code>            : set qform_code\n");
 	printf(" -sform <code>            : set sform_code\n");
 	#if defined(_OPENMP)
-	printf(" -p <threads>             : set maximum number of parallel threads (to turn on by default 'export AFNI_COMPRESSOR=PIGZ')\n");
+	printf(" -p <threads>             : set maximum number of parallel threads (0 = use all available)\n");
 	#else
 	printf(" -p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif
@@ -367,6 +383,7 @@ int show_help( void ) {
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
+	printf(" -unifize                 : bias field correction (adapted from AFNI 3dUnifize)\n");
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels [1 is typical]; scl is amount [0.5 medium, 1.0 heavy])\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");
@@ -494,6 +511,10 @@ int show_help( void ) {
 	printf("     niimath inputVolume -add 2.5 -mul inputVolume2 output_volume\n");
 	printf("\n");
 	printf("     niimath 4D_inputVolume -Tmean -mul -1 -add 4D_inputVolume demeaned_4D_inputVolume\n");
+	printf("\n");
+	printf("Threading: OpenMP is enabled by default. Control threads with:\n");
+	printf("     niimath -p 4 in.nii -add 1 out.nii    (use 4 threads)\n");
+	printf("     export OMP_NUM_THREADS=4               (environment variable, applies to all OpenMP programs)\n");
     return 0;
 }
 #endif //ifndef __EMSCRIPTEN__

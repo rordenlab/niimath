@@ -2,7 +2,7 @@
 #include "print.h"
 #include <limits.h>
 #include <math.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>

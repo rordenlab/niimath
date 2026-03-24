@@ -49,6 +49,10 @@ static int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool ver
 	uint32_t *idx_in = (uint32_t *)malloc(npt * sizeof(uint32_t));
 	uint32_t *idx_out = (uint32_t *)malloc(npt * sizeof(uint32_t));
 	int *old2new = (int *)malloc(npt * sizeof(int));
+	if (!dx_in || !dx_out || !idx_in || !idx_out || !old2new) {
+		free(dx_in); free(dx_out); free(idx_in); free(idx_out); free(old2new);
+		return npt;
+	}
 	vec3d ref = pts[0];
 	for (int i = 0; i < npt; i++) {
 		dx_in[i] = dx(ref, pts[i]);
@@ -91,6 +95,10 @@ static int unify_vertices(vec3d **inpt, vec3i *tris, int npt, int ntri, bool ver
 	}
 	vec3d *newpts = (vec3d *)calloc(nnew, sizeof(vec3d));
 	char *written = (char *)calloc(nnew, sizeof(char));
+	if (!newpts || !written) {
+		free(newpts); free(written); free(dx_out); free(idx_out); free(old2new);
+		return npt;
+	}
 	for (int i = 0; i < npt; i++) {
 		int ni = old2new[i];
 		if (!written[ni]) {
@@ -118,6 +126,7 @@ static int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, boo
 	double startTime = clockMsec();
 	vec3i *tris = *intris;
 	int *isdegenerate = (int *)malloc(ntri * sizeof(int));
+	if (!isdegenerate) return ntri;
 	int ndegenerate = 0;
 	for (int i = 0; i < ntri; i++) {
 		// sorted lengths a ≥ b ≥ c
@@ -157,10 +166,12 @@ static int remove_degenerate_triangles(vec3d *pts, vec3i **intris, int ntri, boo
 	}
 	int newtri = ntri - ndegenerate;
 	vec3i *oldtris = (vec3i *)malloc(ntri * sizeof(vec3i));
+	if (!oldtris) { free(isdegenerate); return ntri; }
 	for (int i = 0; i < ntri; i++)
 		oldtris[i] = tris[i];
 	free(*intris);
 	*intris = (vec3i *)malloc(newtri * sizeof(vec3i));
+	if (!*intris) { free(oldtris); free(isdegenerate); *intris = oldtris; return ntri; }
 	tris = *intris;
 	int j = 0;
 	for (int i = 0; i < ntri; i++) {
@@ -181,6 +192,7 @@ static int quick_smooth(float *img, int nx, int ny, int nz) {
 		return EXIT_FAILURE;
 	int nvox = nx * ny * nz;
 	float *tmp = (float *)malloc(nvox * sizeof(float));
+	if (!tmp) return EXIT_FAILURE;
 #define kwid 2
 #define k0 0.45
 #define k1 0.225
@@ -231,11 +243,13 @@ static void dilate(float *img, size_t dim[3], bool is26) {
 	int nxy = nx * ny;
 	int nvox = nx * ny * nz;
 	uint8_t *mask = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+	if (!mask) return;
 	memset(mask, 0, nvox * sizeof(uint8_t));
 	int numk = 6;
 	if (is26)
 		numk = 26;
 	int32_t *k = (int32_t *)malloc(numk * sizeof(int32_t)); // queue with untested seed
+	if (!k) { free(mask); return; }
 	if (is26) {
 		int j = 0;
 		for (int z = -1; z <= 1; z++)
@@ -333,6 +347,7 @@ int meshify(float *img, short dim[3], int originalMC, float isolevel, vec3i **t,
 	if ((onlyLargest) || (fillBubbles)) {
 		double startTime = clockMsec();
 		float *mask = (float *)malloc(nvox * sizeof(float));
+		if (!mask) return EXIT_FAILURE;
 		size_t dim[3] = {(size_t)NX, (size_t)NY, (size_t)NZ};
 		memset(mask, 0, nvox * sizeof(float));
 		for (int i = 0; i < nvox; i++)
@@ -455,6 +470,7 @@ static int zmat_run(const size_t inputsize, unsigned char *inputstr, size_t *out
 				return -2;
 			buflen[0] = deflateBound(&zs, inputsize);
 			*outputbuf = (unsigned char *)malloc(buflen[0]);
+			if (!*outputbuf) { deflateEnd(&zs); return -1; }
 			zs.avail_in = inputsize;			 /* size of input, string + terminator*/
 			zs.next_in = (Bytef *)inputstr;		 /* input char array*/
 			zs.avail_out = buflen[0];			 /* size of output*/
@@ -480,12 +496,15 @@ static int zmat_run(const size_t inputsize, unsigned char *inputstr, size_t *out
 					return -2;
 			buflen[0] = inputsize * 20;
 			*outputbuf = (unsigned char *)malloc(buflen[0]);
+			if (!*outputbuf) { inflateEnd(&zs); return -1; }
 			zs.avail_in = inputsize;			 /* size of input, string + terminator*/
 			zs.next_in = inputstr;				 /* input char array*/
 			zs.avail_out = buflen[0];			 /* size of output*/
 			zs.next_out = (Bytef *)(*outputbuf); /*(Bytef *)(); // output char array*/
 			while ((*ret = inflate(&zs, Z_SYNC_FLUSH)) != Z_STREAM_END && count <= 10) {
-				*outputbuf = (unsigned char *)realloc(*outputbuf, (buflen[0] << count));
+				unsigned char *tmp = (unsigned char *)realloc(*outputbuf, (buflen[0] << count));
+				if (!tmp) { free(*outputbuf); *outputbuf = NULL; inflateEnd(&zs); return -1; }
+				*outputbuf = tmp;
 				zs.next_out = (Bytef *)(*outputbuf + (buflen[0] << (count - 1)));
 				zs.avail_out = (buflen[0] << (count - 1)); /* size of output*/
 				count++;
@@ -523,6 +542,7 @@ static int save_jmsh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt
 	cJSON_AddItemToObject(node, "_ArrayZipSize_", cJSON_CreateIntArray(len, 2));
 	totalbytes = dim[0] * dim[1] * sizeof(pts[0].x);
 	unsigned int *val = (unsigned int *)malloc(totalbytes);
+	if (!val) { fclose(fp); return EXIT_FAILURE; }
 	memcpy(val, &(tris[0].x), totalbytes);
 	for (int i = 0; i < len[1]; i++)
 		val[i]++;
@@ -606,7 +626,7 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	h.NFACE = ntri;
 	h.NVERT = npt;
 	h.NSKIP = 0;
-	if (!&littleEndianPlatform)
+	if (!littleEndianPlatform())
 		swap_4bytes(3, &h.NFACE);
 	FILE *fp;
 #ifdef HAVE_ZLIB
@@ -624,8 +644,9 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 			return EXIT_FAILURE;
 		fwrite(&h, sizeof(struct mz3hdr), 1, fp);
 	}
-	if (!&littleEndianPlatform) {
+	if (!littleEndianPlatform()) {
 		vec3i *trisSwap = (vec3i *)malloc(ntri * sizeof(vec3i));
+		if (!trisSwap) goto mz3_fail;
 		for (int i = 0; i < ntri; i++)
 			trisSwap[i] = tris[i];
 		swap_4bytes(ntri * 3, trisSwap);
@@ -633,10 +654,9 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 		if (isGz)
 			gzwrite(fgz, trisSwap, ntri * sizeof(vec3i));
 		else
-#else
-		fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
 #endif
-			free(trisSwap);
+			fwrite(trisSwap, ntri * sizeof(vec3i), 1, fp);
+		free(trisSwap);
 	} else {
 #ifdef HAVE_ZLIB
 		if (isGz)
@@ -646,9 +666,10 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 			fwrite(tris, ntri * sizeof(vec3i), 1, fp);
 	}
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
+	if (!pts32) goto mz3_fail;
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (!&littleEndianPlatform)
+	if (!littleEndianPlatform())
 		swap_4bytes(npt * 3, pts32);
 #ifdef HAVE_ZLIB
 	if (isGz) {
@@ -665,6 +686,12 @@ int save_mz3(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool i
 	}
 	free(pts32);
 	return EXIT_SUCCESS;
+mz3_fail:
+#ifdef HAVE_ZLIB
+	if (isGz) gzclose(fgz); else
+#endif
+	fclose(fp);
+	return EXIT_FAILURE;
 }
 
 #ifdef HAVE_FORMATS
@@ -683,21 +710,23 @@ static int save_freesurfer(const char *fnm, vec3i *tris, vec3d *pts, int ntri, i
 	fwrite(s, strlen(s), 1, fp);
 	int32_t VertexCount = npt;
 	int32_t FaceCount = ntri;
-	if (&littleEndianPlatform) {
+	if (littleEndianPlatform()) {
 		swap_4bytes(1, &VertexCount);
 		swap_4bytes(1, &FaceCount);
 	}
 	fwrite(&VertexCount, sizeof(int32_t), 1, fp);
 	fwrite(&FaceCount, sizeof(int32_t), 1, fp);
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
+	if (!pts32) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(npt * 3, pts32);
 	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
 	free(pts32);
-	if (&littleEndianPlatform) {
+	if (littleEndianPlatform()) {
 		vec3i *trisSwap = (vec3i *)malloc(ntri * sizeof(vec3i));
+		if (!trisSwap) { fclose(fp); return EXIT_FAILURE; }
 		for (int i = 0; i < ntri; i++)
 			trisSwap[i] = tris[i];
 		swap_4bytes(ntri * 3, trisSwap);
@@ -776,6 +805,7 @@ static int save_stl(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	int32_t nf = ntri;
 	fwrite(&nf, sizeof(int32_t), 1, fp);
 	tfacet *facets = (tfacet *)malloc(ntri * sizeof(tfacet));
+	if (!facets) { fclose(fp); return EXIT_FAILURE; }
 	vec3s n0 = (vec3s){.x = 0.0, .y = 0.0, .z = 0.0};
 	for (int i = 0; i < ntri; i++) { // double->single precision
 		facets[i].norm = n0;
@@ -808,7 +838,7 @@ static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	if (fp == NULL)
 		return EXIT_FAILURE;
 	fputs("ply\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("format binary_little_endian 1.0\n", fp);
 	else
 		fputs("format binary_big_endian 1.0\n", fp);
@@ -825,6 +855,7 @@ static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	fputs("property list uchar int vertex_indices\n", fp);
 	fputs("end_header\n", fp);
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
+	if (!pts32) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < npt; i++) { // double->single precision
 		pts32[i].x = pts[i].x;
 		pts32[i].y = pts[i].y;
@@ -833,6 +864,7 @@ static int save_ply(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
 	free(pts32);
 	vec1b3i *tris4 = (vec1b3i *)malloc(ntri * sizeof(vec1b3i));
+	if (!tris4) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < ntri; i++) { // double->single precision
 		tris4[i].n = 3;
 		tris4[i].x = tris[i].x;
@@ -874,7 +906,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	else
 #endif
 		fputs("               Encoding=\"Base64Binary\"\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("               Endian=\"LittleEndian\"\n", fp);
 	else
 		fputs("               Endian=\"BigEndian\"\n", fp);
@@ -891,6 +923,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 		unsigned long srcLen = ntri * sizeof(vec3i);
 		uLongf destLen = compressBound(srcLen);
 		unsigned char *ostream = (unsigned char *)malloc(destLen);
+		if (!ostream) { fclose(fp); return EXIT_FAILURE; }
 		int res = compress(ostream, &destLen, (const unsigned char *)tris, srcLen);
 		if (res != Z_OK)
 			printf("Compression error\n");
@@ -916,7 +949,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	else
 #endif
 		fputs("               Encoding=\"Base64Binary\"\n", fp);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		fputs("               Endian=\"LittleEndian\"\n", fp);
 	else
 		fputs("               Endian=\"BigEndian\"\n", fp);
@@ -932,6 +965,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 	fputs("      </CoordinateSystemTransformMatrix>\n", fp);
 	fputs("      <Data>", fp);
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
+	if (!pts32) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
 	unsigned char *vts;
@@ -940,6 +974,7 @@ static int save_gii(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt,
 		unsigned long srcLen = npt * sizeof(vec3s);
 		uLongf destLen = compressBound(srcLen);
 		unsigned char *ostream = (unsigned char *)malloc(destLen);
+		if (!ostream) { free(pts32); fclose(fp); return EXIT_FAILURE; }
 		int res = compress(ostream, &destLen, (const unsigned char *)pts32, srcLen);
 		if (res != Z_OK)
 			printf("Compression error\n");
@@ -973,9 +1008,10 @@ static int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	sprintf(vpts, "POINTS %d float\n", npt);
 	fwrite(vpts, strlen(vpts), 1, fp);
 	vec3s *pts32 = (vec3s *)malloc(npt * sizeof(vec3s));
+	if (!pts32) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < npt; i++) // double->single precision
 		pts32[i] = vec3d2vec4s(pts[i]);
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(3 * npt, pts32);
 	fwrite(pts32, npt * sizeof(vec3s), 1, fp);
 	free(pts32);
@@ -983,13 +1019,14 @@ static int save_vtk(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt)
 	sprintf(vfac, "POLYGONS %d %d\n", ntri, ntri * 4);
 	fwrite(vfac, strlen(vfac), 1, fp);
 	vec4i *tris4 = (vec4i *)malloc(ntri * sizeof(vec4i));
+	if (!tris4) { fclose(fp); return EXIT_FAILURE; }
 	for (int i = 0; i < ntri; i++) { // double->single precision
 		tris4[i].n = 3;
 		tris4[i].x = tris[i].x;
 		tris4[i].y = tris[i].y;
 		tris4[i].z = tris[i].z;
 	}
-	if (&littleEndianPlatform)
+	if (littleEndianPlatform())
 		swap_4bytes(4 * ntri, tris4);
 	fwrite(tris4, ntri * sizeof(vec4i), 1, fp);
 	free(tris4);
@@ -1012,10 +1049,17 @@ void strip_ext(char *fname) {
 
 int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool isGz) {
 	char basenm[768], ext[768] = "";
-	strcpy(basenm, fnm);
+	size_t fnmlen = strlen(fnm);
+	if (fnmlen >= sizeof(basenm) - 5) {
+		fprintf(stderr, "** filename too long (max %d chars): %s\n", (int)(sizeof(basenm) - 6), fnm);
+		return EXIT_FAILURE;
+	}
+	strncpy(basenm, fnm, sizeof(basenm) - 1);
+	basenm[sizeof(basenm) - 1] = '\0';
 	strip_ext(basenm); // ~/file.nii -> ~/file
-	if (strlen(fnm) > strlen(basenm))
-		strcpy(ext, fnm + strlen(basenm));
+	if (fnmlen > strlen(basenm))
+		strncpy(ext, fnm + strlen(basenm), sizeof(ext) - 1);
+	ext[sizeof(ext) - 1] = '\0';
 	if (strstr(ext, ".mz3"))
 		return save_mz3(fnm, tris, pts, ntri, npt, isGz, NULL);
 #ifdef HAVE_FORMATS
@@ -1042,8 +1086,7 @@ int save_mesh(const char *fnm, vec3i *tris, vec3d *pts, int ntri, int npt, bool 
 		return save_jmsh(fnm, tris, pts, ntri, npt);
 #endif // HAVE_JSON
 #endif // HAVE_ZLIB
-	strcpy(basenm, fnm);
-	strcat(basenm, ".mz3");
+	snprintf(basenm, sizeof(basenm), "%s.mz3", fnm);
 	return save_mz3(basenm, tris, pts, ntri, npt, isGz, NULL);
 }
 

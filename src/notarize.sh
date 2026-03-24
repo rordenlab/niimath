@@ -22,13 +22,26 @@ fi
 cd "$(dirname "$0")"
 
 mkdir ${APP_DIR}
+
+DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE"
+SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c"
+AL_SRCS="allineate.c powell_newuoa.c"
+
+build_arch() {
+    local target="$1" minver="$2" output="$3"
+    # Compile allineate separately with -ffast-math (scoped)
+    gcc -O3 -ffast-math -fno-finite-math-only ${DFLAGS} -target "$target" -mmacosx-version-min="$minver" -c ${AL_SRCS}
+    # Compile everything else without -ffast-math, link allineate objects
+    gcc -sectcreate TEXT info_plist Info.plist -O3 ${DFLAGS} ${SRCS} allineate.o powell_newuoa.o -lm -lz -target "$target" -mmacosx-version-min="$minver" -o "$output"
+    rm -f allineate.o powell_newuoa.o
+    strip "./$output"
+}
+
 # Compile x86
-gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -lm -lz  -target x86_64-apple-macos10.12 -mmacosx-version-min=10.12 -o niimathX86
-strip ./niimathX86
+build_arch "x86_64-apple-macos10.12" "10.12" "niimathX86"
 
 # Compile ARM
-gcc -sectcreate TEXT info_plist Info.plist -O3 -DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c niftilib/nifti2_io.c znzlib/znzlib.c -I./niftilib -I./znzlib -lm -lz  -target arm64-apple-macos11 -mmacosx-version-min=11.0 -o niimathARM
-strip ./niimathARM
+build_arch "arm64-apple-macos11" "11.0" "niimathARM"
 
 # Create the universal binary
 lipo -create -output ./${APP_DIR}/${APP_NAME} niimathX86 niimathARM

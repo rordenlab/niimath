@@ -7,7 +7,7 @@ extern "C" {
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <nifti2_io.h>
+#include "nifti_io.h"
 #include <float.h> //FLT_EPSILON
 //#include <immintrin.h>
 #include <limits.h>

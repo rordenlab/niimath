@@ -45,6 +45,17 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     ADD_DEFINITIONS(-DHAVE_CONFORM)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} unifize.c)
+    option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
+    if(ENABLE_ALLINEATE)
+        ADD_DEFINITIONS(-DHAVE_ALLINEATE)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c)
+        # allineate benefits from fast-math (preserving NaN/Inf detection)
+        if(NOT MSVC)
+            set_source_files_properties(allineate.c powell_newuoa.c PROPERTIES
+                COMPILE_FLAGS "-ffast-math -fno-finite-math-only")
+        endif()
+    endif()
 
     option(USE_CLASSIC_CUBES "Use classic or marching cubes" ON)
     if(USE_CLASSIC_CUBES)
@@ -68,7 +79,12 @@ endif()
 
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
     #e.g.  cmake -DOPENMP_XCODE=ON ..
-    option(OPENMP_XCODE "Build with OpenMP support" OFF)
+    # Default ON when allineate is enabled (benefits from parallel coarse search)
+    if(ENABLE_ALLINEATE)
+        option(OPENMP_XCODE "Build with OpenMP support" ON)
+    else()
+        option(OPENMP_XCODE "Build with OpenMP support" OFF)
+    endif()
     # using AppleClang
     add_definitions(-fno-caret-diagnostics)
     if (OPENMP_XCODE)
@@ -131,14 +147,10 @@ set(NIIMATH_SRCS
     niimath.c
     core.c
     core32.c
-    niftilib/nifti2_io.c
-    znzlib/znzlib.c
+    nifti_io.c
     ${ADDITIONAL_SRCS}
-    ${BMP_SRCS} 
+    ${BMP_SRCS}
 )
-
-include_directories(niftilib)
-include_directories(znzlib)
 add_executable(niimath ${NIIMATH_SRCS})
 
 set(ZLIB_IMPLEMENTATION "Miniz" CACHE STRING "Choose zlib implementation.")
@@ -159,6 +171,30 @@ endif()
 if(NOT MSVC)
     # Link math library
     target_link_libraries(niimath m)
+endif()
+
+# Zstd compression support (optional, enabled by default if found)
+option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
+if(ENABLE_ZSTD)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ZSTD QUIET libzstd)
+    endif()
+    if(NOT ZSTD_FOUND)
+        find_library(ZSTD_LIBRARIES NAMES zstd)
+        find_path(ZSTD_INCLUDE_DIRS NAMES zstd.h)
+        if(ZSTD_LIBRARIES AND ZSTD_INCLUDE_DIRS)
+            set(ZSTD_FOUND TRUE)
+        endif()
+    endif()
+    if(ZSTD_FOUND)
+        add_definitions(-DHAVE_ZSTD)
+        target_include_directories(niimath PRIVATE ${ZSTD_INCLUDE_DIRS})
+        target_link_libraries(niimath ${ZSTD_LIBRARIES})
+        message(STATUS "Zstd support: ON")
+    else()
+        message(STATUS "Zstd support: OFF (libzstd not found, install with: brew install zstd)")
+    endif()
 endif()
 
 if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")

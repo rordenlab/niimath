@@ -32,7 +32,7 @@
 #define SIMD
 #define xmemcpy memcpy
 #define staticx static
-#include <nifti2_io.h>
+#include "nifti_io.h"
 
 #ifdef EMSCRIPTEN
 #define _mm_malloc(size, alignment) malloc(size)
@@ -80,6 +80,10 @@
 #include "conform.h"
 #endif
 
+#include "unifize.h"
+#ifdef HAVE_ALLINEATE
+#include "allineate.h"
+#endif
 #include <stdbool.h>
 // #define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 // #ifdef TFCE //we now use in-built tfce function
@@ -343,6 +347,7 @@ staticx inline void transposeXZ(flt *img3Din, flt *img3Dout, int *nxp, int ny, i
 }
 
 staticx flt vx(flt *f, int p, int q) {
+	if (p == q) return INFINITY;
 	flt ret = ((f[q] + q * q) - (f[p] + p * p)) / (2.0 * q - 2.0 * p);
 	if (isnanx(ret))
 		ret = INFINITY;
@@ -532,7 +537,7 @@ staticx int nifti_sedt(nifti_image *nim) {
 		return ok;
 	flt *img = (flt *)nim->data;
 	flt *imgEDT = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
-	memcpy(imgEDT, img, nvox3D * sizeof(float));
+	memcpy(imgEDT, img, nvox3D * sizeof(flt));
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] > 0.0)
 			img[i] = 0;
@@ -633,7 +638,7 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -682,7 +687,7 @@ staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -715,7 +720,7 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	}
 	flt *imgIn = (flt *)_mm_malloc(nvox3D * sizeof(flt), 64); // alloc for each volume to allow openmp
 	flt *img = (flt *)nim->data;
-	memcpy(imgIn, img, nvox3D * sizeof(float));
+	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
 	//  -thr iso -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -1283,6 +1288,7 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 				} // x
 			} // y
 		} // z
+		_mm_free(vxs2);
 	} // v
 	flt fill = 0.0;
 	if (!isZeroFill)
@@ -5258,6 +5264,69 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	exit(0);
 } // nifti_compare()
 
+// unifize wrapper: always processes in float internally
+staticx int nifti_unifize(nifti_image *nim) {
+	if (nim->datatype != DT_CALC) return 1;
+	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
+	size_t nvox3D = (size_t)nx * ny * nz;
+#ifdef DT32
+	return unifize_image((float *)nim->data, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+#else
+	float *tmp = (float *)malloc(nvox3D * sizeof(float));
+	if (!tmp) return 1;
+	double *dd = (double *)nim->data;
+	for (size_t i = 0; i < nvox3D; i++) tmp[i] = (float)dd[i];
+	int ret = unifize_image(tmp, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+	if (ret == 0)
+		for (size_t i = 0; i < nvox3D; i++) dd[i] = (double)tmp[i];
+	free(tmp);
+	return ret;
+#endif
+}
+
+#ifdef HAVE_ALLINEATE
+staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts) {
+#ifdef DT32
+	nifti_image *base = nifti_image_read(basefile, 1);
+	if (!base) {
+		printfx("** failed to read base image from '%s'\n", basefile);
+		return 1;
+	}
+	int ok = nii_allineate(nim, base, opts);
+	nifti_image_free(base);
+	return ok;
+#else
+	(void)basefile; (void)opts;
+	printfx("'-dt double' does not support allineate\n");
+	return 1;
+#endif
+}
+
+staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
+#ifdef DT32
+	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
+	if (!tmpl) {
+		printfx("** failed to read template image from '%s'\n", tmplfile);
+		return 1;
+	}
+	nifti_image *mask = nifti_image_read(maskfile, 1);
+	if (!mask) {
+		printfx("** failed to read mask image from '%s'\n", maskfile);
+		nifti_image_free(tmpl);
+		return 1;
+	}
+	int ok = nii_deface(nim, tmpl, mask, opts);
+	nifti_image_free(tmpl);
+	nifti_image_free(mask);
+	return ok;
+#else
+	(void)tmplfile; (void)maskfile; (void)opts;
+	printfx("'-dt double' does not support deface\n");
+	return 1;
+#endif
+}
+#endif
+
 #ifdef DT32
 int main32(int argc, char *argv[]) {
 #else
@@ -5364,18 +5433,6 @@ int main64(int argc, char *argv[]) {
 	argc = argc - 1;
 #if defined(_OPENMP)
 	const int maxNumThreads = omp_get_max_threads();
-	const char *key = "AFNI_COMPRESSOR";
-	char *value;
-	value = getenv(key);
-	// export AFNI_COMPRESSOR=PIGZ
-	char pigzKey[5] = "PIGZ";
-	if ((value != NULL) && (strstr(value, pigzKey))) {
-		omp_set_num_threads(maxNumThreads);
-		printfx("Using %d threads\n", maxNumThreads);
-	} else {
-		omp_set_num_threads(1);
-		// printfx("Single threaded\n");
-	}
 #endif
 
 	// read operations
@@ -5870,7 +5927,40 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			double dx = strtod(argv[ac], &end);
 			ok = nifti_erode(nim, iso, dx);
-		} else if (!strcmp(argv[ac], "-edt"))
+		} else if (!strcmp(argv[ac], "-unifize"))
+			ok = nifti_unifize(nim);
+#ifdef HAVE_ALLINEATE
+		else if (!strcmp(argv[ac], "-allineate")) {
+			ac++;
+			if (ac >= argc) {
+				printfx("-allineate requires a base image argument\n");
+				goto fail;
+			}
+			char *al_basefile = argv[ac];
+			al_opts al_options = al_opts_default();
+			if (al_parse_subopts(&ac, argc, argv, &al_options, "-allineate"))
+				goto fail;
+			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
+		}
+		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-skullstrip")) {
+			int is_skullstrip = (argv[ac][1] == 's');
+			const char *cmd = argv[ac];
+			al_opts df_opts = al_opts_default();
+			ac++;
+			if (ac + 1 >= argc) {
+				printfx("%s requires template and mask arguments\n", cmd);
+				goto fail;
+			}
+			char *tmpl_file = argv[ac]; ac++;
+			char *mask_file = argv[ac];
+			if (is_skullstrip)
+				df_opts.skullstrip = mask_file;
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd))
+				goto fail;
+			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
+		}
+#endif
+		else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
 		else if (!strcmp(argv[ac], "-scale01"))
 			ok = nifti_scale01(nim);

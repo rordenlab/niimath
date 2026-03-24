@@ -117,7 +117,6 @@ double calculate_error(int id_v1, int id_v2, vec3d *p_result, struct TVertex ver
 		p_result->y =  1.0/det*(symMatDet(q,0, 2, 3, 1, 5, 6, 2, 7 , 8));  // vy = A42/det(q_delta)
 		p_result->z = -1.0/det*(symMatDet(q,0, 1, 3, 1, 4, 6, 2, 5,  8));  // vz = A43/det(q_delta)
 		return vertex_error(q, p_result->x, p_result->y, p_result->z);
-		return 1.0;
 	}
 	// det = 0 -> try to find best result
 	vec3d p1 = vertices[id_v1].p;
@@ -133,7 +132,6 @@ double calculate_error(int id_v1, int id_v2, vec3d *p_result, struct TVertex ver
 	return error;
 }
 
-#define loopi(start_l,end_l) for ( int i=start_l;i<end_l;++i )
 #define loopi(start_l,end_l) for ( int i=start_l;i<end_l;++i )
 #define loopj(start_l,end_l) for ( int j=start_l;j<end_l;++j )
 #define loopk(start_l,end_l) for ( int k=start_l;k<end_l;++k )
@@ -209,7 +207,7 @@ void update_mesh(int iteration, struct TTriangle triangles[], struct TVertex ver
 					if(vids[ofs]==id)break;
 					ofs++;
 				}
-				if(ofs == nvcount) {
+				if(ofs == nvcount && nvcount < *nVert) {
 					vcount[nvcount] = 1;
 					vids[nvcount] = id;
 					nvcount++;
@@ -379,9 +377,8 @@ void laplacian_smoothHC(vec3d *verts, vec3i *tris, int nvert, int ntri, double a
 	struct TVertex* vertices = (struct TVertex*) malloc(nvert * sizeof(struct TVertex));
 	loopi(0, nvert)
 		vertices[i].p = verts[i];
-	struct TTriangle* triangles = (struct TTriangle*) malloc(ntri * sizeof(struct TTriangle));
+	struct TTriangle* triangles = (struct TTriangle*) calloc(ntri, sizeof(struct TTriangle));
 	loopi(0, ntri) {
-		triangles[i].deleted=0;
 		triangles[i].v[0] = tris[i].x;
 		triangles[i].v[1] = tris[i].y;
 		triangles[i].v[2] = tris[i].z;
@@ -410,9 +407,8 @@ void quadric_simplify_mesh(vec3d **vs, vec3i **ts, int* nvert, int *ntri, int ta
 	free(*vs);
 	//init: load triangle faces
 	vec3i *tris = *ts;
-	struct TTriangle* triangles = (struct TTriangle*) malloc(*ntri * sizeof(struct TTriangle));
+	struct TTriangle* triangles = (struct TTriangle*) calloc(*ntri, sizeof(struct TTriangle));
 	loopi(0,*ntri) {
-		triangles[i].deleted=0;
 		triangles[i].v[0] = tris[i].x;
 		triangles[i].v[1] = tris[i].y;
 		triangles[i].v[2] = tris[i].z;

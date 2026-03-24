@@ -103,8 +103,9 @@ MCB *MarchingCubes( int size_x, int size_y , int size_z  )
 void FreeMarchingCubes(MCB *mcb)
 //-----------------------------------------------------------------------------
 {
+  if (mcb == NULL) return;
   clean_all(mcb) ;
-  return;
+  free(mcb) ;
 }
 //_____________________________________________________________________________
 
@@ -837,9 +838,14 @@ void add_triangle( MCB *mcb , const char* trig, char n, int v12 )
       if( mcb->ntrigs >= mcb->Ntrigs )
       {
         Triangle *temp = mcb->triangles ;
-        mcb->triangles = (Triangle*)malloc(2*mcb->Ntrigs * sizeof(Triangle));
-        memcpy( mcb->triangles, temp, mcb->Ntrigs*sizeof(Triangle) ) ;
-        free(temp) ; temp = NULL;
+        Triangle *newMem = (Triangle*)malloc(2*mcb->Ntrigs * sizeof(Triangle));
+        if (newMem == NULL) {
+          printf("Marching Cubes: failed to reallocate triangles\n");
+          return;
+        }
+        memcpy( newMem, temp, mcb->Ntrigs*sizeof(Triangle) ) ;
+        free(temp) ;
+        mcb->triangles = newMem ;
         if (debug) printf("%d allocated triangles\n", mcb->Ntrigs) ;
         mcb->Ntrigs *= 2 ;
       }
@@ -912,9 +918,14 @@ void test_vertex_addition(MCB *mcb)
   if( mcb->nverts >= mcb->Nverts )
   {
     Vertex *temp = mcb->vertices ;
-    mcb->vertices =  (Vertex*)malloc(mcb->Nverts*2 * sizeof(Vertex)) ;
-    memcpy( mcb->vertices, temp, mcb->Nverts*sizeof(Vertex) ) ;
-    free(temp); temp = NULL;
+    Vertex *newMem = (Vertex*)malloc(mcb->Nverts*2 * sizeof(Vertex)) ;
+    if (newMem == NULL) {
+      printf("Marching Cubes: failed to reallocate vertices\n");
+      return;
+    }
+    memcpy( newMem, temp, mcb->Nverts*sizeof(Vertex) ) ;
+    free(temp) ;
+    mcb->vertices = newMem ;
     if (debug) printf("%d allocated vertices\n", mcb->Nverts) ;
     mcb->Nverts *= 2 ;
   }
@@ -930,7 +941,8 @@ int add_x_vertex(MCB *mcb )
   test_vertex_addition(mcb) ;
   vert = mcb->vertices + mcb->nverts++ ;
 
-  u = ( mcb->cube[0] ) / ( mcb->cube[0] - mcb->cube[1] ) ;
+  { float denom = mcb->cube[0] - mcb->cube[1] ;
+  u = (denom != 0.0f) ? mcb->cube[0] / denom : 0.5f ; }
 
   vert->x      = (float)mcb->i+u;
   vert->y      = (float) mcb->j ;
@@ -961,7 +973,8 @@ int add_y_vertex( MCB *mcb)
   test_vertex_addition(mcb) ;
   vert = mcb->vertices + mcb->nverts++ ;
 
-  u = ( mcb->cube[0] ) / ( mcb->cube[0] - mcb->cube[3] ) ;
+  { float denom = mcb->cube[0] - mcb->cube[3] ;
+  u = (denom != 0.0f) ? mcb->cube[0] / denom : 0.5f ; }
 
   vert->x      = (float) mcb->i ;
   vert->y      = (float)mcb->j+u;
@@ -990,7 +1003,8 @@ int add_z_vertex(MCB *mcb )
   test_vertex_addition(mcb) ;
   vert = mcb->vertices + mcb->nverts++ ;
 
-  u = ( mcb->cube[0] ) / ( mcb->cube[0] - mcb->cube[4] ) ;
+  { float denom = mcb->cube[0] - mcb->cube[4] ;
+  u = (denom != 0.0f) ? mcb->cube[0] / denom : 0.5f ; }
 
   vert->x      = (float) mcb->i ;
   vert->y      = (float) mcb->j ;
@@ -1050,9 +1064,11 @@ int add_c_vertex( MCB *mcb)
   vid = get_z_vert( mcb, mcb->i ,mcb->j+1, mcb->k ) ;
   if( vid != -1 ) { ++u ;   v = mcb->vertices[vid] ; vert->x += v.x ;  vert->y += v.y ;  vert->z += v.z ;  vert->nx += v.nx ; vert->ny += v.ny ; vert->nz += v.nz ; }
 
-  vert->x  /= u ;
-  vert->y  /= u ;
-  vert->z  /= u ;
+  if( u > 0 ) {
+    vert->x  /= u ;
+    vert->y  /= u ;
+    vert->z  /= u ;
+  }
 
   u = (float) sqrt( vert->nx * vert->nx + vert->ny * vert->ny +vert->nz * vert->nz ) ;
   if( u > 0 )
@@ -1153,7 +1169,7 @@ void writePLY( MCB *mcb , const char *fn) {
   if (fp == NULL)
     return;// EXIT_FAILURE;
   fputs("ply\n",fp);
-  if (&littleEndianPlatform)
+  if (littleEndianPlatform())
     fputs("format binary_little_endian 1.0\n",fp);
   else
     fputs("format binary_big_endian 1.0\n",fp);

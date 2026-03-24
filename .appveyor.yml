@@ -71,7 +71,7 @@ for:
     build_script:
       - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
       - cmake --build build/x86_64
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -B build/arm64
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -DENABLE_ZSTD=OFF -B build/arm64
       - cmake --build build/arm64
 
     after_build:

@@ -1,4 +1,6 @@
 *.DS_Store
+*.dSYM/
+*.o
 /build/
 /bin/
 /src/niimath
@@ -18,3 +20,8 @@ __pycache__/
 niimath/_dist_ver.py
 # scikit-build
 _skbuild/niimath/_dist_ver.py
+# Test data and benchmark outputs
+/benchmark/
+/deface/
+/mesh/
+/validate/
