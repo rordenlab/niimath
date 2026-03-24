@@ -383,6 +383,7 @@ int show_help( void ) {
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
+	printf(" -unifize                 : bias field correction (adapted from AFNI 3dUnifize)\n");
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels [1 is typical]; scl is amount [0.5 medium, 1.0 heavy])\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");
@@ -510,6 +511,10 @@ int show_help( void ) {
 	printf("     niimath inputVolume -add 2.5 -mul inputVolume2 output_volume\n");
 	printf("\n");
 	printf("     niimath 4D_inputVolume -Tmean -mul -1 -add 4D_inputVolume demeaned_4D_inputVolume\n");
+	printf("\n");
+	printf("Threading: OpenMP is enabled by default. Control threads with:\n");
+	printf("     niimath -p 4 in.nii -add 1 out.nii    (use 4 threads)\n");
+	printf("     export OMP_NUM_THREADS=4               (environment variable, applies to all OpenMP programs)\n");
     return 0;
 }
 #endif //ifndef __EMSCRIPTEN__

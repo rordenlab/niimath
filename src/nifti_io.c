@@ -97,8 +97,11 @@ static FILE *zst_decompress_to_tmpfile(const char *path)
    if (!dbuf) { free(cbuf); return NULL; }
 
    size_t result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
-   /* If decompression failed and buffer might be too small, retry with larger buffer */
-   while (ZSTD_isError(result) && dsize < (unsigned long long)csize * 256) {
+   /* If buffer too small, retry with larger buffer (check error name to avoid zstd_errors.h) */
+   int retries = 0;
+   while (ZSTD_isError(result) && retries++ < 10 &&
+          dsize < (unsigned long long)csize * 256 &&
+          strstr(ZSTD_getErrorName(result), "too small")) {
       dsize *= 2;
       char *newbuf = (char *)realloc(dbuf, dsize);
       if (!newbuf) { free(dbuf); free(cbuf); return NULL; }
@@ -113,7 +116,7 @@ static FILE *zst_decompress_to_tmpfile(const char *path)
 
    FILE *tmpf = tmpfile();
    if (!tmpf) { free(dbuf); return NULL; }
-   fwrite(dbuf, 1, result, tmpf);
+   if (fwrite(dbuf, 1, result, tmpf) != result) { free(dbuf); fclose(tmpf); return NULL; }
    free(dbuf);
    rewind(tmpf);
    return tmpf;
@@ -144,9 +147,13 @@ static int zst_compress_from_tmpfile(FILE *tmpf, const char *path)
 
    FILE *fout = fopen(path, "wb");
    if (!fout) { free(cbuf); return -1; }
-   fwrite(cbuf, 1, csize, fout);
+   size_t written = fwrite(cbuf, 1, csize, fout);
    fclose(fout);
    free(cbuf);
+   if (written != csize) {
+      fprintf(stderr, "** zstd write error: wrote %zu of %zu bytes\n", written, csize);
+      return -1;
+   }
    return 0;
 }
 #endif /* HAVE_ZSTD */

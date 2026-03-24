@@ -131,9 +131,7 @@ cd src && make sanitize    # Builds with -fsanitize=address
 
 ## Known Remaining Issues
 
-1. **NULL checks** — ~22 malloc/calloc calls in mesh code lack NULL checks
-2. **File handle leaks** — save_mz3 doesn't close fp/fgz if malloc fails after fopen
-3. **Buffer overflows** — fixed-size buffers in save_mesh() (768-char filename limit)
+1. **NULL checks** — meshify.c is largely fixed; ~26 unchecked malloc/calloc calls remain in MarchingCubes.c (6), oldcubes.c (3), and quadric.c (17)
 
 ## Optimization Constraints
 
