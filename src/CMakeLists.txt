@@ -155,20 +155,29 @@ set(NIIMATH_SRCS
 )
 add_executable(niimath ${NIIMATH_SRCS})
 
-set(ZLIB_IMPLEMENTATION "Miniz" CACHE STRING "Choose zlib implementation.")
-set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Miniz;System;Custom")
-if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
-    if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "System")
-        set(ZLIB_ROOT ${ZLIB_ROOT} CACHE PATH "Specify custom zlib root directory.")
-        if(NOT ZLIB_ROOT)
-            message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!")
-        endif()
-    endif()
-    find_package(ZLIB REQUIRED)
-    add_definitions(-DHAVE_ZLIB)
-    target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
-    target_link_libraries(niimath ${ZLIB_LIBRARIES})
+# Default to System zlib for standalone `cmake -S src` builds: there is no bundled
+# miniz, and spng.c (bitmap support, on by default) needs zlib's deflate/inflate, so
+# the old "Miniz" default failed to link. The SuperBuild overrides this with its
+# Cloudflare zlib via -DZLIB_IMPLEMENTATION, so release/CI/wheel builds are unaffected.
+set(ZLIB_IMPLEMENTATION "System" CACHE STRING "Choose zlib implementation.")
+set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "System;Custom")
+# There is no bundled miniz; spng.c (bitmap) and nifti gz I/O need a real zlib, so
+# reject the legacy "Miniz" value instead of silently producing an unlinkable build.
+# (The SuperBuild forwards "Cloudflare" with a ZLIB_ROOT, which the Custom path below
+# resolves.) zlib is always linked.
+if(${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
+    message(FATAL_ERROR "ZLIB_IMPLEMENTATION=Miniz is not supported (no bundled miniz). Use System (default) or Custom with ZLIB_ROOT.")
 endif()
+if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "System")
+    set(ZLIB_ROOT ${ZLIB_ROOT} CACHE PATH "Specify custom zlib root directory.")
+    if(NOT ZLIB_ROOT)
+        message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!")
+    endif()
+endif()
+find_package(ZLIB REQUIRED)
+add_definitions(-DHAVE_ZLIB)
+target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
+target_link_libraries(niimath ${ZLIB_LIBRARIES})
 
 if(NOT MSVC)
     # Link math library
