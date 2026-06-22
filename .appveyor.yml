@@ -69,13 +69,26 @@ for:
         - job_name: mac
 
     build_script:
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
-      - cmake --build build/x86_64
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -DENABLE_ZSTD=OFF -B build/arm64
-      - cmake --build build/arm64
+      # Build a universal (x86_64+arm64) STATIC libzstd from source so both slices can
+      # link zstd. Homebrew only provides the runner's native arch, which is why the
+      # cross-compiled slice previously had to disable zstd. Static linking also drops
+      # the runtime libzstd.dylib dependency, making the released binary portable.
+      - curl -sL -o zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+      - tar xzf zstd.tar.gz
+      - make -C zstd-1.5.6/lib -j libzstd.a CFLAGS="-O3 -fPIC -arch x86_64 -arch arm64"
+      - mkdir -p zstduniv/lib/pkgconfig zstduniv/include && cp zstd-1.5.6/lib/libzstd.a zstduniv/lib/ && cp zstd-1.5.6/lib/zstd.h zstduniv/include/
+      - printf 'prefix=%s/zstduniv\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\nName: zstd\nDescription: zstd\nVersion: 1.5.6\nLibs: -L${libdir} -lzstd\nCflags: -I${includedir}\n' "$PWD" > zstduniv/lib/pkgconfig/libzstd.pc
+      # PKG_CONFIG_PATH must be set for the build step too: the SuperBuild configures the
+      # inner src project (which runs pkg_check_modules) during `cmake --build`.
+      - PKG_CONFIG_PATH=$PWD/zstduniv/lib/pkgconfig cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
+      - PKG_CONFIG_PATH=$PWD/zstduniv/lib/pkgconfig cmake --build build/x86_64
+      - PKG_CONFIG_PATH=$PWD/zstduniv/lib/pkgconfig cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -B build/arm64
+      - PKG_CONFIG_PATH=$PWD/zstduniv/lib/pkgconfig cmake --build build/arm64
 
     after_build:
       - lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
+      - lipo -info build/niimath   # expect: x86_64 arm64
+      - otool -L build/niimath | grep -i zstd || echo "zstd statically linked (no dylib dependency)"
       - zip -j niimath_macos.zip ./build/niimath &>/dev/null
       - appveyor PushArtifact niimath_macos.zip
 

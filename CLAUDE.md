@@ -136,8 +136,11 @@ cd src && make sanitize    # Builds with -fsanitize=address
 
 1. **NULL checks** — meshify.c is largely fixed; ~26 unchecked malloc/calloc calls remain in MarchingCubes.c (6), oldcubes.c (3), and quadric.c (17)
 2. **Build feature-list drift** — the feature source/define inventory is duplicated across `src/Makefile` (all/static/debug/verbose/sanitize/wasm), `src/CMakeLists.txt`, and `src/notarize.sh`; adding a feature requires touching all of them (dtifit hit this). A shared/generated source-list fragment would prevent release mismatches.
-3. **`src/windows.bat` is stale/non-functional** — it references the removed `niftilib/` and `znzlib/` (replaced by `nifti_io.c`) and lacks most feature defines; it cannot build. The maintained Windows path is CMake (AppVeyor). Remove or rewrite it.
-4. **`nifti_save` returns 0 unconditionally** (`core.c`) — callers cannot detect write failures. Commands writing many outputs (e.g. `--dtifit`'s 11 files) can report success on a failed write. Project-wide API improvement.
+3. **`nifti_save` returns 0 unconditionally** (`core.c`) — callers cannot detect write failures. Commands writing many outputs (e.g. `--dtifit`'s 11 files) can report success on a failed write. Project-wide API improvement.
+
+### macOS universal release (zstd)
+
+The AppVeyor macOS job builds a universal binary by compiling x86_64 and arm64 slices separately and `lipo`-combining them. Homebrew only ships the runner's native arch of libzstd, so the cross-compiled slice cannot link homebrew zstd. The job therefore builds a **universal static `libzstd.a` from source** (`-arch x86_64 -arch arm64`) and points both slices at it via `PKG_CONFIG_PATH`; this also makes the released binary self-contained (no runtime `libzstd.dylib`). `src/CMakeLists.txt` resolves the pkg-config result to a full library path so the correct (cross/universal/non-default-prefix) zstd links — without this, zstd fails to link from `/opt/homebrew` or for a cross build.
 
 ## Optimization Constraints
 

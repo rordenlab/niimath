@@ -190,10 +190,21 @@ if(ENABLE_ZSTD)
         endif()
     endif()
     if(ZSTD_FOUND)
+        # pkg-config returns a bare name ("zstd") plus a separate library dir. Resolve a
+        # full path so the correct library links from non-default prefixes (e.g.
+        # /opt/homebrew, which is not on the default link path) and so cross-built or
+        # universal release libraries are picked instead of a host-arch homebrew lib.
+        set(ZSTD_LINK ${ZSTD_LIBRARIES})
+        if(ZSTD_LIBRARY_DIRS)
+            find_library(ZSTD_LIB_FULL NAMES zstd libzstd PATHS ${ZSTD_LIBRARY_DIRS} NO_DEFAULT_PATH)
+            if(ZSTD_LIB_FULL)
+                set(ZSTD_LINK ${ZSTD_LIB_FULL})
+            endif()
+        endif()
         add_definitions(-DHAVE_ZSTD)
         target_include_directories(niimath PRIVATE ${ZSTD_INCLUDE_DIRS})
-        target_link_libraries(niimath ${ZSTD_LIBRARIES})
-        message(STATUS "Zstd support: ON")
+        target_link_libraries(niimath ${ZSTD_LINK})
+        message(STATUS "Zstd support: ON (${ZSTD_LINK})")
     else()
         message(STATUS "Zstd support: OFF (libzstd not found, install with: brew install zstd)")
     endif()
