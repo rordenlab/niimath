@@ -63,8 +63,8 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 ### Core computational pipeline
 - **niimath.c** — CLI entry point, dispatches to `main32()` or `main64()` based on `-dt` flag
 - **coreFLT.c** (6k lines) — Main computational engine, compiled twice via template pattern:
-  - **core32.c** — `#define DT32` + `#include "coreFLT.c"` → float32 with SSE 4-wide SIMD
-  - **core64.c** — includes coreFLT.c without DT32 → float64 with SSE 2-wide SIMD
+  - **core32.c** — `#define DT32` + `#include "coreFLT.c"` → float32 (SSE 4-wide SIMD on x86_64; scalar on ARM/WASM)
+  - **core64.c** — includes coreFLT.c without DT32 → float64 (SSE 2-wide SIMD on x86_64; scalar on ARM/WASM)
 - **core.c** — Shared utilities: datatype conversion, kernel creation, Otsu thresholding, resampling filters, NIfTI I/O helpers
 - **unifize.c** — Bias field correction via `-unifize` flag (adapted from AFNI 3dUnifize, public domain)
 - **allineate.c** (~3.9k lines) — Affine image registration, defacing, and skull-stripping. Shared identically with the standalone `allineate/` project. Supports Hellinger (default), lpc, lpa, and Pearson (ls) cost functions via `-cost`; compile with `-DAL_LPC_MICHO` for lpc+ZZ/lpa+ZZ combined cost variant. Variable DOF via `-warp` (sho/3, shr/6, srs/9, aff/12; default: aff). Matching interpolation via `-interp` (NN, linear, cubic; default: linear). Output interpolation via `-final` or `-nearest`/`-linear`/`-cubic` (default: cubic for allineate, linear for deface/skullstrip via `AL_INTERP_DEFAULT`). `-cmass`/`-nocmass` control center-of-mass initial alignment; `-source_automask` fills outside source brain mask with noise for robust cross-modal registration. CLEQWD edge-bin histogram mode (from AFNI's `clipate`/`THD_cliplevel`). TOHD blok type (truncated octahedron, ~555 voxels/blok) for local Pearson correlation. 2x downsampling for coarse grid search. Twopass coarse-to-fine optimization with parallel candidate refinement (adapted from AFNI 3dAllineate, public domain). Core registration in `al_register()` helper, used by `nii_allineate()`, `nii_deface()`, and `-skullstrip`. Options defined in `al_opts` struct in `allineate.h` (cost, cmass, source_automask, interp, final_interp, warp, skullstrip). Reports wall-clock time and thread count on completion. OpenMP parallelization of coarse search and candidate refinement. Thread-local histogram, warp matrix, and workspace buffers.
@@ -92,7 +92,6 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 ### External/vendored libraries
 - **nifti_io.c/nifti_io.h** — Consolidated NIfTI 1/2 format I/O with integrated zlib and optional zstd wrapper (public domain, ~2k lines; replaces niftilib and znzlib)
 - **spng.c** — PNG encoder library (~7k lines)
-- **sse2neon.h** — SSE→NEON SIMD translation for ARM (~228k)
 
 ## Memory Management Patterns
 
@@ -154,5 +153,5 @@ The AppVeyor macOS job builds a universal binary by compiling x86_64 and arm64 s
 - C99 with extensive use of `#ifdef` for conditional compilation
 - Template pattern: coreFLT.c compiled as both float32 and float64 via macro inclusion
 - Function naming: `nifti_*` for NIfTI operations, `nii_*` for internal helpers
-- SIMD code has scalar fallbacks gated on `__x86_64__`, `__aarch64__`, or `myDisableSSE`
+- Explicit SIMD (Intel intrinsics via `immintrin.h`) is compiled only on `__x86_64__`; ARM/WASM use the scalar fallbacks, which clang `-O3` auto-vectorizes to NEON just as fast (these ops are memory-bandwidth bound). The `sse2neon.h` shim was removed after benchmarks showed it gave no benefit on Apple Silicon (bit-identical output, conformance suite passes).
 - Error returns: `EXIT_SUCCESS`/`EXIT_FAILURE` from stdlib

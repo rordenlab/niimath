@@ -29,7 +29,12 @@
 #include <omp.h>
 #endif
 
+// Explicit SIMD (Intel intrinsics) is used only on x86_64. On ARM/WASM the scalar
+// fallbacks are used: clang -O3 auto-vectorizes them to NEON just as fast (these ops
+// are memory-bandwidth bound), so we no longer ship the large sse2neon.h shim.
+#ifdef __x86_64__
 #define SIMD
+#endif
 #define xmemcpy memcpy
 #define staticx static
 #include "nifti_io.h"
@@ -40,20 +45,11 @@
 #undef SIMD
 #endif
 
-#ifdef SIMD // explicitly vectorize (SSE,AVX,Neon)
-#ifdef __x86_64__
+#ifdef SIMD // explicitly vectorize (SSE/AVX); x86_64 only
 #ifdef DT32
 #define kSSE32 4 // 128-bit SSE handles 4 32-bit floats per instruction
 #else
 #define kSSE64 2 // 128-bit SSE handles 2 64-bit floats per instruction
-#endif
-#else
-#ifdef DT32
-#include "sse2neon.h"
-#define kSSE32 4 // 128-bit SSE handles 4 32-bit floats per instruction
-#else
-#undef SIMD
-#endif
 #endif
 #endif
 
