@@ -29,7 +29,12 @@
 #include <omp.h>
 #endif
 
+// Explicit SIMD (Intel intrinsics) is used only on x86_64. On ARM/WASM the scalar
+// fallbacks are used: clang -O3 auto-vectorizes them to NEON just as fast (these ops
+// are memory-bandwidth bound), so we no longer ship the large sse2neon.h shim.
+#ifdef __x86_64__
 #define SIMD
+#endif
 #define xmemcpy memcpy
 #define staticx static
 #include "nifti_io.h"
@@ -40,20 +45,11 @@
 #undef SIMD
 #endif
 
-#ifdef SIMD // explicitly vectorize (SSE,AVX,Neon)
-#ifdef __x86_64__
+#ifdef SIMD // explicitly vectorize (SSE/AVX); x86_64 only
 #ifdef DT32
 #define kSSE32 4 // 128-bit SSE handles 4 32-bit floats per instruction
 #else
 #define kSSE64 2 // 128-bit SSE handles 2 64-bit floats per instruction
-#endif
-#else
-#ifdef DT32
-#include "sse2neon.h"
-#define kSSE32 4 // 128-bit SSE handles 4 32-bit floats per instruction
-#else
-#undef SIMD
-#endif
 #endif
 #endif
 
@@ -95,7 +91,7 @@
 staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (size_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 ma = _mm_sqrt_ps(v4);
 		_mm_storeu_ps(vin, ma);
@@ -112,7 +108,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128 slope = _mm_set1_ps(slope1);
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (size_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 m = _mm_mul_ps(v4, slope);
 		_mm_storeu_ps(vin, m);
@@ -132,7 +128,7 @@ staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	flt *vin = v;
 	__m128 intercept = _mm_set1_ps(intercept1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (int64_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 ma = _mm_add_ps(v4, intercept);
 		_mm_storeu_ps(vin, ma);
@@ -153,7 +149,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	__m128 intercept = _mm_set1_ps(intercept1);
 	__m128 slope = _mm_set1_ps(slope1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (int64_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 m = _mm_mul_ps(v4, slope);
 		__m128 ma = _mm_add_ps(m, intercept);
@@ -172,7 +168,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (size_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d ma = _mm_sqrt_pd(v2);
 		_mm_storeu_pd(vin, ma);
@@ -189,7 +185,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128d slope = _mm_set1_pd(slope1);
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (size_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d m = _mm_mul_pd(v2, slope);
 		_mm_storeu_pd(vin, m);
@@ -209,7 +205,7 @@ staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	flt *vin = v;
 	__m128d intercept = _mm_set1_pd(intercept1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (int64_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d ma = _mm_add_pd(v2, intercept);
 		_mm_storeu_pd(vin, ma);
@@ -230,7 +226,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	__m128d intercept = _mm_set1_pd(intercept1);
 	__m128d slope = _mm_set1_pd(slope1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (int64_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d m = _mm_mul_pd(v2, slope);
 		__m128d ma = _mm_add_pd(m, intercept);
@@ -5495,7 +5491,7 @@ int main64(int argc, char *argv[]) {
 		if (!strcmp(argv[ac], "-ceil"))
 			op = ceil1;
 		if (!strcmp(argv[ac], "-round"))
-			op = ceil1;
+			op = round1;
 		if (!strcmp(argv[ac], "-floor"))
 			op = floor1;
 		if (!strcmp(argv[ac], "-trunc"))
@@ -6044,11 +6040,23 @@ int main64(int argc, char *argv[]) {
 			nifti_image_free(nim);
 			if (kernel != NULL)
 				_mm_free(kernel);
-			kernel = make_kernel(nim, &nkernel, 3, 3, 3);
+			kernel = NULL;
 			ac++;
 			nim = nifti_image_read(argv[ac], 1);
 			if (!nim)
 				ok = 1; // error
+			else {
+				// match the initial-load handling: convert the replacement image to the
+				// calculation datatype (else later ops read raw ints as floats), and
+				// restore the output name so we save to fout (not overwrite the restart input)
+				in_hdr rhdr = set_input_hdr(nim);
+				if (nifti_image_change_datatype(nim, dtCalc, &rhdr) != 0) {
+					nifti_image_free(nim); nim = NULL; ok = 1;
+				} else if (nifti_set_filenames(nim, fout, 0, 1)) {
+					nifti_image_free(nim); nim = NULL; ok = 1;
+				} else
+					kernel = make_kernel(nim, &nkernel, 3, 3, 3); // rebuild from the new image (was a use-after-free on the freed nim)
+			}
 		} else if (!strcmp(argv[ac], "-grid")) {
 			ac++;
 			double v = strtod(argv[ac], &end);
@@ -6074,7 +6082,7 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			int c = atoi(argv[ac]);
 			printfx("qform_code: %d -> %d\n", nim->qform_code, c);
-			nim->sform_code = c;
+			nim->qform_code = c;
 		} else if (!strcmp(argv[ac], "-sform")) {
 			ac++;
 			int c = atoi(argv[ac]);

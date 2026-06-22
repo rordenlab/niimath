@@ -69,13 +69,28 @@ for:
         - job_name: mac
 
     build_script:
+      # Build a universal (x86_64+arm64) STATIC libzstd from source, then replace the
+      # runner's single-arch homebrew libzstd with it. CMake's zstd detection resolves
+      # to /usr/local/lib/libzstd (shown in the build log), so we overwrite the lib there
+      # and remove the dylibs. Both the native x86_64 and cross-compiled arm64 slices then
+      # link the universal static lib; this also drops the runtime libzstd.dylib
+      # dependency, making the released binary self-contained. (Done this way rather than
+      # via PKG_CONFIG_PATH, which the SuperBuild's nested configure does not honor.)
+      - curl -sL -o zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+      - tar xzf zstd.tar.gz
+      - make -C zstd-1.5.6/lib -j libzstd.a CFLAGS="-O3 -fPIC -arch x86_64 -arch arm64"
+      - sudo find /usr/local -name 'libzstd*.dylib' -delete
+      - sudo cp zstd-1.5.6/lib/libzstd.a /usr/local/lib/libzstd.a
+      - sudo cp zstd-1.5.6/lib/zstd.h /usr/local/include/zstd.h
       - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
       - cmake --build build/x86_64
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -DENABLE_ZSTD=OFF -B build/arm64
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -B build/arm64
       - cmake --build build/arm64
 
     after_build:
       - lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
+      - lipo -info build/niimath   # expect: x86_64 arm64
+      - otool -L build/niimath | grep -i zstd || echo "zstd statically linked (no dylib dependency)"
       - zip -j niimath_macos.zip ./build/niimath &>/dev/null
       - appveyor PushArtifact niimath_macos.zip
 

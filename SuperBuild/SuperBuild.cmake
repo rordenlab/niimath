@@ -47,6 +47,7 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
 endif()
 
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
+option(BUILD_BMP "Build bitmap (PNG) output support" ON)
 
 include(ExternalProject)
 
@@ -54,7 +55,7 @@ set(DEPENDENCIES)
 
 set(DEP_INSTALL_DIR ${CMAKE_BINARY_DIR})
 set(ZLIB_IMPLEMENTATION "Cloudflare" CACHE STRING "Choose zlib implementation.")
-set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Cloudflare;Miniz;System;Custom")
+set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Cloudflare;System;Custom")
 if(${ZLIB_IMPLEMENTATION} STREQUAL "Cloudflare")
     message("-- Build with Cloudflare zlib: ON")
     include(${CMAKE_SOURCE_DIR}/SuperBuild/External-CLOUDFLARE-ZLIB.cmake)
@@ -87,6 +88,7 @@ ExternalProject_Add(src
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
         -DENABLE_ZSTD:BOOL=${ENABLE_ZSTD}
+        -DBUILD_BMP:BOOL=${BUILD_BMP}
         # forward static runtime and static linking
         -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}
         -DBUILD_SHARED_LIBS:BOOL=${BUILD_SHARED_LIBS}

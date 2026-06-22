@@ -41,6 +41,8 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} base64.c)
     ADD_DEFINITIONS(-DHAVE_TENSOR)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} tensor.c)
+    ADD_DEFINITIONS(-DHAVE_DTIFIT)
+    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} dtifit.c)
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     ADD_DEFINITIONS(-DHAVE_CONFORM)
@@ -153,20 +155,29 @@ set(NIIMATH_SRCS
 )
 add_executable(niimath ${NIIMATH_SRCS})
 
-set(ZLIB_IMPLEMENTATION "Miniz" CACHE STRING "Choose zlib implementation.")
-set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "Miniz;System;Custom")
-if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
-    if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "System")
-        set(ZLIB_ROOT ${ZLIB_ROOT} CACHE PATH "Specify custom zlib root directory.")
-        if(NOT ZLIB_ROOT)
-            message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!")
-        endif()
-    endif()
-    find_package(ZLIB REQUIRED)
-    add_definitions(-DHAVE_ZLIB)
-    target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
-    target_link_libraries(niimath ${ZLIB_LIBRARIES})
+# Default to System zlib for standalone `cmake -S src` builds: there is no bundled
+# miniz, and spng.c (bitmap support, on by default) needs zlib's deflate/inflate, so
+# the old "Miniz" default failed to link. The SuperBuild overrides this with its
+# Cloudflare zlib via -DZLIB_IMPLEMENTATION, so release/CI/wheel builds are unaffected.
+set(ZLIB_IMPLEMENTATION "System" CACHE STRING "Choose zlib implementation.")
+set_property(CACHE ZLIB_IMPLEMENTATION PROPERTY STRINGS  "System;Custom")
+# There is no bundled miniz; spng.c (bitmap) and nifti gz I/O need a real zlib, so
+# reject the legacy "Miniz" value instead of silently producing an unlinkable build.
+# (The SuperBuild forwards "Cloudflare" with a ZLIB_ROOT, which the Custom path below
+# resolves.) zlib is always linked.
+if(${ZLIB_IMPLEMENTATION} STREQUAL "Miniz")
+    message(FATAL_ERROR "ZLIB_IMPLEMENTATION=Miniz is not supported (no bundled miniz). Use System (default) or Custom with ZLIB_ROOT.")
 endif()
+if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "System")
+    set(ZLIB_ROOT ${ZLIB_ROOT} CACHE PATH "Specify custom zlib root directory.")
+    if(NOT ZLIB_ROOT)
+        message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!")
+    endif()
+endif()
+find_package(ZLIB REQUIRED)
+add_definitions(-DHAVE_ZLIB)
+target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
+target_link_libraries(niimath ${ZLIB_LIBRARIES})
 
 if(NOT MSVC)
     # Link math library
@@ -188,10 +199,21 @@ if(ENABLE_ZSTD)
         endif()
     endif()
     if(ZSTD_FOUND)
+        # pkg-config returns a bare name ("zstd") plus a separate library dir. Resolve a
+        # full path so the correct library links from non-default prefixes (e.g.
+        # /opt/homebrew, which is not on the default link path) and so cross-built or
+        # universal release libraries are picked instead of a host-arch homebrew lib.
+        set(ZSTD_LINK ${ZSTD_LIBRARIES})
+        if(ZSTD_LIBRARY_DIRS)
+            find_library(ZSTD_LIB_FULL NAMES zstd libzstd PATHS ${ZSTD_LIBRARY_DIRS} NO_DEFAULT_PATH)
+            if(ZSTD_LIB_FULL)
+                set(ZSTD_LINK ${ZSTD_LIB_FULL})
+            endif()
+        endif()
         add_definitions(-DHAVE_ZSTD)
         target_include_directories(niimath PRIVATE ${ZSTD_INCLUDE_DIRS})
-        target_link_libraries(niimath ${ZSTD_LIBRARIES})
-        message(STATUS "Zstd support: ON")
+        target_link_libraries(niimath ${ZSTD_LINK})
+        message(STATUS "Zstd support: ON (${ZSTD_LINK})")
     else()
         message(STATUS "Zstd support: OFF (libzstd not found, install with: brew install zstd)")
     endif()

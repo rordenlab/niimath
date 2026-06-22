@@ -16,6 +16,12 @@ cmake.minimum-version = "3.5"
 write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
 
+[tool.cibuildwheel]
+# Smoke-test every wheel before it can reach PyPI: the console script subprocesses
+# the bundled binary, so this fails fast if the binary is missing, the wrong
+# architecture, or not executable. Portable across Linux/macOS/Windows shells.
+test-command = "niimath"
+
 [project]
 name = "niimath"
 description = "NIfTI arithmetic utilities"
