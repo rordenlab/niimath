@@ -91,7 +91,7 @@
 staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (size_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 ma = _mm_sqrt_ps(v4);
 		_mm_storeu_ps(vin, ma);
@@ -108,7 +108,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128 slope = _mm_set1_ps(slope1);
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (size_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 m = _mm_mul_ps(v4, slope);
 		_mm_storeu_ps(vin, m);
@@ -128,7 +128,7 @@ staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	flt *vin = v;
 	__m128 intercept = _mm_set1_ps(intercept1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (int64_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 ma = _mm_add_ps(v4, intercept);
 		_mm_storeu_ps(vin, ma);
@@ -149,7 +149,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	__m128 intercept = _mm_set1_ps(intercept1);
 	__m128 slope = _mm_set1_ps(slope1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE32); i += kSSE32) {
+	for (int64_t i = 0; i + kSSE32 <= n; i += kSSE32) {
 		__m128 v4 = _mm_loadu_ps(vin);
 		__m128 m = _mm_mul_ps(v4, slope);
 		__m128 ma = _mm_add_ps(m, intercept);
@@ -168,7 +168,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 staticx void nifti_sqrt(flt *v, size_t n) {
 	flt *vin = v;
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (size_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d ma = _mm_sqrt_pd(v2);
 		_mm_storeu_pd(vin, ma);
@@ -185,7 +185,7 @@ staticx void nifti_mul(flt *v, size_t n, flt slope1) {
 	flt *vin = v;
 	__m128d slope = _mm_set1_pd(slope1);
 	// #pragma omp parallel for
-	for (size_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (size_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d m = _mm_mul_pd(v2, slope);
 		_mm_storeu_pd(vin, m);
@@ -205,7 +205,7 @@ staticx void nifti_add(flt *v, int64_t n, flt intercept1) {
 	flt *vin = v;
 	__m128d intercept = _mm_set1_pd(intercept1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (int64_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d ma = _mm_add_pd(v2, intercept);
 		_mm_storeu_pd(vin, ma);
@@ -226,7 +226,7 @@ staticx void nifti_fma(flt *v, int64_t n, flt slope1, flt intercept1) {
 	__m128d intercept = _mm_set1_pd(intercept1);
 	__m128d slope = _mm_set1_pd(slope1);
 	// #pragma omp parallel for
-	for (int64_t i = 0; i <= (n - kSSE64); i += kSSE64) {
+	for (int64_t i = 0; i + kSSE64 <= n; i += kSSE64) {
 		__m128d v2 = _mm_loadu_pd(vin);
 		__m128d m = _mm_mul_pd(v2, slope);
 		__m128d ma = _mm_add_pd(m, intercept);
