@@ -77,7 +77,8 @@ for:
       - tar xzf zstd.tar.gz
       - make -C zstd-1.5.6/lib -j libzstd.a CFLAGS="-O3 -fPIC -arch x86_64 -arch arm64"
       - mkdir -p zstduniv/lib/pkgconfig zstduniv/include && cp zstd-1.5.6/lib/libzstd.a zstduniv/lib/ && cp zstd-1.5.6/lib/zstd.h zstduniv/include/
-      - printf 'prefix=%s/zstduniv\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\nName: zstd\nDescription: zstd\nVersion: 1.5.6\nLibs: -L${libdir} -lzstd\nCflags: -I${includedir}\n' "$PWD" > zstduniv/lib/pkgconfig/libzstd.pc
+      - |
+        printf 'prefix=%s/zstduniv\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\nName: zstd\nDescription: zstd\nVersion: 1.5.6\nLibs: -L${libdir} -lzstd\nCflags: -I${includedir}\n' "$PWD" > zstduniv/lib/pkgconfig/libzstd.pc
       # PKG_CONFIG_PATH must be set for the build step too: the SuperBuild configures the
       # inner src project (which runs pkg_check_modules) during `cmake --build`.
       - PKG_CONFIG_PATH=$PWD/zstduniv/lib/pkgconfig cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
