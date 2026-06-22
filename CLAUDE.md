@@ -29,6 +29,7 @@ make tiny               # Minimal terminal build (emulates WASM constraints)
 make nano               # Without mesh (nii2mesh) functions
 MESH=0 make             # Disable mesh support
 AL=0 make               # Disable allineate registration
+DTIFIT=0 make           # Disable dtifit (diffusion tensor fit)
 ZSTD=0 make             # Disable zstd (.nii.zst) compression support
 OMP=0 make              # Disable OpenMP (single-threaded build)
 CF=1 make               # CloudFlare accelerated zlib
@@ -50,6 +51,7 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 - `HAVE_BMP` — bitmap/PNG creation
 - `HAVE_BUTTERWORTH` — bandpass temporal filtering
 - `HAVE_TENSOR` — tensor decomposition
+- `HAVE_DTIFIT` — linear diffusion tensor fit (`--dtifit`), emulates FSL dtifit; needs `HAVE_TENSOR`
 - `HAVE_CONFORM` — image conforming to standard space
 - `HAVE_ALLINEATE` — affine image registration, defacing, and skull-stripping (allineate.c + powell_newuoa.c); compiled separately with -ffast-math and OpenMP
 - `AL_LPC_MICHO` — enables lpc+ZZ/lpa+ZZ combined cost variant for allineate (default: pure lpc/lpa)
@@ -76,6 +78,7 @@ cmake -DUSE_OPENMP=OFF ..    # To disable OpenMP (enabled by default)
 - **meshtypes.h** — `vec3d` (double xyz), `vec3i` (int xyz) structs
 
 ### Supporting modules
+- **dtifit.c** — `niimath --dtifit`: linear diffusion tensor fit emulating FSL's `dtifit`. Self-contained TU dispatched early in `niimath.c:main()` (like the `.mz3` mesh path), parsing FSL-identical flags (`-k/-m/-r/-b/-o`, plus `-xflip 0|1|auto`). Fits the 6-volume tensor by 7-parameter (S0 + 6 tensor terms) log-linear OLS (`D = (AᵀA)⁻¹Aᵀ·logS`; fit math from AFNI 3dDWItoDT linear path, public domain — nonlinear path intentionally omitted), then reuses `EIG_tsfunc` (tensor.c) for FA/MD/L*/V*. Emulates FSL's determinant-based bvec x-flip (flips gradient X when voxel→world det>0). Writes `<base>_{FA,MD,L1,L2,L3,V1,V2,V3,S0,MO,tensor}`. Unsupported FSL features (`--wls`, `--kurt`, etc.) error out clearly. **Validation (against FSL `dtifit` reference, in brain mask):** FA r=0.998, MD r=0.9998, L1–L3 r≈0.999, S0 r=1.0, MO r=0.998, V1/V2/V3 \|cos\|≈0.9998, tensor r=1.0. bvec determinant x-flip confirmed FSL-correct on real LPS (det>0, auto-flips) and LAS (det<0, no flip) images: both yield identical world-space fiber orientations (\|cos\|=1.0); a flip-disabled negative control drops to 0.55. Validation data and scripts are kept out of the repo (gitignored), so re-running requires regenerating the FSL reference. Notes on gotchas: tensor buffer must use NIfTI planar (volume-major) layout; eigenvector sign is arbitrary, so validate V* with \|cos angle\|, not Pearson r.
 - **tensor.c** — Eigenvalue decomposition (Jacobi method from EISPACK)
 - **bw.c** — Butterworth IIR filter design (LGPL, Exstrom Laboratories)
 - **bwlabel.c** — Connected component labeling (6/18/26 connectivity)
@@ -132,6 +135,9 @@ cd src && make sanitize    # Builds with -fsanitize=address
 ## Known Remaining Issues
 
 1. **NULL checks** — meshify.c is largely fixed; ~26 unchecked malloc/calloc calls remain in MarchingCubes.c (6), oldcubes.c (3), and quadric.c (17)
+2. **Build feature-list drift** — the feature source/define inventory is duplicated across `src/Makefile` (all/static/debug/verbose/sanitize/wasm), `src/CMakeLists.txt`, and `src/notarize.sh`; adding a feature requires touching all of them (dtifit hit this). A shared/generated source-list fragment would prevent release mismatches.
+3. **`src/windows.bat` is stale/non-functional** — it references the removed `niftilib/` and `znzlib/` (replaced by `nifti_io.c`) and lacks most feature defines; it cannot build. The maintained Windows path is CMake (AppVeyor). Remove or rewrite it.
+4. **`nifti_save` returns 0 unconditionally** (`core.c`) — callers cannot detect write failures. Commands writing many outputs (e.g. `--dtifit`'s 11 files) can report success on a failed write. Project-wide API improvement.
 
 ## Optimization Constraints
 

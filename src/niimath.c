@@ -26,6 +26,9 @@
 #ifdef HAVE_64BITS
 	#include "core64.h" //all 64-bit functions
 #endif
+#ifdef HAVE_DTIFIT
+	#include "dtifit.h"
+#endif
 #ifdef NII2MESH
 	#include <stdbool.h>
 	#include "meshtypes.h"
@@ -68,7 +71,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20260315"
+#define kMTHdate "v1.0.20260622"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
@@ -390,6 +393,9 @@ int show_help( void ) {
 	printf(" -dogx <sPos> <sNeg>      : as dog, zero-crossing for 2D sagittal slices\n");
 	printf(" -dogy <sPos> <sNeg>      : as dog, zero-crossing for 2D coronal slices\n");
 	printf(" -dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices\n");
+#ifdef HAVE_DTIFIT
+	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
+#endif
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");
 	printf(" filename.nii             : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image\n");
@@ -543,6 +549,10 @@ int main(int argc, char * argv[]) {
 	if (isMz3(argv[1])) {
 		return mainMz3(argc, argv);
 	}
+#endif
+#ifdef HAVE_DTIFIT
+	if (!strcmp(argv[1], "--dtifit"))
+		return nii_dtifit(argc, argv);
 #endif
 
 	int dtCalc = DT_FLOAT32; //data type for calculation

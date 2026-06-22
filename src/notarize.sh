@@ -23,8 +23,8 @@ cd "$(dirname "$0")"
 
 mkdir ${APP_DIR}
 
-DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE"
-SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c"
+DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE"
+SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c dtifit.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c"
 AL_SRCS="allineate.c powell_newuoa.c"
 
 build_arch() {

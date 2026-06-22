@@ -151,6 +151,9 @@ niimath has a few features not provided by fslmaths:
    - opts: same as allineate (default final: linear)
  - `skullstrip <tmpl> <mask> [opts]`: skull-strip using template registration
    - opts: same as allineate (default final: linear)
+ - `--dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto]` : linear diffusion tensor fit (emulates FSL `dtifit`)
+   - writes `<base>_{FA,MD,L1,L2,L3,V1,V2,V3,S0,MO,tensor}`; fit math from AFNI 3dDWItoDT (public domain)
+   - `-xflip auto` (default) flips the bvec X component when the spatial transform determinant is positive, matching FSL
  - `--compare <ref>`       : report if images are identical, terminates without saving new image
  - `--bitmap -a name.png`  : mimic fsl slicer (see [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap))
  - `filename.nii`          : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
