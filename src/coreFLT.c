@@ -5495,7 +5495,7 @@ int main64(int argc, char *argv[]) {
 		if (!strcmp(argv[ac], "-ceil"))
 			op = ceil1;
 		if (!strcmp(argv[ac], "-round"))
-			op = ceil1;
+			op = round1;
 		if (!strcmp(argv[ac], "-floor"))
 			op = floor1;
 		if (!strcmp(argv[ac], "-trunc"))
@@ -6044,11 +6044,23 @@ int main64(int argc, char *argv[]) {
 			nifti_image_free(nim);
 			if (kernel != NULL)
 				_mm_free(kernel);
-			kernel = make_kernel(nim, &nkernel, 3, 3, 3);
+			kernel = NULL;
 			ac++;
 			nim = nifti_image_read(argv[ac], 1);
 			if (!nim)
 				ok = 1; // error
+			else {
+				// match the initial-load handling: convert the replacement image to the
+				// calculation datatype (else later ops read raw ints as floats), and
+				// restore the output name so we save to fout (not overwrite the restart input)
+				in_hdr rhdr = set_input_hdr(nim);
+				if (nifti_image_change_datatype(nim, dtCalc, &rhdr) != 0) {
+					nifti_image_free(nim); nim = NULL; ok = 1;
+				} else if (nifti_set_filenames(nim, fout, 0, 1)) {
+					nifti_image_free(nim); nim = NULL; ok = 1;
+				} else
+					kernel = make_kernel(nim, &nkernel, 3, 3, 3); // rebuild from the new image (was a use-after-free on the freed nim)
+			}
 		} else if (!strcmp(argv[ac], "-grid")) {
 			ac++;
 			double v = strtod(argv[ac], &end);
@@ -6074,7 +6086,7 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			int c = atoi(argv[ac]);
 			printfx("qform_code: %d -> %d\n", nim->qform_code, c);
-			nim->sform_code = c;
+			nim->qform_code = c;
 		} else if (!strcmp(argv[ac], "-sform")) {
 			ac++;
 			int c = atoi(argv[ac]);
