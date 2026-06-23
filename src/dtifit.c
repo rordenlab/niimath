@@ -249,13 +249,15 @@ int nii_dtifit(int argc, char *argv[]) {
 		for (size_t v = 0; v < nvox3D; v++) {
 			if (mask && mask[v] <= 0.0f) continue;
 			double p[7] = {0};
-			int ok = 1;
+			// Clamp non-positive signal to a small floor and fit every in-mask
+			// voxel, matching FSL dtifit. Dropping the whole voxel when any
+			// volume read <= 0 (the previous behaviour) left noisy/edge voxels
+			// with no tensor -> FA "dropout" and a holey, noisy map.
 			for (int i = 0; i < nvol; i++) {
 				float s = dwi[v + (size_t)i * nvox3D];
-				if (s <= 0.0f) { ok = 0; break; }
+				if (s < 1.0f) s = 1.0f;
 				Y[i] = log((double)s);
 			}
-			if (!ok) continue;
 			for (int k = 0; k < 7; k++) {
 				double acc = 0;
 				const double *pk = Pinv + (size_t)k * nvol;
@@ -312,13 +314,19 @@ int nii_dtifit(int argc, char *argv[]) {
 			nim->ndim = 3; nim->nt = nim->nu = nim->nv = nim->nw = 1; \
 			nim->nvox = nvox3D; nim->data = (void *)(buf); \
 			nim->cal_min = (cmin); nim->cal_max = (cmax);  \
+			nim->intent_code = NIFTI_INTENT_NONE;          \
 			nifti_save(nim, suffix, gz);                   \
 		} while (0)
+	// Eigenvector volumes are tagged as RGB vectors (intent_code 2003, matching
+	// FSL dtifit) so viewers like NiiVue render them as directionally-encoded
+	// colour instead of a grayscale 4D scalar.
+	#define NIFTI_INTENT_RGB_VECTOR 2003
 	#define SAVE_VEC3(buf, suffix)                         \
 		do {                                               \
 			nim->ndim = 4; nim->nt = 3; nim->nu = nim->nv = nim->nw = 1; \
 			nim->nvox = nvox3D * 3; nim->data = (void *)(buf); \
 			nim->cal_min = -1; nim->cal_max = 1;           \
+			nim->intent_code = NIFTI_INTENT_RGB_VECTOR;    \
 			nifti_save(nim, suffix, gz);                   \
 		} while (0)
 
