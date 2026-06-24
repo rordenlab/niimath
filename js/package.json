@@ -9,7 +9,8 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
-    }
+    },
+    "./niimath.js": "./dist/niimath.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

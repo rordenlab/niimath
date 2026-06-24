@@ -71,7 +71,7 @@
 	#define kOS "Windows"
 #endif
 
-#define kMTHdate "v1.0.20260622"
+#define kMTHdate "v1.0.20260623"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf
 
 #ifdef NII2MESH
