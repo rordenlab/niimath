@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include <limits.h>
+#include <stdint.h>
 #include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1582,7 +1584,7 @@ static inline float al_interp_linear_checked(
     CLIP(jy_00, any1); CLIP(jy_p1, any1);
     CLIP(kz_00, anz1); CLIP(kz_p1, anz1);
     float w0 = 1.0f - fx, w1 = fx;
-#define XLINT(j,k) w0*aim[(ix_00)+(j)*anx+(k)*nxy_a]+w1*aim[(ix_p1)+(j)*anx+(k)*nxy_a]
+#define XLINT(j,k) (w0*aim[(ix_00)+(j)*anx+(k)*nxy_a]+w1*aim[(ix_p1)+(j)*anx+(k)*nxy_a])
     float fk0 = (1.0f-fy)*XLINT(jy_00,kz_00) + fy*XLINT(jy_p1,kz_00);
     float fk1 = (1.0f-fy)*XLINT(jy_00,kz_p1) + fy*XLINT(jy_p1,kz_p1);
 #undef XLINT
@@ -3678,6 +3680,101 @@ static int al_register(nifti_image *source, nifti_image *base,
     return 0;
 }
 
+/* Adopt base grid geometry into source (dims + sform/qform); source->data must
+ * already hold the float volume sampled on the base grid. */
+static void al_adopt_geometry(nifti_image *s, const nifti_image *b)
+{
+    s->datatype = DT_FLOAT32;
+    s->nbyper = sizeof(float);
+    s->scl_slope = 0.0f;
+    s->scl_inter = 0.0f;
+    s->nx = b->nx; s->ny = b->ny; s->nz = b->nz;
+    s->dx = b->dx; s->dy = b->dy; s->dz = b->dz;
+    s->dim[1] = b->nx; s->dim[2] = b->ny; s->dim[3] = b->nz;
+    s->pixdim[1] = b->pixdim[1];
+    s->pixdim[2] = b->pixdim[2];
+    s->pixdim[3] = b->pixdim[3];
+    s->nvox = (size_t)b->nx * b->ny * b->nz;
+    s->sform_code = b->sform_code; s->sto_xyz = b->sto_xyz; s->sto_ijk = b->sto_ijk;
+    s->qform_code = b->qform_code; s->qto_xyz = b->qto_xyz; s->qto_ijk = b->qto_ijk;
+    s->quatern_b = b->quatern_b; s->quatern_c = b->quatern_c; s->quatern_d = b->quatern_d;
+    s->qoffset_x = b->qoffset_x; s->qoffset_y = b->qoffset_y; s->qoffset_z = b->qoffset_z;
+}
+
+/* Validate a 3D image for resampling: positive dims, an in-slice product that fits
+ * int (so anx*any indexing is safe), and a total voxel*float product that fits
+ * size_t. Returns 0 if usable. Guards against malformed/extreme NIfTI-2 headers. */
+static int al_dims_ok(const nifti_image *n, const char *who)
+{
+    if (n->nx <= 0 || n->ny <= 0 || n->nz <= 0) {
+        fprintf(stderr, "%s: non-positive dimensions\n", who); return 1; }
+    if ((long long)n->nx * n->ny > INT_MAX) {
+        fprintf(stderr, "%s: slice too large\n", who); return 1; }
+    long long nv = (long long)n->nx * n->ny * n->nz;
+    if (nv <= 0 || (unsigned long long)nv > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "%s: voxel count out of range\n", who); return 1; }
+    return 0;
+}
+
+/* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index
+ * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
+ * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*
+ * (NN/LINEAR/CUBIC); out-of-FOV voxels set to `fillv` (0 or NaN). Returns 0 on
+ * success. The interpolation is the same BSD code -allineate uses; -spmcoreg
+ * reuses it so the GPL module only computes the transform, never resamples. */
+int nii_reslice_affine(nifti_image *source, const nifti_image *base,
+                       mat44 gam, int interp, float fillv)
+{
+    if (source == NULL || base == NULL) { fprintf(stderr, "reslice: NULL image\n"); return 1; }
+    if (al_dims_ok(source, "reslice source") || al_dims_ok(base, "reslice grid")) return 1;
+    float *aim = nii_to_float(source);
+    if (!aim) { fprintf(stderr, "reslice: cannot extract source data\n"); return 1; }
+    int anx = source->nx, any = source->ny, anz = source->nz;
+    int bnx = base->nx, bny = base->ny, bnz = base->nz;
+    long bnvox = (long)bnx * bny * bnz;
+    float *out = (float *)malloc(sizeof(float) * (size_t)bnvox);
+    if (!out) { free(aim); fprintf(stderr, "reslice: out of memory\n"); return 1; }
+    int nxy_a = anx * any;
+    float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
+    int anx1 = anx - 1, any1 = any - 1, anz1 = anz - 1;
+    float mx0=gam.m[0][0], mx1=gam.m[0][1], mx2=gam.m[0][2], mx3=gam.m[0][3];
+    float my0=gam.m[1][0], my1=gam.m[1][1], my2=gam.m[1][2], my3=gam.m[1][3];
+    float mz0=gam.m[2][0], mz1=gam.m[2][1], mz2=gam.m[2][2], mz3=gam.m[2][3];
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(bnvox > 100000)
+#endif
+    for (int kk = 0; kk < bnz; kk++) {
+        for (int jj = 0; jj < bny; jj++) {
+            long ob = ((long)kk * bny + jj) * bnx;
+            float bx = mx1*jj + mx2*kk + mx3;
+            float by = my1*jj + my2*kk + my3;
+            float bz = mz1*jj + mz2*kk + mz3;
+            for (int ii = 0; ii < bnx; ii++) {
+                float xx = mx0*ii + bx, yy = my0*ii + by, zz = mz0*ii + bz;
+                float v = fillv; int oob = 0;
+                if (interp == AL_INTERP_NN) {
+                    if (xx<-0.499f||xx>nxh||yy<-0.499f||yy>nyh||zz<-0.499f||zz>nzh) oob = 1;
+                    else { int ix=(int)(xx+0.5f), jy=(int)(yy+0.5f), kz=(int)(zz+0.5f);
+                           if(ix<0)ix=0; else if(ix>anx1)ix=anx1;
+                           if(jy<0)jy=0; else if(jy>any1)jy=any1;
+                           if(kz<0)kz=0; else if(kz>anz1)kz=anz1;
+                           v = aim[ix + jy*anx + (long)kz*nxy_a]; }
+                } else if (interp == AL_INTERP_CUBIC) {
+                    v = al_interp_cubic_checked(xx,yy,zz, nxh,nyh,nzh, anx1,any1,anz1, aim,anx,nxy_a, &oob);
+                } else {
+                    v = al_interp_linear_checked(xx,yy,zz, nxh,nyh,nzh, anx1,any1,anz1, aim,anx,nxy_a, &oob);
+                }
+                out[ob+ii] = oob ? fillv : v;
+            }
+        }
+    }
+    free(aim);
+    free(source->data);
+    source->data = out;
+    al_adopt_geometry(source, base);
+    return 0;
+}
+
 int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
 {
     double t_start = al_wtime();
@@ -3731,34 +3828,35 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
         return 1;
     }
 
-    /* Replace source->data with warped result, update dims/transforms */
+    /* Replace source->data with warped result, adopt base dims/transforms */
     free(source->data);
     source->data = warped;
-    source->datatype = DT_FLOAT32;
-    source->nbyper = sizeof(float);
-    source->scl_slope = 0.0f;
-    source->scl_inter = 0.0f;
-    source->nx = bnx; source->ny = bny; source->nz = bnz;
-    source->dx = base->dx; source->dy = base->dy; source->dz = base->dz;
-    source->dim[1] = bnx; source->dim[2] = bny; source->dim[3] = bnz;
-    source->pixdim[1] = base->pixdim[1];
-    source->pixdim[2] = base->pixdim[2];
-    source->pixdim[3] = base->pixdim[3];
-    source->nvox = (size_t)bnx * bny * bnz;
-    source->sform_code = base->sform_code;
-    source->sto_xyz = base->sto_xyz;
-    source->sto_ijk = base->sto_ijk;
-    source->qform_code = base->qform_code;
-    source->qto_xyz = base->qto_xyz;
-    source->qto_ijk = base->qto_ijk;
-    source->quatern_b = base->quatern_b;
-    source->quatern_c = base->quatern_c;
-    source->quatern_d = base->quatern_d;
-    source->qoffset_x = base->qoffset_x;
-    source->qoffset_y = base->qoffset_y;
-    source->qoffset_z = base->qoffset_z;
+    al_adopt_geometry(source, base);
 
     return 0;
+}
+
+/* Zero (to the image minimum) every input voxel whose warped mask < 0.5. The
+   warped mask is sampled on input's grid (e.g. from al_scalar_warpone or
+   nii_reslice_affine). Ensures input is float32 first. BSD; shared by -deface
+   and the GPL -spm_deface. Returns #voxels masked, or -1 on error. */
+long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
+{
+    if (input->datatype != DT_FLOAT32) {
+        float *fdata = nii_to_float(input);
+        if (!fdata) { fprintf(stderr, "deface: unsupported input datatype %d\n", input->datatype); return -1; }
+        free(input->data);
+        input->data = fdata;
+        input->datatype = DT_FLOAT32; input->nbyper = sizeof(float);
+        input->scl_slope = 0.0f; input->scl_inter = 0.0f;
+    }
+    long nvox = (long)input->nx * input->ny * input->nz;
+    float *idata = (float *)input->data;
+    float min_val = idata[0];
+    for (long i = 1; i < nvox; i++) if (idata[i] < min_val) min_val = idata[i];
+    long nmasked = 0;
+    for (long i = 0; i < nvox; i++) if (warped_mask[i] < 0.5f) { idata[i] = min_val; nmasked++; }
+    return nmasked;
 }
 
 /* Deface: register template to input, warp mask to input space, zero masked voxels.
@@ -3827,31 +3925,18 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
         return 1;
     }
 
-    /* Find minimum value in input image */
-    float *idata = (float *)input->data;
-    float min_val = idata[0];
-    for (int i = 1; i < nvox; i++)
-        if (idata[i] < min_val) min_val = idata[i];
-
-    /* Apply mask: zero out voxels where warped mask < 0.5 */
-    int nmasked = 0;
-    for (int i = 0; i < nvox; i++) {
-        if (warped_mask[i] < 0.5f) {
-            idata[i] = min_val;
-            nmasked++;
-        }
-    }
-
+    long nmasked = nii_apply_deface_mask(input, warped_mask);
     free(warped_mask);
+    if (nmasked < 0) return 1;
     long elapsed_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
 #ifdef _OPENMP
     int nthreads = omp_get_max_threads();
     if (nthreads > 1)
-        fprintf(stderr, " + %s complete: %d of %d voxels masked (%.1f%%; %ldms, %d threads)\n",
+        fprintf(stderr, " + %s complete: %ld of %d voxels masked (%.1f%%; %ldms, %d threads)\n",
                 label, nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms, nthreads);
     else
 #endif
-        fprintf(stderr, " + %s complete: %d of %d voxels masked (%.1f%%; %ldms)\n",
+        fprintf(stderr, " + %s complete: %ld of %d voxels masked (%.1f%%; %ldms)\n",
                 label, nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms);
     return 0;
 }

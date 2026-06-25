@@ -49,6 +49,17 @@ DTFLAGS= -DHAVE_DTIFIT dtifit.c
 #dtifit's dependencies for the WASM target (which otherwise ships no tensor support);
 #grouped so "DTIFIT=0 make wasm" restores the original tensor-free WASM build
 DT_WASM= $(TFILES) $(DTFLAGS)
+#Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spmcoreg. OFF by
+#default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
+#provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).
+GPL_SRCS=
+ifeq "$(GPL)" "1"
+    ifeq ($(wildcard GPL/spm_coreg.c),)
+        $(error GPL=1 set but src/GPL is empty -- initialize the GPL submodule: git submodule update --init src/GPL)
+    endif
+    # GPL estimate only (returns the rigid transform); reslice/interpolation use BSD code.
+    GPL_SRCS= -DHAVE_GPL -IGPL -I. GPL/cost.c GPL/hist2.c GPL/loaduint8.c GPL/matrix.c GPL/powell.c GPL/smooth.c GPL/spm_coreg.c GPL/spmcoreg_niimath.c
+endif
 #Marching Cubes flag: run "MC=1 make" for new MarchingCubes instead of classic oldcubes
 MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
 
@@ -106,7 +117,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 all: $(ALOBJS)
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
 allineate.o: allineate.c allineate.h
 	$(CNAME) $(CFLAGS) $(AFASTMATH) $(OMPFLAGS) -c allineate.c -o allineate.o
@@ -122,7 +133,7 @@ endif
 
 #issue30: static build
 static:
-	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(DTFLAGS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
@@ -134,15 +145,15 @@ nano:
 
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
-	$(CNAME) $(CFLAGS) $(TFILES) $(DTFLAGS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(TFILES) $(DTFLAGS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 wasm:
 	emcc -O3 -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o ../js/src/niimath.js

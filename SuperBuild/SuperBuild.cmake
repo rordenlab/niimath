@@ -48,6 +48,7 @@ endif()
 
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
 option(BUILD_BMP "Build bitmap (PNG) output support" ON)
+option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spmcoreg/-spm_deface); GPL-2 binary" OFF)
 
 include(ExternalProject)
 
@@ -88,6 +89,7 @@ ExternalProject_Add(src
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
         -DENABLE_ZSTD:BOOL=${ENABLE_ZSTD}
+        -DENABLE_GPL:BOOL=${ENABLE_GPL}
         -DBUILD_BMP:BOOL=${BUILD_BMP}
         # forward static runtime and static linking
         -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}
