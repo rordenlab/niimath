@@ -1,0 +1,30 @@
+name: JS build
+
+# Exercise the JS package's generated metadata so it can't silently drift/break.
+# The operator JSON and TS types are generated (not committed); `prebuild` builds
+# niimath, scrapes its help text, regenerates them, and builds the WASM bundle.
+on:
+  push:
+    branches: [master]
+    paths: ['js/**', 'src/**', '.github/workflows/js.yml']
+  pull_request:
+    paths: ['js/**', 'src/**', '.github/workflows/js.yml']
+
+jobs:
+  prebuild:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install niimath build deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev
+      - uses: oven-sh/setup-bun@v2
+      - uses: mymindstorm/setup-emsdk@v14
+      - name: Install JS dependencies
+        run: bun install
+      - name: Regenerate operators/types and build WASM (prebuild)
+        run: bun run prebuild
+      - name: Type-check generated definitions
+        run: ./node_modules/.bin/tsc --noEmit

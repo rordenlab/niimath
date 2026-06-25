@@ -114,6 +114,12 @@ To build the library, run the following command
 bun run build
 ```
 
+> **Note:** `src/niimathOperators.json` and `src/types.ts` are **generated** from the
+> niimath CLI help text and are not checked into git. `bun run build` regenerates them
+> via its `prebuild` step (`parseHelpText` + `generateTypes`). On a fresh clone, run
+> `bun run prebuild` (or `bun run parseHelpText && bun run generateTypes`) once before
+> using your editor / `tsc`, otherwise the imports in `src/index.ts` will appear missing.
+
 To run the tests, run the following command:
 
 ```bash

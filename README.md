@@ -125,7 +125,8 @@ niimath has a few features not provided by fslmaths:
  - `mod`                    : modulus fractional remainder - same as '-rem' but includes fractions
  - `otsu <mode>`            : binarize image using Otsu''s method (mode 1..5; higher yields more bright voxels))
  - `power <exponent>`       : raise the current image by following exponent
- - `resize <X> <Y> <Z> <m>` : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");
+ - `resize <X> <Y> <Z> <m>` : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)
+ - `robustfov [mm]`         : crop to a robust field of view (default 170mm) from the top of the head down, removing lower head/neck (emulates FSL robustfov); adjusts dim and sform/qform
  - `round`                  : round voxels to the nearest integer
  - `sobel`                  : fast edge detection
  - `sobel_binary`           : sobel creating binary edge
