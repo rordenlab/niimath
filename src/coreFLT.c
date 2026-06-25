@@ -3827,6 +3827,169 @@ staticx int nifti_subsamp2(nifti_image *nim, int offc) {
 	return 0;
 }
 
+// Robust field-of-view head truncation (emulates FSL robustfov; clean-room from a
+// functional spec). Detects the superior-inferior (head-foot) voxel axis from the
+// spatial transform (sform/qform, higher code, sform on ties), finds the top of the
+// head from the per-slice intensity variance in a central sagittal slab, then keeps
+// `fovmm` mm of slices below it (default 170 mm), discarding superior air and the
+// lower head/neck. Removes slices and shifts the sform/qform translation so the kept
+// data stays at the same physical location.
+staticx int nifti_robustfov(nifti_image *nim, double fovmm) {
+	if (nim->datatype != DT_CALC)
+		return 1;
+	if (!isfinite(fovmm) || fovmm <= 0.0) // reject NaN/Inf/non-positive (cast to int later)
+		fovmm = 170.0;
+	// dimensions are int64 in NIfTI-2; the crop indexing below uses int, so reject any
+	// header whose spatial dims do not fit (guards against truncation / undersized buffers)
+	if ((nim->nx > INT_MAX) || (nim->ny > INT_MAX) || (MAX(nim->nz, 1) > INT_MAX) || (nim->nx < 1) || (nim->ny < 1))
+		return 1;
+	int dim[3] = {(int)nim->nx, (int)nim->ny, (int)MAX(nim->nz, 1)};
+	double pix[3] = {nim->dx, nim->dy, nim->dz};
+	size_t nvox3D = (size_t)dim[0] * dim[1] * dim[2];
+	if (nvox3D < 1)
+		return 1;
+	size_t nvoltmp = nim->nvox / nvox3D;
+	if ((nvoltmp < 1) || (nvox3D * nvoltmp != (size_t)nim->nvox) || (nvoltmp > INT_MAX))
+		return 1; // refuse ragged/overflowing geometry rather than under-allocate
+	int nvol = (int)nvoltmp;
+	// choose transform: higher xform code, sform on ties; fall back to xform()
+	nifti_dmat44 M;
+	if ((nim->sform_code >= nim->qform_code) && (nim->sform_code > 0))
+		M = nim->sto_xyz;
+	else if (nim->qform_code > 0)
+		M = nim->qto_xyz;
+	else {
+		mat44 f = xform(nim);
+		for (int i = 0; i < 4; i++)
+			for (int j = 0; j < 4; j++)
+				M.m[i][j] = f.m[i][j];
+	}
+	// Compare *direction* cosines, not raw matrix columns: the columns carry voxel
+	// scale, so on anisotropic/oblique data a large voxel size could otherwise dominate
+	// the axis choice. Normalize each spatial column by its norm first.
+	double cn[3];
+	for (int a = 0; a < 3; a++) {
+		cn[a] = sqrt(M.m[0][a] * M.m[0][a] + M.m[1][a] * M.m[1][a] + M.m[2][a] * M.m[2][a]);
+		if (cn[a] <= 0.0) cn[a] = 1.0;
+	}
+	// voxel axis whose direction is closest to world Z (superior+) is head-foot; among
+	// the rest, the one closest to world X (R) is left-right (remaining = anterior-posterior)
+	int siax = 0;
+	double bz = fabs(M.m[2][0]) / cn[0];
+	for (int a = 1; a < 3; a++)
+		if (fabs(M.m[2][a]) / cn[a] > bz) { bz = fabs(M.m[2][a]) / cn[a]; siax = a; }
+	int lrax = -1;
+	double bx = -1.0;
+	for (int a = 0; a < 3; a++)
+		if ((a != siax) && (fabs(M.m[0][a]) / cn[a] > bx)) { bx = fabs(M.m[0][a]) / cn[a]; lrax = a; }
+	int oax = 3 - siax - lrax; // remaining (anterior-posterior) axis
+	double pol = (M.m[2][siax] >= 0.0) ? 1.0 : -1.0; // +: increasing index -> superior
+	int nSI = dim[siax];
+	double pixSI = (pix[siax] > 0.0) ? pix[siax] : 1.0;
+	size_t stride[3] = {1, (size_t)dim[0], (size_t)dim[0] * dim[1]};
+	// central 40% of left-right extent
+	int lo = (int)round(dim[lrax] * 0.30), hi = (int)round(dim[lrax] * 0.70);
+	if (hi <= lo) { lo = 0; hi = dim[lrax]; }
+	// per-slice variance of central sagittal slab (volume 0)
+	flt *img = (flt *)nim->data;
+	double *var = (double *)calloc(nSI, sizeof(double));
+	if (!var)
+		return 1;
+	for (int s = 0; s < nSI; s++) {
+		double sum = 0.0, sum2 = 0.0;
+		long cnt = 0;
+		for (int l = lo; l < hi; l++)
+			for (int o = 0; o < dim[oax]; o++) {
+				double val = img[s * stride[siax] + (size_t)l * stride[lrax] + (size_t)o * stride[oax]];
+				sum += val;
+				sum2 += val * val;
+				cnt++;
+			}
+		var[s] = (cnt > 0) ? (sum2 / cnt - (sum / cnt) * (sum / cnt)) : 0.0;
+	}
+	// Z_top = most superior slice whose variance exceeds 1% of the peak (head enters
+	// from the air side), plus a ~2 mm superior buffer to keep the scalp.
+	double mx = 0.0;
+	for (int s = 0; s < nSI; s++)
+		if (var[s] > mx) mx = var[s];
+	double thresh = 0.01 * mx;
+	int ztop = -1;
+	if (pol > 0) {
+		for (int s = nSI - 1; s >= 0; s--) if (var[s] > thresh) { ztop = s; break; }
+	} else {
+		for (int s = 0; s < nSI; s++) if (var[s] > thresh) { ztop = s; break; }
+	}
+	free(var);
+	if (ztop < 0)
+		return 0; // no signal found; leave image unchanged
+	int buf = (int)round(2.0 / pixSI);
+	ztop += (pol > 0) ? buf : -buf;
+	if (ztop < 0) ztop = 0;
+	if (ztop > nSI - 1) ztop = nSI - 1;
+	double nkd = round(fovmm / pixSI);
+	if (!isfinite(nkd) || nkd >= (double)nSI)
+		return 0; // requested FOV spans the whole image (or is absurdly large); nothing to crop
+	if (nkd < 1.0) nkd = 1.0;
+	int nkeep = (int)nkd; // safe: 1 <= nkd < nSI, so within int range
+	int start, end;
+	if (pol > 0) { end = ztop; start = end - nkeep + 1; }
+	else { start = ztop; end = start + nkeep - 1; }
+	if (start < 0) start = 0;
+	if (end > nSI - 1) end = nSI - 1;
+	nkeep = end - start + 1;
+	if (nkeep >= nSI)
+		return 0;
+#ifdef ROBUSTFOV_VERBOSE // compile with -DROBUSTFOV_VERBOSE for diagnostics; silent otherwise
+	printfx("robustfov: head-foot axis %d (polarity %s), keeping %d of %d slices (%g mm)\n",
+		siax, (pol > 0) ? "+" : "-", nkeep, nSI, nkeep * pixSI);
+#endif
+	// crop along siax keeping [start..end] for every volume
+	int nd[3] = {dim[0], dim[1], dim[2]};
+	nd[siax] = nkeep;
+	size_t nnew3D = (size_t)nd[0] * nd[1] * nd[2];
+	size_t ns[3] = {1, (size_t)nd[0], (size_t)nd[0] * nd[1]};
+	// checked allocation: peak memory here is input + cropped output, so a near-whole-image
+	// crop can fail. The copy loop fills every output voxel, so no zero-init is needed.
+	flt *out = (flt *)_mm_malloc(nnew3D * nvol * sizeof(flt), 64);
+	if (!out)
+		return 1; // allocation failed; input image left unchanged
+	for (int v = 0; v < nvol; v++)
+		for (int z = 0; z < nd[2]; z++)
+			for (int y = 0; y < nd[1]; y++)
+				for (int x = 0; x < nd[0]; x++) {
+					int ic[3] = {x, y, z};
+					ic[siax] += start;
+					size_t ii = v * nvox3D + (size_t)ic[0] * stride[0] + (size_t)ic[1] * stride[1] + (size_t)ic[2] * stride[2];
+					size_t oo = v * nnew3D + (size_t)x * ns[0] + (size_t)y * ns[1] + (size_t)z * ns[2];
+					out[oo] = img[ii];
+				}
+	// shift sform & qform translation so kept voxels keep their world coordinates
+	for (int i = 0; i < 3; i++) {
+		nim->sto_xyz.m[i][3] += start * nim->sto_xyz.m[i][siax];
+		nim->qto_xyz.m[i][3] += start * nim->qto_xyz.m[i][siax];
+	}
+	// the qform is written from qoffset_*, not qto_xyz, so update those too
+	nim->qoffset_x = nim->qto_xyz.m[0][3];
+	nim->qoffset_y = nim->qto_xyz.m[1][3];
+	nim->qoffset_z = nim->qto_xyz.m[2][3];
+	// keep the inverse transforms consistent for any chained operation
+	nim->sto_ijk = nifti_dmat44_inverse(nim->sto_xyz);
+	nim->qto_ijk = nifti_dmat44_inverse(nim->qto_xyz);
+	// slice-timing indices no longer reference valid slices after cropping
+	nim->slice_start = 0;
+	nim->slice_end = 0;
+	nim->nx = nd[0];
+	nim->ny = nd[1];
+	nim->nz = nd[2];
+	nim->dim[1] = nd[0];
+	nim->dim[2] = nd[1];
+	nim->dim[3] = nd[2];
+	nim->nvox = nnew3D * nvol;
+	free(nim->data);
+	nim->data = out;
+	return 0;
+}
+
 staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_method) {
 	// see AFNI's 3dresample
 	// better than fslmaths: fslmaths can not resample 4D data
@@ -5834,6 +5997,18 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_subsamp2(nim, 0);
 		else if (!strcmp(argv[ac], "-subsamp2offc"))
 			ok = nifti_subsamp2(nim, 1);
+		else if ((!strcmp(argv[ac], "-robustfov")) || (!strcmp(argv[ac], "-robustv"))) {
+			double fovmm = 170.0; // optional millimeter argument; default 170
+			if ((ac + 1) < argc) {
+				char *e = NULL;
+				double v = strtod(argv[ac + 1], &e);
+				if ((e != argv[ac + 1]) && (*e == '\0')) { // next token is a pure number
+					fovmm = v;
+					ac++;
+				}
+			}
+			ok = nifti_robustfov(nim, fovmm);
+		}
 		else if (!strcmp(argv[ac], "-resize")) {
 			ac++;
 			double X = strtod(argv[ac], &end);

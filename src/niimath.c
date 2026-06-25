@@ -377,6 +377,7 @@ int show_help( void ) {
 	printf(" -p <threads>             : set maximum number of parallel threads. DISABLED: recompile for OpenMP support\n");
 	#endif
 	printf(" -resize <X> <Y> <Z> <m>  : grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)\n");
+	printf(" -robustfov [mm]          : crop to a robust field of view (default 170mm) from the top of the head down, removing lower head/neck (emulates FSL robustfov); adjusts dim and sform/qform\n");
 	printf(" -round                   : round voxels to the nearest integer\n");
 	printf(" -scale01                 : linearly rescale intensities to the range 0–1 using global min/max\n");
 	printf(" -sedt                    : estimate signed Euler Distance Transform (distance field). Assumes isotropic input\n");
