@@ -1418,6 +1418,45 @@ static mat33 nifti_mat33_polar(mat33 A)
 
 /*========== Header ↔ nifti_image conversion ==========*/
 
+/* A 3x3 spatial block is usable if every value is finite, no column is zero, and
+   it is non-singular. Singularity is tested scale-invariantly: |det| normalized
+   by the product of the column norms is the volume of the unit-vector
+   parallelepiped (~1 orthogonal, ~0 collinear), so one fixed tolerance works at
+   any voxel size and tiny-scale grids are not wrongly rejected. */
+static int nifti_dmat44_spatial_ok(nifti_dmat44 m)
+{
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         if (!isfinite(m.m[r][c])) return 0;
+   double n[3];
+   for (int c = 0; c < 3; c++) {
+      n[c] = sqrt(m.m[0][c]*m.m[0][c] + m.m[1][c]*m.m[1][c] + m.m[2][c]*m.m[2][c]);
+      if (!(n[c] > 0.0) || !isfinite(n[c])) return 0;
+   }
+   double det = m.m[0][0]*(m.m[1][1]*m.m[2][2] - m.m[1][2]*m.m[2][1])
+              - m.m[0][1]*(m.m[1][0]*m.m[2][2] - m.m[1][2]*m.m[2][0])
+              + m.m[0][2]*(m.m[1][0]*m.m[2][1] - m.m[1][1]*m.m[2][0]);
+   return fabs(det) / (n[0]*n[1]*n[2]) > 1e-4;
+}
+
+/* After reading, fill a MISSING/INVALID sform from a valid qform. Several niimath
+   operators (e.g. -reslice) read sto_xyz directly instead of choosing the best
+   xform, so a qform-only image (sform_code == 0, common in FSL-preprocessed data)
+   would hand them a zero matrix. This fires ONLY when the sform is absent or
+   degenerate — a present, valid sform is left untouched, even if qform_code is
+   higher, so simply reading a file never rewrites intentional spatial metadata
+   (audit High #1). */
+static void nifti_sync_sform_from_qform(nifti_image *nim)
+{
+   int s_ok = nim->sform_code > 0 && nifti_dmat44_spatial_ok(nim->sto_xyz);
+   int q_ok = nim->qform_code > 0 && nifti_dmat44_spatial_ok(nim->qto_xyz);
+   if (q_ok && !s_ok) {
+      nim->sto_xyz = nim->qto_xyz;
+      nim->sto_ijk = nim->qto_ijk;
+      nim->sform_code = nim->qform_code;
+   }
+}
+
 static nifti_image *nifti_convert_n1hdr2nim(nifti_1_header nhdr, const char *fname)
 {
    int ii, doswap, ioff, ni_ver, is_onefile;
@@ -1534,6 +1573,7 @@ static nifti_image *nifti_convert_n1hdr2nim(nifti_1_header nhdr, const char *fna
       if (!nim->iname) { free(nim); return NULL; }
    }
    nim->num_ext = 0; nim->ext_list = NULL;
+   nifti_sync_sform_from_qform(nim);
    return nim;
 }
 
@@ -1639,6 +1679,7 @@ static nifti_image *nifti_convert_n2hdr2nim(nifti_2_header nhdr, const char *fna
       if (!nim->iname) { free(nim); return NULL; }
    }
    nim->num_ext = 0; nim->ext_list = NULL;
+   nifti_sync_sform_from_qform(nim);
    return nim;
 }
 
