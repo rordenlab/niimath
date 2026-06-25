@@ -19,6 +19,17 @@ interface KernelOperatorDefinition {
 
 type MethodDefinitions = Record<string, OperatorDefinition | KernelOperatorDefinition>;
 
+// Operators whose operands are *filenames* of secondary images. The browser worker
+// only stages the primary input file into the Emscripten filesystem, so exposing
+// these as high-level methods would guarantee a runtime failure. They remain available
+// in the native CLI and via raw `callMain`; exclude them from the generated browser API
+// until multi-file staging exists.
+const fileOperandOps = new Set<string>([
+  'allineate', 'deface', 'skullstrip',
+  'reslice', 'reslice_nn', 'reslice_mask',
+  'mas', 'restart'
+]);
+
 // Function to parse the niimath help text
 function parseHelpText(helpText: string): MethodDefinitions {
   const lines = helpText.split('\n');
@@ -46,6 +57,11 @@ function parseHelpText(helpText: string): MethodDefinitions {
       const leadingChars = line.substring(0, 4);
       const nSpaces = '    ';
       const command = match[1].trim();
+      // Top-level operators are printed with exactly one leading space (" -op ... : ...").
+      // Sub-option / continuation lines (e.g. allineate's "-warp XX (...) [default: aff]")
+      // are indented far deeper and merely happen to contain a colon; they must NOT become
+      // standalone operators. Mesh/bitmap sub-options (4-space indent) are handled above.
+      const isTopLevel = line.startsWith(' -');
       // console log below is for debugging
       // console.log(leadingChars, command, leadingChars === nSpaces);
       const argsString = match[2].trim();
@@ -105,15 +121,21 @@ function parseHelpText(helpText: string): MethodDefinitions {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
-      } else {
-        // General case for non-kernel, non-mesh, and non-bitmap operations
+      } else if (isTopLevel && !fileOperandOps.has(key)) {
+        // General case for non-kernel, non-mesh, and non-bitmap top-level operations.
+        // File-operand operators are skipped (the browser worker cannot stage their files).
         methodDefinitions[key] = {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         } as OperatorDefinition;
         currentMesh = false; // Stop handling mesh sub-options if another main option is encountered
         currentBitmap = false; // Stop handling bitmap sub-options if another main option is encountered
+      } else if (isTopLevel) {
+        // recognized top-level op, but excluded from the browser API (file operand)
+        currentMesh = false;
+        currentBitmap = false;
       }
+      // deeper-indented lines that are not recognized sub-options are ignored
     }
 
     // Reset kernel mode when moving past kernel-related lines
