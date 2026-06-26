@@ -54,6 +54,27 @@ jobs:
             echo '-dt double -spm_deface should be rejected'; exit 1; fi
           grep -qi 'requires -dt float' errd.txt
 
+      - name: 4D inputs are rejected (fail closed, no corrupt output)
+        run: |
+          set -e
+          # Same negligence class as the fixed 4D-deface privacy bug: registration
+          # and defacing are 3D-only and must exit nonzero, never silently use only
+          # volume 0 or write volume-0 bytes under a 4D header. Uses the allineate-
+          # enabled GPL build above (before the AL=0 rebuild below).
+          for op in "-allineate /tmp/ref.nii.gz" \
+                    "-deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-robustfov -deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-robustfov -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz"; do
+            if src/niimath /tmp/src4d.nii.gz $op /tmp/o4.nii.gz >/dev/null 2>e.txt; then
+              echo "4D subject: '$op' should be rejected"; exit 1; fi
+          done
+          # 4D template or mask must also be rejected
+          if src/niimath /tmp/src.nii.gz -deface /tmp/src4d.nii.gz /tmp/mask.nii.gz /tmp/o.nii.gz >/dev/null 2>e.txt; then
+            echo '4D template should be rejected'; exit 1; fi
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/src4d.nii.gz /tmp/o.nii.gz >/dev/null 2>e.txt; then
+            echo '4D mask should be rejected'; exit 1; fi
+
       - name: GPL=1 AL=0 is estimate-only
         run: |
           set -e

@@ -3714,6 +3714,12 @@ static void al_adopt_geometry(nifti_image *s, const nifti_image *b)
     s->pixdim[1] = b->pixdim[1];
     s->pixdim[2] = b->pixdim[2];
     s->pixdim[3] = b->pixdim[3];
+    /* Output is a single 3D volume — clear any stale higher-dim fields so the
+     * header can't advertise 4D+ over 3D bytes. (Callers already reject 4D, so
+     * this is belt-and-suspenders.) */
+    s->nt = s->nu = s->nv = s->nw = 1;
+    s->dim[0] = 3;
+    s->dim[4] = s->dim[5] = s->dim[6] = s->dim[7] = 1;
     s->nvox = (size_t)b->nx * b->ny * b->nz;
     s->sform_code = b->sform_code; s->sto_xyz = b->sto_xyz; s->sto_ijk = b->sto_ijk;
     s->qform_code = b->qform_code; s->qto_xyz = b->qto_xyz; s->qto_ijk = b->qto_ijk;
@@ -3799,6 +3805,10 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
         fprintf(stderr, "allineate: NULL input image\n");
         return 1;
     }
+    /* 3D only. al_register uses volume 0 of a 4D image and the warped output is a
+     * single 3D buffer, so a 4D source would write a header that advertises 4D over
+     * 3D bytes (corrupt file); a 4D base is equally unsupported. Fail closed. */
+    if (al_dims_ok(source, "allineate source") || al_dims_ok(base, "allineate base")) return 1;
 
     int match_code;
     const char *cost_name;
@@ -3890,12 +3900,13 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
         fprintf(stderr, "%s: NULL input image\n", label);
         return 1;
     }
-    /* 3D only. The face mask covers a single volume (nx*ny*nz); on a 4D input the
-     * mask-apply would zero only volume 0 and silently leave identifiable faces in
-     * volumes 1..N while reporting success — a privacy failure for a defacing tool.
-     * Reject 4D here (matching -spmcoreg/-spm_deface, which already do). Deface the
-     * 3D anatomical instead. */
-    if (al_dims_ok(input, label)) return 1;
+    /* 3D only — for the subject AND the template/mask. The face mask covers a
+     * single volume (nx*ny*nz); a 4D input would zero only volume 0 and silently
+     * leave identifiable faces in volumes 1..N while reporting success (a privacy
+     * failure). A 4D template/mask would silently register/apply only their volume
+     * 0 (al_register / nii_to_float use volume 0). Reject all three; fail closed. */
+    if (al_dims_ok(input, label) || al_dims_ok(tmpl, "deface template")
+        || al_dims_ok(mask, "deface mask")) return 1;
     if (input->datatype != DT_FLOAT32) {
         float *fdata = nii_to_float(input);
         if (!fdata) {

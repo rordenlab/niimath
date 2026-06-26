@@ -30,3 +30,14 @@ for path, data in vols.items():
     img.header.set_qform(aff, code=1)
     nib.save(img, path)
     print("wrote", path, data.shape)
+
+# 4D fixture for the dimension-rejection regression: registration/defacing are
+# 3D-only, and a 4D input must fail closed (not silently use volume 0 or write a
+# corrupt header). See the "4D inputs are rejected" CI step.
+src3d = vols["/tmp/src.nii.gz"]
+src4d = np.stack([src3d, src3d], axis=-1)            # (24, 24, 24, 2)
+img4d = nib.Nifti1Image(src4d, aff)
+img4d.header.set_sform(aff, code=1)
+img4d.header.set_qform(aff, code=1)
+nib.save(img4d, "/tmp/src4d.nii.gz")
+print("wrote /tmp/src4d.nii.gz", src4d.shape)
