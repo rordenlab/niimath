@@ -1584,6 +1584,8 @@ static inline float al_interp_linear_checked(
     CLIP(jy_00, any1); CLIP(jy_p1, any1);
     CLIP(kz_00, anz1); CLIP(kz_p1, anz1);
     float w0 = 1.0f - fx, w1 = fx;
+/* outer parens are load-bearing: XLINT is used as a multiplicand, e.g. fy*XLINT(...),
+ * so without them the weight would bind only to the first term (the w1 term would escape). */
 #define XLINT(j,k) (w0*aim[(ix_00)+(j)*anx+(k)*nxy_a]+w1*aim[(ix_p1)+(j)*anx+(k)*nxy_a])
     float fk0 = (1.0f-fy)*XLINT(jy_00,kz_00) + fy*XLINT(jy_p1,kz_00);
     float fk1 = (1.0f-fy)*XLINT(jy_00,kz_p1) + fy*XLINT(jy_p1,kz_p1);
