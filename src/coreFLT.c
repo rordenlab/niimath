@@ -80,6 +80,9 @@
 #ifdef HAVE_ALLINEATE
 #include "allineate.h"
 #endif
+#ifdef HAVE_GPL
+#include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
+#endif
 #include <stdbool.h>
 // #define TFCE //formerly we used Christian Gaser's tfce, new bespoke code handles connectivity
 // #ifdef TFCE //we now use in-built tfce function
@@ -6129,6 +6132,23 @@ int main64(int argc, char *argv[]) {
 			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd))
 				goto fail;
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
+		}
+#endif
+#ifdef HAVE_GPL
+		else if (!strcmp(argv[ac], "-spmcoreg")) {
+			ok = nii_spmcoreg(nim, fin, &ac, argc, argv, DT_CALC == DT_FLOAT64);
+			if (ok)
+				goto fail;
+		}
+		else if (!strcmp(argv[ac], "-spm_deface")) {
+			ok = nii_spm_deface(nim, &ac, argc, argv, DT_CALC == DT_FLOAT64);
+			if (ok)
+				goto fail;
+		}
+#else
+		else if (!strcmp(argv[ac], "-spmcoreg") || !strcmp(argv[ac], "-spm_deface")) {
+			printfx("%s requires a build with the optional GPL module (see https://github.com/rordenlab/niimath_gpl)\n", argv[ac]);
+			goto fail;
 		}
 #endif
 		else if (!strcmp(argv[ac], "-edt"))

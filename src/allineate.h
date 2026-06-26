@@ -187,6 +187,14 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
    Returns 0 on success, nonzero on error. */
 int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
 
+/* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index
+ * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
+ * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*;
+ * out-of-FOV voxels set to `fillv` (0 or NaN). Returns 0 on success. Shared BSD
+ * interpolation (used by -allineate output and the GPL -spmcoreg reslice). */
+int nii_reslice_affine(nifti_image *source, const nifti_image *base,
+                       mat44 gam, int interp, float fillv);
+
 /* Deface/skullstrip: register template to input, warp mask to input space,
    set voxels where warped mask < 0.5 to the input's minimum value.
    input: the image to modify (modified in-place, stays in its own space)
@@ -196,5 +204,10 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
    final_interp default: linear (to avoid ringing in the mask).
    Returns 0 on success, nonzero on error. */
 int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts opts);
+
+/* Zero (to image minimum) input voxels where the input-grid `warped_mask` < 0.5.
+   Ensures input is float32. BSD; shared by -deface and the GPL -spm_deface.
+   Returns #voxels masked, or -1 on error. */
+long nii_apply_deface_mask(nifti_image *input, const float *warped_mask);
 
 #endif /* ALLINEATE_H */

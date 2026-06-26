@@ -78,6 +78,17 @@ make wasm              # Emscripten/WebAssembly target
 
 You can also compile this project to Web Assembly so it can be embedded in a web page, as shown in the [live demo](https://niivue.github.io/niivue-niimath/).
 
+#### Optional GPL `-spmcoreg` module
+
+The `-spmcoreg` (SPM rigid-body coregistration) and `-spm_deface` (SPM-based defacing) commands live in the separate GPL-2 [niimath_gpl](https://github.com/rordenlab/niimath_gpl) submodule and are OFF by default, so ordinary builds stay BSD-2-Clause. To build them, initialize the submodule and pass `GPL=1` (Makefile) or `-DENABLE_GPL=ON` (CMake). Run both commands from the repository root so the paths resolve:
+
+```
+git submodule update --init src/GPL    # or clone with --recurse-submodules
+make -C src GPL=1
+```
+
+A binary built this way is a GPL-2 combined work (its version string ends in ` GPL`); without the module `-spmcoreg`/`-spm_deface` report a clear error and the build stays BSD-2 (` BSD`). The GPL module computes only the rigid transform; niimath's BSD code applies it (reslicing and mask warping shared with `-allineate`/`-deface`).
+
 ### Windows (command line)
 
 For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported):
@@ -152,6 +163,11 @@ niimath has a few features not provided by fslmaths:
    - opts: same as allineate (default final: linear)
  - `skullstrip <tmpl> <mask> [opts]`: skull-strip using template registration
    - opts: same as allineate (default final: linear)
+ - `spmcoreg <ref> [opts]`: SPM rigid-body coregistration of the chain image to `ref` (optional GPL module, see below)
+   - opts: `-cost XX` (nmi [default], mi, ecc, ncc, ls) `-sep` `-fwhm` `-dither 0|1` `-coarse sparse|downsample` `-verbose 0|1`
+   - default reslices onto the `ref` grid (`-interp trilinear [default]|nearest`, `-fill zero [default]|nan`); `-estimate` instead rewrites only the source sform/qform
+ - `spm_deface <tmpl> <mask> [opts]`: SPM analogue of `deface`, registering with spm_coreg (optional GPL module, see below)
+   - opts: same estimate sub-options as `spmcoreg`, plus `-interp`
  - `--dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto]` : linear diffusion tensor fit (emulates FSL `dtifit`)
    - writes `<base>_{FA,MD,L1,L2,L3,V1,V2,V3,S0,MO,tensor}`; fit math from AFNI 3dDWItoDT (public domain)
    - `-xflip auto` (default) flips the bvec X component when the spatial transform determinant is positive, matching FSL
@@ -242,6 +258,8 @@ niimath can also be compiled to WebAssembly (Wasm) allowing it to be inserted in
 ## License
 
 <!-- codespell-ignore-line --> niimath is licensed under the 2-Clause BSD License. Except where noted, the code was written by Chris Rorden in 2020-2022. The code in `tensor.c` was written by Daniel Glen (2004) from the US National Institutes of Health and is not copyrighted (though it is included here with the permission of the author). The FSL team graciously allowed the text strings (help, warning and error messages) to be copied verbatim. The Butterworth Filter Coefficients in `bw.c` are from [Exstrom Labs](http://www.exstrom.com/journal/sigproc/) and the authors provided permission for it to be included in this project under the [LGPL](https://www.gnu.org/licenses/lgpl-3.0.en.html), the file provides additional details. Taylor Hanayik from the FSL group provided pseudo-code for some functions where there is little available documentation. The PolygoniseCube function comes from Cory Bloyd's public domain [Marching Cubes example](http://paulbourke.net/geometry/polygonise/) program described here. The bwlabel.cpp file was written by Jesper Andersson, who has explicitly allowed this to be shared using the BSD 2-Clause license. The [high performance](https://github.com/gaspardpetit/base64) base64.cpp was written by Jouni Malinen and is distributed under the BSD license. The mesh simplification was written by [Sven Forstmann](https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification) and distributed under the MIT license. It was ported from C++ to C by Chris Rorden.  The [radixsort.c](https://github.com/bitshifter/radixsort) was written by Cameron Hart (2014) using the zlib license.
+
+The optional `-spmcoreg` and `-spm_deface` commands link the separate GPL-2 `spm_coreg` module (the [niimath_gpl](https://github.com/rordenlab/niimath_gpl) submodule), enabled only when built with `make GPL=1` (`-DHAVE_GPL`). A binary built that way is a combined work licensed under the GNU GPL-2; the default build (without the module) remains BSD-2-Clause. The version string reported by `niimath` ends in ` GPL` or ` BSD` to indicate which applies.
 
 ## Links
 

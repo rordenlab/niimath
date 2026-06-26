@@ -22,6 +22,10 @@ interface WorkerInputMessage {
   blob: Blob;
   cmd: string[];
   outName?: string;
+  // Additional files staged into MEMFS by name (e.g. template + mask for
+  // -deface/-spm_deface, whose argv tokens are these filenames). Each is read,
+  // staged before callMain, and unlinked afterward alongside the main input.
+  extraFiles?: { name: string; data: Blob }[];
 }
 
 interface WorkerReadyMessage {
@@ -46,7 +50,15 @@ interface WorkerSuccessMessage {
 // for all subsequent calls without having to reinitialise it (which could be slow due to the WASM loading)
 let mod: EmscriptenModule | null = null;
 
-(Module() as Promise<EmscriptenModule>).then((initializedMod: EmscriptenModule) => {
+// niimath prints progress chatter to stdout/stderr; Emscripten routes those to
+// console.log/console.error (the latter shows red in devtools). Capture both into
+// a per-run buffer instead so a successful run is silent, and surface the captured
+// text only when a run fails (see the nonzero-exit branch below). The buffer is
+// cleared before each callMain.
+let runLog: string[] = [];
+const captureModule = { print: (s: string) => runLog.push(s), printErr: (s: string) => runLog.push(s) };
+
+(Module(captureModule) as Promise<EmscriptenModule>).then((initializedMod: EmscriptenModule) => {
   mod = initializedMod;
   // Send a ready message once initialization is complete
   // so we can signal to the main thread that the worker is ready.
@@ -86,13 +98,28 @@ const handleMessage = (e: MessageEvent<WorkerInputMessage>) => {
     }
 
     const inName = (file as File).name ?? 'input.nii';
+    const extraFiles = e.data.extraFiles ?? [];
     const fr = new FileReader();
+
+    // Surface a read failure as a controlled error. The work runs in fr.onload
+    // (success only), so a failed read never reaches the `fr.result as ArrayBuffer`
+    // cast with a null, and nothing is staged yet so no cleanup is owed here.
+    fr.onerror = function () {
+      const errorMsg: WorkerErrorMessage = {
+        type: 'error',
+        message: `Failed to read input "${inName}": ${fr.error?.message ?? 'unknown read error'}`,
+        error: fr.error?.stack ?? null
+      };
+      self.postMessage(errorMsg);
+    };
 
     fr.readAsArrayBuffer(file);
 
-    fr.onloadend = function () {
-      // This callback runs asynchronously, outside the outer try/catch, so it must
-      // do its own error handling and clean up staged files in a finally block.
+    fr.onload = async function () {
+      // Fires only on a successful read (errors go to fr.onerror), so fr.result is
+      // a valid ArrayBuffer here. This callback runs asynchronously, outside the
+      // outer try/catch, so it does its own error handling and cleans up staged
+      // files in a finally block.
       if (!mod) {
         const errorMsg: WorkerErrorMessage = {
           type: 'error',
@@ -104,6 +131,7 @@ const handleMessage = (e: MessageEvent<WorkerInputMessage>) => {
       }
       const data = new Uint8Array(fr.result as ArrayBuffer);
       let stagedInput = false;
+      const stagedExtras: string[] = [];
       try {
         if (!Array.isArray(args)) {
           throw new Error("Expected args to be an array");
@@ -111,18 +139,32 @@ const handleMessage = (e: MessageEvent<WorkerInputMessage>) => {
         // Create a virtual file in the Emscripten filesystem
         mod.FS_createDataFile(".", inName, data, true, true);
         stagedInput = true;
+        // Stage any extra inputs (template/mask) by name so the chain op can open them.
+        for (const f of extraFiles) {
+          const bytes = new Uint8Array(await f.data.arrayBuffer());
+          mod.FS_createDataFile(".", f.name, bytes, true, true);
+          stagedExtras.push(f.name);
+        }
         // call the main niimath entry point with the arguments.
         // equivalent to calling `niimath <in_file.nii> <args> <out_file.nii>` from the command line
+        runLog = []; // discard prior chatter; keep only this run's output for error reporting
         const exitCode = mod.callMain(args);
         // Check the exit code BEFORE reading the output: a failed run may not have
         // written the output file, so reading it would throw a less useful error.
+        // On failure, attach the captured niimath stdout/stderr so the error is
+        // actionable even though successful runs stay silent.
         if (exitCode !== 0) {
-          throw new Error(`niimath exited with code ${exitCode}`);
+          const detail = runLog.join('\n').trim();
+          throw new Error(`niimath exited with code ${exitCode}${detail ? `:\n${detail}` : ''}`);
         }
         // read the output file from the Emscripten filesystem
         const out_bin = mod.FS_readFile(outName);
-        // binary output file from niimath wasm: nii or mz3
-        const outputFile = new Blob([out_bin.buffer as ArrayBuffer], { type: 'application/sla' });
+        // binary output file from niimath wasm: nii or mz3. Copy into an exact-
+        // length buffer so the Blob is precisely the file's bytes — the FS_readFile
+        // view can in principle sit at an offset/short of its backing ArrayBuffer.
+        const exact = new Uint8Array(out_bin.byteLength);
+        exact.set(out_bin);
+        const outputFile = new Blob([exact.buffer], { type: 'application/sla' });
         // send a message back to the main thread with the output file, exit code and output file name
         const successMsg: WorkerSuccessMessage = {
           blob: outputFile,
@@ -144,6 +186,9 @@ const handleMessage = (e: MessageEvent<WorkerInputMessage>) => {
         // unlink: the file may not exist (e.g. output never written on failure).
         if (stagedInput) {
           try { mod.FS_unlink(inName); } catch { /* already gone */ }
+        }
+        for (const name of stagedExtras) {
+          try { mod.FS_unlink(name); } catch { /* already gone */ }
         }
         if (inName !== outName) {
           try { mod.FS_unlink(outName); } catch { /* never created */ }

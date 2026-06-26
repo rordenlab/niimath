@@ -29,3 +29,6 @@ _skbuild/niimath/_dist_ver.py
 /mesh/
 /validate/
 /dwi/
+audit_temp.md
+audit_response.md
+coreg_plan.md

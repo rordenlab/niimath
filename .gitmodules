@@ -1,0 +1,3 @@
+[submodule "src/GPL"]
+	path = src/GPL
+	url = https://github.com/rordenlab/niimath_gpl.git

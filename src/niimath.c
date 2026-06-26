@@ -70,9 +70,14 @@
 #else
 	#define kOS "Windows"
 #endif
+#if defined(HAVE_GPL)
+	#define kLicense " GPL"
+#else
+	#define kLicense " BSD"
+#endif
 
 #define kMTHdate "v1.0.20260623"
-#define kMTHvers kMTHdate kOMPsuf kCCsuf
+#define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
 
@@ -260,6 +265,11 @@ int show_help( void ) {
 	printf("Chris Rorden's niimath version %s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     //printf("Chris Rorden's niimath version %s (%llu-bit %s)\n", kMATHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     printf("    Math for NIfTI images inspired by fslmaths without encumbrance problems\n\n");
+#ifdef HAVE_GPL
+	printf("    Built with the optional GPL spm_coreg module: this executable is licensed GPL-2.\n\n");
+#else
+	printf("    License: BSD-2-Clause.\n\n");
+#endif
 	printf("\n");
 	printf("Usage: niimath [-dt <datatype>] <first_input> [operations and inputs] <output> [-odt <datatype>]\n");
 	printf("\n");
@@ -335,6 +345,18 @@ int show_help( void ) {
 	printf("                              opts: same as -allineate [default final: linear]\n");
 	printf(" -skullstrip <tmpl> <mask> [opts] : skull-strip using template registration\n");
 	printf("                              opts: same as -allineate [default final: linear]\n");
+#endif
+#ifdef HAVE_GPL
+	printf(" -spmcoreg <ref> [opts]   : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
+	printf("                            opts: -cost XX (nmi,mi,ecc,ncc,ls) -sep 4 2 -fwhm 7 7 -dither 0|1\n");
+	printf("                                  -coarse sparse|downsample -verbose 0|1\n");
+#ifdef HAVE_ALLINEATE
+	printf("                                  -estimate (update sform/qform only) | default reslices onto ref grid\n");
+	printf("                                  -interp trilinear|nearest -fill zero|nan (reslice only; reslice needs -dt float)\n");
+	printf(" -spm_deface <tmpl> <mask> [opts] : deface via SPM coregistration (GPL, rigid 6-DOF; use -deface for 12-DOF affine); opts as -spmcoreg estimate (-cost/-sep/-fwhm/-dither/-coarse/-verbose) + -interp\n");
+#else
+	printf("                                  -estimate only (header sform/qform; reslice/-spm_deface need the allineate module)\n");
+#endif
 #endif
 	printf(" -close <thr> <dx1> <dx2> : morphological close that binarizes with `thr`, dilates with `dx1` and erodes with `dx2` (fills bubbles with `thr`)\n");
 	printf(" -crop <tmin> <tsize>     : remove volumes, starts with 0 not 1! Inputting -1 for a size will set it to the full range\n");

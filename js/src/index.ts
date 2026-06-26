@@ -46,6 +46,7 @@ interface WorkerPostMessage {
   blob: File;
   cmd: string[];
   outName: string;
+  extraFiles?: { name: string; data: Blob }[];
 }
 
 export class Niimath {
@@ -109,6 +110,11 @@ class ImageProcessor {
   private operators: Operators;
   private commands: string[] = [];
   private outputDataType: DataType;
+  // Files (besides the main input) staged into MEMFS by name for chain ops that
+  // take filename argv tokens (e.g. -deface/-spm_deface template + mask).
+  private extraFiles: { name: string; data: Blob }[] = [];
+  // Monotonic counter for generated staging names (collision-proof argv tokens).
+  private stagedCounter = 0;
 
   // Index signature to allow dynamic method assignment from niimath operators
   [key: string]: unknown;
@@ -124,6 +130,47 @@ class ImageProcessor {
   private _addCommand(cmd: string, ...args: (string | number)[]): this {
     this.commands.push(cmd, ...args.map(String));
     return this;
+  }
+
+  // Chain ops that take input filenames as argv tokens (template/mask/ref). The
+  // generated fluent methods only handle scalar args, so these are special-cased.
+  // Each File is staged into MEMFS under a GENERATED internal name (a unique
+  // prefix + the original name, preserving the extension niimath uses to detect
+  // gzip/format) and that name is emitted as the argv token. Generated names keep
+  // a template/mask/ref whose File.name collides with the input, output, or
+  // another staged file from shadowing or unlinking the wrong MEMFS entry.
+  // Extra opts (e.g. '-cost', 'nmi') follow.
+  private _addFileCommand(flag: string, files: File[], opts: (string | number)[] = []): this {
+    // The leading `__nimx<n>_` prefix makes the token unique and ensures it never
+    // begins with '-' (which niimath's option parser would consume) nor with a
+    // path separator; sanitizing the original to [A-Za-z0-9._-] strips embedded
+    // slashes/spaces while keeping the extension niimath reads for gzip/format.
+    const names = files.map(
+      (f) => `__nimx${this.stagedCounter++}_${f.name.replace(/[^A-Za-z0-9._-]/g, '_')}`,
+    );
+    this.commands.push(flag, ...names, ...opts.map(String));
+    this.extraFiles.push(...files.map((f, i) => ({ name: names[i], data: f })));
+    return this;
+  }
+
+  // Affine defacing (BSD allineate): -deface <tmpl> <mask>
+  deface(tmpl: File, mask: File): this {
+    return this._addFileCommand('-deface', [tmpl, mask]);
+  }
+
+  // SPM rigid-body defacing (GPL spm_coreg): -spm_deface <tmpl> <mask> [opts]
+  spmDeface(tmpl: File, mask: File, opts: (string | number)[] = []): this {
+    return this._addFileCommand('-spm_deface', [tmpl, mask], opts);
+  }
+
+  // SPM rigid-body coregistration (GPL): -spmcoreg <ref> [opts]
+  spmcoreg(ref: File, opts: (string | number)[] = []): this {
+    return this._addFileCommand('-spmcoreg', [ref], opts);
+  }
+
+  // Affine registration (BSD allineate): -allineate <base> [opts]
+  allineate(base: File, opts: (string | number)[] = []): this {
+    return this._addFileCommand('-allineate', [base], opts);
   }
 
   private _generateMethods(): void {
@@ -214,7 +261,15 @@ class ImageProcessor {
 
   async run(outName: string = 'output.nii'): Promise<Blob> {
     return new Promise((resolve, reject) => {
-      this.worker!.onmessage = (e: MessageEvent) => {
+      // Check the worker exists BEFORE touching it — otherwise `.run()` before
+      // `init()` throws a raw TypeError on `this.worker!.onmessage` instead of
+      // this clear message.
+      if (this.worker === null) {
+        reject(new Error('Worker not initialized. Did you await the init() method?'));
+        return;
+      }
+
+      this.worker.onmessage = (e: MessageEvent) => {
         const data = e.data as WorkerMessage;
         if (data.type === 'error') {
           reject(new Error(data.message));
@@ -232,17 +287,13 @@ class ImageProcessor {
       };
 
       const args = [this.file.name, ...this.commands, outName, '-odt', this.outputDataType];
-      if (this.worker === null) {
-        reject(new Error('Worker not initialized. Did you await the init() method?'));
-        return;
-      }
-
       const message: WorkerPostMessage = {
         blob: this.file,
         cmd: args,
-        outName: outName
+        outName: outName,
+        extraFiles: this.extraFiles
       };
-      this.worker!.postMessage(message);
+      this.worker.postMessage(message);
     });
   }
 }
