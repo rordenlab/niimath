@@ -3890,6 +3890,12 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
         fprintf(stderr, "%s: NULL input image\n", label);
         return 1;
     }
+    /* 3D only. The face mask covers a single volume (nx*ny*nz); on a 4D input the
+     * mask-apply would zero only volume 0 and silently leave identifiable faces in
+     * volumes 1..N while reporting success — a privacy failure for a defacing tool.
+     * Reject 4D here (matching -spmcoreg/-spm_deface, which already do). Deface the
+     * 3D anatomical instead. */
+    if (al_dims_ok(input, label)) return 1;
     if (input->datatype != DT_FLOAT32) {
         float *fdata = nii_to_float(input);
         if (!fdata) {
