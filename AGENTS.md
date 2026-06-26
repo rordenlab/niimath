@@ -158,3 +158,8 @@ The AppVeyor macOS job builds a universal binary by compiling x86_64 and arm64 s
 - Function naming: `nifti_*` for NIfTI operations, `nii_*` for internal helpers
 - Explicit SIMD (Intel intrinsics via `immintrin.h`) is compiled only on `__x86_64__`; ARM/WASM use the scalar fallbacks, which clang `-O3` auto-vectorizes to NEON just as fast (these ops are memory-bandwidth bound). The `sse2neon.h` shim was removed after benchmarks showed it gave no benefit on Apple Silicon (bit-identical output, conformance suite passes).
 - Error returns: `EXIT_SUCCESS`/`EXIT_FAILURE` from stdlib
+
+## Documentation style
+- Do not add artificial end-of-line characters to Markdown/text prose. Let the editor/renderer word-wrap to the window — one paragraph (or list item) is one physical line; do not hard-wrap paragraphs at a fixed column.
+- Use newlines only for genuine structure: between paragraphs, headings, list items, table rows, and code-fence boundaries, and for new lines of code inside fences.
+- When editing an existing `.md` file that has hard-wrapped paragraphs, unwrap them to one line per paragraph.
