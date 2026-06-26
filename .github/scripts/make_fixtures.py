@@ -41,3 +41,36 @@ img4d.header.set_sform(aff, code=1)
 img4d.header.set_qform(aff, code=1)
 nib.save(img4d, "/tmp/src4d.nii.gz")
 print("wrote /tmp/src4d.nii.gz", src4d.shape)
+
+# Larger fixture pair for the OpenMP thread-parity step. The parallel histogram
+# branch in coreg_hist2_cached only triggers when base samples exceed 100000;
+# 64^3 = 262144 voxels clears that at the 2mm sampling step (the 24^3 blobs do
+# not, so they would only ever exercise the serial path). The phantom is
+# ANISOTROPIC + multi-lobe (not a symmetric sphere): a symmetric blob hides
+# rotational/trajectory differences, so it would not expose a thread-dependent
+# divergence in the optimizer. bigref is a translated copy (a real registration
+# target); the asymmetry makes the cost landscape rotation-sensitive.
+def phantom(shape=(64, 64, 64), shift=(0, 0, 0)):
+    z, y, x = np.ogrid[: shape[0], : shape[1], : shape[2]]
+    sz, sy, sx = shift
+    # anisotropic main ellipsoid (distinct per-axis extents -> rotation-sensitive)
+    e = ((x - (30 + sx)) / 22.0) ** 2 + ((y - (32 + sy)) / 16.0) ** 2 + ((z - (34 + sz)) / 12.0) ** 2
+    v = np.clip(1.0 - e, 0.0, 1.0)
+    # two off-center lobes break the remaining symmetry
+    for cx, cy, cz, r in [(44, 40, 28, 7.0), (20, 26, 42, 5.0)]:
+        d = np.sqrt((x - (cx + sx)) ** 2 + (y - (cy + sy)) ** 2 + (z - (cz + sz)) ** 2)
+        v = np.maximum(v, np.clip(1.0 - d / r, 0.0, 1.0) * 0.8)
+    return v.astype(np.float32)
+
+affbig = np.diag([2.0, 2.0, 2.0, 1.0])
+affbig[:3, 3] = [-64.0, -64.0, -64.0]
+big = {
+    "/tmp/big.nii.gz": phantom(shift=(0, 0, 0)),
+    "/tmp/bigref.nii.gz": phantom(shift=(1, 0, -1)),   # translated target
+}
+for path, data in big.items():
+    img = nib.Nifti1Image(data, affbig)
+    img.header.set_sform(affbig, code=1)
+    img.header.set_qform(affbig, code=1)
+    nib.save(img, path)
+    print("wrote", path, data.shape)
