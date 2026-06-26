@@ -2929,13 +2929,31 @@ static void al_center_of_mass(const float *data, int nx, int ny, int nz,
 
 
 
-/* Extract float data from NIfTI image. Returns malloc'd float array. */
+/* Overflow-safe 3D voxel count (nx*ny*nz), kept within int range so the int loop
+ * counters/indices used throughout allineate stay valid. NIfTI dims are int64; this
+ * uses division-based checked multiplication so the product is never formed unless it
+ * is provably <= INT_MAX. Returns 0 and sets *out on success, 1 (message) on failure. */
+static int al_safe_nvox(const nifti_image *n, const char *who, size_t *out)
+{
+    long long nx = n->nx, ny = n->ny, nz = n->nz;
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        fprintf(stderr, "%s: non-positive dimensions\n", who); return 1; }
+    if (nx > (long long)INT_MAX / ny || nx * ny > (long long)INT_MAX / nz) {
+        fprintf(stderr, "%s: voxel count out of range\n", who); return 1; }
+    *out = (size_t)(nx * ny * nz);   /* proven <= INT_MAX */
+    return 0;
+}
+
+/* Extract float data from NIfTI image. Returns malloc'd float array (NULL on bad
+ * dims/datatype) — the dimension guard is centralized here so every caller (allineate,
+ * deface, reslice) is protected without each needing to pre-validate. */
 static float *nii_to_float(nifti_image *nim)
 {
-    int ii;
+    size_t ii;
     float *fdata;
     if (nim == NULL || nim->data == NULL) return NULL;
-    int nvox = (int)((size_t)nim->nx * nim->ny * nim->nz);
+    size_t nvox;
+    if (al_safe_nvox(nim, "nii_to_float", &nvox)) return NULL;
     fdata = (float *)calloc(nvox, sizeof(float));
     if (!fdata) return NULL;
 
@@ -3701,18 +3719,15 @@ static void al_adopt_geometry(nifti_image *s, const nifti_image *b)
     s->qoffset_x = b->qoffset_x; s->qoffset_y = b->qoffset_y; s->qoffset_z = b->qoffset_z;
 }
 
-/* Validate a 3D image for resampling: positive dims, an in-slice product that fits
- * int (so anx*any indexing is safe), and a total voxel*float product that fits
- * size_t. Returns 0 if usable. Guards against malformed/extreme NIfTI-2 headers. */
+/* Validate a 3D image for resampling: an overflow-safe voxel count that fits int
+ * (via al_safe_nvox) and that the 3D product equals nim->nvox (a genuine single-volume
+ * 3D image, not 4D). Returns 0 if usable. Guards malformed/extreme NIfTI-2 headers. */
 static int al_dims_ok(const nifti_image *n, const char *who)
 {
-    if (n->nx <= 0 || n->ny <= 0 || n->nz <= 0) {
-        fprintf(stderr, "%s: non-positive dimensions\n", who); return 1; }
-    if ((long long)n->nx * n->ny > INT_MAX) {
-        fprintf(stderr, "%s: slice too large\n", who); return 1; }
-    long long nv = (long long)n->nx * n->ny * n->nz;
-    if (nv <= 0 || (unsigned long long)nv > SIZE_MAX / sizeof(float)) {
-        fprintf(stderr, "%s: voxel count out of range\n", who); return 1; }
+    size_t nv;
+    if (al_safe_nvox(n, who, &nv)) return 1;
+    if ((long long)n->nvox != (long long)nv) {
+        fprintf(stderr, "%s: 4D/multi-volume input not supported (3D only)\n", who); return 1; }
     return 0;
 }
 
@@ -3731,8 +3746,8 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
     if (!aim) { fprintf(stderr, "reslice: cannot extract source data\n"); return 1; }
     int anx = source->nx, any = source->ny, anz = source->nz;
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
-    long bnvox = (long)bnx * bny * bnz;
-    float *out = (float *)malloc(sizeof(float) * (size_t)bnvox);
+    size_t bnvox = (size_t)bnx * bny * bnz;
+    float *out = (float *)malloc(sizeof(float) * bnvox);
     if (!out) { free(aim); fprintf(stderr, "reslice: out of memory\n"); return 1; }
     int nxy_a = anx * any;
     float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
@@ -3745,7 +3760,7 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
 #endif
     for (int kk = 0; kk < bnz; kk++) {
         for (int jj = 0; jj < bny; jj++) {
-            long ob = ((long)kk * bny + jj) * bnx;
+            size_t ob = ((size_t)kk * bny + jj) * bnx;
             float bx = mx1*jj + mx2*kk + mx3;
             float by = my1*jj + my2*kk + my3;
             float bz = mz1*jj + mz2*kk + mz3;
@@ -3850,12 +3865,12 @@ long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
         input->datatype = DT_FLOAT32; input->nbyper = sizeof(float);
         input->scl_slope = 0.0f; input->scl_inter = 0.0f;
     }
-    long nvox = (long)input->nx * input->ny * input->nz;
+    size_t nvox = (size_t)input->nx * input->ny * input->nz;
     float *idata = (float *)input->data;
     float min_val = idata[0];
-    for (long i = 1; i < nvox; i++) if (idata[i] < min_val) min_val = idata[i];
+    for (size_t i = 1; i < nvox; i++) if (idata[i] < min_val) min_val = idata[i];
     long nmasked = 0;
-    for (long i = 0; i < nvox; i++) if (warped_mask[i] < 0.5f) { idata[i] = min_val; nmasked++; }
+    for (size_t i = 0; i < nvox; i++) if (warped_mask[i] < 0.5f) { idata[i] = min_val; nmasked++; }
     return nmasked;
 }
 

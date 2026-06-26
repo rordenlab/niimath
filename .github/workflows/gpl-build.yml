@@ -1,0 +1,84 @@
+name: GPL build & smoke
+
+# Validate the optional GPL spm_coreg module end to end:
+#  - clean-submodule linkage (src/GPL fetched over the public HTTPS submodule URL)
+#  - the BSD / GPL / GPL+AL=0 build matrix (Makefile) and CMake ENABLE_GPL builds
+#  - the -spmcoreg / -spm_deface command contracts (exit codes), incl. -dt double
+#    rejection and the BSD "requires GPL module" error.
+on:
+  push:
+    branches: [master]
+    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py']
+  pull_request:
+    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py']
+  workflow_dispatch:
+
+jobs:
+  make-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # clones src/GPL via the HTTPS submodule URL (clean-submodule check)
+      - name: Install build + fixture deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev python3-numpy python3-nibabel
+
+      - name: Synthetic fixtures
+        run: python3 .github/scripts/make_fixtures.py
+
+      - name: BSD build is BSD and rejects -spmcoreg
+        run: |
+          make -C src
+          src/niimath 2>&1 | head -1 | grep -q ' BSD ' || { echo 'expected BSD version string'; exit 1; }
+          # real input so we reach the op dispatch (a missing file would error earlier)
+          if src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/o.nii.gz >/dev/null 2>err.txt; then
+            echo 'BSD build should reject -spmcoreg'; exit 1; fi
+          grep -qi 'requires a build with the optional GPL module' err.txt
+
+      - name: GPL build links the submodule and is GPL
+        run: |
+          test -f src/GPL/spm_coreg.c || { echo 'src/GPL submodule not initialized'; exit 1; }
+          make -C src GPL=1
+          src/niimath 2>&1 | head -1 | grep -q ' GPL ' || { echo 'expected GPL version string'; exit 1; }
+
+      - name: GPL command contracts
+        run: |
+          set -e
+          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz -estimate /tmp/est.nii.gz   # estimate (header-only)
+          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/res.nii.gz             # reslice (float)
+          src/niimath /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/df.nii.gz
+          if src/niimath -dt double /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/d.nii.gz >/dev/null 2>err.txt; then
+            echo '-dt double reslice should be rejected'; exit 1; fi
+          grep -qi 'requires -dt float' err.txt
+          if src/niimath -dt double /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/dd.nii.gz >/dev/null 2>errd.txt; then
+            echo '-dt double -spm_deface should be rejected'; exit 1; fi
+          grep -qi 'requires -dt float' errd.txt
+
+      - name: GPL=1 AL=0 is estimate-only
+        run: |
+          set -e
+          rm -f src/*.o src/niimath
+          make -C src GPL=1 AL=0
+          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz -estimate /tmp/est2.nii.gz   # estimate works
+          if src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/r2.nii.gz >/dev/null 2>err2.txt; then
+            echo 'reslice should be rejected without allineate'; exit 1; fi
+          grep -qi 'allineate' err2.txt
+          if src/niimath /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/d2.nii.gz >/dev/null 2>err3.txt; then
+            echo '-spm_deface should be rejected without allineate'; exit 1; fi
+          grep -qi 'allineate' err3.txt
+
+  cmake-gpl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev
+      - name: CMake ENABLE_GPL
+        run: |
+          cmake -S src -B build-gpl -DENABLE_GPL=ON
+          cmake --build build-gpl
+      - name: CMake ENABLE_GPL + ENABLE_ALLINEATE=OFF
+        run: |
+          cmake -S src -B build-gpl-noal -DENABLE_GPL=ON -DENABLE_ALLINEATE=OFF
+          cmake --build build-gpl-noal
