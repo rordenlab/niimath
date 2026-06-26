@@ -89,6 +89,8 @@ make -C src GPL=1
 
 A binary built this way is a GPL-2 combined work (its version string ends in ` GPL`); without the module `-spmcoreg`/`-spm_deface` report a clear error and the build stays BSD-2 (` BSD`). The GPL module computes only the rigid transform; niimath's BSD code applies it (reslicing and mask warping shared with `-allineate`/`-deface`).
 
+When built with OpenMP, `-spmcoreg`/`-spm_deface` parallelize a single registration (the per-evaluation histogram and smoothing); the result is independent of the thread count. Control threads with `OMP_NUM_THREADS=N` or `-p N` (place `-p` before `-spmcoreg`). For batch runs of many subjects, prefer one subject per process with `OMP_NUM_THREADS=1` rather than threading each registration.
+
 ### Windows (command line)
 
 For Windows, using the cmake method described above is highly recommended. However, you can also compile the project directly from the command line (here without the `-DHAVE_ZLIB` directive, so gz files will not be supported):

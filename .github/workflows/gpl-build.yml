@@ -54,6 +54,50 @@ jobs:
             echo '-dt double -spm_deface should be rejected'; exit 1; fi
           grep -qi 'requires -dt float' errd.txt
 
+      - name: OpenMP thread parity (histogram + smoothing)
+        run: |
+          set -e
+          # The parallel histogram (coreg_hist2_cached) and parallel smoothing
+          # (smooth_hist_into) must not change the result. big.nii.gz clears the
+          # >100000-sample threshold so the parallel histogram branch runs;
+          # smoothing parallelizes on any multi-core runner. Assert (1) exact
+          # reproducibility at a fixed thread count and (2) equivalence across
+          # thread counts. Smoothing is bit-identical (a map); the histogram
+          # reduction reorders float adds but is damped by smoothing — compared
+          # within a tight tolerance to stay robust on any runner/core count.
+          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_a.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_b.nii.gz
+          src/niimath /tmp/par_a.nii.gz --compare /tmp/par_b.nii.gz   # exact: deterministic at fixed nt
+          OMP_NUM_THREADS=1 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_s1.nii.gz
+          src/niimath /tmp/par_s1.nii.gz --compare 1e-4 /tmp/par_a.nii.gz   # equivalent across nt
+          # The runtime may launch FEWER threads than OMP_NUM_THREADS requests
+          # (OMP_THREAD_LIMIT, dynamic teams). The histogram must chunk by the
+          # actual team size, not the requested one — otherwise it silently drops
+          # the samples for the unlaunched thread IDs. Regression for that bug:
+          OMP_THREAD_LIMIT=2 OMP_NUM_THREADS=8 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_lim.nii.gz
+          src/niimath /tmp/par_lim.nii.gz --compare 1e-4 /tmp/par_a.nii.gz   # must still match (no dropped samples)
+
+      - name: 4D inputs are rejected (fail closed, no corrupt output)
+        run: |
+          set -e
+          # Same negligence class as the fixed 4D-deface privacy bug: registration
+          # and defacing are 3D-only and must exit nonzero, never silently use only
+          # volume 0 or write volume-0 bytes under a 4D header. Uses the allineate-
+          # enabled GPL build above (before the AL=0 rebuild below).
+          for op in "-allineate /tmp/ref.nii.gz" \
+                    "-deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-robustfov -deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz" \
+                    "-robustfov -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz"; do
+            if src/niimath /tmp/src4d.nii.gz $op /tmp/o4.nii.gz >/dev/null 2>e.txt; then
+              echo "4D subject: '$op' should be rejected"; exit 1; fi
+          done
+          # 4D template or mask must also be rejected
+          if src/niimath /tmp/src.nii.gz -deface /tmp/src4d.nii.gz /tmp/mask.nii.gz /tmp/o.nii.gz >/dev/null 2>e.txt; then
+            echo '4D template should be rejected'; exit 1; fi
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/src4d.nii.gz /tmp/o.nii.gz >/dev/null 2>e.txt; then
+            echo '4D mask should be rejected'; exit 1; fi
+
       - name: GPL=1 AL=0 is estimate-only
         run: |
           set -e

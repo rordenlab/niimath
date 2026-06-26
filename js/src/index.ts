@@ -49,6 +49,14 @@ interface WorkerPostMessage {
   extraFiles?: { name: string; data: Blob }[];
 }
 
+/**
+ * Niimath runs one WASM worker per instance. **Single-flight contract:** only one
+ * `.run()` may be in flight per `Niimath` instance at a time — `run()` reassigns the
+ * worker's single `onmessage` handler, so two overlapping runs on the same instance
+ * cross-wire each other's results (the first promise can hang or resolve with the
+ * wrong output). Serialize calls (await the previous `run()` before the next), or
+ * create a separate `Niimath` instance per concurrent stream.
+ */
 export class Niimath {
   private worker: Worker | null = null;
   public readonly operators: Operators;
