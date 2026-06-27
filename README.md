@@ -89,7 +89,7 @@ make -C src GPL=1
 
 A binary built this way is a GPL-2 combined work (its version string ends in ` GPL`); without the module `-spmcoreg`/`-spm_deface` report a clear error and the build stays BSD-2 (` BSD`). The GPL module computes only the rigid transform; niimath's BSD code applies it (reslicing and mask warping shared with `-allineate`/`-deface`).
 
-When built with OpenMP, `-spmcoreg`/`-spm_deface` parallelize a single registration (the per-evaluation histogram and smoothing); the result is independent of the thread count. Control threads with `OMP_NUM_THREADS=N` or `-p N` (place `-p` before `-spmcoreg`). For batch runs of many subjects, prefer one subject per process with `OMP_NUM_THREADS=1` rather than threading each registration.
+When built with OpenMP, `-spmcoreg`/`-spm_deface` parallelize a single registration (the per-evaluation histogram and smoothing); results agree across thread counts to within the SPM golden tolerance (the histogram reduction sums in a thread-count-dependent order, so it is not guaranteed bit-identical across different team sizes, though it is deterministic at a fixed thread count). Control threads with `OMP_NUM_THREADS=N` or `-p N` (place `-p` before `-spmcoreg`). For batch runs of many subjects, prefer one subject per process with `OMP_NUM_THREADS=1` rather than threading each registration.
 
 ### Windows (command line)
 
@@ -161,9 +161,7 @@ niimath has a few features not provided by fslmaths:
    - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass` `-source_automask`
    - `-warp XX` (sho, shr, srs, aff [default]) `-interp XX` (NN, linear [default], cubic)
    - `-final XX` (NN, linear, cubic [default]) or `-nearest` `-linear` `-cubic`
- - `deface <tmpl> <mask> [opts]`: deface using affine registration of template
-   - opts: same as allineate (default final: linear)
- - `skullstrip <tmpl> <mask> [opts]`: skull-strip using template registration
+ - `deface <tmpl> <mask> [opts]`: remove voxels using a template-space mask. Registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and zeros voxels where the warped mask < 0.5 (the input itself is never resampled). `mask` is in `tmpl` space: ≥0.5 = keep, <0.5 = remove. The mask determines what is removed — supply a brain mask to skull-strip (keep the brain) or a face mask to deface (remove the face).
    - opts: same as allineate (default final: linear)
  - `spmcoreg <ref> [opts]`: SPM rigid-body coregistration of the chain image to `ref` (optional GPL module, see below)
    - opts: `-cost XX` (nmi [default], mi, ecc, ncc, ls) `-sep` `-fwhm` `-dither 0|1` `-coarse sparse|downsample` `-verbose 0|1`

@@ -6116,8 +6116,7 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
 		}
-		else if (!strcmp(argv[ac], "-deface") || !strcmp(argv[ac], "-skullstrip")) {
-			int is_skullstrip = (argv[ac][1] == 's');
+		else if (!strcmp(argv[ac], "-deface")) {
 			const char *cmd = argv[ac];
 			al_opts df_opts = al_opts_default();
 			ac++;
@@ -6127,8 +6126,6 @@ int main64(int argc, char *argv[]) {
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			if (is_skullstrip)
-				df_opts.skullstrip = mask_file;
 			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd))
 				goto fail;
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);

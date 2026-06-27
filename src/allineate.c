@@ -3750,13 +3750,20 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
 {
     if (source == NULL || base == NULL) { fprintf(stderr, "reslice: NULL image\n"); return 1; }
     if (al_dims_ok(source, "reslice source") || al_dims_ok(base, "reslice grid")) return 1;
-    float *aim = nii_to_float(source);
+    /* Fast path: alias float32 source data instead of copying via nii_to_float.
+     * Only safe when no intensity scaling is pending — nii_to_float bakes in
+     * scl_slope/scl_inter, so a scaled float32 source (e.g. a raw-read -spm_deface
+     * mask) must take the converting path or the reslice would use raw values. */
+    int aim_alias = (source->datatype == DT_FLOAT32 && source->data != NULL &&
+                     (source->scl_slope == 0.0f ||
+                      (source->scl_slope == 1.0f && source->scl_inter == 0.0f)));
+    float *aim = aim_alias ? (float *)source->data : nii_to_float(source);
     if (!aim) { fprintf(stderr, "reslice: cannot extract source data\n"); return 1; }
     int anx = source->nx, any = source->ny, anz = source->nz;
     int bnx = base->nx, bny = base->ny, bnz = base->nz;
     size_t bnvox = (size_t)bnx * bny * bnz;
     float *out = (float *)malloc(sizeof(float) * bnvox);
-    if (!out) { free(aim); fprintf(stderr, "reslice: out of memory\n"); return 1; }
+    if (!out) { if (!aim_alias) free(aim); fprintf(stderr, "reslice: out of memory\n"); return 1; }
     int nxy_a = anx * any;
     float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
     int anx1 = anx - 1, any1 = any - 1, anz1 = anz - 1;
@@ -3791,7 +3798,7 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
             }
         }
     }
-    free(aim);
+    if (!aim_alias) free(aim);
     free(source->data);
     source->data = out;
     al_adopt_geometry(source, base);
@@ -3869,6 +3876,10 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
    and the GPL -spm_deface. Returns #voxels masked, or -1 on error. */
 long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
 {
+    /* Exported shared helper (BSD -deface + GPL -spm_deface): validate the
+     * preconditions callers rely on rather than trusting them. */
+    if (input == NULL || warped_mask == NULL) { fprintf(stderr, "deface: NULL input/mask\n"); return -1; }
+    if (al_dims_ok(input, "deface apply")) return -1;
     if (input->datatype != DT_FLOAT32) {
         float *fdata = nii_to_float(input);
         if (!fdata) { fprintf(stderr, "deface: unsupported input datatype %d\n", input->datatype); return -1; }
@@ -3879,23 +3890,41 @@ long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
     }
     size_t nvox = (size_t)input->nx * input->ny * input->nz;
     float *idata = (float *)input->data;
-    float min_val = idata[0];
-    for (size_t i = 1; i < nvox; i++) if (idata[i] < min_val) min_val = idata[i];
+    if (input->data == NULL) { fprintf(stderr, "deface: input has no data\n"); return -1; }
+    /* Finite minimum: a NaN-first voxel must not poison every masked voxel with NaN.
+     * Magnitude guard (not isfinite()) because this TU is built with -ffast-math;
+     * `-FLT_MAX <= v <= FLT_MAX` excludes NaN and ±inf. Fallback 0 if all nonfinite. */
+    float min_val = 0.0f; int have_min = 0;
+    for (size_t i = 0; i < nvox; i++) {
+        float v = idata[i];
+        if (v >= -FLT_MAX && v <= FLT_MAX && (!have_min || v < min_val)) { min_val = v; have_min = 1; }
+    }
     long nmasked = 0;
-    for (size_t i = 0; i < nvox; i++) if (warped_mask[i] < 0.5f) { idata[i] = min_val; nmasked++; }
+    long nv = (long)nvox;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) reduction(+:nmasked) if(nv > 100000)
+#endif
+    for (long i = 0; i < nv; i++) {
+        float m = warped_mask[i];
+        if (!(m >= 0.5f && m <= FLT_MAX)) { idata[i] = min_val; nmasked++; }
+    }
     return nmasked;
 }
 
-/* Deface: register template to input, warp mask to input space, zero masked voxels.
-   input: the image to deface (modified in-place, stays in its own space)
-   tmpl: template image (moving image for registration)
-   mask: mask in template space (non-zero = keep, zero = remove face)
+/* Deface: register input to template, INVERT the transform, warp the
+   template-space mask onto the input's native grid, zero masked voxels.
+   input: the image to deface (modified in-place, stays in its own native space)
+   tmpl: template image — the registration FIXED/base (input is the moving image,
+         the well-posed direction; the transform is then inverted for the mask warp)
+   mask: mask in template space (>=0.5 = keep, <0.5 = remove). The mask, not any
+         command name, determines what is removed (brain mask -> keep brain;
+         face mask -> remove face).
    opts: registration options (cost function, cmass)
    Returns 0 on success, nonzero on error. */
 int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts opts)
 {
     double t_start = al_wtime();
-    const char *label = opts.skullstrip ? "Skullstrip" : "Deface";
+    const char *label = "Deface";
     if (input == NULL || tmpl == NULL || mask == NULL) {
         fprintf(stderr, "%s: NULL input image\n", label);
         return 1;
@@ -3924,43 +3953,47 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
     int match_code;
     const char *cost_name;
     al_resolve_cost(opts.cost, &match_code, &cost_name);
-    fprintf(stderr, " + %s: registering template to input using %s\n", label, cost_name);
+    fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, cost_name);
 
-    /* Register template (moving) to input (fixed) */
+    /* Register the SUBJECT (moving) to the TEMPLATE (fixed) — the well-posed
+     * direction, identical to -allineate. It is robust because the template is
+     * the base: a clean target image with a good autoweight. Registering the
+     * brain-only template ONTO the full-head subject (base = subject) converges
+     * poorly and mislocates the mask, because the subject's neck/shoulders/FOV
+     * dominate the cost. We then INVERT the transform to pull the template-space
+     * mask back onto the subject's native grid (so brain voxels are never
+     * interpolated — the subject stays in its own space). */
     float wpar[12];
-    int ok = al_register(tmpl, input, match_code, opts.cmass, 0, opts.interp, opts.warp, wpar);
+    int ok = al_register(input, tmpl, match_code, opts.cmass,
+                         opts.source_automask, opts.interp, opts.warp, wpar);
     if (ok) {
         fprintf(stderr, "%s: registration failed\n", label);
         return 1;
     }
 
-    /* Warp mask to input space using the same transform with linear interpolation */
-    float *mask_data = nii_to_float(mask);
-    if (!mask_data) {
-        fprintf(stderr, "%s: failed to extract mask data\n", label);
-        return 1;
-    }
-
-    int mnx = mask->nx, mny = mask->ny, mnz = mask->nz;
     int inx = input->nx, iny = input->ny, inz = input->nz;
     int nvox = inx * iny * inz;
 
-    /* Default: linear for mask warping (cubic can ring) */
+    /* gam maps template(base) voxels -> subject(source) voxels; invert to get
+     * subject -> template, the pull-warp that resamples the mask onto the input
+     * grid. nifti_mat44_inverse handles the translation/origin offset. */
+    mat44 gam = GA_setup_affine(12, wpar);
+    mat44 gam_inv = nifti_mat44_inverse(gam);
+
+    /* Default: linear for mask warping (cubic can ring). Reuse the modular BSD
+     * reslicer (shared with -spmcoreg): it resamples the mask onto input's grid
+     * in place (mask->data becomes float on the input lattice). Out-of-FOV -> 0
+     * so anything the mask does not cover is treated as "remove". */
     int mask_interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_LINEAR : opts.final_interp;
     const char *minterp_name = mask_interp == AL_INTERP_NN ? "NN" :
                                mask_interp == AL_INTERP_CUBIC ? "cubic" : "linear";
     fprintf(stderr, " + Warping mask to input space (%s interpolation)\n", minterp_name);
-    float *warped_mask = al_scalar_warpone(12, wpar, al_wfunc_affine,
-                                           mask_data, mnx, mny, mnz,
-                                           inx, iny, inz, mask_interp);
-    free(mask_data);
-    if (warped_mask == NULL) {
+    if (nii_reslice_affine(mask, input, gam_inv, mask_interp, 0.0f)) {
         fprintf(stderr, "%s: failed to warp mask\n", label);
         return 1;
     }
 
-    long nmasked = nii_apply_deface_mask(input, warped_mask);
-    free(warped_mask);
+    long nmasked = nii_apply_deface_mask(input, (const float *)mask->data);
     if (nmasked < 0) return 1;
     long elapsed_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
 #ifdef _OPENMP

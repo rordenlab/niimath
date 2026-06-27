@@ -41,7 +41,6 @@ typedef struct {
     int interp;            /* AL_INTERP_* for fine-pass matching (default: LINEAR) */
     int final_interp;      /* AL_INTERP_* for output reslicing (default: AL_INTERP_DEFAULT) */
     int warp;              /* AL_WARP_* DOF count (default: AL_WARP_AFFINE_GENERAL = 12) */
-    const char *skullstrip; /* brain mask file for -skullstrip mode (NULL = normal registration) */
 } al_opts;
 
 /* Initialize options to defaults */
@@ -53,7 +52,6 @@ static inline al_opts al_opts_default(void) {
     o.interp = AL_INTERP_LINEAR;
     o.final_interp = AL_INTERP_DEFAULT;
     o.warp = AL_WARP_AFFINE_GENERAL;
-    o.skullstrip = NULL;
     return o;
 }
 
@@ -123,13 +121,6 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
             opts->final_interp = AL_INTERP_LINEAR;
         } else if (!strcmp(argv[*ac], "-cubic") || !strcmp(argv[*ac], "-tricubic")) {
             opts->final_interp = AL_INTERP_CUBIC;
-        } else if (!strcmp(argv[*ac], "-skullstrip")) {
-            (*ac)++;
-            if (*ac >= argc) {
-                fprintf(stderr, "%s -skullstrip requires a brain mask filename\n", cmd_name);
-                return 1;
-            }
-            opts->skullstrip = argv[*ac];
         } else if (!strcmp(argv[*ac], "-warp")) {
             (*ac)++;
             if (*ac >= argc) {
@@ -195,11 +186,15 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
 int nii_reslice_affine(nifti_image *source, const nifti_image *base,
                        mat44 gam, int interp, float fillv);
 
-/* Deface/skullstrip: register template to input, warp mask to input space,
-   set voxels where warped mask < 0.5 to the input's minimum value.
-   input: the image to modify (modified in-place, stays in its own space)
-   tmpl: template image (moving image for registration)
-   mask: mask in template space (non-zero = keep)
+/* Deface: register INPUT to TEMPLATE (the well-posed direction, base =
+   template, same as -allineate), INVERT the transform, warp the template-space mask
+   onto the input's native grid, and set voxels where warped mask < 0.5 to the input's
+   minimum value. (Registering template->input instead mislocates the mask.)
+   input: the image to modify (modified in-place, stays in its own native space)
+   tmpl: template image — the registration base/fixed (input is the moving image)
+   mask: mask in template space (>=0.5 = keep, <0.5 = remove). CONSUMED: its data is
+         freed and replaced with the resliced mask on the input grid (regridded to
+         input geometry). Caller still owns the nifti_image and must free it.
    opts: registration options (cost function, cmass)
    final_interp default: linear (to avoid ringing in the mask).
    Returns 0 on success, nonzero on error. */

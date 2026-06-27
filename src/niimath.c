@@ -341,9 +341,8 @@ int show_help( void ) {
 	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                                  -nearest -linear -cubic (shortcuts for -final)\n");
 	printf("                            default cost: Hellinger; use -source_automask with lpc/lpa\n");
-	printf(" -deface <tmpl> <mask> [opts] : deface using affine registration; default Hellinger cost\n");
-	printf("                              opts: same as -allineate [default final: linear]\n");
-	printf(" -skullstrip <tmpl> <mask> [opts] : skull-strip using template registration\n");
+	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; default Hellinger cost)\n");
+	printf("                              the mask determines what is removed: >=0.5 keep, <0.5 remove (brain mask keeps brain, face mask removes face)\n");
 	printf("                              opts: same as -allineate [default final: linear]\n");
 #endif
 #ifdef HAVE_GPL
