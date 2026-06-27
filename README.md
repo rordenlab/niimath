@@ -163,6 +163,7 @@ niimath has a few features not provided by fslmaths:
    - `-final XX` (NN, linear, cubic [default]) or `-nearest` `-linear` `-cubic`
  - `deface <tmpl> <mask> [opts]`: remove voxels using a template-space mask. Registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and zeros voxels where the warped mask < 0.5 (the input itself is never resampled). `mask` is in `tmpl` space: ≥0.5 = keep, <0.5 = remove. The mask determines what is removed — supply a brain mask to skull-strip (keep the brain) or a face mask to deface (remove the face).
    - opts: same as allineate (default final: linear)
+   - **Breaking change:** the former `-skullstrip <tmpl> <mask>` command was removed — it ran the identical operation. Replace `-skullstrip` with `-deface` (supply your brain mask); the result is unchanged.
  - `spmcoreg <ref> [opts]`: SPM rigid-body coregistration of the chain image to `ref` (optional GPL module, see below)
    - opts: `-cost XX` (nmi [default], mi, ecc, ncc, ls) `-sep` `-fwhm` `-dither 0|1` `-coarse sparse|downsample` `-verbose 0|1`
    - default reslices onto the `ref` grid (`-interp trilinear [default]|nearest`, `-fill zero [default]|nan`); `-estimate` instead rewrites only the source sform/qform
