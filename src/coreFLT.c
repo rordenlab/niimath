@@ -6130,6 +6130,13 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
+		else if (!strcmp(argv[ac], "-skullstrip")) {
+			/* Removed alias: -skullstrip ran the identical mask-based removal.
+			 * Give existing scripts a targeted migration message rather than the
+			 * generic "unsupported operation". */
+			printfx("-skullstrip was removed; use -deface with the same template and brain mask (identical operation)\n");
+			goto fail;
+		}
 #endif
 #ifdef HAVE_GPL
 		else if (!strcmp(argv[ac], "-spmcoreg")) {
