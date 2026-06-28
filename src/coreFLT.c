@@ -1911,11 +1911,36 @@ staticx int nifti_ing(nifti_image *nim, double M) {
 	return 0;
 } // nifti_ing()
 
-staticx int compare(const void *a, const void *b) {
-	flt fa = *(const flt *)a;
-	flt fb = *(const flt *)b;
-	return (fa > fb) - (fa < fb);
-} // compare()
+// Comparator-free selection/sort. The C qsort() takes a function-pointer
+// comparator called once per comparison; under WASM that is a call_indirect per
+// comparison — a severe penalty, and these run per-voxel (median/percentile
+// filters, temporal reductions). select_kth_flt returns the k-th smallest in O(n)
+// (3-way quickselect, stays O(n) with many equal voxels); isort_flt is an
+// insertion sort for small arrays that need full order (e.g. modal dilation).
+// Both give the same values as qsort (value sort), so output is byte-identical.
+staticx flt select_kth_flt(flt *a, int n, int k) {
+	if (n < 1) return 0;
+	if (k < 0) k = 0; else if (k >= n) k = n - 1;
+	int lo = 0, hi = n - 1;
+	while (lo < hi) {
+		flt pivot = a[lo + ((hi - lo) >> 1)];
+		int lt = lo, gt = hi, i = lo;
+		while (i <= gt) {
+			if (a[i] < pivot) { flt t = a[lt]; a[lt++] = a[i]; a[i++] = t; }
+			else if (a[i] > pivot) { flt t = a[gt]; a[gt--] = a[i]; a[i] = t; }
+			else i++;
+		}
+		if (k < lt) hi = lt - 1; else if (k > gt) lo = gt + 1; else break;
+	}
+	return a[k];
+}
+staticx void isort_flt(flt *a, int n) {
+	for (int i = 1; i < n; i++) {
+		flt v = a[i]; int j = i - 1;
+		while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+		a[j + 1] = v;
+	}
+}
 
 staticx void dtrend(flt *xx, int npt, int pt0) {
 	// linear detrend, first point is set to zero
@@ -2446,8 +2471,7 @@ staticx int nifti_dim_reduce(nifti_image *nim, enum eDimReduceOp op, int dim, in
 					o32[i] = r;
 				}
 			} else { // Tperc or Tmedian
-				qsort(vxls, nReduce, sizeof(flt), compare);
-				o32[i] = vxls[itm];
+				o32[i] = select_kth_flt(vxls, nReduce, itm); // was qsort+index
 			}
 			_mm_free(vxls);
 		} // for i: each voxel
@@ -2956,9 +2980,8 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					} // for k
 					if (nOK < 1)
 						continue;
-					qsort(vxls, nOK, sizeof(flt), compare);
 					int itm = (nOK * 0.5);
-					f32[i] = vxls[itm];
+					f32[i] = select_kth_flt(vxls, nOK, itm); // median, was qsort+index
 				} // for x
 			} // for y
 		} // for z
@@ -2992,7 +3015,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 					} // for k
 					if (nOK < 1)
 						continue;
-					qsort(vxls, nOK, sizeof(flt), compare);
+					isort_flt(vxls, nOK); // modal dilation needs full order (small kernel); was qsort
 					float value = vxls[nOK - 1];
 					float mode = value;
 					int count = 1;
@@ -4165,6 +4188,33 @@ struct sortIdx {
 	int idx;
 };
 
+// Comparator-free heapsort of sortIdx by .val (ascending), O(n log n) in place.
+// Avoids qsort()'s per-comparison call_indirect (a WASM penalty); used for -rank/
+// -ranknorm (per-voxel over time) and -roc. Same sorted values as qsort; equal
+// .val order is unspecified (as with qsort), which does not change -roc output
+// (it reports at value-change boundaries) and only reorders tied ranks.
+staticx void heapsort_sortIdx(struct sortIdx *a, int n) {
+	for (int s = n / 2 - 1; s >= 0; s--) {
+		int r = s;
+		for (;;) {
+			int c = 2 * r + 1; if (c >= n) break;
+			if (c + 1 < n && a[c + 1].val > a[c].val) c++;
+			if (a[r].val >= a[c].val) break;
+			struct sortIdx t = a[r]; a[r] = a[c]; a[c] = t; r = c;
+		}
+	}
+	for (int e = n - 1; e > 0; e--) {
+		struct sortIdx t = a[0]; a[0] = a[e]; a[e] = t;
+		int r = 0;
+		for (;;) {
+			int c = 2 * r + 1; if (c >= e) break;
+			if (c + 1 < e && a[c + 1].val > a[c].val) c++;
+			if (a[r].val >= a[c].val) break;
+			struct sortIdx tt = a[r]; a[r] = a[c]; a[c] = tt; r = c;
+		}
+	}
+}
+
 staticx int nifti_fillh(nifti_image *nim, int is26) {
 	if (nim->nvox < 1)
 		return 1;
@@ -4536,7 +4586,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 					}
 				}
 				if (varies) {
-					qsort(k, nvol, sizeof(struct sortIdx), compare);
+					heapsort_sortIdx(k, nvol); // was qsort+comparator (WASM call_indirect)
 					for (int v = 0; v < nvol; v++)
 						f32[k[v].idx] = v + 1;
 				} else {
@@ -4577,7 +4627,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 					sumSqr += sqr(k[v].val - mean);
 				double stdev = sqrt(sumSqr / (nvol - 1));
 
-				qsort(k, nvol, sizeof(struct sortIdx), compare);
+				heapsort_sortIdx(k, nvol); // was qsort+comparator (WASM call_indirect)
 				// strange formula, but replicates fslmaths, consider nvol=3 rank[2,0,1] will be pval [2.5/3, 1.5/3, 0.5/3]
 				for (int v = 0; v < nvol; v++)
 					f32[k[v].idx] = (stdev * -qginv((double)(v + 0.5) / (double)nvol)) + mean;
@@ -4847,7 +4897,7 @@ staticx int nifti_roc(nifti_image *nim, double fpThresh, const char *foutfile, c
 				}
 				i++;
 			}
-	qsort(k, nTest, sizeof(struct sortIdx), compare);
+	heapsort_sortIdx(k, nTest); // was qsort+comparator (WASM call_indirect)
 	// for (int v = 0; v < nvol; v++ )
 	//	f32[ k[v].idx ] = v + 1;
 	// printf("%d tests, intensity range %g..%g\n", nTest, k[0].val, k[nTest-1].val);
@@ -4887,7 +4937,7 @@ staticx int nifti_roc(nifti_image *nim, double fpThresh, const char *foutfile, c
 					}
 		} // for each volume
 		nifti_image_free(nimNoise);
-		qsort(mxVox, nvol, sizeof(flt), compare);
+		isort_flt(mxVox, nvol); // small (#volumes); was qsort+comparator
 		int idx = nTest - 1;
 		flt mxNoise = mxVox[nvol - 1];
 		while ((idx >= 1) && (k[idx].val > mxNoise)) {
