@@ -26,9 +26,33 @@
 #define DEFAULT_PBOT  70.0f  /* bottom percentile */
 #define DEFAULT_PTOP  80.0f  /* top percentile */
 
-static int cmp_float(const void *a, const void *b) {
-	float fa = *(const float *)a, fb = *(const float *)b;
-	return (fa > fb) - (fa < fb);
+// Comparator-free selection/sort, replacing qsort()+cmp_float. qsort's comparator
+// is a per-comparison indirect call — a severe WASM penalty, and one site here ran
+// per output voxel. uf_select: k-th smallest in O(n) (3-way quickselect) for the
+// one image-sized percentile; uf_isort: insertion sort for the small per-voxel
+// neighborhood (a trimmed mean over a sorted range). Same values as qsort.
+static float uf_select(float *a, int n, int k) {
+	if (n < 1) return 0.0f;
+	if (k < 0) k = 0; else if (k >= n) k = n - 1;
+	int lo = 0, hi = n - 1;
+	while (lo < hi) {
+		float pivot = a[lo + ((hi - lo) >> 1)];
+		int lt = lo, gt = hi, i = lo;
+		while (i <= gt) {
+			if (a[i] < pivot) { float t = a[lt]; a[lt++] = a[i]; a[i++] = t; }
+			else if (a[i] > pivot) { float t = a[gt]; a[gt--] = a[i]; a[i] = t; }
+			else i++;
+		}
+		if (k < lt) hi = lt - 1; else if (k > gt) lo = gt + 1; else break;
+	}
+	return a[k];
+}
+static void uf_isort(float *a, int n) {
+	for (int i = 1; i < n; i++) {
+		float v = a[i]; int j = i - 1;
+		while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+		a[j + 1] = v;
+	}
 }
 
 /*--- Automask: threshold at fraction of robust maximum ---*/
@@ -43,8 +67,7 @@ static uint8_t *compute_automask(const float *data, int nvox) {
 	if (!vals) { free(mask); return NULL; }
 	for (int i = 0, j = 0; i < nvox; i++)
 		if (data[i] > 0.0f) vals[j++] = data[i];
-	qsort(vals, npos, sizeof(float), cmp_float);
-	float p98 = vals[(int)(0.98f * (npos - 1))];
+	float p98 = uf_select(vals, npos, (int)(0.98f * (npos - 1))); // was qsort+index
 	float thresh = 0.10f * p98;
 	free(vals);
 	for (int i = 0; i < nvox; i++)
@@ -188,7 +211,7 @@ static float *local_percmean(const float *data, const uint8_t *mask,
 				}
 				float val = 0.0f;
 				if (ncount >= 2) {
-					qsort(nbar, ncount, sizeof(float), cmp_float);
+					uf_isort(nbar, ncount); // small neighborhood; was qsort+comparator
 					int q1 = (int)(0.01f * pbot * (ncount - 1));
 					int q2 = (int)(0.01f * ptop * (ncount - 1));
 					if (q2 > ncount - 1) q2 = ncount - 1;

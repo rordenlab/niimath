@@ -59,9 +59,9 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         endif()
     endif()
 
-    # Optional GPL spm_coreg module (-spmcoreg/-spm_deface). OFF so default builds stay
+    # Optional GPL spm_coreg module (-spm_coreg/-spm_deface). OFF so default builds stay
     # BSD-2; ON produces a GPL-2 combined-work binary. Sources from the niimath_gpl submodule.
-    option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spmcoreg/-spm_deface); GPL-2 binary" OFF)
+    option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
     if(ENABLE_GPL)
         if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/GPL/spm_coreg.c")
             message(FATAL_ERROR "ENABLE_GPL set but src/GPL is empty — run: git submodule update --init")

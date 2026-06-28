@@ -3,14 +3,14 @@ name: GPL build & smoke
 # Validate the optional GPL spm_coreg module end to end:
 #  - clean-submodule linkage (src/GPL fetched over the public HTTPS submodule URL)
 #  - the BSD / GPL / GPL+AL=0 build matrix (Makefile) and CMake ENABLE_GPL builds
-#  - the -spmcoreg / -spm_deface command contracts (exit codes), incl. -dt double
+#  - the -spm_coreg / -spm_deface command contracts (exit codes), incl. -dt double
 #    rejection and the BSD "requires GPL module" error.
 on:
   push:
     branches: [master]
-    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py']
+    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py', '.github/scripts/reg_quality.py']
   pull_request:
-    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py']
+    paths: ['src/**', '.gitmodules', '.github/workflows/gpl-build.yml', '.github/scripts/make_fixtures.py', '.github/scripts/reg_quality.py']
   workflow_dispatch:
 
 jobs:
@@ -26,13 +26,13 @@ jobs:
       - name: Synthetic fixtures
         run: python3 .github/scripts/make_fixtures.py
 
-      - name: BSD build is BSD and rejects -spmcoreg
+      - name: BSD build is BSD and rejects -spm_coreg
         run: |
           make -C src
           src/niimath 2>&1 | head -1 | grep -q ' BSD ' || { echo 'expected BSD version string'; exit 1; }
           # real input so we reach the op dispatch (a missing file would error earlier)
-          if src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/o.nii.gz >/dev/null 2>err.txt; then
-            echo 'BSD build should reject -spmcoreg'; exit 1; fi
+          if src/niimath /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz /tmp/o.nii.gz >/dev/null 2>err.txt; then
+            echo 'BSD build should reject -spm_coreg'; exit 1; fi
           grep -qi 'requires a build with the optional GPL module' err.txt
 
       - name: GPL build links the submodule and is GPL
@@ -44,10 +44,11 @@ jobs:
       - name: GPL command contracts
         run: |
           set -e
-          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz -estimate /tmp/est.nii.gz   # estimate (header-only)
-          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/res.nii.gz             # reslice (float)
+          src/niimath /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz -estimate /tmp/est.nii.gz   # estimate (header-only)
+          src/niimath /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz /tmp/res.nii.gz             # reslice (float)
+          src/niimath /tmp/src.nii.gz -spmcoreg  /tmp/ref.nii.gz -estimate /tmp/est_alias.nii.gz  # deprecated -spmcoreg alias still accepted
           src/niimath /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/df.nii.gz
-          if src/niimath -dt double /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/d.nii.gz >/dev/null 2>err.txt; then
+          if src/niimath -dt double /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz /tmp/d.nii.gz >/dev/null 2>err.txt; then
             echo '-dt double reslice should be rejected'; exit 1; fi
           grep -qi 'requires -dt float' err.txt
           if src/niimath -dt double /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/dd.nii.gz >/dev/null 2>errd.txt; then
@@ -65,17 +66,40 @@ jobs:
           # thread counts. Smoothing is bit-identical (a map); the histogram
           # reduction reorders float adds but is damped by smoothing — compared
           # within a tight tolerance to stay robust on any runner/core count.
-          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_a.nii.gz
-          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_b.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spm_coreg /tmp/bigref.nii.gz /tmp/par_a.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -spm_coreg /tmp/bigref.nii.gz /tmp/par_b.nii.gz
           src/niimath /tmp/par_a.nii.gz --compare /tmp/par_b.nii.gz   # exact: deterministic at fixed nt
-          OMP_NUM_THREADS=1 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_s1.nii.gz
+          OMP_NUM_THREADS=1 src/niimath /tmp/big.nii.gz -spm_coreg /tmp/bigref.nii.gz /tmp/par_s1.nii.gz
           src/niimath /tmp/par_s1.nii.gz --compare 1e-4 /tmp/par_a.nii.gz   # equivalent across nt
           # The runtime may launch FEWER threads than OMP_NUM_THREADS requests
           # (OMP_THREAD_LIMIT, dynamic teams). The histogram must chunk by the
           # actual team size, not the requested one — otherwise it silently drops
           # the samples for the unlaunched thread IDs. Regression for that bug:
-          OMP_THREAD_LIMIT=2 OMP_NUM_THREADS=8 src/niimath /tmp/big.nii.gz -spmcoreg /tmp/bigref.nii.gz /tmp/par_lim.nii.gz
+          OMP_THREAD_LIMIT=2 OMP_NUM_THREADS=8 src/niimath /tmp/big.nii.gz -spm_coreg /tmp/bigref.nii.gz /tmp/par_lim.nii.gz
           src/niimath /tmp/par_lim.nii.gz --compare 1e-4 /tmp/par_a.nii.gz   # must still match (no dropped samples)
+
+      - name: Allineate registration quality + thread byte-parity
+        run: |
+          set -e
+          # -allineate is byte-reproducible across thread counts (the mfac
+          # thread-local fix), but NOT across builds/-ffast-math codegen (NEWUOA
+          # lands in neighboring equally-valid optima), so the cross-build gate is
+          # QUALITY, not bytes: the warped result must correlate with the target
+          # far above the unregistered baseline. reg_quality.py fails closed on
+          # empty/constant/non-finite output, so a zeroed registration cannot
+          # pass. Reuses the anisotropic big/bigref phantoms.
+          # Cover both fused final-warp interpolation paths (linear and cubic in
+          # al_scalar_warpone) plus the generic path (nearest), at two thread
+          # counts, so a regression in any reslice path or in convergence fails CI.
+          for final in linear cubic nearest; do
+            for nt in 1 4; do
+              OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -final $final /tmp/reg_${final}_$nt.nii.gz
+              python3 .github/scripts/reg_quality.py /tmp/reg_${final}_$nt.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+            done
+            # nt=1 and nt=4 of the SAME build must be byte-identical (regression
+            # guard for the mfac-not-set-per-worker thread-divergence bug).
+            src/niimath /tmp/reg_${final}_1.nii.gz --compare /tmp/reg_${final}_4.nii.gz
+          done
 
       - name: 4D inputs are rejected (fail closed, no corrupt output)
         run: |
@@ -103,8 +127,8 @@ jobs:
           set -e
           rm -f src/*.o src/niimath
           make -C src GPL=1 AL=0
-          src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz -estimate /tmp/est2.nii.gz   # estimate works
-          if src/niimath /tmp/src.nii.gz -spmcoreg /tmp/ref.nii.gz /tmp/r2.nii.gz >/dev/null 2>err2.txt; then
+          src/niimath /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz -estimate /tmp/est2.nii.gz   # estimate works
+          if src/niimath /tmp/src.nii.gz -spm_coreg /tmp/ref.nii.gz /tmp/r2.nii.gz >/dev/null 2>err2.txt; then
             echo 'reslice should be rejected without allineate'; exit 1; fi
           grep -qi 'allineate' err2.txt
           if src/niimath /tmp/src.nii.gz -spm_deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/d2.nii.gz >/dev/null 2>err3.txt; then

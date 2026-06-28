@@ -171,9 +171,9 @@ class ImageProcessor {
     return this._addFileCommand('-spm_deface', [tmpl, mask], opts);
   }
 
-  // SPM rigid-body coregistration (GPL): -spmcoreg <ref> [opts]
+  // SPM rigid-body coregistration (GPL): -spm_coreg <ref> [opts]
   spmcoreg(ref: File, opts: (string | number)[] = []): this {
-    return this._addFileCommand('-spmcoreg', [ref], opts);
+    return this._addFileCommand('-spm_coreg', [ref], opts);
   }
 
   // Affine registration (BSD allineate): -allineate <base> [opts]

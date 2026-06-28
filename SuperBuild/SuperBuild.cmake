@@ -48,7 +48,7 @@ endif()
 
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
 option(BUILD_BMP "Build bitmap (PNG) output support" ON)
-option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spmcoreg/-spm_deface); GPL-2 binary" OFF)
+option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
 
 include(ExternalProject)
 
