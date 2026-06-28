@@ -2278,6 +2278,16 @@ void powell_set_mfac( float mm , float aa )
   else            { mfac = 2.0f ; afac = 3.0f ; }  /* reset */
 }
 
+/* Read this thread's current sampling factors. mfac/afac are PNL_TLOCAL, so a
+   powell_set_mfac() on one thread does NOT configure OpenMP workers; a parallel
+   powell_newuoa() loop must capture the main thread's values with this and
+   re-apply them inside the parallel body (see al_register's candidate loops). */
+void powell_get_mfac( float *mm , float *aa )
+{
+  if( mm ) *mm = mfac ;
+  if( aa ) *aa = afac ;
+}
+
 /*---------------------------------------------------------------------------*/
 /*! Driver for Powell's general purpose minimization newuoa function:
     - ndim   = number of variables in function to be minimized
@@ -2292,13 +2302,17 @@ void powell_set_mfac( float mm , float aa )
     If return is negative, something bad happened.
 ------------------------------------------------------------------------------*/
 
+/* NEWUOA workspace for powell_newuoa(). Hoisted to file scope (was a function
+   static) so powell_newuoa_free_threadlocal() can release it: it is grow-only
+   and the dominant per-thread retained buffer (~64 KB at 12 DOF). */
+static PNL_TLOCAL double *pn_w = NULL ; static PNL_TLOCAL int pn_w_len = 0 ;
+
 int powell_newuoa( int ndim , double *x ,
                    double rstart , double rend ,
                    int maxcall , double (*ufunc)(int,double *) )
 {
    integer n , npt , icode , maxfun ;
    doublereal rhobeg , rhoend ;
-   static PNL_TLOCAL double *w = NULL ; static PNL_TLOCAL int w_len = 0 ;
 
    /* check inputs */
 
@@ -2319,7 +2333,12 @@ int powell_newuoa( int ndim , double *x ,
    rhoend = (doublereal)rend   ;
 
    icode   = (npt+14)*(npt+n) + 3*n*(n+3)/2 + 6666 ;
-   do { if(w_len < (icode)) { free(w); w = (double*)calloc((size_t)(icode),sizeof(double)); w_len = (icode); } } while(0) ;
+   if( pn_w_len < icode ){
+     free(pn_w);
+     pn_w = (double*)calloc((size_t)icode,sizeof(double)) ;
+     if( pn_w == NULL ){ pn_w_len = 0 ; return -7 ; }  /* alloc failed: don't run NEWUOA on NULL */
+     pn_w_len = icode ;
+   }
    icode   = 0 ;
    SET_USERFUN(ufunc) ;
    scalx = 0 ;
@@ -2327,9 +2346,23 @@ int powell_newuoa( int ndim , double *x ,
    /* do the work: best params are put back into x[] */
 
    (void)newuoa_( &n , &npt , (doublereal *)x ,
-                  &rhobeg , &rhoend , &maxfun , w , &icode ) ;
+                  &rhobeg , &rhoend , &maxfun , pn_w , &icode ) ;
 
    return icode ;  /* number of function calls */
+}
+
+/* Release the calling thread's grow-only NEWUOA workspace. Call once per
+   OpenMP thread at registration teardown (see al_register). Frees pn_w (used by
+   powell_newuoa(), the only entry point niimath calls) plus the file-scope
+   constrained-search scratch; the constrained variants' own function-local
+   buffers are never allocated unless those entry points run, so they need no
+   teardown here. Safe to call when nothing was allocated (frees NULL). */
+void powell_newuoa_free_threadlocal( void )
+{
+   free(pn_w);      pn_w = NULL;      pn_w_len = 0;
+   free(sxmin_arr); sxmin_arr = NULL; sxmin_arr_len = 0;
+   free(sxsiz_arr); sxsiz_arr = NULL; sxsiz_arr_len = 0;
+   free(sx_arr);    sx_arr = NULL;    sx_arr_len = 0;
 }
 
 /*---------------------------------------------------------------------------*/

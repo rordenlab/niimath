@@ -76,7 +76,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260623"
+#define kMTHdate "v1.0.20260627"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -346,13 +346,13 @@ int show_help( void ) {
 	printf("                              opts: same as -allineate [default final: linear]\n");
 #endif
 #ifdef HAVE_GPL
-	printf(" -spmcoreg <ref> [opts]   : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
+	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
 	printf("                            opts: -cost XX (nmi,mi,ecc,ncc,ls) -sep 4 2 -fwhm 7 7 -dither 0|1\n");
 	printf("                                  -coarse sparse|downsample -verbose 0|1\n");
 #ifdef HAVE_ALLINEATE
 	printf("                                  -estimate (update sform/qform only) | default reslices onto ref grid\n");
 	printf("                                  -interp trilinear|nearest -fill zero|nan (reslice only; reslice needs -dt float)\n");
-	printf(" -spm_deface <tmpl> <mask> [opts] : deface via SPM coregistration (GPL, rigid 6-DOF; use -deface for 12-DOF affine); opts as -spmcoreg estimate (-cost/-sep/-fwhm/-dither/-coarse/-verbose) + -interp\n");
+	printf(" -spm_deface <tmpl> <mask> [opts] : deface via SPM coregistration (GPL, rigid 6-DOF; use -deface for 12-DOF affine); opts as -spm_coreg estimate (-cost/-sep/-fwhm/-dither/-coarse/-verbose) + -interp\n");
 #else
 	printf("                                  -estimate only (header sform/qform; reslice/-spm_deface need the allineate module)\n");
 #endif

@@ -49,7 +49,7 @@ DTFLAGS= -DHAVE_DTIFIT dtifit.c
 #dtifit's dependencies for the WASM target (which otherwise ships no tensor support);
 #grouped so "DTIFIT=0 make wasm" restores the original tensor-free WASM build
 DT_WASM= $(TFILES) $(DTFLAGS)
-#Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spmcoreg. OFF by
+#Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spm_coreg. OFF by
 #default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
 #provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).
 GPL_SRCS=
@@ -172,11 +172,15 @@ verbose:
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
+# $(AFASTMATH) matches the shipped allineate FP build: without it NEWUOA converges
+# poorly and runs near its iteration cap, which ASan instrumentation amplifies into a
+# pseudo-hang (a 0.2s registration took 30+ min). -ffast-math is orthogonal to ASan's
+# memory checking, so this does not weaken leak/overflow detection.
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(AFASTMATH) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
-# allineate (-deface/-allineate) and the spm_coreg module (-spmcoreg/-spm_deface,
+# allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,
 # GPL-2) — both via $(WASM_AL)/$(GPL_SRCS), empty unless GPL=1. allineate.c/
 # powell_newuoa.c are pre-built (wasm_al_objs) WITH -ffast-math to match the native
 # build: that reassociation is load-bearing for the registration cost reduction —

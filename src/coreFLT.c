@@ -6181,7 +6181,8 @@ int main64(int argc, char *argv[]) {
 		}
 #endif
 #ifdef HAVE_GPL
-		else if (!strcmp(argv[ac], "-spmcoreg")) {
+		/* "-spmcoreg" kept as a silent backward-compat alias for "-spm_coreg" */
+		else if (!strcmp(argv[ac], "-spm_coreg") || !strcmp(argv[ac], "-spmcoreg")) {
 			ok = nii_spmcoreg(nim, fin, &ac, argc, argv, DT_CALC == DT_FLOAT64);
 			if (ok)
 				goto fail;
@@ -6192,7 +6193,7 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 		}
 #else
-		else if (!strcmp(argv[ac], "-spmcoreg") || !strcmp(argv[ac], "-spm_deface")) {
+		else if (!strcmp(argv[ac], "-spm_coreg") || !strcmp(argv[ac], "-spmcoreg") || !strcmp(argv[ac], "-spm_deface")) {
 			printfx("%s requires a build with the optional GPL module (see https://github.com/rordenlab/niimath_gpl)\n", argv[ac]);
 			goto fail;
 		}

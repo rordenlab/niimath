@@ -245,6 +245,8 @@ extern int powell_newuoa_con(int ndim, double *x, double *xbot, double *xtop,
                              int nrand, double rstart, double rend,
                              int maxcall, double (*ufunc)(int, double *));
 extern void powell_set_mfac(float mm, float aa);
+extern void powell_get_mfac(float *mm, float *aa);
+extern void powell_newuoa_free_threadlocal(void);
 
 /*==========================================================================*/
 /*========================== GLOBAL STATE =================================*/
@@ -1112,6 +1114,7 @@ static al_float_pair al_clipate(int n, const float *ar)
 static AL_TLOCAL float *al_xc = NULL, *al_yc = NULL, *al_xyc = NULL;
 static AL_TLOCAL float al_nww = 0.0f;
 static AL_TLOCAL int al_nbin = 0, al_nbp = 0, al_nbm = 0;
+static AL_TLOCAL int al_nbp_cap = 0;
 static double al_hpow = 0.33333333333;
 
 #undef  XYC
@@ -1126,12 +1129,40 @@ static double al_hpow = 0.33333333333;
 #undef  WW
 #define WW(i) ((w==NULL) ? 1.0f : w[i])
 
+static void reset_2Dhist_state(void)
+{
+    al_nbin = al_nbp = al_nbm = 0; al_nww = 0.0f;
+}
+
 static void clear_2Dhist(void)
 {
     if (al_xc)  { free(al_xc);  al_xc = NULL; }
     if (al_yc)  { free(al_yc);  al_yc = NULL; }
     if (al_xyc) { free(al_xyc); al_xyc = NULL; }
-    al_nbin = al_nbp = al_nbm = 0; al_nww = 0.0f;
+    al_nbp_cap = 0;
+    reset_2Dhist_state();
+}
+
+static int ensure_2Dhist_capacity(int nbp)
+{
+    if (nbp <= 0) return 1;
+    if (al_nbp_cap >= nbp && al_xc != NULL && al_yc != NULL && al_xyc != NULL)
+        return 0;
+
+    size_t nb = (size_t)nbp;
+    float *new_xc = (float *)malloc(nb * sizeof(float));
+    float *new_yc = (float *)malloc(nb * sizeof(float));
+    float *new_xyc = (float *)malloc(nb * nb * sizeof(float));
+    if (!new_xc || !new_yc || !new_xyc) {
+        free(new_xc); free(new_yc); free(new_xyc);
+        clear_2Dhist();
+        return 1;
+    }
+
+    free(al_xc); free(al_yc); free(al_xyc);
+    al_xc = new_xc; al_yc = new_yc; al_xyc = new_xyc;
+    al_nbp_cap = nbp;
+    return 0;
 }
 
 /* Build 2D histogram with CLEQWD edge-bin mode (matching AFNI's xyclip path).
@@ -1149,7 +1180,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
 
     if (n <= 9 || x == NULL || y == NULL) return;
 
-    clear_2Dhist();
+    reset_2Dhist_state();
 
     good = (unsigned char *)malloc(n);
     if (!good) return;
@@ -1184,11 +1215,11 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
     al_nbp = al_nbin + 1;
     al_nbm = al_nbin - 1;
 
-    al_xc  = (float *)calloc(al_nbp, sizeof(float));
-    al_yc  = (float *)calloc(al_nbp, sizeof(float));
-    al_xyc = (float *)calloc(al_nbp * al_nbp, sizeof(float));
-    if (!al_xc || !al_yc || !al_xyc) { clear_2Dhist(); free(good); return; }
-    al_nww = 0.0f;
+    if (ensure_2Dhist_capacity(al_nbp)) { free(good); return; }
+    memset(al_xc, 0, (size_t)al_nbp * sizeof(float));
+    memset(al_yc, 0, (size_t)al_nbp * sizeof(float));
+    memset(al_xyc, 0, (size_t)al_nbp * (size_t)al_nbp * sizeof(float));
+    /* al_nww already zeroed by reset_2Dhist_state() at function entry */
 
     /* Determine if CLEQWD clipping is active and data extends beyond clips */
     int xyclip = (xbot < xtop) &&
@@ -1258,43 +1289,6 @@ static void normalize_2Dhist(void)
         for (ii = 0; ii < al_nbp; ii++) { al_xc[ii] *= ni; al_yc[ii] *= ni; }
         for (ii = 0; ii < nbq; ii++) { al_xyc[ii] *= ni; }
     }
-}
-
-/* Pearson correlation (nondestructive) */
-static float al_pearson_corr(int n, float *x, float *y)
-{
-    float xv = 0.0f, yv = 0.0f, xy = 0.0f, vv, ww;
-    float xm = 0.0f, ym = 0.0f;
-    int ii;
-    if (n < 2) return 0.0f;
-    for (ii = 0; ii < n; ii++) { xm += x[ii]; ym += y[ii]; }
-    xm /= n; ym /= n;
-    for (ii = 0; ii < n; ii++) {
-        vv = x[ii] - xm; ww = y[ii] - ym;
-        xv += vv * vv; yv += ww * ww; xy += vv * ww;
-    }
-    if (xv <= 0.0f || yv <= 0.0f) return 0.0f;
-    return xy / sqrtf(xv * yv);
-}
-
-/* Weighted Pearson */
-static float al_pearson_corr_wt(int n, float *x, float *y, float *wt)
-{
-    float xv = 0.0f, yv = 0.0f, xy = 0.0f, vv, ww;
-    float xm = 0.0f, ym = 0.0f, ws = 0.0f;
-    int ii;
-    if (wt == NULL) return al_pearson_corr(n, x, y);
-    for (ii = 0; ii < n; ii++) {
-        xm += wt[ii] * x[ii]; ym += wt[ii] * y[ii]; ws += wt[ii];
-    }
-    if (ws <= 0.0f) return 0.0f;
-    xm /= ws; ym /= ws;
-    for (ii = 0; ii < n; ii++) {
-        vv = x[ii] - xm; ww = y[ii] - ym;
-        xv += wt[ii] * vv * vv; yv += wt[ii] * ww * ww; xy += wt[ii] * vv * ww;
-    }
-    if (xv <= 0.0f || yv <= 0.0f) return 0.0f;
-    return xy / sqrtf(xv * yv);
 }
 
 /* Combined Hellinger, MI, NMI, CRA from built histogram
@@ -1586,7 +1580,7 @@ static inline float al_interp_linear_checked(
     float xx, float yy, float zz,
     float nxh, float nyh, float nzh,
     int anx1, int any1, int anz1,
-    const float *aim, int anx, int nxy_a, int *oob)
+    const float * restrict aim, int anx, int nxy_a, int *oob)
 {
     if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
         zz < -0.499f || zz > nzh) { *oob = 1; return 0.0f; }
@@ -1615,7 +1609,7 @@ static inline float al_interp_cubic_checked(
     float xx, float yy, float zz,
     float nxh, float nyh, float nzh,
     int anx1, int any1, int anz1,
-    const float *aim, int anx, int nxy_a, int *oob)
+    const float * restrict aim, int anx, int nxy_a, int *oob)
 {
     if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
         zz < -0.499f || zz > nzh) { *oob = 1; return 0.0f; }
@@ -1654,9 +1648,9 @@ static inline float al_interp_cubic_checked(
 #undef XINTC_
 }
 
-static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int anz,
+static void GA_warp_interp_fused(mat44 gam, const float * restrict aim, int anx, int any, int anz,
                                   int bnx, int bny, int bnz, int interp_code,
-                                  float *avm)
+                                  float * restrict avm)
 {
     int nxy_b = bnx * bny;
     int nxy_a = anx * any;
@@ -1797,10 +1791,30 @@ static void GA_warp_interp_fused(mat44 gam, float *aim, int anx, int any, int an
     }
 }
 
+static inline void al_clip_values(float * restrict v, int n, float lo, float hi)
+{
+    for (int ii = 0; ii < n; ii++)
+        if (v[ii] < lo) v[ii] = lo;
+        else if (v[ii] > hi) v[ii] = hi;
+}
+
+static void al_clip_to_source_range(float * restrict v, int n,
+                                    const float * restrict src, int nsrc)
+{
+    if (v == NULL || src == NULL || n <= 0 || nsrc <= 0) return;
+    float lo = src[0], hi = src[0];
+    for (int ii = 1; ii < nsrc; ii++) {
+        if (src[ii] < lo) lo = src[ii];
+        if (src[ii] > hi) hi = src[ii];
+    }
+    al_clip_values(v, n, lo, hi);
+}
+
 /*--- Get warped target values at control points (or all points) ---*/
 static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
 {
-    int npar, ii, jj, kk, qq, pp, npp, mm, nx, ny, nxy, npt, nall, nper, clip = 0;
+    (void)nmpar;
+    int npar, ii, jj, kk, qq, pp, npp, mm, nx, ny, nxy, npt, nall, nper;
     float *wpar, v;
     float *imf = NULL, *jmf = NULL, *kmf = NULL;
     float *imw, *jmw, *kmw;
@@ -1846,10 +1860,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
         /* Clip for cubic */
         if (gstup->interp_code == AL_INTERP_CUBIC) {
             npt = gstup->bnx * gstup->bny * gstup->bnz;
-            float bb = gstup->ajbot, tt = gstup->ajtop;
-            for (pp = 0; pp < npt; pp++)
-                if (avm[pp] < bb) avm[pp] = bb;
-                else if (avm[pp] > tt) avm[pp] = tt;
+            al_clip_values(avm, npt, gstup->ajbot, gstup->ajtop);
         }
         return;
     }
@@ -1921,10 +1932,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
 
     /* Clip interpolated values to original source data range (not CLEQWD range) */
     if (gstup->interp_code == AL_INTERP_CUBIC) {
-        float bb = gstup->ajmin, tt = gstup->ajmax;
-        for (pp = 0; pp < npt; pp++)
-            if (avm[pp] < bb) avm[pp] = bb;
-            else if (avm[pp] > tt) avm[pp] = tt;
+        al_clip_values(avm, npt, gstup->ajmin, gstup->ajmax);
     }
 }
 
@@ -1948,6 +1956,7 @@ static void al_ensure_blokset(GA_setup *stup)
 /* Returns signed local correlation (always signed; LPA applies 1-|val| externally) */
 static float GA_pearson_local(int npt, float *avm, float *bvm, float *wvm)
 {
+    (void)npt;
     GA_BLOK_set *gbs;
     int nblok, nelm, *elm, dd, ii, jj;
     float xv, yv, xy, xm, ym, vv, ww, ws, wss, pcor, wt, psum = 0.0f, pabs;
@@ -2077,7 +2086,9 @@ static float GA_get_warped_overlap_fraction(void)
 /* Weighted global Pearson correlation: returns negative correlation (for minimization).
    Two-pass algorithm: compute means, then variance/covariance.
    Auto-vectorized by the compiler with -ffast-math. */
-static double GA_pearson_global(int npt, float *avm, float *bvm, float *wvm)
+static double GA_pearson_global(int npt, const float * restrict avm,
+                                const float * restrict bvm,
+                                const float * restrict wvm)
 {
     double ws = 0.0, xm = 0.0, ym = 0.0;
     double xv = 0.0, yv = 0.0, xy = 0.0;
@@ -2454,6 +2465,7 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
     if (stup->wfunc_numfree <= 0) return -2;
 
     wpar = (double *)calloc(stup->wfunc_numfree, sizeof(double));
+    if (wpar == NULL) return -3;   /* OOM: fail closed rather than deref NULL */
     for (ii = qq = 0; qq < stup->wfunc_numpar; qq++) {
         if (!stup->wfunc_param[qq].fixed) {
             wpar[ii] = (stup->wfunc_param[qq].val_init - stup->wfunc_param[qq].min)
@@ -2470,6 +2482,7 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
     if (rend >= 0.9 * rstart || rend <= 0.0) rend = 0.0666 * rstart;
 
     nfunc = powell_newuoa(stup->wfunc_numfree, wpar, rstart, rend, nstep, GA_scalar_fitter);
+    if (nfunc < 0) { free(wpar); return nfunc; }  /* optimizer OOM: don't accept unoptimized params */
     stup->vbest = (float)GA_scalar_fitter(stup->wfunc_numfree, wpar);
 
     /* Copy results back */
@@ -2492,7 +2505,7 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
 #define NKEEP (3*PARAM_MAXTRIAL+1)
     double val, vbest, *bpar;
     double *kpar[NKEEP], kval[NKEEP];
-    int ii, qq, ss, nfr, kk, jj, ngrid, ngtot, ngood, twof, maxstep;
+    int ii, qq, nfr, kk, jj, ngrid, ngtot, ngood, twof, maxstep;
     int ival[NKEEP], rval[NKEEP];
     float fval[NKEEP];
 
@@ -2624,13 +2637,18 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
 
     al_ensure_blokset(stup);
 
+    /* mfac/afac are thread-local: the caller's powell_set_mfac() ran on the main
+       thread only, so capture it and re-apply per worker (else workers use the
+       default/stale factors → thread-count-dependent npt). See al_register. */
+    float rs_mfac, rs_afac; powell_get_mfac(&rs_mfac, &rs_afac);
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic)
 #endif
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] >= AL_BIGVAL) continue;
-        powell_newuoa(nfr, kpar[kk], 0.05, 0.001, maxstep, GA_scalar_fitter);
-        kval[kk] = GA_scalar_fitter(nfr, kpar[kk]);
+        powell_set_mfac(rs_mfac, rs_afac);
+        int prc = powell_newuoa(nfr, kpar[kk], 0.05, 0.001, maxstep, GA_scalar_fitter);
+        kval[kk] = (prc < 0) ? AL_BIGVAL : GA_scalar_fitter(nfr, kpar[kk]);  /* OOM -> not selectable */
     }
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] < vbest) { vbest = kval[kk]; jj = kk; }
@@ -2706,12 +2724,19 @@ static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
 
     nper = NPER;
 
-    /* Send parameters to warp function */
-    wfunc(npar, wpar, 0, NULL, NULL, NULL, NULL, NULL, NULL);
-
     nx = nnx; ny = nny; nz = nnz; nxy = nx * ny; npt = nxy * nz;
     war = (float *)calloc(npt, sizeof(float));
     if (!war) return NULL;
+
+    if (wfunc == al_wfunc_affine &&
+        (icode == AL_INTERP_LINEAR || icode == AL_INTERP_CUBIC)) {
+        mat44 gam = GA_setup_affine(npar, wpar);
+        GA_warp_interp_fused(gam, imtarg, tnx, tny, tnz,
+                              nnx, nny, nnz, icode, war);
+        if (icode == AL_INTERP_CUBIC)
+            al_clip_to_source_range(war, npt, imtarg, tnx * tny * tnz);
+        return war;
+    }
 
     nall = (nper < npt) ? nper : npt;
     imf = (float *)calloc(nall, sizeof(float));
@@ -2726,6 +2751,8 @@ static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
     }
 
     /* outval is always 0.0f (AL_OUTVAL) */
+    /* Send parameters to warp function for generic chunked warps */
+    wfunc(npar, wpar, 0, NULL, NULL, NULL, NULL, NULL, NULL);
 
     for (pp = 0; pp < npt; pp += nall) {
         npp = nall;
@@ -2744,18 +2771,8 @@ static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
     /* (outval restore removed - AL_OUTVAL is a constant) */
 
     /* Clip to source range */
-    if (icode == AL_INTERP_CUBIC) {
-        int nvox_t = tnx * tny * tnz;
-        float bb = imtarg[0], tt = imtarg[0];
-        for (pp = 1; pp < nvox_t; pp++) {
-            if (imtarg[pp] < bb) bb = imtarg[pp];
-            if (imtarg[pp] > tt) tt = imtarg[pp];
-        }
-        for (pp = 0; pp < npt; pp++) {
-            if (war[pp] < bb) war[pp] = bb;
-            else if (war[pp] > tt) war[pp] = tt;
-        }
-    }
+    if (icode == AL_INTERP_CUBIC)
+        al_clip_to_source_range(war, npt, imtarg, tnx * tny * tnz);
 
     free(kmw); free(jmw); free(imw);
     free(kmf); free(jmf); free(imf);
@@ -2842,6 +2859,7 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
  *   (default)                  al_pct98_robust     — FSL-style robust range
  *   -DAL_AUTOMASK_QUICKSELECT  al_pct98_quickselect — exact percentile (== old) */
 
+#ifdef AL_AUTOMASK_QUICKSELECT
 /* Exact p-th percentile (p in 0..1) via 3-way quickselect on a scratch copy.
  * O(n) average; the 3-way (Dutch-flag) partition stays O(n) even when millions of
  * voxels share a value (image background) — the case that degrades 2-way schemes
@@ -2858,6 +2876,7 @@ static float al_pct98_quickselect(const float *src, int nvox, float p)
     free(a);
     return v;
 }
+#endif
 
 /* FSL-style robust "98th percentile" (port of nifti_robust_range for a float
  * array): 1001-bin histogram with zero handling + the binary-image expansion
@@ -2932,24 +2951,10 @@ static unsigned char *al_automask(float *srcim, int nvox)
 /*============= SECTION 10: BEFAFTER COORDINATE SETUP =====================*/
 /*==========================================================================*/
 
-static void al_setup_befafter(mat44 base_cmat, mat44 base_imat,
-                              mat44 targ_cmat, mat44 targ_imat)
+static void al_setup_befafter(mat44 base_cmat, mat44 targ_imat)
 {
-    /* before = targ_imat * (transform from base_xyz to targ_ijk)
-       after  = base_imat converted to base_ijk from base_xyz
-
-       The affine parameters operate in xyz (DICOM) space.
-       before: base_ijk -> base_xyz (via base_cmat)
-       after:  targ_xyz -> targ_ijk (via targ_imat)
-
-       So the full chain is:
-       base_ijk -> base_xyz [before] -> targ_xyz [affine] -> targ_ijk [after]
-
-       In AFNI's convention:
-       aff_before = base_cmat (base index -> base xyz)
-       aff_after  = targ_imat (targ xyz -> targ index)
-    */
-
+    /* The affine parameters operate in xyz space:
+       base index -> base xyz [before] -> transformed source xyz -> source index [after]. */
     aff_before = base_cmat;
     aff_after  = targ_imat;
     aff_use_before = 1;
@@ -3305,7 +3310,7 @@ static int al_register(nifti_image *source, nifti_image *base,
     memset(params, 0, sizeof(params));
 
     /* Set up befafter matrices */
-    al_setup_befafter(base_cmat, base_imat, targ_cmat, targ_imat);
+    al_setup_befafter(base_cmat, targ_imat);
 
     /* Compute shift ranges (about 1/3 of base FOV in each direction) */
     float xxx = 0.321f * (bnx - 1);
@@ -3470,7 +3475,7 @@ static int al_register(nifti_image *source, nifti_image *base,
         stup.ajmask = NULL;
         stup.ajmask_ranfill = 0;
         stup.ajim_orig = NULL;
-        al_setup_befafter(stup.base_cmat, stup.base_imat, ds_targ_cmat, ds_targ_imat);
+        al_setup_befafter(stup.base_cmat, ds_targ_imat);
         fprintf(stderr, " + Source downsampled 2x for grid search: %dx%dx%d → %dx%dx%d\n",
                 anx, any, anz, ds_anx, ds_any, ds_anz);
     }
@@ -3513,7 +3518,7 @@ static int al_register(nifti_image *source, nifti_image *base,
         stup.ajmask_ranfill = ajmask_ranfill_orig;
         stup.aj_ubot = aj_ubot_orig; stup.aj_usiz = aj_usiz_orig;
         stup.ajim_orig = ajim_orig_backup;
-        al_setup_befafter(stup.base_cmat, stup.base_imat, targ_cmat_orig, targ_imat_orig);
+        al_setup_befafter(stup.base_cmat, targ_imat_orig);
     }
 
     /* Unfreeze temporarily frozen params */
@@ -3579,9 +3584,9 @@ static int al_register(nifti_image *source, nifti_image *base,
 #endif
         for (int ib = 0; ib < tfdone; ib++) {
             powell_set_mfac(mfac_m, mfac_a);
-            powell_newuoa(nfr_ref, cand_wpar[ib], rstart_ref, rend_ref,
+            int prc = powell_newuoa(nfr_ref, cand_wpar[ib], rstart_ref, rend_ref,
                          maxstep_ref, GA_scalar_fitter);
-            tfcost[ib] = (float)GA_scalar_fitter(nfr_ref, cand_wpar[ib]);
+            tfcost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr_ref, cand_wpar[ib]);
         }
 
         /* Unpack results back to tfparm */
@@ -3672,14 +3677,17 @@ static int al_register(nifti_image *source, nifti_image *base,
         }
 
         gstup = &stup;
+        /* re-apply the main thread's thread-local sampling factors per worker */
+        float fc_mfac, fc_afac; powell_get_mfac(&fc_mfac, &fc_afac);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic)
 #endif
         for (int ib = 0; ib < tfdone; ib++) {
             int maxstep = cand_rtb[ib];
             if (maxstep <= 4 * nfr + 5) maxstep = 6666;
-            powell_newuoa(nfr, cand_wpar[ib], rad, 0.01 * rad, maxstep, GA_scalar_fitter);
-            cand_cost[ib] = (float)GA_scalar_fitter(nfr, cand_wpar[ib]);
+            powell_set_mfac(fc_mfac, fc_afac);
+            int prc = powell_newuoa(nfr, cand_wpar[ib], rad, 0.01 * rad, maxstep, GA_scalar_fitter);
+            cand_cost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr, cand_wpar[ib]);
         }
 
         /* Unpack results back to ffparm */
@@ -3705,9 +3713,14 @@ static int al_register(nifti_image *source, nifti_image *base,
     PROFILE_END(fine_cand, "fine candidate refinement");
 
     /* Final optimization: full resolution, user-selected interpolation */
+    int reg_rc = 0;   /* nonzero -> abort via al_cleanup (e.g. optimizer OOM) */
     PROFILE_START(fine_final);
     rad = 0.0333;
     nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
+    if (nfunc < 0) {   /* OOM in the optimizer: fail closed, do not emit an unrefined result */
+        fprintf(stderr, "allineate: final optimization failed (out of memory)\n");
+        reg_rc = 1; goto al_cleanup;
+    }
     fprintf(stderr, " + Fine cost = %f (%d evaluations)\n",
             stup.vbest, nfunc);
     FITTER_PROFILE_DUMP("fine final fitter");
@@ -3731,6 +3744,10 @@ static int al_register(nifti_image *source, nifti_image *base,
         rad = 0.0666;
         powell_set_mfac(4.0f, 4.0f);
         nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
+        if (nfunc < 0) {
+            fprintf(stderr, "allineate: +ZZ refinal failed (out of memory)\n");
+            reg_rc = 1; goto al_cleanup;
+        }
         fprintf(stderr, " + Refinal cost = %f (%d evaluations)\n", stup.vbest, nfunc);
 
         stup.micho_mi  = save_mi;
@@ -3750,6 +3767,7 @@ static int al_register(nifti_image *source, nifti_image *base,
     fprintf(stderr, "\n");
 
     /* --- Cleanup --- */
+al_cleanup:
     /* Restore original source data if noise-filled, before freeing */
     if (stup.ajim_orig) {
         memcpy(ajim, stup.ajim_orig, sizeof(float) * nvox_src);
@@ -3777,11 +3795,13 @@ static int al_register(nifti_image *source, nifti_image *base,
         free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
         free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
         free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
+        powell_newuoa_free_threadlocal();  /* free this thread's NEWUOA workspace */
     }
 
     PROFILE_END(fine, "fine pass total");
-    fprintf(stderr, " + Registration complete\n");
-    return 0;
+    if (reg_rc == 0)
+        fprintf(stderr, " + Registration complete\n");
+    return reg_rc;
 }
 
 /* Adopt base grid geometry into source (dims + sform/qform); source->data must
@@ -3827,7 +3847,7 @@ static int al_dims_ok(const nifti_image *n, const char *who)
  * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
  * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*
  * (NN/LINEAR/CUBIC); out-of-FOV voxels set to `fillv` (0 or NaN). Returns 0 on
- * success. The interpolation is the same BSD code -allineate uses; -spmcoreg
+ * success. The interpolation is the same BSD code -allineate uses; -spm_coreg
  * reuses it so the GPL module only computes the transform, never resamples. */
 int nii_reslice_affine(nifti_image *source, const nifti_image *base,
                        mat44 gam, int interp, float fillv)
@@ -4065,7 +4085,7 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
     mat44 gam_inv = nifti_mat44_inverse(gam);
 
     /* Default: linear for mask warping (cubic can ring). Reuse the modular BSD
-     * reslicer (shared with -spmcoreg): it resamples the mask onto input's grid
+     * reslicer (shared with -spm_coreg): it resamples the mask onto input's grid
      * in place (mask->data becomes float on the input lattice). Out-of-FOV -> 0
      * so anything the mask does not cover is treated as "remove". */
     int mask_interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_LINEAR : opts.final_interp;

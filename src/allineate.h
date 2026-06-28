@@ -182,7 +182,7 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts);
  * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
  * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*;
  * out-of-FOV voxels set to `fillv` (0 or NaN). Returns 0 on success. Shared BSD
- * interpolation (used by -allineate output and the GPL -spmcoreg reslice). */
+ * interpolation (used by -allineate output and the GPL -spm_coreg reslice). */
 int nii_reslice_affine(nifti_image *source, const nifti_image *base,
                        mat44 gam, int interp, float fillv);
 
