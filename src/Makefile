@@ -172,12 +172,13 @@ verbose:
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
-# $(AFASTMATH) matches the shipped allineate FP build: without it NEWUOA converges
-# poorly and runs near its iteration cap, which ASan instrumentation amplifies into a
-# pseudo-hang (a 0.2s registration took 30+ min). -ffast-math is orthogonal to ASan's
-# memory checking, so this does not weaken leak/overflow detection.
+# macOS note: ASan here is very slow on real-size images (allineate's scattered 3D
+# interpolation thrashes ASan shadow memory — >100x, not specific to these flags;
+# OMP=0 and MallocNanoZone=0 do not help). For memory validation use a small image
+# (the 64^3 CI fixture runs clean in <1s) plus `leaks`; full-size ASan is impractical.
+# Run with: MallocNanoZone=0 ASAN_OPTIONS=detect_leaks=1 make sanitize
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(AFASTMATH) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,
