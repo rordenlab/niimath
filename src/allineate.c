@@ -315,6 +315,31 @@ static void qsort_floatint(int n, float *a, int *b)
     free(fi);
 }
 
+/* In-place selection of the k-th smallest element (0-based) via 3-way quickselect.
+ * O(n) average; the 3-way (Dutch-flag) partition stays O(n) even when many values
+ * are equal (image background). Reorders `a`. Returns a[k]. This replaces the
+ * libc qsort+comparator the percentile helpers used to call — a comparator is a
+ * per-comparison indirect call (call_indirect), a severe penalty under WASM. */
+static float al_select_rank(float *a, int n, int k)
+{
+    if (n < 1) return 0.0f;
+    if (k < 0) k = 0; else if (k >= n) k = n - 1;
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = a[lo + ((hi - lo) >> 1)];
+        int lt = lo, gt = hi, i = lo;
+        while (i <= gt) {
+            if (a[i] < pivot)      { float t = a[lt]; a[lt++] = a[i]; a[i++] = t; }
+            else if (a[i] > pivot) { float t = a[gt]; a[gt--] = a[i]; a[i]   = t; }
+            else i++;
+        }
+        if (k < lt) hi = lt - 1;
+        else if (k > gt) lo = gt + 1;
+        else break;   /* k in the ==pivot band -> a[k] == pivot */
+    }
+    return a[k];
+}
+
 /* Column norm of mat44 */
 static float mat44_colnorm(mat44 m, int col)
 {
@@ -1029,15 +1054,8 @@ static float al_cliplevel(int n, const float *ar, float mfrac)
     return (float)ncut / sfac;
 }
 
-/* Float comparison for qsort */
-static int al_float_cmp(const void *a, const void *b)
-{
-    float fa = *(const float *)a, fb = *(const float *)b;
-    return (fa > fb) - (fa < fb);
-}
-
 /* Compute the p-th quantile (0 <= p <= 1) of an array.
-   Uses qsort. Allocates a temporary copy. */
+   O(n) selection (al_select_rank); allocates a temporary copy. */
 static float al_quantile(int n, const float *ar, float p)
 {
     if (n <= 0 || ar == NULL) return 0.0f;
@@ -1051,9 +1069,8 @@ static float al_quantile(int n, const float *ar, float p)
         if (ar[ii] < WAY_BIG) tmp[nn++] = ar[ii];
     if (nn == 0) { free(tmp); return 0.0f; }
 
-    qsort(tmp, nn, sizeof(float), al_float_cmp);
     int idx = (int)(p * (nn - 1));
-    float val = tmp[idx];
+    float val = al_select_rank(tmp, nn, idx);   /* O(n) select, no qsort comparator */
     free(tmp);
     return val;
 }
@@ -2787,9 +2804,7 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
             if (tmp) {
                 int tt = 0;
                 for (ii = 0; ii < nxyz; ii++) if (wf[ii] > 0.0f) tmp[tt++] = wf[ii];
-                /* Partial sort to find median */
-                qsort(tmp, npos, sizeof(float), al_float_cmp);
-                float median = tmp[npos / 2];
+                float median = al_select_rank(tmp, npos, npos / 2);  /* O(n) select */
                 free(tmp);
                 clip = 3.0f * median;
                 for (ii = 0; ii < nxyz; ii++) if (wf[ii] > clip) wf[ii] = clip;
@@ -2818,30 +2833,98 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
     return wf;
 }
 
-/* Compute simple source automask (binary) */
+/* --- Source-intensity percentile for the automask --------------------------
+ * al_automask needs only the ~98th intensity percentile to set a background
+ * threshold. The original sorted ALL voxels via libc qsort just to read one
+ * value — O(n log n) with a heavy indirect comparator that is ~100x slower under
+ * emscripten/musl than native (it effectively hangs the WASM build on large
+ * volumes). Two O(n) replacements, selected at compile time:
+ *   (default)                  al_pct98_robust     — FSL-style robust range
+ *   -DAL_AUTOMASK_QUICKSELECT  al_pct98_quickselect — exact percentile (== old) */
+
+/* Exact p-th percentile (p in 0..1) via 3-way quickselect on a scratch copy.
+ * O(n) average; the 3-way (Dutch-flag) partition stays O(n) even when millions of
+ * voxels share a value (image background) — the case that degrades 2-way schemes
+ * and that a quicksort hits as worst-case. Returns the same value the old
+ * sort-then-index did (sorted[(int)(p*nvox)]). */
+static float al_pct98_quickselect(const float *src, int nvox, float p)
+{
+    if (nvox < 1) return 0.0f;
+    float *a = (float *)malloc(sizeof(float) * nvox);
+    if (!a) return 0.0f;
+    memcpy(a, src, sizeof(float) * nvox);
+    int k = (int)(p * nvox); if (k >= nvox) k = nvox - 1; if (k < 0) k = 0;
+    float v = al_select_rank(a, nvox, k);   /* same value the old sort-then-index gave */
+    free(a);
+    return v;
+}
+
+/* FSL-style robust "98th percentile" (port of nifti_robust_range for a float
+ * array): 1001-bin histogram with zero handling + the binary-image expansion
+ * trick. O(n), no sort/comparator — ideal for (effectively 16-bit) scan data and
+ * immune to the emscripten qsort pathology. Outlier-aware, so generally a better
+ * automask threshold than the raw percentile. ignoreZero=0 to match the original
+ * automask (percentiled all voxels). */
+static float al_pct98_robust(const float *src, int nvox)
+{
+    const int ignoreZero = 0;
+    if (nvox < 1) return 1.0f;
+    float mn = INFINITY, mx = -INFINITY;
+    size_t nZero = 0, nSkip = 0;
+    for (int i = 0; i < nvox; i++) {
+        float v = src[i];
+        if (!(v >= -FLT_MAX && v <= FLT_MAX)) { nSkip++; continue; }  /* NaN/inf */
+        if (v == 0.0f) { nZero++; if (ignoreZero) continue; }
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    if ((nZero > 0) && (mn > 0.0f) && !ignoreZero) mn = 0.0f;
+    if (mn > mx) return 1.0f;        /* everything skipped */
+    if (mn == mx) return mx;
+    size_t excl = ignoreZero ? (nZero + nSkip) : nSkip;
+    size_t n2pct = (size_t)((double)(nvox - excl) * 0.02 + 0.5);
+    if (n2pct < 1 || (size_t)nvox - excl < 100) return mx; /* tiny volume */
+    enum { NB = 1001 };
+    float scl = (NB - 1) / (mx - mn);
+    int hist[NB]; for (int i = 0; i < NB; i++) hist[i] = 0;
+    for (int i = 0; i < nvox; i++) {
+        float v = src[i];
+        if (!(v >= -FLT_MAX && v <= FLT_MAX)) continue;
+        if (ignoreZero && v == 0.0f) continue;
+        int b = (int)((v - mn) * scl + 0.5f);
+        if (b < 0) b = 0; else if (b >= NB) b = NB - 1;
+        hist[b]++;
+    }
+    size_t n = 0; int lo = 0;
+    while (n < n2pct && lo < NB) { n += hist[lo]; lo++; }
+    lo--;
+    n = 0; int hi = NB;
+    while (n < n2pct && hi > 0) { hi--; n += hist[hi]; }
+    if (lo == hi) {  /* majority share one bin: expand to nearest non-empty bins */
+        int ok = -1;
+        while (ok != 0) {
+            if (lo > 0) { lo--; if (hist[lo] > 0) ok = 0; }
+            if (ok != 0 && hi < NB - 1) { hi++; if (hist[hi] > 0) ok = 0; }
+            if (lo == 0 && hi == NB - 1) ok = 0;
+        }
+    }
+    return (float)hi / scl + mn;     /* pct98 */
+}
+
+/* Compute simple source automask (binary): keep voxels above 10% of the ~98th
+ * intensity percentile. See the percentile helpers above for the O(n) methods. */
 static unsigned char *al_automask(float *srcim, int nvox)
 {
-    unsigned char *mask;
-    float *sorted, pct98;
-    int ii, np;
-
-    mask = (unsigned char *)calloc(nvox, sizeof(unsigned char));
+    unsigned char *mask = (unsigned char *)calloc(nvox, sizeof(unsigned char));
     if (!mask) return NULL;
-
-    sorted = (float *)malloc(sizeof(float) * nvox);
-    if (!sorted) { free(mask); return NULL; }
-    memcpy(sorted, srcim, sizeof(float) * nvox);
-    qsort_floatint(nvox, sorted, NULL); /* sort ascending */
-
-    np = (int)(0.98f * nvox);
-    if (np >= nvox) np = nvox - 1;
-    pct98 = sorted[np];
-    free(sorted);
-
+#ifdef AL_AUTOMASK_QUICKSELECT
+    float pct98 = al_pct98_quickselect(srcim, nvox, 0.98f);  /* exact (== old sort) */
+#else
+    float pct98 = al_pct98_robust(srcim, nvox);              /* FSL robust range (default) */
+#endif
     float thresh = 0.10f * pct98;
-    for (ii = 0; ii < nvox; ii++)
+    for (int ii = 0; ii < nvox; ii++)
         mask[ii] = (srcim[ii] > thresh) ? 1 : 0;
-
     return mask;
 }
 
@@ -3162,9 +3245,10 @@ static int al_register(nifti_image *source, nifti_image *base,
             int pp = 0;
             for (ii = 0; ii < nvox_src; ii++)
                 if (smask[ii]) mvals[pp++] = ajim[ii];
-            qsort(mvals, nm, sizeof(float), al_float_cmp);
-            float q07 = mvals[(int)(0.07f * (nm - 1))];
-            float q93 = mvals[(int)(0.93f * (nm - 1))];
+            /* O(n) selects (was a full qsort+comparator over up to ~millions of
+             * masked voxels); two passes for the two percentiles. */
+            float q07 = al_select_rank(mvals, nm, (int)(0.07f * (nm - 1)));
+            float q93 = al_select_rank(mvals, nm, (int)(0.93f * (nm - 1)));
             free(mvals);
             stup.aj_ubot = q07;
             stup.aj_usiz = (q93 - q07) * 0.5f;

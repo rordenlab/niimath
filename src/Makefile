@@ -65,8 +65,13 @@ endif
 #BSD wasm omits it to keep the published @niivue/niimath package minimal — the full
 #toolset (allineate + spm_coreg) ships in the separate GPL @niivue/niimath-gpl build.
 WASM_AL=
+WASM_AL_PREREQ=
 ifeq "$(GPL)" "1"
-    WASM_AL= $(AFLAGS) $(ALSRC)
+    # Link allineate/powell as pre-built objects (wasm_al_objs rule) so they get
+    # -ffast-math like the native build; -DHAVE_ALLINEATE still flows to the other
+    # inline TUs (coreFLT deface dispatch, GPL reslice hook).
+    WASM_AL= $(AFLAGS) al_wasm.o pn_wasm.o
+    WASM_AL_PREREQ= wasm_al_objs
 endif
 
 #Marching Cubes flag: run "MC=1 make" for new MarchingCubes instead of classic oldcubes
@@ -173,13 +178,24 @@ sanitize:
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spmcoreg/-spm_deface,
 # GPL-2) — both via $(WASM_AL)/$(GPL_SRCS), empty unless GPL=1. allineate.c/
-# powell_newuoa.c are compiled inline WITHOUT -ffast-math (single-threaded; emcc
-# simplicity). Every OpenMP construct in those files is #ifdef _OPENMP-guarded and
-# _OPENMP is never set here, so the scalar fallbacks compile.
+# powell_newuoa.c are pre-built (wasm_al_objs) WITH -ffast-math to match the native
+# build: that reassociation is load-bearing for the registration cost reduction —
+# WITHOUT it the optimizer converges to a worse local minimum in WASM (verified:
+# -deface masked 37% vs 60% native; fast-math restores 60%). Scoped to allineate/
+# powell only so the GPL spm_coreg golden match and the BSD-default wasm are untouched.
+# Every OpenMP construct in those files is #ifdef _OPENMP-guarded and _OPENMP is never
+# set here, so the scalar fallbacks compile.
 # STACK_SIZE is raised from emcc's 64 KB default because the GPL cost function keeps a
 # 256x256 joint histogram (double H[65536] = 512 KB) on the stack (cost.c); the default
 # overflows into a RuntimeError. Harmless for non-GPL builds (just reserves more).
-wasm:
+# Pre-build allineate + powell with -ffast-math (matches the native allineate.o/
+# powell_newuoa.o). Load-bearing: the cost-reduction reassociation it enables is what
+# makes the WASM registration converge to the same optimum as native.
+wasm_al_objs:
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c allineate.c -o al_wasm.o
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c powell_newuoa.c -o pn_wasm.o
+
+wasm: $(WASM_AL_PREREQ)
 	emcc -O3 -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o ../js/src/niimath.js
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
