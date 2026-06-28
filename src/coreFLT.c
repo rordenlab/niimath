@@ -2972,8 +2972,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; // wrapped anterior-posterior
-						// if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
-						if (inf32[vx] == NAN)
+						if (!isfinite(inf32[vx])) // skip NaN/inf (was `== NAN`, always false)
 							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
@@ -3008,7 +3007,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 						int dy = y + kernel[k + nkernel + nkernel];
 						if ((dy < 0) || (dy >= nim->ny))
 							continue; // wrapped anterior-posterior
-						if ((inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((inf32[vx] == 0.0) || (!isfinite(inf32[vx]))) // skip zero + NaN/inf (was `== NAN`, always false)
 							continue;
 						vxls[nOK] = inf32[vx];
 						nOK++;
