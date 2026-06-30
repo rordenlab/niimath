@@ -60,16 +60,16 @@ ifeq "$(GPL)" "1"
     # GPL estimate only (returns the rigid transform); reslice/interpolation use BSD code.
     GPL_SRCS= -DHAVE_GPL -IGPL -I. GPL/cost.c GPL/hist2.c GPL/loaduint8.c GPL/matrix.c GPL/powell.c GPL/smooth.c GPL/spm_coreg.c GPL/spmcoreg_niimath.c
 endif
-#WASM allineate inclusion. The GPL build REQUIRES allineate (GPL reslice calls the
-#BSD nii_reslice_affine in allineate.c), so it is bundled whenever GPL=1. The default
-#BSD wasm omits it to keep the published @niivue/niimath package minimal — the full
-#toolset (allineate + spm_coreg) ships in the separate GPL @niivue/niimath-gpl build.
+#WASM allineate inclusion. allineate (-allineate/-deface) is BSD/public-domain
+#(adapted from AFNI 3dAllineate), so it ships in BOTH the default BSD wasm and the
+#GPL wasm. The GPL build additionally REQUIRES it because the GPL reslice calls the
+#BSD nii_reslice_affine in allineate.c. Link allineate/powell as pre-built objects
+#(wasm_al_objs rule) so they get -ffast-math like the native build; -DHAVE_ALLINEATE
+#flows to the other inline TUs (coreFLT deface dispatch, GPL reslice hook). Set
+#AL=0 to omit it (e.g. for a smaller minimal wasm).
 WASM_AL=
 WASM_AL_PREREQ=
-ifeq "$(GPL)" "1"
-    # Link allineate/powell as pre-built objects (wasm_al_objs rule) so they get
-    # -ffast-math like the native build; -DHAVE_ALLINEATE still flows to the other
-    # inline TUs (coreFLT deface dispatch, GPL reslice hook).
+ifneq "$(AL)" "0"
     WASM_AL= $(AFLAGS) al_wasm.o pn_wasm.o
     WASM_AL_PREREQ= wasm_al_objs
 endif
@@ -200,8 +200,14 @@ wasm_al_objs:
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c allineate.c -o al_wasm.o
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c powell_newuoa.c -o pn_wasm.o
 
+# WASM_OUT names the emitted ES6 module (emcc derives the sibling .wasm from it).
+# Default is the BSD ../js/src/niimath.js; the GPL build overrides it to
+# niimath-gpl.js (see the makeWasmGpl npm script) so the two binaries can ship side
+# by side under separate package.json exports.
+WASM_OUT= ../js/src/niimath.js
+
 wasm: $(WASM_AL_PREREQ)
-	emcc -O3 -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o ../js/src/niimath.js
+	emcc -O3 -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 

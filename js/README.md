@@ -25,6 +25,42 @@ await niimath.init();
 const outFile = await niimath.image(selectedFile).dog(2, 3.2).run();
 ```
 
+### Registration & defacing
+
+The default (BSD-2-Clause) build includes the affine registration and defacing operations `-allineate` and `-deface` (adapted from AFNI 3dAllineate, public domain). These take other browser `File` objects as arguments:
+
+```javascript
+import { Niimath } from '@niivue/niimath';
+const niimath = new Niimath();
+await niimath.init();
+
+// affine-register `selectedFile` onto a base volume
+const registered = await niimath.image(selectedFile).allineate(baseFile).run();
+
+// deface using a template + mask pair
+const defaced = await niimath.image(selectedFile).deface(templateFile, maskFile).run();
+```
+
+### GPL build (`-spm_coreg`, `-spm_deface`)
+
+A second, larger WASM module adds the optional **GPL-2** SPM coregistration operations (`-spm_coreg`, `-spm_deface`) on top of everything in the BSD build. It is exposed under a separate subpath export so you explicitly opt into the GPL licensing:
+
+```javascript
+// GPL-2 build — same API as the default import, plus SPM coregistration
+import { Niimath } from '@niivue/niimath/gpl';
+
+const niimath = new Niimath();
+await niimath.init();
+
+// rigid-body coregister `selectedFile` onto a reference volume
+const coregistered = await niimath.image(selectedFile).spmcoreg(referenceFile).run();
+
+// SPM rigid-body defacing with a template + mask pair
+const defaced = await niimath.image(selectedFile).spmDeface(templateFile, maskFile).run();
+```
+
+> **Licensing:** importing from `@niivue/niimath/gpl` pulls in GPL-2 code, so a bundle that includes it becomes a GPL-2 combined work. Use the default `@niivue/niimath` import if your project must remain BSD-2-Clause — it still provides `-allineate`/`-deface`, just not the SPM operations. The GPL WASM binary is built from the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule; a plain clone without that submodule still builds the BSD package (the GPL entry point is simply omitted).
+
 ### Example: meshes
 
 The `@niivue/niimath` library also supports the `-mesh` options available in the `niimath` CLI. However, the JavaScript API is slightly different from the volume processing due to the use of the `-mesh` suboptions. 
@@ -125,6 +161,12 @@ To run the tests, run the following command:
 ```bash
 bun run test
 ```
+
+The tests in `tests/` load the built WASM modules from `dist/` directly (via the
+in-memory filesystem, no browser Worker), so run `bun run build` first. The GPL
+tests (`tests/gpl.test.ts`) automatically **skip** when `dist/niimath-gpl.js` was
+not produced (e.g. a clone without the `niimath_gpl` submodule), so the suite still
+passes on a BSD-only build.
 
 ### Development server with Hot Module Reloading
 

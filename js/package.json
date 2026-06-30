@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "1.2.0",
+  "version": "1.3.1",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -10,16 +10,22 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
-    "./niimath.js": "./dist/niimath.js"
+    "./gpl": {
+      "import": "./dist/index-gpl.js",
+      "types": "./dist/index-gpl.d.ts"
+    },
+    "./niimath.js": "./dist/niimath.js",
+    "./niimath-gpl.js": "./dist/niimath-gpl.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "bun test",
     "build": "bun run esbuild.config.ts",
     "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
+    "makeWasmGpl": "git submodule update --init ../src/GPL && make wasm GPL=1 WASM_OUT=../js/src/niimath-gpl.js -C ../src && bun run scripts/pre-build.ts -i src/niimath-gpl.js -o src/niimath-gpl.js",
     "parseHelpText": "bun run scripts/parseNiimathHelp.ts",
     "generateTypes": "bun run scripts/generateTypeDefinitions.ts",
-    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js",
+    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js && (bun run makeWasmGpl || echo 'GPL build skipped (submodule/emcc unavailable) — shipping BSD only')",
     "dev": "bun run build && bun run server.ts",
     "pub": "bun run build && npm publish --access public"
   },
