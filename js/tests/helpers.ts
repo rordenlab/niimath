@@ -99,6 +99,12 @@ export async function run(
     for (const name of staged) {
       try { mod.FS_unlink(name); } catch { /* already gone */ }
     }
+    // niimath runs that exit nonzero (e.g. the intentional-failure tests) make
+    // Emscripten set process.exitCode under Node/Bun. We already captured the exit
+    // code from callMain's return value, so clear this artifact — otherwise the
+    // test process exits nonzero even when every assertion passed. (Bun still
+    // reports real test failures via its own exit code.)
+    if (typeof process !== 'undefined') process.exitCode = 0;
   }
 }
 

@@ -59,7 +59,7 @@ const coregistered = await niimath.image(selectedFile).spmcoreg(referenceFile).r
 const defaced = await niimath.image(selectedFile).spmDeface(templateFile, maskFile).run();
 ```
 
-> **Licensing:** importing from `@niivue/niimath/gpl` pulls in GPL-2 code, so a bundle that includes it becomes a GPL-2 combined work. Use the default `@niivue/niimath` import if your project must remain BSD-2-Clause — it still provides `-allineate`/`-deface`, just not the SPM operations. The GPL WASM binary is built from the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule; a plain clone without that submodule still builds the BSD package (the GPL entry point is simply omitted).
+> **Licensing:** importing from `@niivue/niimath/gpl` pulls in GPL-2 code, so a bundle that includes it becomes a GPL-2 combined work. Use the default `@niivue/niimath` import if your project must remain BSD-2-Clause — it still provides `-allineate`/`-deface`, just not the SPM operations. The GPL WASM binary is built from the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule; a plain clone without that submodule still builds the BSD package (the GPL entry point is simply omitted). The package ships the GPL-2 license text (`LICENSE.GPL-2.0.txt`) and a written offer for the complete corresponding source (`GPL-NOTICE.md`); see `LICENSE` for the dual-license summary (`BSD-2-Clause AND GPL-2.0-only`).
 
 ### Example: meshes
 

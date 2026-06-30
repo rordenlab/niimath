@@ -18,6 +18,7 @@ js/src/types.ts
 # Python packaging artifacts
 niimath.egg-info/
 dist/
+js/corresponding-source/
 build/
 __pycache__/
 *.py[cod]
