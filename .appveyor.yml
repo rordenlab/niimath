@@ -42,7 +42,7 @@ for:
         - job_name: win
 
     build_script:
-      - ps: Invoke-WebRequest -Uri https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.zip -OutFile zstd.zip
+      - ps: Invoke-WebRequest -Uri https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.zip -OutFile zstd.zip
       - ps: Expand-Archive zstd.zip -DestinationPath .
       - cmake -Wno-dev -S zstd-1.5.6\build\cmake -B zstd-build -DCMAKE_INSTALL_PREFIX=%APPVEYOR_BUILD_FOLDER%\zstd-install -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
       - cmake --build zstd-build --config Release --target install
