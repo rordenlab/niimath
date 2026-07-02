@@ -3975,7 +3975,14 @@ staticx int nifti_robustfov(nifti_image *nim, double fovmm) {
 	size_t ns[3] = {1, (size_t)nd[0], (size_t)nd[0] * nd[1]};
 	// checked allocation: peak memory here is input + cropped output, so a near-whole-image
 	// crop can fail. The copy loop fills every output voxel, so no zero-init is needed.
-	flt *out = (flt *)_mm_malloc(nnew3D * nvol * sizeof(flt), 64);
+	// MUST be plain malloc, NOT _mm_malloc: this buffer becomes nim->data and is released
+	// by the NIfTI library's nifti_image_free() with plain free(). On glibc/macOS
+	// _mm_malloc() resolves to posix_memalign(), whose result IS free()-able, so the
+	// mismatch was silent there; on MSVC _mm_malloc() resolves to _aligned_malloc(),
+	// which MUST be paired with _aligned_free()/_mm_free() — plain free() on it corrupts
+	// the heap (STATUS_HEAP_CORRUPTION 0xC0000374 at teardown). A freshly read image's
+	// nim->data is only malloc-aligned anyway, so downstream ops already tolerate it.
+	flt *out = (flt *)malloc(nnew3D * nvol * sizeof(flt));
 	if (!out)
 		return 1; // allocation failed; input image left unchanged
 	for (int v = 0; v < nvol; v++)
