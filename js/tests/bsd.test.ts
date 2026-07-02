@@ -1,6 +1,7 @@
 // BSD build tests: the default @niivue/niimath WASM module. Verifies core math
 // works and that the BSD build now ships allineate (-allineate/-deface), which is
 // public-domain (AFNI 3dAllineate), not GPL.
+import { gzipSync } from 'node:zlib';
 import { describe, test, expect, beforeAll } from 'bun:test';
 import { BSD_MODULE, loadModule, makeNifti, run, voxel, type EmscriptenModule } from './helpers';
 
@@ -19,6 +20,23 @@ describe('BSD build (@niivue/niimath)', () => {
     expect(r.output).not.toBeNull();
     expect(voxel(r.output!, 0)).toBeCloseTo(10, 5);
     expect(voxel(r.output!, 5)).toBeCloseTo(15, 5);
+  });
+
+  test('gzip round-trip: reads .nii.gz input and writes .nii.gz output', async () => {
+    // Guards WASM compressed I/O (-DHAVE_ZLIB + emscripten -s USE_ZLIB=1). A build
+    // that dropped zlib would fail to READ the gzipped input (nonzero exit) or WRITE
+    // a real gzip stream (run() gunzips out.nii.gz, so a plain-bytes file named .gz
+    // fails to inflate and leaves output null). Exercising both directions in one
+    // run mirrors the user's `in.nii.gz -mul 1 out.nii.gz` case.
+    const input = { name: 'in.nii.gz', data: gzipSync(makeNifti(8, (i) => i)) };
+    const r = await run(
+      mod, log, [input],
+      ['in.nii.gz', '-mul', '1', 'out.nii.gz', '-odt', 'float'], 'out.nii.gz',
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.output).not.toBeNull(); // non-null ⇒ out.nii.gz was a valid gzip stream
+    expect(voxel(r.output!, 0)).toBeCloseTo(0, 5);
+    expect(voxel(r.output!, 5)).toBeCloseTo(5, 5);
   });
 
   test('-allineate registers a volume onto a base (BSD, public-domain)', async () => {
