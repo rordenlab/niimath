@@ -189,6 +189,15 @@ if(NOT ${ZLIB_IMPLEMENTATION} STREQUAL "System")
         message(FATAL_ERROR "ZLIB_ROOT needs to be set to locate custom zlib!")
     endif()
 endif()
+# On MSVC, prefer the STATIC zlib (zlibstatic.lib) so niimath.exe is
+# self-contained. Upstream madler zlib (used on Windows — see
+# SuperBuild/External-CLOUDFLARE-ZLIB.cmake) installs BOTH a shared zlib.dll
+# and zlibstatic.lib; without this hint find_package(ZLIB) picks the DLL import
+# lib, leaving niimath.exe with a runtime dependency on zlib.dll that fails with
+# STATUS_DLL_NOT_FOUND (0xC0000135) when spawned outside the build tree.
+if(MSVC)
+    set(ZLIB_USE_STATIC_LIBS ON)
+endif()
 find_package(ZLIB REQUIRED)
 add_definitions(-DHAVE_ZLIB)
 target_include_directories(niimath PRIVATE ${ZLIB_INCLUDE_DIRS})
