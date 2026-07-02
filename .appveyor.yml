@@ -42,8 +42,13 @@ for:
         - job_name: win
 
     build_script:
-      - cmake -Wno-dev -B build
+      - ps: Invoke-WebRequest -Uri https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.zip -OutFile zstd.zip
+      - ps: Expand-Archive zstd.zip -DestinationPath .
+      - cmake -Wno-dev -S zstd-1.5.6\build\cmake -B zstd-build -DCMAKE_INSTALL_PREFIX=%APPVEYOR_BUILD_FOLDER%\zstd-install -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+      - cmake --build zstd-build --config Release --target install
+      - cmake -Wno-dev -B build -DENABLE_ZSTD=ON -DCMAKE_PREFIX_PATH=%APPVEYOR_BUILD_FOLDER%\zstd-install
       - cmake --build build --config %configuration%
+      - python .github\scripts\release_smoke.py .\build\bin\niimath.exe --expect-zstd
 
     after_build:
       - 7z a niimath_win.zip .\build\bin\* >$null
@@ -56,8 +61,11 @@ for:
 
     build_script:
       - export CC=gcc-9 CXX=g++-9
-      - cmake -Wno-dev -B build
+      - sudo apt-get update
+      - sudo apt-get install -y libzstd-dev
+      - cmake -Wno-dev -B build -DENABLE_ZSTD=ON
       - cmake --build build
+      - python3 .github/scripts/release_smoke.py ./build/bin/niimath --expect-zstd
 
     after_build:
       - 7z a niimath_lnx.zip ./build/bin/* &>/dev/null
@@ -91,6 +99,7 @@ for:
       - lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
       - lipo -info build/niimath   # expect: x86_64 arm64
       - otool -L build/niimath | grep -i zstd || echo "zstd statically linked (no dylib dependency)"
+      - python3 .github/scripts/release_smoke.py ./build/niimath --expect-zstd
       - zip -j niimath_macos.zip ./build/niimath &>/dev/null
       - appveyor PushArtifact niimath_macos.zip
 
@@ -101,8 +110,11 @@ for:
 
     build_script:
       - export CC=gcc-9 CXX=g++-9
-      - cmake -Wno-dev -B build
+      - sudo apt-get update
+      - sudo apt-get install -y libzstd-dev
+      - cmake -Wno-dev -B build -DENABLE_ZSTD=ON
       - cmake --build build
+      - python3 .github/scripts/release_smoke.py ./build/bin/niimath --expect-zstd
 
     after_build:
       - export builddir=$APPVEYOR_BUILD_FOLDER/build

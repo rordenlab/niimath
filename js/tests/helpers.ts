@@ -18,8 +18,9 @@ type Factory = (overrides?: Record<string, unknown>) => Promise<EmscriptenModule
 
 export const BSD_MODULE = new URL('../dist/niimath.js', import.meta.url).pathname;
 export const GPL_MODULE = new URL('../dist/niimath-gpl.js', import.meta.url).pathname;
+export const GPL_WASM = new URL('../dist/niimath-gpl.wasm', import.meta.url).pathname;
 
-export const gplBuilt = existsSync(GPL_MODULE);
+export const gplBuilt = existsSync(GPL_MODULE) && existsSync(GPL_WASM);
 
 /** Load an Emscripten module factory and capture its stdout/stderr into `log`. */
 export async function loadModule(modulePath: string): Promise<{ mod: EmscriptenModule; log: string[] }> {

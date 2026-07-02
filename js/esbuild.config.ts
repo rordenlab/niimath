@@ -1,7 +1,10 @@
 import * as esbuild from "esbuild";
 import type { BuildOptions } from "esbuild";
-import { copyFileSync, existsSync } from "fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
+
+rmSync("./dist", { recursive: true, force: true });
+mkdirSync("./dist", { recursive: true });
 
 // Common build options
 const commonOptions: Partial<BuildOptions> = {
@@ -63,9 +66,12 @@ if (hasGpl) {
   );
 }
 
-// Generate TypeScript declarations using tsc with tsconfig
+// Generate TypeScript declarations using tsc with tsconfig. Declaration-only is
+// important: plain `tsc --project` emits JS into dist and overwrites esbuild's
+// browser-ready bundles with extensionless imports (`./core`), which fail under
+// native ESM in browsers.
 try {
-  execSync("bun x tsc --project tsconfig.json", { stdio: "inherit" });
+  execSync("bun x tsc --project tsconfig.json --emitDeclarationOnly", { stdio: "inherit" });
 } catch (error) {
   const err = error as Error;
   console.warn("Warning: Could not generate .d.ts files:", err.message);
@@ -82,6 +88,19 @@ if (hasGpl) {
   copyFileSync("./src/niimath-gpl.js", "./dist/niimath-gpl.js");
   // Assemble the complete corresponding source (GPL-2 requirement into the package.
   execSync("bun run scripts/collect-gpl-source.ts", { stdio: "inherit" });
+} else {
+  const unavailableMessage =
+    "The @niivue/niimath GPL build was not generated. Run `bun run makeWasmGpl` before importing @niivue/niimath/gpl.";
+  rmSync("./dist/niimath-gpl.wasm", { force: true });
+  rmSync("./corresponding-source", { recursive: true, force: true });
+  writeFileSync(
+    "./dist/index-gpl.js",
+    `export { dataTypes } from "./core.js";\nexport class Niimath {\n  constructor() {\n    throw new Error(${JSON.stringify(unavailableMessage)});\n  }\n}\n`,
+  );
+  writeFileSync(
+    "./dist/niimath-gpl.js",
+    `export default function niimathGplUnavailable() {\n  return Promise.reject(new Error(${JSON.stringify(unavailableMessage)}));\n}\n`,
+  );
 }
 
 console.log("Build completed!");

@@ -196,6 +196,18 @@ class ImageProcessor {
     return this._addFileCommand('-allineate', [base], opts);
   }
 
+  // Nearest-neighbour reslice of the current image onto another image's grid:
+  // -reslice_nn <ref>. (e.g. bring a conformed-space mask back to a native grid.)
+  resliceNN(ref: File): this {
+    return this._addFileCommand('-reslice_nn', [ref]);
+  }
+
+  // Multiply the current image by another image: -mul <img>. The generated `mul`
+  // only handles a scalar token; this stages a File operand into MEMFS.
+  mulImage(img: File): this {
+    return this._addFileCommand('-mul', [img]);
+  }
+
   private _generateMethods(): void {
     Object.keys(this.operators).forEach((methodName) => {
       const definition = this.operators[methodName];
@@ -309,9 +321,17 @@ class ImageProcessor {
         }
       };
 
-      const args = [this.file.name, ...this.commands, outName, '-odt', this.outputDataType];
+      // Stage the primary input under a generated internal name (sanitized, extension
+      // preserved) rather than the raw file.name — otherwise a caller's file whose name
+      // matches the fixed output (e.g. re-running on a prior `defaced.nii.gz`) makes
+      // input and output share one MEMFS path (fragile in-place overwrite + cleanup).
+      // The `__nimi_` prefix never starts with '-'/'/' and can't collide with outName
+      // or the `__nimx<n>_` operand names. Mirrors _addFileCommand's staging.
+      const inName = `__nimi_${this.file.name.replace(/[^A-Za-z0-9._-]/g, '_')}`;
+      const inputFile = new File([this.file], inName);
+      const args = [inName, ...this.commands, outName, '-odt', this.outputDataType];
       const message: WorkerPostMessage = {
-        blob: this.file,
+        blob: inputFile,
         cmd: args,
         outName: outName,
         extraFiles: this.extraFiles
@@ -321,7 +341,19 @@ class ImageProcessor {
   }
 }
 
+// File-operand methods are hand-written on the class (not parsed CLI operators),
+// so they are absent from the generated ImageProcessorMethods. Declare them here
+// (NOT in the regenerated types.ts) so consumers get a complete typed API.
+interface FileOperandMethods {
+  deface(tmpl: File, mask: File): this;
+  spmDeface(tmpl: File, mask: File, opts?: (string | number)[]): this;
+  spmcoreg(ref: File, opts?: (string | number)[]): this;
+  allineate(base: File, opts?: (string | number)[]): this;
+  resliceNN(ref: File): this;
+  mulImage(img: File): this;
+}
+
 // Use interface merging to add method types to ImageProcessor
-interface ImageProcessor extends ImageProcessorMethods {}
+interface ImageProcessor extends ImageProcessorMethods, FileOperandMethods {}
 
 export { ImageProcessor };

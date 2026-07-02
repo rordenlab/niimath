@@ -26,11 +26,10 @@
 #define DEFAULT_PBOT  70.0f  /* bottom percentile */
 #define DEFAULT_PTOP  80.0f  /* top percentile */
 
-// Comparator-free selection/sort, replacing qsort()+cmp_float. qsort's comparator
-// is a per-comparison indirect call — a severe WASM penalty, and one site here ran
-// per output voxel. uf_select: k-th smallest in O(n) (3-way quickselect) for the
-// one image-sized percentile; uf_isort: insertion sort for the small per-voxel
-// neighborhood (a trimmed mean over a sorted range). Same values as qsort.
+// Comparator-free selection, replacing qsort()+cmp_float. qsort's comparator is a
+// per-comparison indirect call — a severe WASM penalty. uf_select is used for the
+// image-sized percentile and for per-voxel trimmed means without fully sorting the
+// neighborhood.
 static float uf_select(float *a, int n, int k) {
 	if (n < 1) return 0.0f;
 	if (k < 0) k = 0; else if (k >= n) k = n - 1;
@@ -46,13 +45,6 @@ static float uf_select(float *a, int n, int k) {
 		if (k < lt) hi = lt - 1; else if (k > gt) lo = gt + 1; else break;
 	}
 	return a[k];
-}
-static void uf_isort(float *a, int n) {
-	for (int i = 1; i < n; i++) {
-		float v = a[i]; int j = i - 1;
-		while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
-		a[j + 1] = v;
-	}
 }
 
 /*--- Automask: threshold at fraction of robust maximum ---*/
@@ -211,10 +203,17 @@ static float *local_percmean(const float *data, const uint8_t *mask,
 				}
 				float val = 0.0f;
 				if (ncount >= 2) {
-					uf_isort(nbar, ncount); // small neighborhood; was qsort+comparator
 					int q1 = (int)(0.01f * pbot * (ncount - 1));
 					int q2 = (int)(0.01f * ptop * (ncount - 1));
 					if (q2 > ncount - 1) q2 = ncount - 1;
+					/* Trimmed mean of the [q1,q2] percentile band. Two O(n) quickselects
+					   isolate that band into nbar[q1..q2] (select q2 over all, then q1 over
+					   the lower part); we only sum it, so it needn't be sorted. The previous
+					   full insertion sort was O(n^2) per output voxel and the neighborhood is
+					   thousands of voxels wide. (Summing in partition order rather than
+					   sorted order changes the bias-field estimate by at most a float ULP.) */
+					uf_select(nbar, ncount, q2);
+					uf_select(nbar, q2 + 1, q1);
 					for (int qq = q1; qq <= q2; qq++) val += nbar[qq];
 					val /= (q2 - q1 + 1.0f);
 				} else if (ncount == 1) {

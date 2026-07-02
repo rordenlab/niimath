@@ -89,6 +89,8 @@ ExternalProject_Add(src
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
         -DENABLE_ZSTD:BOOL=${ENABLE_ZSTD}
+        -DZSTD_ROOT:PATH=${ZSTD_ROOT}
+        -DCMAKE_PREFIX_PATH:STRING=${CMAKE_PREFIX_PATH}
         -DENABLE_GPL:BOOL=${ENABLE_GPL}
         -DBUILD_BMP:BOOL=${BUILD_BMP}
         # forward static runtime and static linking

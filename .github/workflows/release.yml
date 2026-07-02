@@ -10,12 +10,28 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with: {fetch-depth: 0, submodules: false}
+    - name: Install macOS build deps
+      if: startsWith(matrix.os, 'macos')
+      run: brew install libomp zstd
+    - name: Install Windows zstd
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install zstd:x64-windows-static'
     - uses: pypa/cibuildwheel@2.x
       with: {output-dir: dist}
       env:
         CIBW_ARCHS: auto64
         CIBW_SKIP: pp*  # skip 32bit & PyPy
-        CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=OFF
+        CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON cmake.define.OPENMP_XCODE=ON
+        CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
+        CIBW_BEFORE_ALL_LINUX: >
+          if command -v yum; then yum install -y libzstd-devel;
+          elif command -v dnf; then dnf install -y libzstd-devel;
+          elif command -v microdnf; then microdnf install -y libzstd-devel;
+          elif command -v apt-get; then apt-get update && apt-get install -y libzstd-dev;
+          elif command -v apk; then apk add zstd-dev;
+          else echo "No supported package manager for zstd" >&2; exit 1; fi
+        CIBW_ENVIRONMENT_WINDOWS: CMAKE_PREFIX_PATH='C:/vcpkg/installed/x64-windows-static'
     - uses: actions/upload-artifact@v4
       with:
         name: wheels-${{ matrix.os }}-${{ strategy.job-index }}

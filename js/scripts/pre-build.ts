@@ -31,7 +31,17 @@ fs.readFile(inputFilePath, 'utf8', (err: NodeJS.ErrnoException | null, data: str
     }
 
     // Replace all occurrences of "args=[]" with "args"
-    const modifiedData = data.replace(/args=\[\]/g, 'args');
+    let modifiedData = data.replace(/args=\[\]/g, 'args');
+
+    // Emscripten 6 emits wasmMemory.toResizableBuffer() when memory growth is
+    // enabled. Current Chromium rejects typed-array views backed by resizable
+    // buffers in TextDecoder.decode(), and Emscripten's own UTF-8 helper decodes
+    // HEAPU8 subarrays. Use the classic ArrayBuffer view; updateMemoryViews()
+    // already refreshes views after memory growth when the backing buffer changes.
+    modifiedData = modifiedData.replace(
+        /function getMemoryBuffer\(\)\{try\{var b=wasmMemory\.toResizableBuffer\(\);return b\}catch\{\}return wasmMemory\.buffer\}/g,
+        'function getMemoryBuffer(){return wasmMemory.buffer}'
+    );
 
     fs.writeFile(outputFilePath, modifiedData, 'utf8', (err: NodeJS.ErrnoException | null) => {
         if (err) {

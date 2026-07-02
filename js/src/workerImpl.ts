@@ -49,6 +49,10 @@ interface WorkerSuccessMessage {
   exitCode: number;
 }
 
+function outputCandidates(outName: string): string[] {
+  return outName.endsWith('.gz') ? [outName] : [outName, `${outName}.gz`];
+}
+
 export function setupWorker(ModuleFactory: EmscriptenModuleFactory): void {
   // initialise an instance of the Emscripten Module so that
   // it is ready when the worker receives a message.
@@ -163,8 +167,24 @@ export function setupWorker(ModuleFactory: EmscriptenModuleFactory): void {
             const detail = runLog.join('\n').trim();
             throw new Error(`niimath exited with code ${exitCode}${detail ? `:\n${detail}` : ''}`);
           }
-          // read the output file from the Emscripten filesystem
-          const out_bin = mod.FS_readFile(outName);
+          // Read the output file from the Emscripten filesystem. niimath follows
+          // FSL gzip defaults, so an argv output like "out.nii" can materialize as
+          // "out.nii.gz"; mirror the test helper's lookup instead of failing the
+          // public worker API on a valid run.
+          let actualOutName = outName;
+          let out_bin: Uint8Array | null = null;
+          for (const candidate of outputCandidates(outName)) {
+            try {
+              out_bin = mod.FS_readFile(candidate);
+              actualOutName = candidate;
+              break;
+            } catch {
+              /* try the next output spelling */
+            }
+          }
+          if (!out_bin) {
+            throw new Error(`niimath completed but output "${outName}" was not found`);
+          }
           // binary output file from niimath wasm: nii or mz3. Copy into an exact-
           // length buffer so the Blob is precisely the file's bytes — the FS_readFile
           // view can in principle sit at an offset/short of its backing ArrayBuffer.
@@ -174,7 +194,7 @@ export function setupWorker(ModuleFactory: EmscriptenModuleFactory): void {
           // send a message back to the main thread with the output file, exit code and output file name
           const successMsg: WorkerSuccessMessage = {
             blob: outputFile,
-            outName: outName,
+            outName: actualOutName,
             exitCode: exitCode
           };
           self.postMessage(successMsg);
@@ -196,8 +216,10 @@ export function setupWorker(ModuleFactory: EmscriptenModuleFactory): void {
           for (const name of stagedExtras) {
             try { mod.FS_unlink(name); } catch { /* already gone */ }
           }
-          if (inName !== outName) {
-            try { mod.FS_unlink(outName); } catch { /* never created */ }
+          for (const name of outputCandidates(outName)) {
+            if (inName !== name) {
+              try { mod.FS_unlink(name); } catch { /* never created */ }
+            }
           }
         }
       };

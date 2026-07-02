@@ -6430,12 +6430,12 @@ int main64(int argc, char *argv[]) {
 			}
 		} // binary operations
 		if (ok != 0)
-			return ok;
+			goto fail;  /* fail: frees nim + kernel; every error site sets ok=1 */
 		ac++;
 	}
 	// convert data to output type (-odt)
 	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
-		return 1;
+		goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
 	// if we get here, write the output dataset
 	nifti_save(nim, "", gzMode); // nifti_image_write( nim );
 	// and clean up memory

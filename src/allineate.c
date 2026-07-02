@@ -1811,7 +1811,9 @@ static void al_clip_to_source_range(float * restrict v, int n,
 }
 
 /*--- Get warped target values at control points (or all points) ---*/
-static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
+/* Returns 0 on success (avm fully written), 1 if a buffer allocation failed
+   (avm left untouched — caller must reject the cost, not score stale values). */
+static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
 {
     (void)nmpar;
     int npar, ii, jj, kk, qq, pp, npp, mm, nx, ny, nxy, npt, nall, nper;
@@ -1828,7 +1830,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
         tl_wpar_len = tl_wpar ? npar : 0;  /* only update length on success */
     }
     wpar = tl_wpar;
-    if (!wpar) return;
+    if (!wpar) return 1;
     nper = NPER;
 
     /* Load warping parameters */
@@ -1862,7 +1864,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
             npt = gstup->bnx * gstup->bny * gstup->bnz;
             al_clip_values(avm, npt, gstup->ajbot, gstup->ajtop);
         }
-        return;
+        return 0;
     }
 
     /* Space for control points */
@@ -1886,7 +1888,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
     int alloc_ijk = (mpar == NULL || gstup->im_ar == NULL);
     if (!tl_wbuf || (alloc_ijk && (!imf || !jmf || !kmf))) {
         if (alloc_ijk) { free(imf); free(jmf); free(kmf); }
-        return;
+        return 1;
     }
     imw = tl_wbuf;
     jmw = tl_wbuf + nall;
@@ -1934,6 +1936,7 @@ static void GA_get_warped_values(int nmpar, double *mpar, float *avm)
     if (gstup->interp_code == AL_INTERP_CUBIC) {
         al_clip_values(avm, npt, gstup->ajmin, gstup->ajmax);
     }
+    return 0;
 }
 
 /*--- Ensure blokset is created (avoids lazy-init race in parallel regions) ---*/
@@ -2204,7 +2207,8 @@ static double GA_scalar_fitter(int npar, double *mpar)
 #ifdef AL_PROFILE
     double _t0 = al_wtime();
 #endif
-    GA_get_warped_values(npar, mpar, avm);
+    if (GA_get_warped_values(npar, mpar, avm) != 0)
+        return (double)AL_BIGVAL;  /* buffer OOM: reject, don't score stale avm */
 #ifdef AL_PROFILE
     double _t1 = al_wtime();
 #endif
@@ -2430,6 +2434,11 @@ static void al_scalar_setup(GA_setup *stup)
     stup->bvm = (float *)calloc(nmatch, sizeof(float));
     if (stup->bwght != NULL)
         stup->wvm = (float *)calloc(nmatch, sizeof(float));
+    if (!stup->bvm || (stup->bwght != NULL && !stup->wvm)) {
+        free(stup->bvm); stup->bvm = NULL;
+        free(stup->wvm); stup->wvm = NULL;
+        return;  /* OOM: leave stup->setup = 0 so callers fail closed (checked below) */
+    }
 
     if (stup->im_ar == NULL) {
         memcpy(stup->bvm, bsar, sizeof(float) * nmatch);
@@ -2499,21 +2508,24 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
     return nfunc;
 }
 
-/*--- Random startup search (coarse pass) ---*/
-static void al_scalar_ransetup(GA_setup *stup, int nrand)
+/*--- Random startup search (coarse pass): returns nonzero on allocation failure ---*/
+static int al_scalar_ransetup(GA_setup *stup, int nrand)
 {
 #define NKEEP (3*PARAM_MAXTRIAL+1)
     double val, vbest, *bpar;
-    double *kpar[NKEEP], kval[NKEEP];
+    double *kpar[NKEEP] = {0}, kval[NKEEP];
+    double *all_wpar = NULL, *tvals = NULL, *tpars = NULL;
+    int *all_isrand = NULL, *tisrand = NULL;
     int ii, qq, nfr, kk, jj, ngrid, ngtot, ngood, twof, maxstep;
     int ival[NKEEP], rval[NKEEP];
     float fval[NKEEP];
+    int icod, oom = 0;
 
-    if (stup == NULL || stup->setup != AL_SMAGIC) return;
+    if (stup == NULL || stup->setup != AL_SMAGIC) return 0;
     if (nrand < NKEEP) nrand = NKEEP + 13;
 
     GA_param_setup(stup); gstup = stup;
-    if (stup->wfunc_numfree <= 0) return;
+    if (stup->wfunc_numfree <= 0) return 0;
 
     nfr = stup->wfunc_numfree;
     switch (nfr) {
@@ -2529,11 +2541,13 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     if (nfr < 4) nrand *= 2;
 
     /* Save and set interp to linear for coarse pass */
-    int icod = stup->interp_code;
+    icod = stup->interp_code;
     stup->interp_code = AL_INTERP_LINEAR;
 
-    for (kk = 0; kk < NKEEP; kk++)
+    for (kk = 0; kk < NKEEP; kk++) {
         kpar[kk] = (double *)calloc(nfr, sizeof(double));
+        if (!kpar[kk]) { oom = 1; goto ran_cleanup; }
+    }
 
     /* Evaluate center of parameter space */
     for (qq = 0; qq < nfr; qq++) kpar[0][qq] = 0.5;
@@ -2548,8 +2562,9 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     fprintf(stderr, " + Coarse search: %d grid + %d random trials\n", ngtot, nrand);
 
     /* Pre-generate all starting parameter sets (sequential — uses RNG) */
-    double *all_wpar = (double *)malloc(ntotal * nfr * sizeof(double));
-    int *all_isrand = (int *)malloc(ntotal * sizeof(int));
+    all_wpar = (double *)malloc((size_t)ntotal * nfr * sizeof(double));
+    all_isrand = (int *)malloc((size_t)ntotal * sizeof(int));
+    if (!all_wpar || !all_isrand) { oom = 1; goto ran_cleanup; }
     for (ii = 0; ii < ntotal; ii++) {
         double *wp = all_wpar + ii * nfr;
         if (ii < ngtot) {
@@ -2573,9 +2588,10 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     /* Evaluate all grid+random × reflections in parallel */
     {
         long ntasks = (long)ntotal * twof;
-        double *tvals = (double *)malloc(ntasks * sizeof(double));
-        double *tpars = (double *)malloc(ntasks * nfr * sizeof(double));
-        int *tisrand = (int *)malloc(ntasks * sizeof(int));
+        tvals = (double *)malloc((size_t)ntasks * sizeof(double));
+        tpars = (double *)malloc((size_t)ntasks * nfr * sizeof(double));
+        tisrand = (int *)malloc((size_t)ntasks * sizeof(int));
+        if (!tvals || !tpars || !tisrand) { oom = 1; goto ran_cleanup; }
 
         /* Pre-generate all reflected parameter sets */
         for (long idx = 0; idx < ntasks; idx++) {
@@ -2613,16 +2629,17 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
             }
         }
 
-        free(tisrand); free(tpars); free(tvals);
+        free(tisrand); tisrand = NULL;
+        free(tpars); tpars = NULL;
+        free(tvals); tvals = NULL;
     }
-    free(all_isrand); free(all_wpar);
+    free(all_isrand); all_isrand = NULL;
+    free(all_wpar); all_wpar = NULL;
 
     for (ngood = kk = 0; kk < NKEEP && kval[kk] < AL_BIGVAL; kk++, ngood++) ;
     if (ngood < 1) {
         fprintf(stderr, "allineate: no good starting locations found\n");
-        for (kk = 0; kk < NKEEP; kk++) free(kpar[kk]);
-        stup->interp_code = icod;
-        return;
+        goto ran_cleanup;
     }
 
     /* Make sure all in 0..1 range */
@@ -2708,8 +2725,17 @@ static void al_scalar_ransetup(GA_setup *stup, int nrand)
     }
     stup->wfunc_ntrial = nt;
 
+ran_cleanup:
+    free(tisrand);
+    free(tpars);
+    free(tvals);
+    free(all_isrand);
+    free(all_wpar);
     for (kk = 0; kk < NKEEP; kk++) free(kpar[kk]);
     stup->interp_code = icod;
+    if (oom)
+        fprintf(stderr, "allineate: coarse startup search failed (out of memory)\n");
+    return oom;
 #undef NKEEP
 }
 
@@ -3129,6 +3155,7 @@ static int al_register(nifti_image *source, nifti_image *base,
                        int match_code, int do_cmass, int do_src_automask,
                        int fine_interp_code, int warp_dof, float wpar_out[12])
 {
+    int reg_rc = 0;   /* nonzero -> abort via al_cleanup (setup/optimizer OOM) */
     GA_setup stup;
     GA_param params[12];
     float *bsim, *ajim;
@@ -3481,6 +3508,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     }
 
     al_scalar_setup(&stup);
+    if (stup.setup != AL_SMAGIC) {  /* setup OOM (im_ar/bvm/wvm): fail closed */
+        fprintf(stderr, "allineate: registration setup failed (out of memory)\n");
+        reg_rc = 1; goto al_cleanup;
+    }
 
     /* Permanently fix params beyond warp DOF (fixed=2 survives unfreeze) */
     int nparam_free = warp_dof;
@@ -3503,11 +3534,14 @@ static int al_register(nifti_image *source, nifti_image *base,
     int nrand = 17 + 4 * tbest;
     if (METH_USES_BLOKS(match_code)) nrand += 2 * tbest;
     if (nrand < 31) nrand = 31;
-    al_scalar_ransetup(&stup, nrand);
+    if (al_scalar_ransetup(&stup, nrand) != 0) {
+        reg_rc = 1; goto al_cleanup;
+    }
 
     /* Restore full-resolution source for refinement rounds */
     if (ajim_ds) {
         free(ajim_ds);
+        ajim_ds = NULL;
         if (stup.ajims) { free(stup.ajims); stup.ajims = NULL; }
         stup.ajim = ajim_orig_ptr;
         stup.anx = anx_orig; stup.any = any_orig; stup.anz = anz_orig;
@@ -3554,6 +3588,10 @@ static int al_register(nifti_image *source, nifti_image *base,
         stup.npt_match = (int)(stup.npt_match * 1.5);
 
         al_scalar_setup(&stup);
+        if (stup.setup != AL_SMAGIC) {  /* setup OOM: fail closed */
+            fprintf(stderr, "allineate: refinement setup failed (out of memory)\n");
+            reg_rc = 1; goto al_cleanup;
+        }
         GA_param_setup(&stup);
         gstup = &stup;
 
@@ -3566,9 +3604,14 @@ static int al_register(nifti_image *source, nifti_image *base,
         float mfac_m = 1.0f, mfac_a = 5.0f + 2.0f * rr;
 
         /* Convert candidates to normalized 0-1 parameter arrays */
-        double *cand_wpar[PARAM_MAXTRIAL + 2];
+        double *cand_wpar[PARAM_MAXTRIAL + 2] = {0};
         for (int ib = 0; ib < tfdone; ib++) {
             cand_wpar[ib] = (double *)calloc(nfr_ref, sizeof(double));
+            if (!cand_wpar[ib]) {
+                for (int jb = 0; jb < ib; jb++) free(cand_wpar[jb]);
+                fprintf(stderr, "allineate: refinement candidate setup failed (out of memory)\n");
+                reg_rc = 1; goto al_cleanup;
+            }
             int qi = 0;
             for (jj = 0; jj < stup.wfunc_numpar; jj++) {
                 if (!stup.wfunc_param[jj].fixed) {
@@ -3646,6 +3689,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     stup.npt_match = npt_match_full;
 
     al_scalar_setup(&stup);
+    if (stup.setup != AL_SMAGIC) {  /* setup OOM: fail closed */
+        fprintf(stderr, "allineate: final setup failed (out of memory)\n");
+        reg_rc = 1; goto al_cleanup;
+    }
     powell_set_mfac(0.0f, 0.0f);
 
     /* Refine all candidates at full resolution then pick the best */
@@ -3660,10 +3707,15 @@ static int al_register(nifti_image *source, nifti_image *base,
 
         /* Prepare per-candidate parameter arrays (normalized 0-1 for powell) */
         int nfr = stup.wfunc_numfree;
-        double *cand_wpar[PARAM_MAXTRIAL];
+        double *cand_wpar[PARAM_MAXTRIAL] = {0};
         int cand_rtb[PARAM_MAXTRIAL];
         for (int ib = 0; ib < tfdone; ib++) {
             cand_wpar[ib] = (double *)calloc(nfr, sizeof(double));
+            if (!cand_wpar[ib]) {
+                for (int jb = 0; jb < ib; jb++) free(cand_wpar[jb]);
+                fprintf(stderr, "allineate: fine candidate setup failed (out of memory)\n");
+                reg_rc = 1; goto al_cleanup;
+            }
             cand_rtb[ib] = (ib == tfdone - 1) ? 2 * num_rtb : num_rtb;
             /* Convert from val_init space to normalized 0-1 for powell */
             int qi = 0;
@@ -3713,7 +3765,6 @@ static int al_register(nifti_image *source, nifti_image *base,
     PROFILE_END(fine_cand, "fine candidate refinement");
 
     /* Final optimization: full resolution, user-selected interpolation */
-    int reg_rc = 0;   /* nonzero -> abort via al_cleanup (e.g. optimizer OOM) */
     PROFILE_START(fine_final);
     rad = 0.0333;
     nfunc = al_scalar_optim(&stup, rad, 0.001, 6666);
@@ -3768,6 +3819,23 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     /* --- Cleanup --- */
 al_cleanup:
+    /* If an OOM aborts during the downsampled coarse pass, the normal
+       full-resolution restore block above has not run yet. Restore enough state
+       here so the standard cleanup below frees the right buffers and backup. */
+    if (ajim_ds && stup.ajim == ajim_ds) {
+        free(ajim_ds);
+        ajim_ds = NULL;
+        if (stup.ajims) { free(stup.ajims); stup.ajims = NULL; }
+        stup.ajim = ajim_orig_ptr;
+        stup.anx = anx_orig; stup.any = any_orig; stup.anz = anz_orig;
+        stup.adx = adx_orig; stup.ady = ady_orig; stup.adz = adz_orig;
+        stup.targ_cmat = targ_cmat_orig; stup.targ_imat = targ_imat_orig;
+        stup.targ_di = targ_di_orig; stup.targ_dj = targ_dj_orig; stup.targ_dk = targ_dk_orig;
+        stup.ajmask = ajmask_orig;
+        stup.ajmask_ranfill = ajmask_ranfill_orig;
+        stup.aj_ubot = aj_ubot_orig; stup.aj_usiz = aj_usiz_orig;
+        stup.ajim_orig = ajim_orig_backup;
+    }
     /* Restore original source data if noise-filled, before freeing */
     if (stup.ajim_orig) {
         memcpy(ajim, stup.ajim_orig, sizeof(float) * nvox_src);

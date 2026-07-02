@@ -17,10 +17,10 @@ write_to = "niimath/_dist_ver.py"
 write_to_template = "__version__ = '{version}'\n"
 
 [tool.cibuildwheel]
-# Smoke-test every wheel before it can reach PyPI: the console script subprocesses
-# the bundled binary, so this fails fast if the binary is missing, the wrong
-# architecture, or not executable. Portable across Linux/macOS/Windows shells.
-test-command = "niimath"
+# Smoke-test every wheel before it can reach PyPI. The script synthesizes NIfTI
+# fixtures without third-party dependencies and exercises gzip I/O, the reported
+# -conform/-gz 0/-odt char short-read class, zstd, and packaged feature dispatch.
+test-command = "python {project}/.github/scripts/release_smoke.py --expect-bsd --expect-zstd"
 
 [project]
 name = "niimath"
