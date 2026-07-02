@@ -25,12 +25,14 @@ jobs:
         CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON cmake.define.OPENMP_XCODE=ON
         CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
         CIBW_BEFORE_ALL_LINUX: >
-          if command -v yum; then yum install -y libzstd-devel;
-          elif command -v dnf; then dnf install -y libzstd-devel;
-          elif command -v microdnf; then microdnf install -y libzstd-devel;
-          elif command -v apt-get; then apt-get update && apt-get install -y libzstd-dev;
-          elif command -v apk; then apk add zstd-dev;
-          else echo "No supported package manager for zstd" >&2; exit 1; fi
+          set -eux;
+          if command -v curl; then curl -fsSL -o /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz;
+          else wget -O /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz; fi;
+          tar -xzf /tmp/zstd.tar.gz -C /tmp;
+          make -C /tmp/zstd-1.5.6/lib -j2 libzstd.a;
+          mkdir -p /usr/local/lib /usr/local/include;
+          cp /tmp/zstd-1.5.6/lib/libzstd.a /usr/local/lib/;
+          cp /tmp/zstd-1.5.6/lib/zstd.h /tmp/zstd-1.5.6/lib/zdict.h /tmp/zstd-1.5.6/lib/zstd_errors.h /usr/local/include/
         CIBW_ENVIRONMENT_WINDOWS: CMAKE_PREFIX_PATH='C:/vcpkg/installed/x64-windows-static'
     - uses: actions/upload-artifact@v4
       with:
