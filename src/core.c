@@ -4,6 +4,7 @@
 #include <math.h>
 #include "nifti_io.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "core.h"
@@ -12,17 +13,6 @@
 #ifdef NII2MESH
 	#include "meshify.h"
 	#include "quadric.h"
-#endif
-
-#ifdef EMSCRIPTEN
-	#define _mm_malloc(size, alignment) malloc(size)
-	#define _mm_free(ptr) free(ptr)
-#else
-	#ifdef __aarch64__
-		#include "arm_malloc.h"
-	#else
-		#include <immintrin.h>
-	#endif
 #endif
 
 #if defined(_OPENMP) //compile with 'OMP=1 make -j'
@@ -36,6 +26,41 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846264338327
 #endif
+
+// Zeroed buffer for a NIfTI image's nim->data. Plain calloc — nifti_image_free()
+// and the datatype conversion in this file release nim->data with plain free().
+// This helper exists as the named, greppable home for nim->data allocation; it
+// also documents WHY the whole project uses plain malloc/calloc/free rather than
+// _mm_malloc/_mm_free: those aligned allocators produced the MSVC heap-corruption
+// bug class (aligned buffer freed with plain free() → STATUS_HEAP_CORRUPTION
+// 0xC0000374; the reverse _mm_free on a malloc buffer corrupts equally). The
+// 64-byte alignment was never load-bearing — SSE-only, all unaligned loads
+// (_mm_loadu_*), and a freshly read nim->data is only malloc-aligned — so every
+// scratch _mm_malloc/_mm_free was swept to malloc/free and arm_malloc.h removed.
+// Do NOT reintroduce _mm_malloc. Shared across TUs (conform.c, coreFLT.c).
+static void nii_allocation_failure(const char *what) {
+	fprintf(stderr, "niimath: %s\n", what);
+	exit(EXIT_FAILURE);
+}
+
+int nii_mul_size(size_t a, size_t b, size_t *out) {
+	if (out == NULL)
+		return 1;
+	if (a != 0 && b > SIZE_MAX / a)
+		return 1;
+	*out = a * b;
+	return 0;
+}
+
+void *nii_calloc(size_t count, size_t size) {
+	size_t bytes;
+	if (nii_mul_size(count, size, &bytes) != 0)
+		nii_allocation_failure("allocation size overflow");
+	void *ptr = calloc(count, size);
+	if (ptr == NULL && count != 0 && size != 0)
+		nii_allocation_failure("failed to allocate memory");
+	return ptr;
+}
 
 int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
@@ -834,7 +859,7 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 	if ((sum == 0.0) || (n == 0))
 		return NULL;
 	*nkernel = n;
-	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
+	int *kernel = (int *)malloc((n * 4) * sizeof(int)); //4 values: offset, xpos, ypos, weight
 	//for evenly weighted voxels:
 	//int kernelWeight = (int)((double)INT_MAX/(double)n); //requires <limits.h>
 	double kernelWeight = (double)INT_MAX / sum;
@@ -881,7 +906,7 @@ int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 				n++;
 			}
 	*nkernel = n;
-	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
+	int *kernel = (int *)malloc((n * 4) * sizeof(int)); //4 values: offset, xpos, ypos, weight
 	int kernelWeight = (int)((double)INT_MAX / (double)n);		//requires <limits.h>
 	//second pass: fill surviving voxels
 	int i = 0;
@@ -1106,7 +1131,7 @@ int *make_kernel(nifti_image *nim, int *nkernel, int x, int y, int z) {
 		printfx("Off-center kernel due to even dimensions.\n");
 	int n = x * y * z;
 	*nkernel = n;
-	int *kernel = (int *)_mm_malloc((n * 4) * sizeof(int), 64); //4 values: offset, xpos, ypos, weight
+	int *kernel = (int *)malloc((n * 4) * sizeof(int)); //4 values: offset, xpos, ypos, weight
 	int xlo = (int)(-x / 2);
 	int ylo = (int)(-y / 2);
 	int zlo = (int)(-z / 2);

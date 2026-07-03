@@ -8,27 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef EMSCRIPTEN
-	#define _mm_malloc(size, alignment) malloc(size)
-	#define _mm_free(ptr) free(ptr)
-#else
-	#if defined(_MSC_VER)
-		// MSVC (x86 or ARM64)
-		#include <malloc.h>  // provides _aligned_malloc / _aligned_free
-		#define _mm_malloc(size, alignment) _aligned_malloc(size, alignment)
-		#define _mm_free(ptr) _aligned_free(ptr)
-	#elif defined(__x86_64__) || defined(__SSE__)
-		// GCC/Clang on x86
-		#include <immintrin.h>
-	#elif defined(__aarch64__) || defined(__arm__) || defined(__ARM_NEON)
-		// GCC/Clang on ARM: use custom or fallback
-		#include "arm_malloc.h"
-	#else
-		// fallback
-		#define _mm_malloc(size, alignment) malloc(size)
-		#define _mm_free(ptr) free(ptr)
-	#endif
-#endif
 
 // conform.py functions follow
 // Python->C port of
@@ -258,51 +237,41 @@ int doReslice(nifti_image *nim, const float outPixDims[3], const int outDims[3],
 		printfx("conform only supports FLOAT32 images\n");
 		return EXIT_FAILURE;
 	}
-	int nvoxIn = nim->nx * nim->ny * MAX(nim->nz, 1);
-	// set output header
-	for (int i = 0; i < 4; i++) {
-		for (int j = 0; j < 4; j++) {
-			nim->sto_xyz.m[i][j] = out_affine.m[i][j];
-			nim->qto_xyz.m[i][j] = out_affine.m[i][j];
-		}
+	if (nim->nx < 1 || nim->ny < 1 || nim->nz < 0 ||
+		outDims[0] < 1 || outDims[1] < 1 || outDims[2] < 1) {
+		printfx("conform failed: invalid dimensions\n");
+		return EXIT_FAILURE;
 	}
-	// set output header quaternion
-	nifti_dmat44_to_quatern(nim->sto_xyz,
-							&nim->quatern_b, &nim->quatern_c, &nim->quatern_d,
-							&nim->qoffset_x, &nim->qoffset_y, &nim->qoffset_z,
-							&nim->dx, &nim->dy, &nim->dz, &nim->qfac);
-	int max_code = (nim->qform_code > nim->sform_code) ? nim->qform_code : nim->sform_code;
-	nim->qform_code = max_code;
-	nim->sform_code = max_code;
-	nim->dx = outPixDims[0];
-	nim->dy = outPixDims[1];
-	nim->dz = outPixDims[2];
-	nim->scl_slope = 1.0;
-	nim->scl_inter = 0.0;
-	nim->cal_min = 0.0;
-	nim->cal_max = 0.0;
+	size_t inXY, nvoxInSize, outXYSize, nvoxOutSize, inBytes;
+	if (nii_mul_size((size_t)nim->nx, (size_t)nim->ny, &inXY) ||
+		nii_mul_size(inXY, (size_t)MAX(nim->nz, 1), &nvoxInSize) ||
+		nii_mul_size((size_t)outDims[0], (size_t)outDims[1], &outXYSize) ||
+		nii_mul_size(outXYSize, (size_t)outDims[2], &nvoxOutSize) ||
+		nii_mul_size(nvoxInSize, sizeof(float), &inBytes) ||
+		nvoxInSize > INT_MAX || nvoxOutSize > INT_MAX || outXYSize > INT_MAX) {
+		printfx("conform failed: image dimensions are too large\n");
+		return EXIT_FAILURE;
+	}
+	int nvoxIn = (int)nvoxInSize;
+	int nvoxOut = (int)nvoxOutSize;
 	// reslice data
-	float *in_img = (float *)_mm_malloc(nvoxIn * sizeof(float), 64); // alloc for each volume to allow openmp
+	float *in_img = (float *)malloc(inBytes); // alloc for each volume to allow openmp
+	if (in_img == NULL) {
+		printfx("conform failed to allocate memory\n");
+		return EXIT_FAILURE;
+	}
+	float *out_img = (float *)nii_calloc(nvoxOutSize, sizeof(float)); // plain-calloc nim->data buffer (see core.c)
+	if (out_img == NULL) {
+		free(in_img);
+		printfx("conform failed to allocate memory\n");
+		return EXIT_FAILURE;
+	}
 	float *raw_img = (float *)nim->data;
 	memcpy(in_img, raw_img, nvoxIn * sizeof(float));
 	int dimX = nim->nx;
 	int dimY = nim->ny;
 	int dimZ = nim->nz;
 	int dimXY = dimX * dimY;
-	// set output
-	nim->nx = outDims[0];
-	nim->ny = outDims[1];
-	nim->nz = outDims[2];
-	int nvoxOut = outDims[0] * outDims[1] * outDims[2];
-	nim->nvox = nvoxOut;
-	free(nim->data);												   // Free the memory allocated with calloc
-	float *out_img = (float *)_mm_malloc(nvoxOut * sizeof(float), 64); // output image
-	memset(out_img, 0, nim->nvox * sizeof(float));					   // zero array
-	nim->data = (void *)out_img;
-	if (nim->data == NULL) {
-		printfx("conform failed to allocate memory\n");
-		return EXIT_FAILURE;
-	}
 	// find minimimum of input image, used to fill output voxels outside bounding box
 	float mn = in_img[0];
 	for (int i = 0; i < nvoxIn; i++) {
@@ -377,7 +346,34 @@ int doReslice(nifti_image *nim, const float outPixDims[3], const int outDims[3],
 			}
 		}
 	} // nearest neighbor
-	_mm_free(in_img);
+	// set output header only after all fallible work has succeeded
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			nim->sto_xyz.m[i][j] = out_affine.m[i][j];
+			nim->qto_xyz.m[i][j] = out_affine.m[i][j];
+		}
+	}
+	nifti_dmat44_to_quatern(nim->sto_xyz,
+							&nim->quatern_b, &nim->quatern_c, &nim->quatern_d,
+							&nim->qoffset_x, &nim->qoffset_y, &nim->qoffset_z,
+							&nim->dx, &nim->dy, &nim->dz, &nim->qfac);
+	int max_code = (nim->qform_code > nim->sform_code) ? nim->qform_code : nim->sform_code;
+	nim->qform_code = max_code;
+	nim->sform_code = max_code;
+	nim->dx = outPixDims[0];
+	nim->dy = outPixDims[1];
+	nim->dz = outPixDims[2];
+	nim->scl_slope = 1.0;
+	nim->scl_inter = 0.0;
+	nim->cal_min = 0.0;
+	nim->cal_max = 0.0;
+	nim->nx = outDims[0];
+	nim->ny = outDims[1];
+	nim->nz = outDims[2];
+	nim->nvox = nvoxOutSize;
+	free(nim->data);
+	nim->data = (void *)out_img;
+	free(in_img);
 	return EXIT_SUCCESS;
 }
 
@@ -600,7 +596,7 @@ int toRAS(nifti_image *nim) {
 	// printfx("Starts: [%d %d %d]\n", inStarts[0], inStarts[1], inStarts[2]);
 	int nvox3D = inDims[0] * inDims[1] * inDims[2];
 	int nVol = nim->nvox / nvox3D;
-	float *in_img = (float *)_mm_malloc(nvox3D * sizeof(float), 64);
+	float *in_img = (float *)malloc(nvox3D * sizeof(float));
 	float *ras_img = (float *)nim->data;
 	int mx = -1;
 	int mn = 1;
@@ -626,7 +622,7 @@ int toRAS(nifti_image *nim) {
 		} // for z slice
 		ras_img += nvox3D;
 	} // for v : volume
-	_mm_free(in_img);
+	free(in_img);
 	if ((mn != 0) || (mx != (nvox3D - 1))) {
 		printf("ERROR expected %d..%d not 0..%d\n", mn, mx, nvox3D - 1);
 		return EXIT_FAILURE;

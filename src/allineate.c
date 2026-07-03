@@ -35,6 +35,15 @@ static inline double al_wtime(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 #endif
 }
+
+static int al_mul_size(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL) return 1;
+    if (a != 0 && b > SIZE_MAX / a) return 1;
+    *out = a * b;
+    return 0;
+}
+
 /* Profiling support: compile with -DAL_PROFILE to enable timing output */
 #ifdef AL_PROFILE
 #define PROFILE_START(name) double _prof_##name = al_wtime()
@@ -910,9 +919,16 @@ static GA_BLOK_set *create_GA_BLOK_set(
                         dd = (aa - pb) + (bb - qb) * np + (cc - rb) * npq;
                         /* Add to blok: expand array if needed */
                         if (nelm[dd] == nalm[dd]) {
-                            nalm[dd] = (int)(1.5f * nalm[dd]) + 16;
-                            elm[dd] = (int *)realloc(elm[dd], sizeof(int) * nalm[dd]);
-                            if (elm[dd] == NULL) { nalm[dd] = nelm[dd] = 0; continue; }
+                            int new_nalm = (int)(1.5f * nalm[dd]) + 16;
+                            int *new_elm = (int *)realloc(elm[dd], sizeof(int) * new_nalm);
+                            if (new_elm == NULL) {
+                                free(elm[dd]);
+                                elm[dd] = NULL;
+                                nalm[dd] = nelm[dd] = 0;
+                                continue;
+                            }
+                            elm[dd] = new_elm;
+                            nalm[dd] = new_nalm;
                         }
                         elm[dd][nelm[dd]++] = ss;
                         ntot++; nsaved++;
@@ -938,7 +954,8 @@ static GA_BLOK_set *create_GA_BLOK_set(
         } else {
             /* Clip array to actual size */
             if (nelm[dd] < nalm[dd] && nelm[dd] > 0) {
-                elm[dd] = (int *)realloc(elm[dd], sizeof(int) * nelm[dd]);
+                int *new_elm = (int *)realloc(elm[dd], sizeof(int) * nelm[dd]);
+                if (new_elm != NULL) elm[dd] = new_elm;
             }
             nsav++;
         }
@@ -947,15 +964,28 @@ static GA_BLOK_set *create_GA_BLOK_set(
 
     if (nsav == 0) {
         fprintf(stderr, "allineate: BLOK set has 0 surviving bloks\n");
+        for (dd = 0; dd < nblok; dd++) free(elm[dd]);
         free(nelm); free(elm); return NULL;
     }
 
     /* Build output struct */
     gbs = (GA_BLOK_set *)malloc(sizeof(GA_BLOK_set));
-    if (gbs == NULL) { free(nelm); free(elm); return NULL; }
+    if (gbs == NULL) {
+        for (dd = 0; dd < nblok; dd++) free(elm[dd]);
+        free(nelm); free(elm); return NULL;
+    }
     gbs->num  = nsav;
     gbs->nelm = (int *)  calloc(nsav, sizeof(int));
     gbs->elm  = (int **) calloc(nsav, sizeof(int *));
+    if (gbs->nelm == NULL || gbs->elm == NULL) {
+        for (dd = 0; dd < nblok; dd++) free(elm[dd]);
+        free(gbs->nelm);
+        free(gbs->elm);
+        free(gbs);
+        free(nelm);
+        free(elm);
+        return NULL;
+    }
     for (ntot = nsav = dd = 0; dd < nblok; dd++) {
         if (nelm[dd] > 0 && elm[dd] != NULL) {
             gbs->nelm[nsav] = nelm[dd]; ntot += nelm[dd];
@@ -2638,7 +2668,14 @@ static int al_scalar_ransetup(GA_setup *stup, int nrand)
 
     for (ngood = kk = 0; kk < NKEEP && kval[kk] < AL_BIGVAL; kk++, ngood++) ;
     if (ngood < 1) {
+        // Fail closed: EVERY coarse candidate (including the near-identity center) scored
+        // AL_BIGVAL — from a cost-path OOM or degenerate input (constant/empty base, no
+        // surviving bloks). Returning success here let al_register proceed with only the
+        // identity transform and print "Registration complete" on an unregistered result —
+        // a correctness bug and, for -deface, a privacy failure (identity pulls the mask
+        // onto the wrong grid, leaving faces intact). Signal the caller to abort instead.
         fprintf(stderr, "allineate: no good starting locations found\n");
+        oom = 1;
         goto ran_cleanup;
     }
 
@@ -2734,7 +2771,7 @@ ran_cleanup:
     for (kk = 0; kk < NKEEP; kk++) free(kpar[kk]);
     stup->interp_code = icod;
     if (oom)
-        fprintf(stderr, "allineate: coarse startup search failed (out of memory)\n");
+        fprintf(stderr, "allineate: coarse startup search failed\n"); // OOM or no usable start
     return oom;
 #undef NKEEP
 }
@@ -3190,8 +3227,18 @@ static int al_register(nifti_image *source, nifti_image *base,
     ady = (float)fabs(source->dy); if (ady <= 0.0f) ady = 1.0f;
     adz = (float)fabs(source->dz); if (adz <= 0.0f) adz = 1.0f;
 
-    nvox_base = (int)((size_t)bnx * bny * bnz);
-    nvox_src  = (int)((size_t)anx * any * anz);
+    size_t nvox_base_size, nvox_src_size, tmp_size;
+    if (al_mul_size((size_t)bnx, (size_t)bny, &tmp_size) ||
+        al_mul_size(tmp_size, (size_t)bnz, &nvox_base_size) ||
+        al_mul_size((size_t)anx, (size_t)any, &tmp_size) ||
+        al_mul_size(tmp_size, (size_t)anz, &nvox_src_size) ||
+        nvox_base_size > INT_MAX || nvox_src_size > INT_MAX) {
+        fprintf(stderr, "allineate: image dimensions are too large\n");
+        free(bsim); free(ajim);
+        return 1;
+    }
+    nvox_base = (int)nvox_base_size;
+    nvox_src  = (int)nvox_src_size;
 
     /* --- 2. Get sform matrices --- */
     if (base->sform_code > 0)
@@ -3218,9 +3265,19 @@ static int al_register(nifti_image *source, nifti_image *base,
     PROFILE_START(autoweight);
     fprintf(stderr, " + Computing autoweight from base image\n");
     wght = al_autoweight(bsim, bnx, bny, bnz, bdx, bdy, bdz);
+    if (wght == NULL) {
+        fprintf(stderr, "allineate: failed to allocate autoweight image\n");
+        free(bsim); free(ajim);
+        return 1;
+    }
 
     /* --- 4. Compute source automask --- */
     smask = al_automask(ajim, nvox_src);
+    if (smask == NULL) {
+        fprintf(stderr, "allineate: failed to allocate source automask\n");
+        free(bsim); free(ajim); free(wght);
+        return 1;
+    }
     if (smask) {
         int nm = 0;
         for (ii = 0; ii < nvox_src; ii++) if (smask[ii]) nm++;
@@ -3251,6 +3308,11 @@ static int al_register(nifti_image *source, nifti_image *base,
     if (wght) {
         stup.bwght = wght;
         stup.bmask = (unsigned char *)calloc(nvox_base, sizeof(unsigned char));
+        if (stup.bmask == NULL) {
+            fprintf(stderr, "allineate: failed to allocate base mask\n");
+            free(bsim); free(ajim); free(smask); free(wght);
+            return 1;
+        }
         stup.nmask = 0;
         float wmx = 0.0f;
         for (ii = 0; ii < nvox_base; ii++) if (wght[ii] > wmx) wmx = wght[ii];
@@ -3274,6 +3336,11 @@ static int al_register(nifti_image *source, nifti_image *base,
         for (ii = 0; ii < nvox_src; ii++) if (smask[ii]) nm++;
         if (nm > 10) {
             float *mvals = (float *)malloc(sizeof(float) * nm);
+            if (mvals == NULL) {
+                fprintf(stderr, "allineate: failed to allocate source automask scratch\n");
+                free(bsim); free(ajim); free(smask); free(stup.bmask); free(wght);
+                return 1;
+            }
             int pp = 0;
             for (ii = 0; ii < nvox_src; ii++)
                 if (smask[ii]) mvals[pp++] = ajim[ii];
@@ -3288,8 +3355,12 @@ static int al_register(nifti_image *source, nifti_image *base,
                 stup.ajmask_ranfill = 1;
                 /* Backup original source data before noise fill */
                 stup.ajim_orig = (float *)malloc(sizeof(float) * nvox_src);
-                if (stup.ajim_orig)
-                    memcpy(stup.ajim_orig, ajim, sizeof(float) * nvox_src);
+                if (stup.ajim_orig == NULL) {
+                    fprintf(stderr, "allineate: failed to allocate source automask backup\n");
+                    free(bsim); free(ajim); free(smask); free(stup.bmask); free(wght);
+                    return 1;
+                }
+                memcpy(stup.ajim_orig, ajim, sizeof(float) * nvox_src);
                 fprintf(stderr, " + Source automask noise fill: range [%.1f, %.1f]\n",
                         q07, q07 + 2.0f * stup.aj_usiz);
             }

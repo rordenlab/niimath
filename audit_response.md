@@ -1,64 +1,56 @@
-# Audit response — release hardening after Windows/MSVC merge
+# Audit Response
 
-This supersedes the previous audit response. I reviewed the current working-tree changes plus the recent Windows/MSVC merge, with emphasis on allocator ownership, fail-closed behavior, WASM/browser packaging, and duplicate build paths.
+## Status
 
-## Changes made
+Not ready before this pass. The allocator ownership sweep was directionally correct, but several touched paths still failed open or mutated image state before fallible allocations completed. I corrected the release-blocking issues I found.
 
-1. Fixed a JS worker output edge case. `workerImpl.ts` now reads `outName` and then `outName + ".gz"` when the requested output was not already gzip-named, matching niimath/FSL gzip defaults and the direct WASM test helper. It also reports the actual output name and unlinks both possible output spellings so failed or gzip-renamed runs do not leave stale MEMFS files.
+## Changes Made
 
-2. Restored GPL TypeScript packaging. The earlier `tsconfig` exclusion kept BSD-only type checks green but stopped `dist/index-gpl.d.ts` from being emitted for a GPL build even though `package.json` exports it. I removed that exclusion and added tiny source declarations for the generated Emscripten modules (`js/src/niimath.d.ts`, `js/src/niimath-gpl.d.ts`) so `tsc` works even when ignored generated JS artifacts are absent.
+- Reworked `nii_calloc` into `nii_calloc(count, size)` with an overflow check via `nii_mul_size`. Updated current call sites to pass element counts and element sizes explicitly.
+- Set the allocation policy for `nii_calloc`: allocation overflow or nonzero OOM prints a clear error and exits with `EXIT_FAILURE`.
+- Hardened conform reslicing. `doReslice` now validates dimensions, allocates input/output buffers, and only mutates `nim` header/data after all fallible work succeeds. Allocation failure no longer leaves `nim->data` freed or the header half-updated.
+- Hardened high-risk core image operations touched by the allocator sweep: `nifti_crop`, `nifti_dim_reduce`, `nifti_tensor_decomp`, `nifti_subsamp2`, `nifti_resize`, `-pval`, and `-cpval`. These now check key output-size products and allocation results before replacing `nim->data`.
+- Fixed a `Tar1` scratch-buffer leak in `nifti_dim_reduce` when a voxel time series is constant.
+- Removed per-voxel heap allocations from `nifti_tensor_decomp`; the 6-input and 14-output temporary arrays are now stack locals.
+- Hardened allineate setup. Base/source voxel counts are overflow-checked, autoweight/source-mask/base-mask/source-automask scratch allocations fail closed, and source automask backup allocation is mandatory when noise fill is enabled.
+- Hardened `create_GA_BLOK_set` realloc paths. Realloc now uses a temporary pointer, failed shrink keeps the original allocation, and all surviving per-block arrays are freed if output struct allocation fails.
+- Kept the allineate all-`AL_BIGVAL` coarse-search path fail-closed. It no longer reports a successful registration with only the identity transform.
+- Made TypeScript declaration generation fatal in `js/esbuild.config.ts`; a package build should not ship missing or stale `.d.ts` files.
 
-3. Made BSD-only JS builds non-dangling. `esbuild.config.ts` now writes a clear GPL-unavailable stub for `dist/index-gpl.js`/`dist/niimath-gpl.js` when the GPL WASM artifacts are absent, removes any stale `dist/niimath-gpl.wasm`, and removes stale `js/corresponding-source/`. The test helper now treats GPL as built only when both `dist/niimath-gpl.js` and `dist/niimath-gpl.wasm` exist, so a stub does not accidentally run GPL tests.
+## Rationale
 
-4. Fixed the browser package build. A real Playwright browser smoke showed `dist/index.js` loading and then requesting `/dist/core` (404): `tsc --project tsconfig.json` was overwriting esbuild's bundled browser output with extensionless native ESM. `esbuild.config.ts` now cleans `dist/` at the start and runs `tsc --emitDeclarationOnly`, so esbuild owns JS output while TypeScript still emits declarations.
-
-5. Fixed Emscripten 6 resizable-memory browser output. The generated module used `wasmMemory.toResizableBuffer()`, then Emscripten's own UTF-8 helper passed HEAP subarrays backed by that resizable buffer to `TextDecoder.decode()`, which current Chromium rejects. `scripts/pre-build.ts` now rewrites `getMemoryBuffer()` to return `wasmMemory.buffer`; Emscripten's existing `updateMemoryViews()` still refreshes views after memory growth, but browser `TextDecoder` sees normal ArrayBuffers.
-
-6. Finished fail-closed allocation hardening in `allineate.c`. `al_scalar_ransetup()` now returns an error on allocation failure and checks the coarse-start buffers (`kpar`, `all_wpar`, `all_isrand`, `tvals`, `tpars`, `tisrand`) before use. The refinement and fine candidate `cand_wpar` arrays are also checked before OpenMP workers can dereference them.
-
-7. Fixed an OOM cleanup leak introduced by early `goto al_cleanup` paths during the downsampled coarse pass. If setup/startup allocation fails before the normal full-resolution restore block runs, cleanup now frees the downsampled source buffer, frees any smoothed downsample buffer, restores source geometry fields, and restores `stup.ajim_orig` so the source automask backup is freed by the standard cleanup path.
-
-8. Removed the stale `uf_isort` helper and updated the `unifize.c` comment to match the quickselect-based trimmed mean implementation. This avoids future confusion about using insertion sort on the large per-voxel neighborhood.
-
-9. Hardened the PyPI/AppVeyor release paths after the reported PyPI `v1.0.20260315 Clang21.0.0` short-read case. I reproduced the user's command against current source and an installed local wheel using `/Users/chris/src/tmp/brainchop/strokeSubject.nii.gz`; current builds do not emit `++ WARNING: read ...` and produce a valid 256^3 uint8 NIfTI (`16782752` bytes including the 5536-byte header/extension area). The old warning expected `67108864` bytes, i.e. a 256^3 float payload, so the new release smoke explicitly catches any future header/data-size mismatch.
-
-10. Added `.github/scripts/release_smoke.py`, a stdlib-only packaged-binary smoke test that synthesizes NIfTI fixtures, checks the exact `-conform -gz 0 ... -odt char` class, verifies gzip read/write, verifies zstd read/write when expected, checks key feature dispatch in the packaged help, and confirms BSD wheels reject `-spm_coreg` with the GPL-module message.
-
-11. Changed PyPI wheel CI from a help-only smoke (`niimath`) to the release smoke and removed the forced `ENABLE_ZSTD=OFF`. The GitHub Actions wheel matrix now installs zstd/libomp where needed, passes `ENABLE_ZSTD=ON`, enables macOS OpenMP wheels with `OPENMP_XCODE=ON`, and uses vcpkg's static zstd on Windows. I also checked cibuildwheel's current platform behavior: Linux wheels can include manylinux and musllinux containers, so the zstd install step now handles RPM (`yum`/`dnf`/`microdnf`), Debian (`apt-get`), and Alpine (`apk`) package managers instead of assuming a manylinux-only RPM image.
-
-12. Fixed zstd portability for CMake/scikit-build packaging. `src/CMakeLists.txt` now prefers static `libzstd.a` when available, recognizes Windows static names (`zstd_static`/`libzstd_static`), and honors an explicit `ZSTD_ROOT`; `SuperBuild/SuperBuild.cmake` forwards `ZSTD_ROOT` and `CMAKE_PREFIX_PATH` into the nested `src` configure so CI-provided zstd installations are visible to the executable build. A first local OpenMP wheel linked to `/opt/homebrew/opt/zstd/lib/libzstd.1.dylib`; after this fix, `otool -L` on the wheel's `niimath` binary reports only `/usr/lib/libSystem.B.dylib`.
-
-13. Wired the same release smoke into AppVeyor GitHub-release ZIP builds. Linux/test jobs install `libzstd-dev`; Windows builds a static zstd from upstream source and passes it through CMake; the macOS universal artifact continues using its existing universal static zstd path and now smokes the final lipo'd binary before upload.
-
-## Residual notes
-
-The broader project still has known unchecked allocations outside this touched path, especially in older mesh code. I did not sweep those here because they are already tracked as a project-wide issue and are outside the release-facing Windows/MSVC/WASM/registration changes under review.
-
-The optional GPL SPM module remains intentionally absent from the PyPI `niimath` wheel because that package is declared BSD-licensed and exposes a single `niimath` console script. Shipping GPL code there would make the wheel a GPL-2 combined work and require changing PyPI metadata/license posture. The npm package already handles this with a separate `@niivue/niimath/gpl` export and corresponding-source bundle; native GPL builds remain covered by `GPL=1 make`, `cmake -DENABLE_GPL=ON`, and `gpl-build.yml`.
+- `nim->data` ownership must be boring: plain `malloc`/`calloc` buffers released by plain `free`. The sweep removed the aligned-allocator mismatch risk, but the helper also needed normal `calloc(count, size)` semantics so large count products are checked consistently. Failed allocation is treated as fatal, not as recoverable application state.
+- Image transforms must be transactional at the `nim` level. Allocate first, mutate header/data last.
+- Registration and defacing should fail closed on setup/cost-path allocation failure. A degraded identity transform is not an acceptable fallback for privacy-sensitive defacing.
+- Release packaging should fail on type-generation errors. Warning-only declaration generation hides broken package artifacts.
 
 ## Verification
 
-- `make` in `src` passed.
-- `make GPL=1` in `src` passed.
-- `cmake -S src -B /private/tmp/niimath-cmake-src-bsd-audit` and `cmake --build /private/tmp/niimath-cmake-src-bsd-audit` passed.
-- `cmake -S src -B /private/tmp/niimath-cmake-src-gpl-audit -DENABLE_GPL=ON` and `cmake --build /private/tmp/niimath-cmake-src-gpl-audit` passed.
-- CMake BSD `-spm_coreg` smoke failed with the expected GPL-required message; CMake GPL `-spm_coreg` smoke passed.
-- `bun x tsc --project tsconfig.json --noEmit` passed with generated Emscripten JS present and also with `js/src/niimath.js`/`js/src/niimath-gpl.js` temporarily absent.
-- `bun run makeWasm`, `bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js`, and `bun run makeWasmGpl` passed.
-- GPL-enabled `bun run esbuild.config.ts` passed and emitted `dist/index-gpl.d.ts`.
-- GPL-enabled `bun test ./tests` passed: 8 pass, 0 fail.
-- Simulated BSD-only `bun run esbuild.config.ts` passed after temporarily hiding GPL source artifacts; it removed stale GPL WASM/source output, emitted GPL stubs, and `bun test ./tests` passed with 5 pass, 4 skip.
-- Mocked worker harness passed: requested `out.nii`, found `out.nii.gz`, returned the gzip bytes, and left 0 staged MEMFS files.
-- Playwright/Chromium browser smoke passed through the actual `dist/` package and module workers: BSD default gzip fallback, BSD explicit `.nii.gz`, BSD `-allineate`, BSD rejection of `-spm_coreg`, BSD `resliceNN` + `mulImage` file operands, and GPL `-spm_coreg`.
-- `leaks --atExit -- ./niimath ... -spm_coreg ...` reported 0 leaks.
-- Current native GPL binary: `./src/niimath /Users/chris/src/tmp/brainchop/strokeSubject.nii.gz -conform -gz 0 /private/tmp/brainchop-conform-current.nii.gz -odt char` passed with no short-read warning; resulting `/private/tmp/brainchop-conform-current.nii` is datatype `2`, `nbyper=1`, `nvox=16777216`, size `16782752`.
-- New release smoke passed against `./src/niimath --expect-zstd`.
-- Top-level SuperBuild path passed: `cmake -S . -B /private/tmp/niimath-superbuild-release-audit -DENABLE_ZSTD=ON -DOPENMP_XCODE=OFF`, `cmake --build /private/tmp/niimath-superbuild-release-audit`, and `python3 .github/scripts/release_smoke.py /private/tmp/niimath-superbuild-release-audit/bin/niimath --expect-bsd --expect-zstd`.
-- Local scikit-build wheel path passed: `python3 -m pip wheel . -w /private/tmp/niimath-wheel-audit --no-deps`, install into `/private/tmp/niimath-wheel-venv`, and release smoke with `--expect-bsd --expect-zstd`.
-- Release-config macOS wheel path passed: `python3 -m pip wheel . -w /private/tmp/niimath-wheel-audit-staticzstd --no-deps -Ccmake.define.OPENMP_XCODE=ON -Ccmake.define.ENABLE_ZSTD=ON`, install into `/private/tmp/niimath-wheel-staticzstd-venv`, release smoke with `--expect-bsd --expect-zstd`, and `otool -L` confirmed no Homebrew zstd runtime dependency.
-- Installed release-config wheel against the user's real file passed: `/private/tmp/niimath-wheel-staticzstd-venv/bin/niimath /Users/chris/src/tmp/brainchop/strokeSubject.nii.gz -conform -gz 0 /private/tmp/brainchop-wheel-conform.nii.gz -odt char` emitted no short-read warning; output header is datatype `2`, `nbyper=1`, `nvox=16777216`.
-- Cibuildwheel documentation check confirmed platform-specific variables such as `CIBW_CONFIG_SETTINGS_WINDOWS` and `CIBW_BEFORE_ALL_LINUX`, and confirmed Linux builds use manylinux/musllinux containers with different package managers; release CI was adjusted accordingly.
-- Release workflow YAML parses with Ruby/Psych after the multiline Linux zstd install command.
-- Direct `src` CMake reconfigured after the static-name expansion: `cmake -S src -B /private/tmp/niimath-cmake-src-zstd-names-audit -DENABLE_ZSTD=ON` selected `/opt/homebrew/opt/zstd/lib/libzstd.a`, built successfully, and passed the release smoke.
-- JS package tests still pass after the release review: `bun test ./tests` reports 8 pass, 0 fail.
+- `make -C src` passed.
 - `git diff --check` passed.
+- `bun run build` passed after allowing Emscripten to write its cache outside the workspace. BSD and GPL WASM were rebuilt.
+- `bun run esbuild.config.ts` passed. It printed the existing non-fatal `pyenv: cannot rehash` warning.
+- `bun test ./tests` passed after the full build: 8 tests, 0 failures. It printed the existing non-fatal `pyenv: cannot rehash` warning.
+- Native CLI smoke tests passed on synthetic NIfTI fixtures for `-Tmedian`, `-Tar1`, `-pval`, `-resize`, `-subsamp2`, and `-comply`.
+
+## Remaining Release Risks
+
+- This is not a project-wide allocator-wrapper conversion. MarchingCubes, quadric, and older core paths still have direct allocations; they should eventually route through fail-fast helpers or explicitly `exit(EXIT_FAILURE)` on OOM.
+- Several legacy voxel-count products still use `int` in code outside the paths fixed here. The largest-image overflow story is improved, not globally solved.
+- `nifti_save` still reports success unconditionally; multi-output operations can still hide write failures.
+- Release zstd source download verification remains unpinned. Add a SHA-256 check before relying on that workflow for a release.
+- Build-source lists remain duplicated across Makefile, CMake, SuperBuild, and release scripts.
+
+## Supervisor audit + deployment (2026-07-03, v1.0.20260703)
+
+A three-agent audit (security, refactor, docs) plus independent verification reviewed the auditor's hardening ahead of the version bump to `v1.0.20260703` and push to `master`.
+
+**Verdict: no release-blocking regression; the hardening is correct.**
+- **Byte-identical output** confirmed between a clean `git HEAD` build and the hardened build across the touched ops on both synthetic and real (`niivue-demo-images/register`) data: `-crop`, `-resize` (shrink/grow/Lanczos), `-subsamp2`, `-conform`, `-Tar1`/dim_reduce, `-pval`/`-cpval`, and `-tensor_decomp` (all 9 outputs). The auditor's transactional/overflow-check rework changes no successful-path result.
+- **`nii_calloc(count,size)` + `nii_mul_size`**: overflow check is textbook-correct; all 8 call sites pass `(voxel_count, sizeof)` with no double-counting. `exit(EXIT_FAILURE)` on OOM is **not a regression** (the prior `aligned_calloc` had no NULL check → segfault on OOM; `exit()` is cleaner). **Noted, non-blocking:** the auditor also added `if (dat==NULL) return 1;` handlers at every site, which are unreachable while `nii_calloc` exits; switching `nii_calloc` to *return NULL* would make them live and keep the long-lived WASM worker alive on OOM (the refactor agent's recommendation). Left to the auditor's stated "fatal allocation" design; recommended as a follow-up.
+- **`nifti_tensor_decomp`** stack locals are fixed 6/14-float arrays (80 B) — safe, output unchanged. conform `doReslice` reslice math is byte-identical; `create_GA_BLOK_set` realloc-temp and the `Tar1` leak fix are correct; allineate mask/automask fail-closed additions don't alter a successful registration (verified real `-allineate`/`-deface`). No double-free/UAF/leak found in the diff.
+- **ASan** could not run a full suite on this Apple Silicon host (platform ASan is impractically slow even via Homebrew LLVM clang; documented in agent memory). Correctness rests on byte-identical diffing + code review.
+
+**CI / Windows confidence (the original `0xC0000374` failure):** the root cause — a `_mm_malloc`/`_aligned_malloc` buffer handed to `nim->data` and freed with plain `free()` on MSVC — is eliminated for the whole tree by the `_mm_malloc`→plain sweep (conform now uses `nii_calloc`). `release_smoke.py --expect-bsd --expect-zstd` **passes locally on both the Makefile and the CMake (Windows build-path) binaries**; no build system references the deleted `arm_malloc.h`; the diff contains no MSVC-incompatible constructs (no VLA/`typeof`/`__attribute__`/statement-expressions; `SIZE_MAX` via `<stdint.h>`). Native, CMake, nano, tiny, and WASM all build clean. Pushing to `master` runs `release.yml` (Windows wheels + `release_smoke`) but does **not** publish (PyPI upload is gated on `refs/tags/v*`), so this is CI validation without a release — a maintainer tags `v1.0.20260703` later to publish.
+
+**Highest-value open follow-ups for next session:** (1) finish Known Issue #4 — the remaining `int nvox3D` **divisor/loop-bound** truncation sites (SIGFPE/OOB on >2³¹-voxel images) not covered by the allocation-sizing fix; (2) optionally switch `nii_calloc` to return-NULL for WASM-worker survival; (3) pin the zstd tarball SHA-256 in `release.yml`.

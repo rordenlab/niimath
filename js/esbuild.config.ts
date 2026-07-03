@@ -70,12 +70,7 @@ if (hasGpl) {
 // important: plain `tsc --project` emits JS into dist and overwrites esbuild's
 // browser-ready bundles with extensionless imports (`./core`), which fail under
 // native ESM in browsers.
-try {
-  execSync("bun x tsc --project tsconfig.json --emitDeclarationOnly", { stdio: "inherit" });
-} catch (error) {
-  const err = error as Error;
-  console.warn("Warning: Could not generate .d.ts files:", err.message);
-}
+execSync("bun x tsc --project tsconfig.json --emitDeclarationOnly", { stdio: "inherit" });
 
 // copy BSD niimath.wasm, niimath.js, niimathOperators.json to dist folder
 copyFileSync("./src/niimath.wasm", "./dist/niimath.wasm");
@@ -95,7 +90,11 @@ if (hasGpl) {
   rmSync("./corresponding-source", { recursive: true, force: true });
   writeFileSync(
     "./dist/index-gpl.js",
-    `export { dataTypes } from "./core.js";\nexport class Niimath {\n  constructor() {\n    throw new Error(${JSON.stringify(unavailableMessage)});\n  }\n}\n`,
+    // Re-export from the bundled, self-contained BSD index (which exports dataTypes),
+    // NOT "./core.js": esbuild inlines core.ts into index.js and tsc emits only core.d.ts,
+    // so no dist/core.js exists in a BSD-only package — importing it would fail module
+    // resolution before this intended "GPL unavailable" error could throw.
+    `export { dataTypes } from "./index.js";\nexport class Niimath {\n  constructor() {\n    throw new Error(${JSON.stringify(unavailableMessage)});\n  }\n}\n`,
   );
   writeFileSync(
     "./dist/niimath-gpl.js",

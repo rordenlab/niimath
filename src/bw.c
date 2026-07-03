@@ -48,18 +48,6 @@
 #include <math.h>
 
 
-#ifdef EMSCRIPTEN
-	#define _mm_malloc(size, alignment) malloc(size)
-	#define _mm_free(ptr) free(ptr)
-#else
-	#ifdef __aarch64__
-	  #include "arm_malloc.h"
-	#else
-	  #include <immintrin.h>
-	#endif
-#endif
-
-
 #ifndef M_PI //not defined by older gcc unless compiled with `-std=gnu99`:
   #define M_PI 3.14159265358979323846
 #endif
@@ -620,10 +608,10 @@ int butter_design(int order, double fl, double fh, double ** a, double ** b, dou
 		nA = order + 1;	
 	} else
 		return 0;
-	* a = (double *)_mm_malloc( nA * sizeof(double), 64);
+	* a = (double *)malloc( nA * sizeof(double));
 	for (int k = 0; k < nA; k++)
 		(*a)[k] = af[k];
-	* b = (double *)_mm_malloc( nA * sizeof(double), 64);
+	* b = (double *)malloc( nA * sizeof(double));
 	for (int k = 0; k < nA; k++)
 		(*b)[k] = gain * ((double)bi[k]);
 	free(bi);
@@ -644,17 +632,17 @@ int butter_design(int order, double fl, double fh, double ** a, double ** b, dou
 		K.m[i][0] = (*a)[i+1];	
 	K.m[0][0] += 1;
 	matNN  invK = cofactor(K, nM);	
-	    double * ba = (double *)_mm_malloc(nM * sizeof(double), 64);
+	    double * ba = (double *)malloc(nM * sizeof(double));
 	for (int i = 0; i < nM; i++) {
 		ba[i] = (*b)[i+1]-((*a)[i+1] * (*b)[0]);
 	}
-	* IC = (double *)_mm_malloc(nM * sizeof(double), 64);
+	* IC = (double *)malloc(nM * sizeof(double));
 	for (int i = 0; i < nM; i++) {
 		(*IC)[i] = 0.0;
 		for (int j = 0; j < nM; j++)
 			(*IC)[i] += ba[j] * invK.m[i][j];
 	}
-	_mm_free (ba);
+	free(ba);
 	return nA;
 }
 
