@@ -16,6 +16,15 @@
 
 // #include <float.h>
 #include "core.h"
+#ifdef DT32
+#include "core32.h"
+#define NIFTI_SMOOTH_GAUSS_TYPED nifti_smooth_gauss_f32
+#define FLT_EXP expf
+#else
+#include "core64.h"
+#define NIFTI_SMOOTH_GAUSS_TYPED nifti_smooth_gauss_f64
+#define FLT_EXP exp
+#endif
 #include "print.h"
 #ifdef USING_TIMERS
 #include <time.h>
@@ -75,6 +84,7 @@
 #include "unifize.h"
 #ifdef HAVE_ALLINEATE
 #include "allineate.h"
+#include "coreg_fast.h"
 #endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
@@ -283,7 +293,8 @@ staticx bool isnanx(flt f) {
 #else
 
 staticx bool isnanx(double d) {
-	const uint64_t u = *(uint64_t *)&d;
+	uint64_t u;
+	memcpy(&u, &d, sizeof u); // bit inspection without strict-aliasing UB
 #ifdef MY_LITTLE_ENDIAN
 	return (u & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL && (u & 0xFFFFFFFFFFFFFULL);
 #else
@@ -343,15 +354,22 @@ staticx flt vx(flt *f, int p, int q) {
 	return ret;
 }
 
-staticx void edt(flt *f, int n, flt delta) {
+staticx int edt(flt *f, int n, flt delta) {
+	size_t count = (size_t)n + 2;
+	flt *d = (flt *)malloc(count * sizeof(flt));
+	flt *z = (flt *)malloc(count * sizeof(flt));
+	int *v = (int *)malloc(count * sizeof(int));
+	if (!d || !z || !v) {
+		free(d);
+		free(z);
+		free(v);
+		return 1;
+	}
 	if ((delta != 1) && (delta != 0.0)) {
 		flt delta2 = 1.0 / (delta * delta);
 		for (int q = 0; q < n; q++)
 			f[q] *= delta2;
 	}
-	flt *d = (flt *)malloc((n + 2) * sizeof(flt));
-	flt *z = (flt *)malloc((n + 2) * sizeof(flt));
-	int *v = (int *)malloc((n + 2) * sizeof(int));
 	/*# Find the lower envelope of a sequence of parabolas.
 	#   f...source data (returns the Y of the parabola vertex at X)
 	#   d...destination data (final distance values are written here)
@@ -403,6 +421,7 @@ staticx void edt(flt *f, int n, flt delta) {
 	free(d);
 	free(z);
 	free(v);
+	return 0;
 } // edt()
 
 staticx void edt1(flt *df, int n, flt delta) { // first dimension is simple
@@ -478,12 +497,17 @@ staticx int nifti_edt(nifti_image *nim) {
 	nRow = nim->nx * nim->nz;									  // transpose XYZ to YXZ and blur Y columns with XZ Rows
 	for (int v = 0; v < nVol; v++) {							  // transpose each volume separately
 		flt *img3D = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
-		size_t vo = v * nvox3D;									  // volume offset
+		if (!img3D)
+			return EXIT_FAILURE;
+		size_t vo = (size_t)v * (size_t)nvox3D;				  // volume offset
 		transposeXY(&img[vo], img3D, &nx, &ny, nz);
 		// perform EDT for all "rows"
 		flt *imgRow = img3D;
 		for (int r = 0; r < nRow; r++) {
-			edt(imgRow, nx, dy);
+			if (edt(imgRow, nx, dy)) {
+				free(img3D);
+				return EXIT_FAILURE;
+			}
 			imgRow += nx;
 		}
 		transposeXY(img3D, &img[vo], &nx, &ny, nz);
@@ -491,20 +515,35 @@ staticx int nifti_edt(nifti_image *nim) {
 	} // for each volume
 	// EDT in head-foot direction
 	nRow = nim->nx * nim->ny; // transpose XYZ to ZXY and blur Z columns with XY Rows
-#pragma omp parallel for
+	int failed = 0;
+#pragma omp parallel for reduction(|:failed)
 	for (int v = 0; v < nVol; v++) {							  // transpose each volume separately
 		flt *img3D = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
-		size_t vo = v * nvox3D;									  // volume offset
-		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
+		if (!img3D) {
+			failed = 1;
+			continue;
+		}
+		size_t vo = (size_t)v * (size_t)nvox3D;				  // volume offset
+		int tx = nx;
+		int tz = nz;
+		transposeXZ(&img[vo], img3D, &tx, ny, &tz);
 		// perform EDT for all "rows"
 		flt *imgRow = img3D;
+		int volume_failed = 0;
 		for (int r = 0; r < nRow; r++) {
-			edt(imgRow, nx, dz);
-			imgRow += nx;
+			if (edt(imgRow, tx, dz)) {
+				volume_failed = 1;
+				break;
+			}
+			imgRow += tx;
 		}
-		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
+		if (!volume_failed)
+			transposeXZ(img3D, &img[vo], &tx, ny, &tz);
 		free(img3D);
+		failed |= volume_failed;
 	} // for each volume
+	if (failed)
+		return EXIT_FAILURE;
 	nifti_sqrt(img, nim->nvox);
 	return EXIT_SUCCESS;
 } // nifti_edt()
@@ -525,8 +564,14 @@ staticx int nifti_sedt(nifti_image *nim) {
 	if (ok != EXIT_SUCCESS)
 		return ok;
 	flt *img = (flt *)nim->data;
-	flt *imgEDT = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
-	memcpy(imgEDT, img, nvox3D * sizeof(flt));
+	if ((uint64_t)nim->nvox > SIZE_MAX / sizeof(flt))
+		return EXIT_FAILURE;
+	/* Preserve every volume. The old nvox3D allocation was indexed through nim->nvox
+	   below, causing an out-of-bounds read for any 4D -sedt input. */
+	flt *imgEDT = (flt *)malloc((size_t)nim->nvox * sizeof(flt));
+	if (!imgEDT)
+		return EXIT_FAILURE;
+	memcpy(imgEDT, img, (size_t)nim->nvox * sizeof(flt));
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] > 0.0)
 			img[i] = 0;
@@ -534,8 +579,10 @@ staticx int nifti_sedt(nifti_image *nim) {
 			img[i] = 1;
 	}
 	ok = nifti_edt(nim);
-	if (ok != EXIT_SUCCESS)
+	if (ok != EXIT_SUCCESS) {
+		free(imgEDT);
 		return ok;
+	}
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] <= 0.0)
 			img[i] = imgEDT[i];
@@ -626,6 +673,8 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 		return EXIT_FAILURE;
 	}
 	flt *imgIn = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
+	if (!imgIn)
+		return EXIT_FAILURE;
 	flt *img = (flt *)nim->data;
 	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
@@ -636,7 +685,10 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 		else
 			img[i] = 1;
 	}
-	nifti_edt(nim);
+	if (nifti_edt(nim) != EXIT_SUCCESS) {
+		free(imgIn);
+		return EXIT_FAILURE;
+	}
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] <= dx)
 			img[i] = imgIn[i];
@@ -675,6 +727,8 @@ staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
 		return EXIT_FAILURE;
 	}
 	flt *imgIn = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
+	if (!imgIn)
+		return EXIT_FAILURE;
 	flt *img = (flt *)nim->data;
 	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
@@ -685,7 +739,10 @@ staticx int nifti_erode(nifti_image *nim, flt iso, flt dx) {
 		else
 			img[i] = 0;
 	}
-	nifti_edt(nim);
+	if (nifti_edt(nim) != EXIT_SUCCESS) {
+		free(imgIn);
+		return EXIT_FAILURE;
+	}
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] >= dx)
 			img[i] = imgIn[i];
@@ -708,6 +765,8 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 		return EXIT_FAILURE;
 	}
 	flt *imgIn = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
+	if (!imgIn)
+		return EXIT_FAILURE;
 	flt *img = (flt *)nim->data;
 	memcpy(imgIn, img, nvox3D * sizeof(flt));
 	// step 1: threshold and make invert binary
@@ -720,7 +779,10 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	}
 	// step2 apply distance transform to DILATE (required)
 	//  -edt
-	nifti_edt(nim);
+	if (nifti_edt(nim) != EXIT_SUCCESS) {
+		free(imgIn);
+		return EXIT_FAILURE;
+	}
 	// step 3: threshold and make invert binary
 	//  -thr $dx1 -binv
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -732,7 +794,10 @@ staticx int nifti_close(nifti_image *nim, flt iso, flt dx1, flt dx2) {
 	// step4 apply distance transform to ERODE (optional)
 	//  -edt
 	if (dx2 > 0.0) {
-		nifti_edt(nim);
+		if (nifti_edt(nim) != EXIT_SUCCESS) {
+			free(imgIn);
+			return EXIT_FAILURE;
+		}
 		// step 5: threshold and make binary, set surviving voxels to iso
 		//  -thr $dx2 -bin -mul $iso
 		for (size_t i = 0; i < nim->nvox; i++) {
@@ -761,6 +826,8 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 	if (nVol != 1)
 		return 1;
 	flt *img3D = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
+	if (!img3D)
+		return EXIT_FAILURE;
 	flt *img = (flt *)nim->data;
 	int nThresh = 0;
 	flt mn = img[0];
@@ -775,6 +842,7 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 	}
 	if (nThresh < 1) {
 		printfx("Hollow error, no voxels survive threshold %g\n", threshold);
+		free(img3D);
 		return 1;
 	}
 #ifdef NII2MESH
@@ -786,6 +854,10 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 #endif
 #endif
 	int ret = nifti_edt(nim);
+	if (ret != EXIT_SUCCESS) {
+		free(img3D);
+		return ret;
+	}
 	// measure thickest depth
 	float mx = img[0];
 	int mxidx = 0;
@@ -797,6 +869,7 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 	}
 	if (mx <= thick) {
 		printfx("Hollow error, no surface deeper than %g (deepest point %g)\n", thick, mx);
+		free(img3D);
 		return 1;
 	}
 	for (size_t i = 0; i < nim->nvox; i++) {
@@ -845,38 +918,37 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 //  -3 opencv round(3) or round(4) depending on datatype https://github.com/opencv/opencv/blob/9c23f2f1a682faa9f0b2c2223a857c7d93ba65a6/modules/imgproc/src/smooth.cpp#L3782
 // bioimagesuite floor(1.5) https://github.com/bioimagesuiteweb/bisweb/blob/210d678c92fd404287fe5766136379ec94750eb2/js/utilities/bis_imagesmoothreslice.js#L133
 
-// Gaussian blur, both serial and parallel variants, https://github.com/neurolabusc/niiSmooth
-staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid) {
-	// serial blur
-	// make kernels
-	if ((xmm == 0) || (nx < 2) || (ny < 1) || (Sigmamm <= 0.0))
-		return;
-	// flt sigma = (FWHMmm/xmm)/sqrt(8*log(2));
-	flt sigma = (Sigmamm / xmm); // mm to vox
-	// round(6*sigma), ceil(4*sigma) seems spot on larger than fslmaths
-	// int cutoffvox = round(6*sigma); //filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	int cutoffvox;
-	if (kernelWid < 0)
-		cutoffvox = round(fabs(kernelWid) * sigma); // filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	else
-		cutoffvox = ceil(kernelWid * sigma); // filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	// printf(".Blur Cutoff (%g) %d\n", 4*sigma, cutoffvox);
-	// validated on SPM12's 1.5mm isotropic mask_ICV.nii (discrete jump in number of non-zero voxels)
-	// fslmaths mask -s 2.26 f6.nii //Blur Cutoff (6.02667) 7
-	// fslmaths mask -s 2.24 f4.nii //Blur Cutoff (5.97333) 6
+// Gaussian blur, https://github.com/neurolabusc/niiSmooth
+/* Blur the leading dimension of contiguous rows. Allocate all scratch before
+   modifying the image so allocation failure leaves the input unchanged. */
+staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
+								 flt sigma_mm, flt kernelWid, int parallel) {
+	if ((xmm == 0) || (nx < 2) || (nRow < 1) || (sigma_mm <= 0.0))
+		return 0;
+	flt sigma = sigma_mm / xmm;
+	double radius = fabs((double)kernelWid * (double)sigma);
+	int cutoffvox = (!(radius < nx - 1)) ? nx - 1
+					: (kernelWid < 0) ? (int)lround(radius) : (int)ceil(radius);
 	cutoffvox = MAX(cutoffvox, 1);
-	flt *k = (flt *)malloc((cutoffvox + 1) * sizeof(flt)); // FIR Gaussian
+
+	flt *k = (flt *)malloc((size_t)(cutoffvox + 1) * sizeof(flt));
+	int *kStart = (int *)malloc((size_t)nx * sizeof(int));
+	int *kEnd = (int *)malloc((size_t)nx * sizeof(int));
+	flt *kWeight = (flt *)malloc((size_t)nx * sizeof(flt));
+	if (!k || !kStart || !kEnd || !kWeight) {
+		free(k);
+		free(kStart);
+		free(kEnd);
+		free(kWeight);
+		return 1;
+	}
 	flt expd = 2 * sigma * sigma;
 	for (int i = 0; i <= cutoffvox; i++)
-		k[i] = exp(-1.0f * (i * i) / expd);
-	// calculate start, end for each voxel in
-	int *kStart = (int *)malloc(nx * sizeof(int));	//-cutoff except left left columns, e.g. 0, -1, -2... cutoffvox
-	int *kEnd = (int *)malloc(nx * sizeof(int));	//+cutoff except right columns
-	flt *kWeight = (flt *)malloc(nx * sizeof(flt)); // ensure sum of kernel = 1.0
+		k[i] = FLT_EXP(-1.0f * ((flt)i * (flt)i) / expd);
 	for (int i = 0; i < nx; i++) {
-		kStart[i] = MAX(-cutoffvox, -i);											   // do not read below 0
-		kEnd[i] = MIN(cutoffvox, nx - i - 1);										   // do not read beyond final column
-		if ((i > 0) && (kStart[i] == (kStart[i - 1])) && (kEnd[i] == (kEnd[i - 1]))) { // reuse weight
+		kStart[i] = MAX(-cutoffvox, -i);
+		kEnd[i] = MIN(cutoffvox, nx - i - 1);
+		if ((i > 0) && (kStart[i] == kStart[i - 1]) && (kEnd[i] == kEnd[i - 1])) {
 			kWeight[i] = kWeight[i - 1];
 			continue;
 		}
@@ -884,169 +956,198 @@ staticx void blurS(flt *img, int nx, int ny, flt xmm, flt Sigmamm, flt kernelWid
 		for (int j = kStart[i]; j <= kEnd[i]; j++)
 			wt += k[abs(j)];
 		kWeight[i] = 1 / wt;
-		// printf("%d %d->%d %g\n", i, kStart[i], kEnd[i], kWeight[i]);
 	}
-	// apply kernel to each row
-	flt *tmp = (flt *)malloc(nx * sizeof(flt)); // input values prior to blur
-	for (int y = 0; y < ny; y++) {
-		// printf("-+ %d:%d\n", y, ny);
-		xmemcpy(tmp, img, nx * sizeof(flt));
-		for (int x = 0; x < nx; x++) {
-			flt sum = 0;
-			for (int i = kStart[x]; i <= kEnd[x]; i++)
-				sum += tmp[x + i] * k[abs(i)];
-			img[x] = sum * kWeight[x];
-		}
-		img += nx;
-	} // blurX
-	// free kernel
-	free(tmp);
-	free(k);
-	free(kStart);
-	free(kEnd);
-	free(kWeight);
-} // blurS()
 
+	int failed = 0;
 #if defined(_OPENMP)
+	if (parallel) {
+		int nthreads = MIN(omp_get_max_threads(), nRow);
+		flt **scratch = (flt **)calloc((size_t)nthreads, sizeof(flt *));
+		if (!scratch)
+			failed = 1;
+		else {
+			for (int t = 0; t < nthreads; t++) {
+				scratch[t] = (flt *)malloc((size_t)nx * sizeof(flt));
+				if (!scratch[t]) {
+					failed = 1;
+					break;
+				}
+			}
+			if (!failed) {
+#pragma omp parallel for num_threads(nthreads)
+				for (int y = 0; y < nRow; y++) {
+					flt *tmp = scratch[omp_get_thread_num()];
+					flt *row = img + ((size_t)nx * y);
+					xmemcpy(tmp, row, (size_t)nx * sizeof(flt));
+					for (int x = 0; x < nx; x++) {
+						flt sum = 0;
+						for (int i = kStart[x]; i <= kEnd[x]; i++)
+							sum += tmp[x + i] * k[abs(i)];
+						row[x] = sum * kWeight[x];
+					}
+				}
+			}
+			for (int t = 0; t < nthreads; t++)
+				free(scratch[t]);
+			free(scratch);
+		}
+	} else
+#else
+	(void)parallel;
+#endif
+	{
+		flt *tmp = (flt *)malloc((size_t)nx * sizeof(flt));
+		if (!tmp)
+			failed = 1;
+		else {
+			flt *row = img;
+			for (int y = 0; y < nRow; y++) {
+				xmemcpy(tmp, row, (size_t)nx * sizeof(flt));
+				for (int x = 0; x < nx; x++) {
+					flt sum = 0;
+					for (int i = kStart[x]; i <= kEnd[x]; i++)
+						sum += tmp[x + i] * k[abs(i)];
+					row[x] = sum * kWeight[x];
+				}
+				row += nx;
+			}
+			free(tmp);
+		}
+	}
 
-staticx void blurP(flt *img, int nx, int ny, flt xmm, flt FWHMmm, flt kernelWid) {
-	// parallel blur
-	// make kernels
-	if ((xmm == 0) || (nx < 2) || (ny < 1) || (FWHMmm <= 0.0))
-		return;
-	// flt sigma = (FWHMmm/xmm)/sqrt(8*log(2));
-	flt sigma = (FWHMmm / xmm); // mm to vox
-	int cutoffvox;
-	if (kernelWid < 0)
-		cutoffvox = round(fabs(kernelWid) * sigma); // filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	else
-		cutoffvox = ceil(kernelWid * sigma); // filter width to 6 sigma: faster but lower precision AFNI_BLUR_FIRFAC = 2.5
-	cutoffvox = MAX(cutoffvox, 1);
-	flt *k = (flt *)malloc((cutoffvox + 1) * sizeof(flt)); // FIR Gaussian
-	flt expd = 2 * sigma * sigma;
-	for (int i = 0; i <= cutoffvox; i++)
-		k[i] = exp(-1.0f * (i * i) / expd);
-	// calculate start, end for each voxel in
-	int *kStart = (int *)malloc(nx * sizeof(int));	//-cutoff except left left columns, e.g. 0, -1, -2... cutoffvox
-	int *kEnd = (int *)malloc(nx * sizeof(int));	//+cutoff except right columns
-	flt *kWeight = (flt *)malloc(nx * sizeof(flt)); // ensure sum of kernel = 1.0
-	for (int i = 0; i < nx; i++) {
-		kStart[i] = MAX(-cutoffvox, -i);											   // do not read below 0
-		kEnd[i] = MIN(cutoffvox, nx - i - 1);										   // do not read beyond final column
-		if ((i > 0) && (kStart[i] == (kStart[i - 1])) && (kEnd[i] == (kEnd[i - 1]))) { // reuse weight
-			kWeight[i] = kWeight[i - 1];
-			continue;
-		}
-		flt wt = 0.0f;
-		for (int j = kStart[i]; j <= kEnd[i]; j++)
-			wt += k[abs(j)];
-		kWeight[i] = 1 / wt;
-		// printf("%d %d->%d %g\n", i, kStart[i], kEnd[i], kWeight[i]);
-	}
-// apply kernel to each row
-#pragma omp parallel for
-	for (int y = 0; y < ny; y++) {
-		flt *tmp = malloc(nx * sizeof(flt)); // input values prior to blur
-		flt *imgx = img;
-		imgx += (nx * y);
-		xmemcpy(tmp, imgx, nx * sizeof(flt));
-		for (int x = 0; x < nx; x++) {
-			flt sum = 0;
-			for (int i = kStart[x]; i <= kEnd[x]; i++)
-				sum += tmp[x + i] * k[abs(i)];
-			imgx[x] = sum * kWeight[x];
-		}
-		free(tmp);
-	}
-	// free kernel
 	free(k);
 	free(kStart);
 	free(kEnd);
 	free(kWeight);
-} // blurP
+	return failed;
+}
 
-#endif // if OPENMP: blurP (parallel blur) is multi-threaded
+staticx int smooth_gauss_volume(flt *data, int nx, int ny, int nz,
+								 flt dx, flt dy, flt dz,
+								 flt sigma_x_mm, flt sigma_y_mm, flt sigma_z_mm,
+								 flt kernel_width, size_t nvox3D, int parallel) {
+	if ((sigma_x_mm > 0.0) && (nx >= 2) &&
+		smooth_gauss_blur1d(data, nx, ny * nz, dx, sigma_x_mm, kernel_width, parallel))
+		return 1;
 
-static int nifti_smooth_gauss(nifti_image *nim, flt SigmammX, flt SigmammY, flt SigmammZ, flt kernelWid) {
-	// https://github.com/afni/afni/blob/699775eba3c58c816d13947b81cf3a800cec606f/src/edt_blur.c
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-	flt *img = NULL;
-	int nVol = 0;
-	int nx = 0;
-	int ny = 0;
-	int nz = 0;
-	size_t nRow = 0;
+	if ((sigma_y_mm > 0.0) && (ny >= 2)) {
+		flt *transposed = (flt *)malloc(nvox3D * sizeof(flt));
+		if (!transposed)
+			return 1;
+		int tx = nx;
+		int ty = ny;
+		transposeXY(data, transposed, &tx, &ty, nz);
+		int rc = smooth_gauss_blur1d(transposed, ny, nx * nz, dy,
+									 sigma_y_mm, kernel_width, parallel);
+		int bx = ny;
+		int by = nx;
+		transposeXY(transposed, data, &bx, &by, nz);
+		free(transposed);
+		if (rc)
+			return 1;
+	}
 
-	if ((nvox3D < 2) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)) {
+	if ((sigma_z_mm > 0.0) && (nz >= 2)) {
+		flt *transposed = (flt *)malloc(nvox3D * sizeof(flt));
+		if (!transposed)
+			return 1;
+		int tx = nx;
+		int tz = nz;
+		transposeXZ(data, transposed, &tx, ny, &tz);
+		int rc = smooth_gauss_blur1d(transposed, nz, nx * ny, dz,
+									 sigma_z_mm, kernel_width, parallel);
+		int bx = nz;
+		int bz = nx;
+		transposeXZ(transposed, data, &bx, ny, &bz);
+		free(transposed);
+		if (rc)
+			return 1;
+	}
+	return 0;
+}
+
+/* Typed raw-buffer backend. Sigma values are millimetres; a negative kernel width
+   selects a rounded rather than ceiled radius. Volumes are independent and stored
+   contiguously in NIfTI order. */
+int NIFTI_SMOOTH_GAUSS_TYPED(flt *data, int nx, int ny, int nz, int nvol,
+								 flt dx, flt dy, flt dz,
+								 flt sigma_x_mm, flt sigma_y_mm, flt sigma_z_mm,
+								 flt kernel_width) {
+	if (!data || (nx < 1) || (ny < 1) || (nz < 1) || (nvol < 1))
+		return 1;
+	size_t nxy;
+	size_t nvox3D;
+	size_t nvox;
+	if (nii_mul_size((size_t)nx, (size_t)ny, &nxy) ||
+		nii_mul_size(nxy, (size_t)nz, &nvox3D) ||
+		nii_mul_size(nvox3D, (size_t)nvol, &nvox) ||
+		(nvox3D < 2) || (nvox3D > (size_t)INT_MAX) ||
+		(nvox > (SIZE_MAX / sizeof(flt))))
+		return 1;
+	if ((sigma_x_mm <= 0.0) && (sigma_y_mm <= 0.0) && (sigma_z_mm <= 0.0))
+		return 0;
+#if defined(_OPENMP)
+	int parallel = omp_get_max_threads() > 1;
+	if (parallel && (nvol > 1)) {
+		int failed = 0;
+#pragma omp parallel for reduction(|:failed)
+		for (int v = 0; v < nvol; v++)
+			failed |= smooth_gauss_volume(data + ((size_t)v * nvox3D), nx, ny, nz,
+											 dx, dy, dz, sigma_x_mm, sigma_y_mm, sigma_z_mm,
+											 kernel_width, nvox3D, 0);
+		return failed;
+	}
+#else
+	int parallel = 0;
+#endif
+	for (int v = 0; v < nvol; v++) {
+		if (smooth_gauss_volume(data + ((size_t)v * nvox3D), nx, ny, nz,
+								 dx, dy, dz, sigma_x_mm, sigma_y_mm, sigma_z_mm,
+								 kernel_width, nvox3D, parallel))
+			return 1;
+	}
+	return 0;
+}
+
+static int nifti_smooth_gauss(nifti_image *nim, flt sigma_x_mm, flt sigma_y_mm,
+								 flt sigma_z_mm, flt kernel_width) {
+	if (!nim || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1)) {
 		printfx("Image size too small for Gaussian blur.\n");
 		return 1;
 	}
 	if (nim->datatype != DT_CALC)
 		return 1;
-	if ((SigmammX == 0) && (SigmammY == 0) && (SigmammZ == 0))
-		return 0;	  // all done: no smoothing, e.g. small kernel for difference of Gaussian
-	if (SigmammX < 0) // negative values for voxels, not mm
-		SigmammX = -SigmammX * nim->dx;
-	if (SigmammY < 0) // negative values for voxels, not mm
-		SigmammY = -SigmammY * nim->dy;
-	if (SigmammZ < 0) // negative values for voxels, not mm
-		SigmammZ = -SigmammZ * nim->dz;
-	img = (flt *)nim->data;
-	nVol = nim->nvox / nvox3D;
-	if ((nVol < 1) || ((nvox3D * nVol) != nim->nvox))
+	size_t nxy;
+	size_t nvox3D;
+	if (nii_mul_size((size_t)nim->nx, (size_t)nim->ny, &nxy) ||
+		nii_mul_size(nxy, (size_t)nim->nz, &nvox3D) ||
+		(nvox3D < 2) || (nvox3D > (size_t)INT_MAX)) {
+		printfx("Image size too small for Gaussian blur.\n");
 		return 1;
-	nx = nim->nx;
-	ny = nim->ny;
-	nz = nim->nz;
+	}
+	if ((nim->nvox < 1) || ((uint64_t)nim->nvox % nvox3D))
+		return 1;
+	size_t nvol = (size_t)((uint64_t)nim->nvox / nvox3D);
+	if (nvol > (size_t)INT_MAX)
+		return 1;
+	if ((sigma_x_mm == 0) && (sigma_y_mm == 0) && (sigma_z_mm == 0))
+		return 0;
+	if (sigma_x_mm < 0)
+		sigma_x_mm = -sigma_x_mm * nim->dx;
+	if (sigma_y_mm < 0)
+		sigma_y_mm = -sigma_y_mm * nim->dy;
+	if (sigma_z_mm < 0)
+		sigma_z_mm = -sigma_z_mm * nim->dz;
 
-	if ((SigmammX <= 0.0) || (nx < 2))
-		goto DO_Y_BLUR;
-	// BLUR X
-	nRow = MAX(nim->ny, 1);
-	nRow *= MAX(nim->nz, 1);
-	nRow *= MAX(nVol, 1);
-#if defined(_OPENMP)
-	if (omp_get_max_threads() > 1)
-		blurP(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
-	else
-		blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
-#else
-	blurS(img, nim->nx, nRow, nim->dx, SigmammX, kernelWid);
-#endif
-
-DO_Y_BLUR:
-	// BLUR Y
-	if ((SigmammY <= 0.0) || (ny < 2))
-		goto DO_Z_BLUR;
-	nRow = nim->nx * nim->nz; // transpose XYZ to YXZ and blur Y columns with XZ Rows
-#pragma omp parallel for
-	for (int v = 0; v < nVol; v++) {							  // transpose each volume separately
-		flt *img3D = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
-		size_t vo = v * nvox3D;									  // volume offset
-		transposeXY(&img[vo], img3D, &nx, &ny, nz);
-		blurS(img3D, nim->ny, nRow, nim->dy, SigmammY, kernelWid);
-		transposeXY(img3D, &img[vo], &nx, &ny, nz);
-		free(img3D);
-	} // for each volume
-
-DO_Z_BLUR:
-	// BLUR Z:
-	if ((SigmammZ <= 0.0) || (nim->nz < 2))
-		return 0;			  // all done!
-	nRow = nim->nx * nim->ny; // transpose XYZ to ZXY and blur Z columns with XY Rows
-#pragma omp parallel for
-	for (int v = 0; v < nVol; v++) { // transpose each volume separately
-		// printf("volume %d uses thread %d\n", v, omp_get_thread_num());
-		flt *img3D = (flt *)malloc(nvox3D * sizeof(flt)); // alloc for each volume to allow openmp
-		size_t vo = v * nvox3D;									  // volume offset
-		transposeXZ(&img[vo], img3D, &nx, ny, &nz);
-		blurS(img3D, nim->nz, nRow, nim->dz, SigmammZ, kernelWid);
-		transposeXZ(img3D, &img[vo], &nx, ny, &nz);
-		free(img3D);
-	} // for each volume
-
-	return 0;
+	return NIFTI_SMOOTH_GAUSS_TYPED((flt *)nim->data,
+									 nim->nx, nim->ny, nim->nz, (int)nvol,
+									 nim->dx, nim->dy, nim->dz,
+									 sigma_x_mm, sigma_y_mm, sigma_z_mm,
+									 kernel_width);
 } // nifti_smooth_gauss()
+
+#undef FLT_EXP
+#undef NIFTI_SMOOTH_GAUSS_TYPED
 
 staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int ignoreZeroVoxels) {
 	// https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=fsl;31f309c1.1307
@@ -1251,6 +1352,8 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 		return nifti_mask_below(nim, threshold, isZeroFill);
 	flt *inimg = (flt *)nim->data;
 	uint8_t *vxs = (uint8_t *)malloc(nim->nvox * sizeof(uint8_t));
+	if (!vxs)
+		return 1;
 	memset(vxs, 0, nim->nvox * sizeof(uint8_t));
 	for (int i = 0; i < nim->nvox; i++) {
 		if ((isnanx(inimg[i])) || (inimg[i] >= threshold))
@@ -1262,6 +1365,10 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 	size_t nVol = nim->nvox / nvox3D;
 	for (int v = 0; v < nVol; v++) {
 		uint8_t *vxs2 = (uint8_t *)malloc(nvox3D * sizeof(uint8_t));
+		if (!vxs2) {
+			free(vxs);
+			return 1;
+		}
 		uint8_t *tmp = vxs + (v * nvox3D);
 		xmemcpy(vxs2, tmp, nvox3D * sizeof(uint8_t)); // dest,src,bytes
 		size_t iv = (v * nvox3D);
@@ -1273,7 +1380,7 @@ staticx int nifti_mask_below_dilate(nifti_image *nim, flt threshold, int isZeroF
 					if (vxs[vx + iv] == 1)
 						continue;
 					if ((vxs2[vx - 1] == 1) || (vxs2[vx + 1] == 1) || (vxs2[vx - nx] == 1) || (vxs2[vx + nx] == 1) || (vxs2[vx - nxy] == 1) || (vxs2[vx + nxy] == 1))
-						vxs[vx] = 1;
+						vxs[vx + iv] = 1;
 				} // x
 			} // y
 		} // z
@@ -2678,6 +2785,8 @@ staticx int nifti_tensor_2(nifti_image *nim, int lower2upper) {
 	// swap volumes 3 and 4
 	flt *in32 = (flt *)nim->data;
 	flt *tmp = (flt *)malloc(nvox3D * sizeof(flt));
+	if (!tmp)
+		return 1;
 	flt *v3 = in32 + (2 * nvox3D);
 	flt *v4 = in32 + (3 * nvox3D);
 	xmemcpy(tmp, v4, nvox3D * sizeof(flt));
@@ -2814,19 +2923,20 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes g
 	// nim->data = dat;
 	// flt * fa32 = (flt *) dat;
 	// save V1
+	int save_rc = 0;   /* OR of every write status: a single failed output fails the op */
 	outv = out32 + (nvox3D * 3);
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V1", gzMode);
+	save_rc |= nifti_save(nim, "_V1", gzMode);
 	// save V2
 	outv = out32 + (nvox3D * 6);
 	// xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V2", gzMode);
+	save_rc |= nifti_save(nim, "_V2", gzMode);
 	// save V3
 	outv = out32 + (nvox3D * 9);
 	// xmemcpy(fa32, outv, 3*nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
-	nifti_save(nim, "_V3", gzMode);
+	save_rc |= nifti_save(nim, "_V3", gzMode);
 	// release 4D memory
 	// free(dat);
 	// save 3D images
@@ -2842,26 +2952,26 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes g
 	// xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L1", gzMode);
+	save_rc |= nifti_save(nim, "_L1", gzMode);
 	// save L2
 	outv = out32 + (nvox3D * 1);
 	// xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L2", gzMode);
+	save_rc |= nifti_save(nim, "_L2", gzMode);
 	// save L3
 	outv = out32 + (nvox3D * 2);
 	// xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_L3", gzMode);
+	save_rc |= nifti_save(nim, "_L3", gzMode);
 	// save MD
 	outv = out32 + (nvox3D * 13);
 	// xmemcpy(fa32, outv, nvox3D*sizeof(flt));
 	nim->data = (void *)outv;
 	nim->cal_min = calmin(nim);
 	nim->cal_max = calmax(nim);
-	nifti_save(nim, "_MD", gzMode);
+	save_rc |= nifti_save(nim, "_MD", gzMode);
 	// single volume data
 	nim->data = dat;
 	flt *fa32 = (flt *)dat;
@@ -2897,17 +3007,19 @@ staticx int nifti_tensor_decomp(nifti_image *nim, int isUpperTriangle, gzModes g
 		d = MAX(d, -1.0);
 		fa32[i] = d;
 	}
-	nifti_save(nim, "_MO", gzMode);
+	save_rc |= nifti_save(nim, "_MO", gzMode);
 	// save FA
 	outv = out32 + (nvox3D * 12);
 	xmemcpy(fa32, outv, nvox3D * sizeof(flt));
 	nim->cal_min = 0;
 	nim->cal_max = 1;
-	nifti_save(nim, "_FA", gzMode);
+	save_rc |= nifti_save(nim, "_FA", gzMode);
 	// keep FA in memory
 	nim->cal_max = 0;
 	free(out32);
-	return 0;
+	if (save_rc)
+		printfx("tensor decomposition: one or more output volumes failed to write\n");
+	return save_rc ? 1 : 0;
 #else
 	(void)nim;
 	(void)isUpperTriangle;
@@ -4298,8 +4410,13 @@ staticx int nifti_resize(nifti_image *nim, flt zx, flt zy, flt zz, int interp_me
 } // nifti_resize()
 
 staticx int essentiallyEqual(float a, float b) {
-	if (isnanx(a) && isnanx(b))
-		return 1; // surprisingly, with C nan != nan
+	int an = isnanx(a), bn = isnanx(b);
+	if (an || bn)
+		return an && bn;   // equal ONLY if BOTH nan (one-sided nan must differ; nan != nan in C)
+	// ±inf: fabs(a-b) is nan (inf-inf) or inf, which the relative test below mishandles
+	// (inf<=inf would read as equal). Treat inf explicitly: equal only if identical sign.
+	if (fabsf(a) > FLT_MAX || fabsf(b) > FLT_MAX)
+		return (a == b);   // +inf==+inf / -inf==-inf equal; +inf/-inf/finite mixes differ
 	return fabs(a - b) <= ((fabs(a) > fabs(b) ? fabs(b) : fabs(a)) * epsilon);
 } // essentiallyEqual()
 
@@ -4559,9 +4676,14 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			int nvol = nim->nvox / nxy;
 			if ((nvol * nxy) != nim->nvox)
 				return 1;
-#pragma omp parallel for
+			int oom = 0;
+#pragma omp parallel for reduction(|:oom)
 			for (int v = 0; v < nvol; v++) { // find maximum for each entire volume (excepted observed volume 0)
 				flt *inp = (flt *)malloc(nxy * sizeof(flt));
+				if (!inp) {
+					oom = 1;
+					continue;
+				}
 				flt *o32 = (flt *)f32;
 				o32 += v * nxy;
 				xmemcpy(inp, o32, nxy * sizeof(flt)); // dst, src
@@ -4576,16 +4698,21 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				} // y
 				free(inp);
 			} // for v
-			return 1;
+			return oom ? 1 : 0;
 		} // edge for 2D volume(s)
 		int nvox3D = nim->nx * nim->ny * nim->nz;
 		int nvol = nim->nvox / nvox3D;
 		if ((nvox3D * nvol) != nim->nvox)
 			return 1;
 		size_t nxy = nim->nx * nim->ny; // slice increment
-#pragma omp parallel for
+		int oom = 0;
+#pragma omp parallel for reduction(|:oom)
 		for (int v = 0; v < nvol; v++) { // find maximum for each entire volume (excepted observed volume 0)
 			flt *inp = (flt *)malloc(nvox3D * sizeof(flt));
+			if (!inp) {
+				oom = 1;
+				continue;
+			}
 			flt *o32 = (flt *)f32;
 			o32 += v * nvox3D;
 			xmemcpy(inp, o32, nvox3D * sizeof(flt)); // dst, src
@@ -4604,7 +4731,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			} // z
 			free(inp);
 		} // for v
-		return 1; // edge for 3D volume(s)
+		return oom ? 1 : 0; // edge for 3D volume(s)
 	} else if (op == index1) {
 		// nb FSLmaths flips dim[1] depending on determinant
 		size_t idx = 0;
@@ -4733,7 +4860,7 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				free(k);
 			} // for i
 		} // nvol > 1
-	} else if ((op == rank1) || (op == ranknorm1)) {
+	} else if (op == ranknorm1) {
 		int nvox3D = nim->nx * nim->ny * nim->nz;
 		int nvol = nim->nvox / nvox3D;
 		if ((nvox3D * nvol) != nim->nvox)
@@ -5166,7 +5293,6 @@ staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
 	int swap4D = 0; // if 1: input nim was 3D, but nim2 is 4D: output will be 4D
 	if ((nvolb > 1) && (nim->nvox != nim2->nvox) && ((op == uthr) || (op == thr))) {
 		//"niimath 3D -uthr 4D out" only uses 1st volume of 4D, only one volume out
-		nvolb = 1;										  // fslmaths
 		printfx("threshold operation expects 3D mask\n"); // fslmaths makes not modification to image
 		if (op == uthr)									  // strictly for fslmaths compatibility - makes no sense
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -5491,12 +5617,18 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	double maxDiff = 0.0;
 	size_t nNotNan = 0;
 	size_t nDifferent = 0;
+	size_t nHardMismatch = 0;   /* mismatches with a NON-FINITE difference (nan/inf) — these have
+	                               no magnitude so they never update maxDiff; must fail regardless */
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (!essentiallyEqual(img[i], img2[i])) {
-			if (fabs(img[i] - img2[i]) > maxDiff) {
-				differentVox = i;
-				maxDiff = fabs(img[i] - img2[i]);
-			}
+			/* Record the FIRST mismatch location even when the difference is non-finite
+			   (fabs(nan/inf) would never beat maxDiff, leaving differentVox at its sentinel
+			   and the equality test below falsely exiting 0 for an all-NaN vs finite pair);
+			   then track the largest FINITE difference for the report. */
+			double d = fabs((double)img[i] - (double)img2[i]);
+			if (differentVox >= nim->nvox) differentVox = i;
+			if (d > maxDiff) { differentVox = i; maxDiff = d; }
+			if (!(d <= (double)FLT_MAX)) nHardMismatch++;   /* d is nan or inf */
 			nDifferent++;
 		}
 		if (isnanx(img[i]) || isnanx(img2[i]))
@@ -5505,7 +5637,7 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		sum += img[i];
 		sum2 += img2[i];
 	}
-	if (differentVox >= nim->nvox) {
+	if (nDifferent == 0) {   /* was `differentVox >= nvox`, which non-finite diffs never cleared */
 		// printfx("Images essentially equal\n"); */
 		nifti_image_free(nim2);
 		exit(0);
@@ -5573,10 +5705,14 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 	// V1 comparison - EXIT_SUCCESS if all vectors are parallel (for DWI up vector [1 0 0] has same direction as down [-1 0 0])
 	if (nVol != 3) {
 		nifti_image_free(nim2);
-		if (maxDiff > thresh)
+		if (maxDiff > thresh || nHardMismatch > 0)   /* a non-finite mismatch always fails */
 			exit(1);
 		printfx("Maximum difference acceptable (less than threshold %g)\n", thresh);
 		exit(0);
+	}
+	if (nHardMismatch > 0) {
+		nifti_image_free(nim2);
+		exit(1);
 	}
 	int allParallel = 1;
 	// niimath ft_V1 -compare nt_V1
@@ -5617,10 +5753,10 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 staticx int nifti_unifize(nifti_image *nim) {
 	if (nim->datatype != DT_CALC) return 1;
 	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
-	size_t nvox3D = (size_t)nx * ny * nz;
 #ifdef DT32
 	return unifize_image((float *)nim->data, nx, ny, nz, nim->dx, nim->dy, nim->dz);
 #else
+	size_t nvox3D = (size_t)nx * ny * nz;
 	float *tmp = (float *)malloc(nvox3D * sizeof(float));
 	if (!tmp) return 1;
 	double *dd = (double *)nim->data;
@@ -5634,14 +5770,303 @@ staticx int nifti_unifize(nifti_image *nim) {
 }
 
 #ifdef HAVE_ALLINEATE
-staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts) {
 #ifdef DT32
+/* (al_nim_deep_copy removed: -master now estimates the affine once via
+   nii_allineate_estimate and applies it once onto the master grid, so it no longer needs
+   to preserve a pre-fit copy of the moving image.) */
+
+/* --- -savemat / -applymat JSON I/O (ported from the standalone allineate project so
+   niimath is a superset). The affine is world-space FIXED(base)->MOVING(source) mm — the
+   same "pull"/resampling convention nii_apply_affine consumes. Compiled once (DT32). --- */
+
+/* Emit `s` as a JSON string literal (escape \, ", and control bytes). */
+static void al_json_str(FILE *f, const char *s) {
+	fputc('"', f);
+	for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+		switch (*p) {
+			case '\\': fputs("\\\\", f); break;
+			case '"':  fputs("\\\"", f); break;
+			case '\b': fputs("\\b", f);  break;
+			case '\f': fputs("\\f", f);  break;
+			case '\n': fputs("\\n", f);  break;
+			case '\r': fputs("\\r", f);  break;
+			case '\t': fputs("\\t", f);  break;
+			default:
+				if (*p < 0x20) fprintf(f, "\\u%04x", (unsigned)*p);
+				else fputc(*p, f);
+		}
+	}
+	fputc('"', f);
+}
+
+static void al_json_mat44(FILE *f, mat44 m, const char *key) {
+	fprintf(f, "  \"%s\": [\n", key);
+	for (int i = 0; i < 4; i++)
+		fprintf(f, "    [%.10g, %.10g, %.10g, %.10g]%s\n",
+		        m.m[i][0], m.m[i][1], m.m[i][2], m.m[i][3], i < 3 ? "," : "");
+	fprintf(f, "  ]");
+}
+
+/* Save the fitted world-space FIXED->MOVING affine as self-describing JSON. Returns 0 on success. */
+static int al_write_affine_json(const char *path, mat44 fwd, const char *engine,
+                                int dof, const char *cost_name,
+                                const char *fixed_name, const char *moving_name) {
+	FILE *f = fopen(path, "w");
+	if (!f) { fprintf(stderr, "Failed to open '%s' for -savemat\n", path); return 1; }
+	mat44 inv = nifti_mat44_inverse(fwd);
+	fprintf(f, "{\n");
+	fprintf(f, "  \"type\": \"allineate_affine\",\n");
+	fprintf(f, "  \"version\": 1,\n");
+	fprintf(f, "  \"space\": \"world\",\n");
+	fprintf(f, "  \"units\": \"mm\",\n");
+	fprintf(f, "  \"engine\": "); al_json_str(f, engine); fprintf(f, ",\n");
+	fprintf(f, "  \"dof\": %d,\n", dof);
+	fprintf(f, "  \"cost\": "); al_json_str(f, cost_name); fprintf(f, ",\n");
+	fprintf(f, "  \"fixed\": "); al_json_str(f, fixed_name ? fixed_name : ""); fprintf(f, ",\n");
+	fprintf(f, "  \"moving\": "); al_json_str(f, moving_name ? moving_name : ""); fprintf(f, ",\n");
+	/* NOTE: keep the literal token `fixed_to_moving` OUT of this comment value — al_read_affine_json
+	   locates the matrix by strstr("\"fixed_to_moving\"") and would match a comment occurrence first. */
+	fprintf(f, "  \"comment\": \"the saved matrix maps FIXED (stationary) world-mm to MOVING "
+	           "(source) world-mm: the pull/resampling transform. Its inverse is the second matrix. "
+	           "It is relative to the ORIGINAL (un-seeded) moving header — any -com/-sym/-sagseed "
+	           "seed is composed out — so -applymat replays it correctly on the original input.\",\n");
+	al_json_mat44(f, fwd, "fixed_to_moving"); fprintf(f, ",\n");
+	al_json_mat44(f, inv, "moving_to_fixed"); fprintf(f, "\n");
+	fprintf(f, "}\n");
+	int write_error = ferror(f);
+	int close_error = fclose(f);
+	if (write_error || close_error) {
+		fprintf(stderr, "Failed to write '%s' for -savemat\n", path);
+		return 1;
+	}
+	return 0;
+}
+
+/* Read the 4x4 "fixed_to_moving" matrix from a -savemat JSON. Minimal parser: slurp the
+   file, anchor on the `"fixed_to_moving" : [` KEY (a `:`+`[` after the token, so a filename
+   value that happens to equal the token is not matched), then read EXACTLY 16 numbers
+   bounded by the matching outer `]` (bracket depth) — a truncated array errors instead of
+   scanning past into the following inverse matrix. Returns 0 on success. */
+static int al_read_affine_json(const char *path, mat44 *out) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { fprintf(stderr, "Failed to open matrix '%s'\n", path); return 1; }
+	if (fseek(f, 0, SEEK_END) != 0) { fclose(f); fprintf(stderr, "Cannot read '%s'\n", path); return 1; }
+	long n = ftell(f);
+	if (n <= 0 || n > (1L << 20)) { fclose(f); fprintf(stderr, "Bad matrix file size '%s'\n", path); return 1; }
+	rewind(f);
+	char *buf = (char *)malloc((size_t)n + 1);
+	if (!buf) { fclose(f); fprintf(stderr, "Memory allocation failed\n"); return 1; }
+	size_t got = fread(buf, 1, (size_t)n, f);
+	fclose(f);
+	buf[got] = '\0';
+	/* Anchor on the KEY: a `:` then `[` after the token. Keep searching later occurrences so
+	   an earlier JSON VALUE equal to "fixed_to_moving" doesn't shadow the real key. */
+	char *p = NULL;
+	for (char *q = strstr(buf, "\"fixed_to_moving\""); q; q = strstr(q + 1, "\"fixed_to_moving\"")) {
+		char *r = q + strlen("\"fixed_to_moving\"");
+		while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+		if (*r != ':') continue;
+		r++;
+		while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+		if (*r != '[') continue;
+		p = r;   /* r is at the outer '[' */
+		break;
+	}
+	if (!p) { free(buf); fprintf(stderr, "'%s' has no \"fixed_to_moving\": [ ... ] matrix\n", path); return 1; }
+	/* Read numbers until the matching outer ']' (depth back to 0). `closed` guards against a
+	   truncated array that happens to hold 16 numbers but is never closed. */
+	int depth = 0, count = 0, closed = 0;
+	float vals[16];
+	for (; *p; p++) {
+		if (*p == '[') { depth++; }
+		else if (*p == ']') { if (--depth == 0) { closed = 1; break; } }
+		else if ((*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.') {
+			if (count >= 16) { free(buf); fprintf(stderr, "'%s': fixed_to_moving has more than 16 numbers\n", path); return 1; }
+			char *end;
+			vals[count] = strtof(p, &end);
+			if (end == p) { free(buf); fprintf(stderr, "'%s': malformed number in fixed_to_moving\n", path); return 1; }
+			count++;
+			p = end - 1;   /* -1: the loop's p++ advances past the number */
+		}
+	}
+	free(buf);
+	if (!closed) { fprintf(stderr, "'%s': fixed_to_moving array is not terminated (missing ']')\n", path); return 1; }
+	if (count != 16) { fprintf(stderr, "'%s': fixed_to_moving has %d numbers, expected 16\n", path, count); return 1; }
+	for (int i = 0; i < 4; i++)
+		for (int j = 0; j < 4; j++)
+			out->m[i][j] = vals[i*4 + j];
+	return 0;
+}
+#endif
+
+staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingfile, al_opts opts) {
+#ifdef DT32
+	int interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : opts.final_interp;
+	/* Use the ORIGINAL input filename for -savemat provenance, not nim->fname — the latter was
+	   already overwritten with the OUTPUT path by nifti_set_filenames before the op loop. */
+	const char *moving_name = (movingfile && movingfile[0]) ? movingfile : "";
+
+	/* --- -applymat: apply a saved world-space FIXED->MOVING matrix (from -savemat) and
+	   reslice `nim` onto the base (target) grid. Does NO registration, so it is exclusive
+	   with the registration/seed options. `base` here is the OUTPUT GRID. --- */
+	if (opts.applymat) {
+		if (opts.fast || opts.savemat || opts.sym || opts.com || opts.master || opts.zoom || !opts.sagseed ||
+		    (opts.cli_set & (AL_CLI_COST | AL_CLI_WARP | AL_CLI_INTERP | AL_CLI_CMASS)) ||
+		    opts.source_automask || opts.dark_automask) {
+			printfx("** -applymat does no registration; it cannot be combined with registration/seed options (-cost/-warp/-interp/-cmass/-source_automask/-dark_automask/-savemat/-sym/-com/-master/-zoom/-nosagseed)\n");
+			return 1;
+		}
+		nifti_image *tgt = nifti_image_read(basefile, 0);   /* geometry only */
+		if (!tgt) { printfx("** failed to read -applymat target grid '%s'\n", basefile); return 1; }
+		mat44 ftm;
+		int arc = al_read_affine_json(opts.applymat, &ftm) ||
+		          nii_apply_affine(nim, tgt, ftm, interp, 0.0f);
+		nifti_image_free(tgt);
+		if (arc) { printfx("** -applymat failed\n"); return 1; }
+		return 0;
+	}
+
 	nifti_image *base = nifti_image_read(basefile, 1);
 	if (!base) {
 		printfx("** failed to read base image from '%s'\n", basefile);
 		return 1;
 	}
-	int ok = nii_allineate(nim, base, opts);
+	/* -master: register at the base resolution but reslice the result onto this grid
+	   (must share the base world frame, e.g. a higher-res template). */
+	nifti_image *master = NULL;
+	if (opts.master) {
+		/* Only the master's geometry (dims + sform/qform) is used — the reslice adopts its
+		   grid and never reads its voxels — so read the header only (read_data=0). */
+		master = nifti_image_read(opts.master, 0);
+		if (!master) {
+			printfx("** failed to read -master grid from '%s'\n", opts.master);
+			nifti_image_free(base);
+			return 1;
+		}
+	}
+	int ok;
+	if (opts.fast) {
+		/* Fast SPM/FLIRT-inspired engine (-cost fast = Hellinger, -cost fastcr = CR):
+		   estimate the world-mm FIXED->MOVING affine WITHOUT mutating inputs, then reslice
+		   `nim` in place onto the base (or -master) grid. The fast engine runs a fixed
+		   12-DOF schedule with its own internal sampling/masking, so reject (rather than
+		   silently ignore) options it cannot honor — the header contract promises this. */
+		if (opts.cli_set & AL_CLI_WARP) {
+			printfx("** -cost fast/fastcr does not support -warp (fixed 12-DOF schedule); omit -warp or use a normal cost\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.cli_set & AL_CLI_INTERP) {
+			printfx("** -cost fast/fastcr does not support -interp (internal sampling); use -final for the output interpolation\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.source_automask || opts.dark_automask) {
+			printfx("** -cost fast/fastcr does not support -source_automask/-dark_automask (internal masking)\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.sym || opts.zoom) {
+			printfx("** -cost fast/fastcr does not support -sym/-symd/-symb/-zoom\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		/* -com is a strict header-recentered initialization. Capture both frames before
+		   registration so -savemat can compose the seeded fit back to the original input. */
+		int seeded_com = opts.com && opts.savemat;
+		mat44 S_orig, S_seed;
+		if (seeded_com) al_image_xform_or_pixdim(nim, &S_orig, NULL);
+		if (opts.com && nii_center_of_mass(nim)) {
+			printfx("** -com failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (seeded_com) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+		coreg_fast_opts cfo = coreg_fast_opts_default();
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
+		cfo.use_cmass = !opts.com &&
+		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		coreg_fast_result res;
+		ok = coreg_fast_estimate(nim, base, &cfo, &res);
+		if (ok)
+			printfx("** fast registration failed\n");
+		else {
+			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp, 0.0f);
+			if (!ok && opts.savemat) {
+				mat44 save_mat = res.fixed_to_moving;
+				if (seeded_com) {
+					mat44 seeded_to_original = nifti_mat44_mul(S_orig, nifti_mat44_inverse(S_seed));
+					save_mat = nifti_mat44_mul(seeded_to_original, save_mat);
+				}
+				const char *fc = (res.resolved_cost == CF_COST_LS) ? "ls" :
+				                 (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
+				if (al_write_affine_json(opts.savemat, save_mat, "coreg_fast",
+				                         res.resolved_dof, fc, basefile, moving_name))
+					ok = 1;
+				else
+					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
+			}
+		}
+	} else {
+		/* Normal allineate engine, with optional header-seed pre-steps applied to the
+		   moving image (nim) before the fit (superset of the standalone allineate):
+		   -com resets the origin to the brightness center of mass; -sym/-symd/-symb fold a
+		   midsagittal-plane correction into the header; -sagseed (default on) then recovers
+		   the 3 in-MSP DOF -sym is blind to via a constrained fit to the base. (-robustfov is
+		   a separate chainable niimath op — run it before -allineate to crop first.)
+		   A header-mutating seed (-com/-sym) fits a matrix relative to the SEEDED moving world
+		   frame; for -savemat we capture the original frame first and compose the saved matrix
+		   back to it (below) so -applymat reproduces the result on the ORIGINAL, un-seeded input. */
+		int seeded = (opts.savemat && (opts.com || opts.sym));
+		mat44 S_orig, S_seed;
+		if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);   /* pre-seed moving world frame */
+		if (opts.com && nii_center_of_mass(nim)) {
+			printfx("** -com failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.sym) {
+			/* nim is already DT_FLOAT32 here (niimath converts the chain image to the calc
+			   datatype before the op loop), so no float32 conversion is needed. */
+			if (nii_symmetry(nim, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
+				printfx("** -sym failed\n");
+				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+			}
+			if (opts.sagseed && nii_sagseed(nim, base, opts)) {
+				printfx("** -sagseed failed\n");
+				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+			}
+		}
+		/* Seeded moving world frame, captured before the fit reslices nim in place (the seeds
+		   are header-only — no data reslice — so composing S_orig*inv(S_seed)*M below reproduces
+		   the seeded-fit sampling when applied to the original input). */
+		if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+		mat44 fitmat; int have_fit = 0;
+		if (master) {
+			/* -master: estimate the affine ONCE without reslicing (the moving image is left
+			   untouched), then apply it ONCE onto the master grid. No deep copy, no discarded
+			   base-grid reslice. The estimate returns the world affine directly (the -master
+			   path does NOT set the g_last_affine global — nii_allineate does), so -savemat
+			   below reads `fitmat` here rather than nii_last_affine(). */
+			ok = nii_allineate_estimate(nim, base, opts, &fitmat);
+			if (!ok) { have_fit = 1; ok = nii_apply_affine(nim, master, fitmat, interp, 0.0f); }
+		} else {
+			ok = nii_allineate(nim, base, opts);
+			if (!ok) have_fit = (nii_last_affine(&fitmat) == 0);
+		}
+		if (!ok && opts.savemat) {
+			if (!have_fit)   /* guard the fitmat read: never serialize an unfitted matrix */
+				ok = 1;
+			else {
+				/* Compose a header-mutating seed back out so the saved matrix is relative to
+				   the ORIGINAL moving frame: M' = S_orig * inv(S_seed) * M (identity if unseeded). */
+				mat44 outmat = seeded
+				    ? nifti_mat44_mul(S_orig, nifti_mat44_mul(nifti_mat44_inverse(S_seed), fitmat))
+				    : fitmat;
+				if (al_write_affine_json(opts.savemat, outmat, "allineate", opts.warp,
+				                         al_cost_name(opts.cost), basefile, moving_name))
+					ok = 1;
+				else
+					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
+			}
+		}
+	}
+	if (master) nifti_image_free(master);
 	nifti_image_free(base);
 	return ok;
 #else
@@ -5653,6 +6078,10 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, al_opts opts)
 
 staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
+	/* -deface uses the ordinary Hellinger allineate engine and reslices the mask onto the
+	   subject's native grid. The fast engine, -master, and the seed/matrix workflow options
+	   are rejected at PARSE time (the -deface dispatch passes AL_CAP_TUNING|AL_CAP_FINAL to
+	   al_parse_subopts), so they cannot reach here — no post-hoc guard needed. */
 	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
 	if (!tmpl) {
 		printfx("** failed to read template image from '%s'\n", tmplfile);
@@ -5720,13 +6149,19 @@ int main64(int argc, char *argv[]) {
 		fin = argv[ac]; // no string copy, just pointer assignment
 		ac++;
 		nifti_image *nim = nifti_image_read(fin, 1);
+		if (!nim) {
+			printfx("** failed to read NIfTI image from '%s'\n", fin);
+			return 2;
+		}
 		fout = argv[ac]; // no string copy, just pointer assignment
 		ac++;
-		if (nifti_set_filenames(nim, fout, 0, 1))
+		if (nifti_set_filenames(nim, fout, 0, 1)) {
+			nifti_image_free(nim);
 			return 1;
-		nifti_save(nim, "", gzMode); // nifti_image_write( nim );
+		}
+		int prc = nifti_save(nim, "", gzMode); // propagate a failed write
 		nifti_image_free(nim);
-		return 0;
+		return prc;
 	} // end pass through
 	// next argument is input file
 	fin = argv[ac]; // no string copy, just pointer assignment
@@ -5735,6 +6170,12 @@ int main64(int argc, char *argv[]) {
 	nifti_image *nim = nifti_image_read2(fin, 1);
 	if (!nim) {
 		printfx("** failed to read NIfTI image from '%s'\n", fin);
+		return 2;
+	}
+	int nvox3D_checked;
+	if (nii_nvox3d_int(nim, &nvox3D_checked)) {
+		printfx("** voxel count for '%s' exceeds the supported INT_MAX computation limit\n", fin);
+		nifti_image_free(nim);
 		return 2;
 	}
 	// printf("read time: %ld ms\n", timediff(startTime, clock()));
@@ -5768,17 +6209,22 @@ int main64(int argc, char *argv[]) {
 				dtOut = nim->datatype; // ihdr.datatype; //!
 		} else {
 			printfx("Error: Unknown datatype '%s' - Possible datatypes are: char short ushort int float double input\n", argv[argc - 1]);
+			nifti_image_free(nim);
 			return 2;
 		}
 		argc = argc - 2;
 	} // odt
 	// convert data to calculation type (-dt)
-	if (nifti_image_change_datatype(nim, dtCalc, &ihdr) != 0)
+	if (nifti_image_change_datatype(nim, dtCalc, &ihdr) != 0) {
+		nifti_image_free(nim);
 		return 1;
+	}
 	// check output filename, e.g does file exist
 	fout = argv[argc - 1]; // no string copy, just pointer assignment
-	if (nifti_set_filenames(nim, fout, 0, 1))
+	if (nifti_set_filenames(nim, fout, 0, 1)) {
+		nifti_image_free(nim);
 		return 1;
+	}
 	argc = argc - 1;
 #if defined(_OPENMP)
 	const int maxNumThreads = omp_get_max_threads();
@@ -6007,7 +6453,7 @@ int main64(int argc, char *argv[]) {
 			int tmin = atoi(argv[ac]);
 			ac++;
 			int tsize = atoi(argv[ac]);
-			nifti_roi(nim, xmin, xsize, ymin, ysize, zmin, zsize, tmin, tsize);
+			ok = nifti_roi(nim, xmin, xsize, ymin, ysize, zmin, zsize, tmin, tsize);
 		} else if (!strcmp(argv[ac], "-bptfm")) {
 			ac++;
 			double hp_sigma = strtod(argv[ac], &end);
@@ -6024,6 +6470,8 @@ int main64(int argc, char *argv[]) {
 #ifdef HAVE_BMP
 		} else if (!strcmp(argv[ac], "-bitmap")) {
 			ok = nifti_ras(nim);
+			if (ok)
+				goto fail;
 			flt mn, mx;
 			ac++;
 			nifti_image *nim2 = NULL;
@@ -6045,28 +6493,48 @@ int main64(int argc, char *argv[]) {
 				}
 				if (nifti_image_change_datatype(nim2, nim->datatype, &ihdr) != 0) {
 					printfx("unable to read %s\n", argv[ac]); // e.g. volume size might differ
+					nifti_image_free(nim2);
 					goto fail;
 				}
 				ok = nifti_ras(nim2);
+				if (ok) {
+					nifti_image_free(nim2);
+					goto fail;
+				}
 				if (isEdge) {
 					ok = nifti_otsu(nim2, 5, 0);
-					ok = nifti_dog(nim2, 2.0, 3.2, 0);
+					if (!ok)
+						ok = nifti_dog(nim2, 2.0, 3.2, 0);
+				}
+				if (ok) {
+					nifti_image_free(nim2);
+					goto fail;
 				}
 				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
 					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+					nifti_image_free(nim2);
 					goto fail;
 				}
-				nifti_robust_range(nim2, &mn, &mx, 0);
+				if (nifti_robust_range(nim2, &mn, &mx, 0)) {
+					nifti_image_free(nim2);
+					goto fail;
+				}
 				nim2->cal_min = mn + FLT_EPSILON;
 				nim2->cal_max = mx;
 				ac++; // consume overlay argument
 			} else if (isEdge) {
 					//only background image: apply edge to that image
 					ok = nifti_otsu(nim, 5, 0);
-					ok = nifti_dog(nim, 2.0, 3.2, 0);
+					if (!ok)
+						ok = nifti_dog(nim, 2.0, 3.2, 0);
+					if (ok)
+						goto fail;
 			}
 			// Compute robust range for main image
-			nifti_robust_range(nim, &mn, &mx, 0);
+			if (nifti_robust_range(nim, &mn, &mx, 0)) {
+				if (nim2) nifti_image_free(nim2);
+				goto fail;
+			}
 			nim->cal_min = mn;
 			nim->cal_max = mx;
 
@@ -6113,13 +6581,13 @@ int main64(int argc, char *argv[]) {
 			double thresh = strtod(argv[ac], &end);
 			ac++;
 			double thick = strtod(argv[ac], &end);
-			nifti_hollow(nim, thresh, thick);
+			ok = nifti_hollow(nim, thresh, thick);
 		} else if (!strcmp(argv[ac], "-unsharp")) {
 			ac++;
 			double sigma = strtod(argv[ac], &end);
 			ac++;
 			double amount = strtod(argv[ac], &end);
-			nifti_unsharp(nim, sigma, sigma, sigma, amount);
+			ok = nifti_unsharp(nim, sigma, sigma, sigma, amount);
 		} else if (strstr(argv[ac], "-otsu")) {
 			ac++;
 			int mode = atoi(argv[ac]);
@@ -6299,9 +6767,9 @@ int main64(int argc, char *argv[]) {
 			}
 			char *al_basefile = argv[ac];
 			al_opts al_options = al_opts_default();
-			if (al_parse_subopts(&ac, argc, argv, &al_options, "-allineate"))
+			if (al_parse_subopts(&ac, argc, argv, &al_options, "-allineate", AL_CAP_ALL))
 				goto fail;
-			ok = nifti_allineate_wrap(nim, al_basefile, al_options);
+			ok = nifti_allineate_wrap(nim, al_basefile, fin, al_options);
 		}
 		else if (!strcmp(argv[ac], "-deface")) {
 			const char *cmd = argv[ac];
@@ -6313,7 +6781,9 @@ int main64(int argc, char *argv[]) {
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd))
+			/* -deface implements only cost/warp/interp/cmass/automask tuning + final interp;
+			   the seed/matrix/master/fast workflow options are rejected at parse time. */
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd, AL_CAP_TUNING | AL_CAP_FINAL))
 				goto fail;
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
@@ -6419,7 +6889,7 @@ int main64(int argc, char *argv[]) {
 			if (nifti_set_filenames(nim, fout2, 1, 1))
 				ok = 1;
 			else {
-				nifti_save(nim, "", gzMode); // nifti_image_write( nim );
+				ok = nifti_save(nim, "", gzMode); // propagate a failed intermediate -save
 				nifti_set_filenames(nim, fout, 1, 1);
 			}
 		} else if (!strcmp(argv[ac], "-restart")) {
@@ -6507,7 +6977,7 @@ int main64(int argc, char *argv[]) {
 		if ((op >= dilMk) && (op <= fmeanuk))
 			ok = nifti_kernel(nim, op, kernel, nkernel);
 		if ((op >= exp1) && (op <= ptoz1))
-			nifti_unary(nim, op);
+			ok = nifti_unary(nim, op);
 		if ((op >= add) && (op < exp1)) { // binary operations
 			ac++;
 			double v = strtod(argv[ac], &end);
@@ -6568,12 +7038,12 @@ int main64(int argc, char *argv[]) {
 	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
 		goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
 	// if we get here, write the output dataset
-	nifti_save(nim, "", gzMode); // nifti_image_write( nim );
+	int save_rc = nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
 	// and clean up memory
 	nifti_image_free(nim);
 	if (kernel != NULL)
 		free(kernel);
-	return 0;
+	return save_rc;
 
 fail:
 	nifti_image_free(nim);

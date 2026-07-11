@@ -1,56 +1,37 @@
-# Audit Response
+# Audit Response — Round 5
 
-## Status
+Response to `audit_temp.md` (Round 5). All Round-4 repairs were re-confirmed. Also audited the maintainer's intentional coreg_fast.c partial-FOV change (see end). Verdicts: **Fixed**, **Resolved** (stale — done between the snapshot and now), **Defer** (pre-existing/own pass).
 
-Not ready before this pass. The allocator ownership sweep was directionally correct, but several touched paths still failed open or mutated image state before fallible allocations completed. I corrected the release-blocking issues I found.
+## High severity
 
-## Changes Made
+### 1. Output-write failure `stat()` workaround was insufficient → **Fixed properly**
+Correct — the stat-after-write could not distinguish a fresh write from a stale file (a read-only pre-existing target read as success; a partial write likewise). Replaced with a real status boundary: **`nifti_image_write` now returns 0/1** (covering header conversion, open, short header/data write, and compressor/close/`pclose` errors — disk-full flushes at close). Its only caller `nifti_save` propagates it (the stat hack is gone), and the main-dispatch / pass-through / intermediate-`-save` sites propagate `nifti_save`. Multi-output `--dtifit` (11 files) and `-tensor_decomp` (9 volumes) now OR every write status (`save_rc |= nifti_save(...)`) and fail if any output failed. Verified: bad directory, **stale read-only file** (the reviewer's specific gap), and normal/gz/zst writes all behave correctly; leak-clean; canonical regression still passes. CI added.
 
-- Reworked `nii_calloc` into `nii_calloc(count, size)` with an overflow check via `nii_mul_size`. Updated current call sites to pass element counts and element sizes explicitly.
-- Set the allocation policy for `nii_calloc`: allocation overflow or nonzero OOM prints a clear error and exits with `EXIT_FAILURE`.
-- Hardened conform reslicing. `doReslice` now validates dimensions, allocates input/output buffers, and only mutates `nim` header/data after all fallible work succeeds. Allocation failure no longer leaves `nim->data` freed or the header half-updated.
-- Hardened high-risk core image operations touched by the allocator sweep: `nifti_crop`, `nifti_dim_reduce`, `nifti_tensor_decomp`, `nifti_subsamp2`, `nifti_resize`, `-pval`, and `-cpval`. These now check key output-size products and allocation results before replacing `nim->data`.
-- Fixed a `Tar1` scratch-buffer leak in `nifti_dim_reduce` when a voxel time series is constant.
-- Removed per-voxel heap allocations from `nifti_tensor_decomp`; the 6-input and 14-output temporary arrays are now stack locals.
-- Hardened allineate setup. Base/source voxel counts are overflow-checked, autoweight/source-mask/base-mask/source-automask scratch allocations fail closed, and source automask backup allocation is mandatory when noise fill is enabled.
-- Hardened `create_GA_BLOK_set` realloc paths. Realloc now uses a temporary pointer, failed shrink keeps the original allocation, and all surviving per-block arrays are freed if output struct allocation fails.
-- Kept the allineate all-`AL_BIGVAL` coarse-search path fail-closed. It no longer reports a successful registration with only the identity transform.
-- Made TypeScript declaration generation fatal in `js/esbuild.config.ts`; a package build should not ship missing or stale `.d.ts` files.
+### 2. `--compare` reported non-finite mismatches as equal → **Fixed**
+Confirmed (all-NaN vs finite returned 0). Root cause: `fabs(nan/inf)` never beat `maxDiff`, so `differentVox` stayed at its sentinel and both the early "equal" test and the final `maxDiff > thresh` exit read as equal. Fixes: `essentiallyEqual` now handles inf (equal only for identical sign) and one-sided nan (differ); the loop records the FIRST mismatch location regardless of magnitude; the equality test uses `nDifferent == 0`; and a **non-finite mismatch always fails** (`nHardMismatch`). Verified: nan-vs-finite / +inf-vs--inf / inf-vs-finite fail; nan-vs-nan / +inf-vs-+inf equal; finite tolerance compare unchanged. CI added (oracle integrity).
 
-## Rationale
+### 3. Whole-program fast-math not implemented → **Resolved (stale)**
+The snapshot predated the change. Whole-program `-ffast-math -fno-finite-math-only` now applies in Make, CMake (`CMAKE_C_FLAGS`), notarize.sh (inline), and wasm (main `emcc` line). MSVC stays strict. Validated: Make vs CMake fast affine byte-identical; **both the canonical suite AND `close.sh` (tolerance ops) pass** on the whole-program build (the reviewer's requested Make/CMake/canonical checks). GPL SPM-MATLAB + dtifit/tensor goldens flagged in AGENTS.md for re-validation if touched.
 
-- `nim->data` ownership must be boring: plain `malloc`/`calloc` buffers released by plain `free`. The sweep removed the aligned-allocator mismatch risk, but the helper also needed normal `calloc(count, size)` semantics so large count products are checked consistently. Failed allocation is treated as fatal, not as recoverable application state.
-- Image transforms must be transactional at the `nim` level. Allocate first, mutate header/data last.
-- Registration and defacing should fail closed on setup/cost-path allocation failure. A degraded identity transform is not an acceptable fallback for privacy-sensitive defacing.
-- Release packaging should fail on type-generation errors. Warning-only declaration generation hides broken package artifacts.
+## Medium severity
+
+### 4. Affine JSON boundary accepted malformed input → **Fixed**
+Confirmed. Fixes: (a) `nii_apply_affine` now validates the **finiteness** of the bottom row (a `[-nan,0,0,1]` row passed `fabsf(nan)>1e-4` and `al_mat44_usable`'s upper-3-rows check — it wrote an all-NaN image); (b) the JSON reader requires the array to actually **close** (`closed` flag on the outer `]` — a 16-number unterminated array is now rejected); (c) the key search **continues to later occurrences** so an earlier value equal to `"fixed_to_moving"` no longer shadows the real key. Verified all three; valid round-trip unchanged. CI added.
+
+### 5. Documented CMake `-DUSE_OPENMP=OFF` did not exist → **Fixed**
+Added one `option(USE_OPENMP ... ON)` gating OpenMP for AppleClang (subordinating the legacy `OPENMP_XCODE`) and GNU. Verified: `-DUSE_OPENMP=OFF` configures with no "unused variable" warning and builds single-threaded; default ON builds with OpenMP. Docs (AGENTS.md/README) now accurate.
+
+### 6. `int` overflow in `nx*ny*nz` → **Defer (pre-existing, Known Issue #4)**
+Unchanged; needs a shared checked 3D-count helper as its own pass.
+
+## Low severity
+- **7. `al_opts` split** → Defer (the capability mask already prevents the silent-no-op class).
+- **8. Serial pyramid resample** → Defer (profile-gated; bit-identical if parallelized).
+
+## Intentional change reviewed — coreg_fast.c partial-FOV cost → **Sound**
+For HEL/CR the fast engine now excludes out-of-FOV moving samples from its statistics (was: fill with `m_bg`), so a moving image that doesn't fully cover the template isn't biased toward scale/shear that pull all fixed samples into the moving box. An independent agent verified: **determinism preserved** (the exclusion is inside each fixed reduction chunk; `nin` combined in fixed order), **all divisions guarded** by the `nin < 0.10*ns || nin < 16` floor, bins in bounds, and HEL/CR statistics are internally consistent (no full-set/intersection mixing). Validated on the real motivating case (`T2w.nii.gz` → `avg152T1`, a 60-slice partial-coverage cross-modal pair): the recovered transform is **near-rigid — scales ≈1, inter-axis angles ≈90° (no shear)**, i.e. the pre-change distortion is gone. Added a self-contained partial-FOV CI fixture (a z-slab moving image) asserting both overlap correlation and a near-rigid recovered transform, so a regression that re-distorts partial-FOV fits fails CI.
 
 ## Verification
-
-- `make -C src` passed.
-- `git diff --check` passed.
-- `bun run build` passed after allowing Emscripten to write its cache outside the workspace. BSD and GPL WASM were rebuilt.
-- `bun run esbuild.config.ts` passed. It printed the existing non-fatal `pyenv: cannot rehash` warning.
-- `bun test ./tests` passed after the full build: 8 tests, 0 failures. It printed the existing non-fatal `pyenv: cannot rehash` warning.
-- Native CLI smoke tests passed on synthetic NIfTI fixtures for `-Tmedian`, `-Tar1`, `-pval`, `-resize`, `-subsamp2`, and `-comply`.
-
-## Remaining Release Risks
-
-- This is not a project-wide allocator-wrapper conversion. MarchingCubes, quadric, and older core paths still have direct allocations; they should eventually route through fail-fast helpers or explicitly `exit(EXIT_FAILURE)` on OOM.
-- Several legacy voxel-count products still use `int` in code outside the paths fixed here. The largest-image overflow story is improved, not globally solved.
-- `nifti_save` still reports success unconditionally; multi-output operations can still hide write failures.
-- Release zstd source download verification remains unpinned. Add a SHA-256 check before relying on that workflow for a release.
-- Build-source lists remain duplicated across Makefile, CMake, SuperBuild, and release scripts.
-
-## Supervisor audit + deployment (2026-07-03, v1.0.20260703)
-
-A three-agent audit (security, refactor, docs) plus independent verification reviewed the auditor's hardening ahead of the version bump to `v1.0.20260703` and push to `master`.
-
-**Verdict: no release-blocking regression; the hardening is correct.**
-- **Byte-identical output** confirmed between a clean `git HEAD` build and the hardened build across the touched ops on both synthetic and real (`niivue-demo-images/register`) data: `-crop`, `-resize` (shrink/grow/Lanczos), `-subsamp2`, `-conform`, `-Tar1`/dim_reduce, `-pval`/`-cpval`, and `-tensor_decomp` (all 9 outputs). The auditor's transactional/overflow-check rework changes no successful-path result.
-- **`nii_calloc(count,size)` + `nii_mul_size`**: overflow check is textbook-correct; all 8 call sites pass `(voxel_count, sizeof)` with no double-counting. `exit(EXIT_FAILURE)` on OOM is **not a regression** (the prior `aligned_calloc` had no NULL check → segfault on OOM; `exit()` is cleaner). **Noted, non-blocking:** the auditor also added `if (dat==NULL) return 1;` handlers at every site, which are unreachable while `nii_calloc` exits; switching `nii_calloc` to *return NULL* would make them live and keep the long-lived WASM worker alive on OOM (the refactor agent's recommendation). Left to the auditor's stated "fatal allocation" design; recommended as a follow-up.
-- **`nifti_tensor_decomp`** stack locals are fixed 6/14-float arrays (80 B) — safe, output unchanged. conform `doReslice` reslice math is byte-identical; `create_GA_BLOK_set` realloc-temp and the `Tar1` leak fix are correct; allineate mask/automask fail-closed additions don't alter a successful registration (verified real `-allineate`/`-deface`). No double-free/UAF/leak found in the diff.
-- **ASan** could not run a full suite on this Apple Silicon host (platform ASan is impractically slow even via Homebrew LLVM clang; documented in agent memory). Correctness rests on byte-identical diffing + code review.
-
-**CI / Windows confidence (the original `0xC0000374` failure):** the root cause — a `_mm_malloc`/`_aligned_malloc` buffer handed to `nim->data` and freed with plain `free()` on MSVC — is eliminated for the whole tree by the `_mm_malloc`→plain sweep (conform now uses `nii_calloc`). `release_smoke.py --expect-bsd --expect-zstd` **passes locally on both the Makefile and the CMake (Windows build-path) binaries**; no build system references the deleted `arm_malloc.h`; the diff contains no MSVC-incompatible constructs (no VLA/`typeof`/`__attribute__`/statement-expressions; `SIZE_MAX` via `<stdint.h>`). Native, CMake, nano, tiny, and WASM all build clean. Pushing to `master` runs `release.yml` (Windows wheels + `release_smoke`) but does **not** publish (PyPI upload is gated on `refs/tags/v*`), so this is CI validation without a release — a maintainer tags `v1.0.20260703` later to publish.
-
-**Highest-value open follow-ups for next session:** (1) finish Known Issue #4 — the remaining `int nvox3D` **divisor/loop-bound** truncation sites (SIGFPE/OOB on >2³¹-voxel images) not covered by the allocation-sizing fix; (2) optionally switch `nii_calloc` to return-NULL for WASM-worker survival; (3) pin the zstd tarball SHA-256 in `release.yml`.
+- Make / CMake (incl. `-DUSE_OPENMP=OFF`) / nano / tiny builds clean; canonical + close.sh pass.
+- Write-failure (bad dir + stale read-only), `--compare` non-finite, malformed-JSON, seeded replay, and partial-FOV registration all behave as intended; leak-clean.
+- Version remains `v1.0.20260711`; nothing committed.

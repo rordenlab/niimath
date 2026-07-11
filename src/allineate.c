@@ -72,6 +72,15 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
     return f;
 }
 
+/* Convert mat44 (float) to nifti_dmat44 (double) */
+static nifti_dmat44 mat44_to_dmat44(mat44 f) {
+    nifti_dmat44 d;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            d.m[i][j] = (double)f.m[i][j];
+    return d;
+}
+
 /*==========================================================================*/
 /*============================== CONSTANTS ================================*/
 /*==========================================================================*/
@@ -81,7 +90,14 @@ static mat44 dmat44_to_mat44(nifti_dmat44 d) {
 
 /* Sparse sampling: fraction of task voxels for fine-pass matching (AFNI default) */
 #define AL_SPARSE_SAMPLE_FRAC  0.47
-#define AL_NPT_MATCH_MIN      9999
+/* Coarse-pass matching-point floor. MUST match AFNI's nmatch_setup (98765). An earlier
+   distillation used 9999 (~10x fewer), which under-samples the coarse cost surface: on a
+   cross-modal / offset case (T2w->avg152T1, header centroids ~25 mm apart) the noisy coarse
+   Hellinger landed in a wrong rotation/translation basin from the header start, needing
+   -cmass to recover (0.760 -> 0.840 L-R symmetry). Restoring AFNI's 98765 makes the coarse
+   surface clean enough to find the right basin WITHOUT -cmass (0.833, matching AFNI's 0.826),
+   with negligible added time (the coarse pass is 2x-downsampled and a small fraction of total). */
+#define AL_NPT_MATCH_MIN      98765
 
 /* Cost function method codes (subset of AFNI's full list) */
 #define GA_MATCH_PEARSON_SCALAR        1
@@ -189,6 +205,8 @@ typedef struct {
     int bnx, bny, bnz;    /* base dimensions */
     float bdx, bdy, bdz;  /* base voxel sizes */
     float bsbot, bstop, bsclip;
+    float bs_topclip;      /* AFNI mri_topclip: histogram-MEMBERSHIP top (drop above); distinct
+                              from bsclip = clipate top used for edge-binning */
     unsigned char *bmask;  /* base mask */
     float *bwght;          /* base weights */
     int nmask;
@@ -199,7 +217,15 @@ typedef struct {
     int anx, any, anz;     /* source dimensions */
     float adx, ady, adz;   /* source voxel sizes */
     float ajbot, ajtop, ajclip;
+    float aj_topclip;      /* AFNI mri_topclip: histogram-MEMBERSHIP top (drop above); distinct
+                              from ajclip = clipate top used for edge-binning */
     float ajmin, ajmax;    /* original data range (for cubic overshoot clamping) */
+    /* AFNI set_2Dhist_xyclip: edge-bin clips from the SAMPLE distribution, recomputed per
+       stage. hxc=source(x), hyc=base(y). need_hist_setup is set at each stage's setup and
+       consumed (compute + clear) by the stage's FIRST, sequential cost eval — never in the
+       parallel region — so the result is deterministic (mirrors AFNI GA_scalar_fitter). */
+    float hxc_bot, hxc_top, hyc_bot, hyc_top;
+    int   need_hist_setup;
     unsigned char *ajmask;  /* source mask */
     int najmask;
 
@@ -239,6 +265,13 @@ typedef struct {
     int ajmask_ranfill;       /* if nonzero, fill outside ajmask with noise */
     float aj_ubot, aj_usiz;   /* noise range: ubot + usiz*(u1+u2) */
     float *ajim_orig;          /* backup of original source data before noise fill */
+
+    /* dark (image-minimum) automask (-dark_automask): drop a matched pair from the
+       cost when the base OR warped-source value sits at that image's darkest value
+       (background / zero-pad / NaN-filled-to-zero). dark_base/dark_targ are those
+       per-image minima; applied per-eval in GA_scalar_fitter. */
+    int do_dark_automask;
+    float dark_base, dark_targ;
 } GA_setup;
 
 /* For qsort_floatint */
@@ -266,9 +299,41 @@ static GA_setup *gstup = NULL;  /* current setup for optimizer callback */
 static int aff_use_before = 0, aff_use_after = 0;
 static mat44 aff_before, aff_after;
 
+/* World-space FIXED(base)->MOVING(source) affine from the most recent successful
+   nii_allineate() fit, exposed via nii_last_affine() so the CLI can save it
+   (-savemat) without changing nii_allineate's signature or making it dereference a
+   new al_opts field (which would break the niimath drop-in, where nii_allineate must
+   ignore demo-only fields). Serial-only, like the other engine globals. */
+static mat44 g_last_affine;
+static int g_last_affine_valid = 0;
+
+/* Wall-clock ms spent in the coarse and fine passes of the most recent al_register()
+   (always measured, unlike the -DAL_PROFILE breakdown). nii_allineate() reports them
+   in its "Registration completed" line. Serial-only, like the other engine globals. */
+static double g_last_coarse_ms = 0.0, g_last_fine_ms = 0.0;
+
+/* When >0, an upper bound (in mm) on each |x/y/z-shift| parameter range in
+   al_register. Set transiently by nii_symmetry() around a mirror registration to
+   keep the recovered translation near isocenter, then reset to 0. Single-threaded
+   at the point of use, so touching this file-scope global is safe (mirrors the
+   aff_use_before/after pattern). */
+static float al_shift_max_override = 0.0f;
+
+/* When nonzero, GA_setup_affine ties the y- and z-scale to the x-scale (parvec[6])
+   so a single free scale parameter drives a GLOBAL ISOTROPIC zoom (no shape
+   distortion), and al_register widens param[6]'s range. Set transiently by
+   nii_sagseed() around the -zoom seed fit + its transform extraction, then reset to
+   0 — so the isotropic *tie* never affects the main nii_allineate() fit. (The main
+   fit's scale *range* is still widened separately, via al_register's `relax_scale`
+   arg, which -zoom also sets; all other regularization is unchanged.) Read during
+   the parallel cost evals but never written there (mirrors aff_use_*). */
+static int al_zoom_isotropic = 0;
+
 /* Thread-local workspace for cost function evaluation (avoids per-call malloc) */
 static AL_TLOCAL float *tl_avm = NULL;
 static AL_TLOCAL int    tl_avm_len = 0;
+static AL_TLOCAL float *tl_weff = NULL;   /* -dark_automask per-eval effective weights */
+static AL_TLOCAL int    tl_weff_len = 0;
 static AL_TLOCAL float *tl_wpar = NULL;
 static AL_TLOCAL int    tl_wpar_len = 0;
 static AL_TLOCAL float *tl_wbuf = NULL;  /* holds imw,jmw,kmw contiguously */
@@ -385,6 +450,88 @@ static mat44 mat44_diag(float a, float b, float c)
     return m;
 }
 
+/* Index->world (mm) matrix for a pixdim-centered frame (no sform/qform): a
+ * diagonal scale by |pixdim| with the volume centered on the origin. Shared by
+ * al_register's sform-absent fallback and nii_symmetry (single source of truth
+ * for the centered-frame convention). Non-positive pixdims clamp to 1.0. */
+static mat44 al_pixdim_frame(int nx, int ny, int nz, float dx, float dy, float dz)
+{
+    if (dx <= 0.0f) dx = 1.0f;
+    if (dy <= 0.0f) dy = 1.0f;
+    if (dz <= 0.0f) dz = 1.0f;
+    mat44 m = mat44_diag(dx, dy, dz);
+    m.m[0][3] = -(nx - 1) * 0.5f * dx;
+    m.m[1][3] = -(ny - 1) * 0.5f * dy;
+    m.m[2][3] = -(nz - 1) * 0.5f * dz;
+    return m;
+}
+
+/* Finite (non-NaN, non-Inf) test via a magnitude guard: this TU is built with
+ * -ffast-math, under which isfinite()/isnan() are unreliable, but the ordered
+ * comparison `-FLT_MAX <= v <= FLT_MAX` still excludes NaN (compares false) and
+ * ±Inf. Single source of truth for the several places that filter non-finite. */
+static inline int al_finitef(float v) { return v >= -FLT_MAX && v <= FLT_MAX; }
+
+/* Return nonzero if m is usable as an index->world transform: every entry is
+ * finite (see al_finitef — isfinite() is unreliable under -ffast-math) and the
+ * upper-left 3x3 is non-singular. The singularity test is
+ * scale-invariant: |det| divided by the three column norms is the product of the
+ * sines of the inter-axis angles, which collapses to ~0 for an all-zero or
+ * coplanar ("bogus") matrix regardless of voxel size. */
+static int al_mat44_usable(mat44 m)
+{
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            if (!al_finitef(m.m[i][j])) return 0;
+    double c[3];
+    for (int a = 0; a < 3; a++) {
+        c[a] = sqrt((double)m.m[0][a]*m.m[0][a] +
+                    (double)m.m[1][a]*m.m[1][a] +
+                    (double)m.m[2][a]*m.m[2][a]);
+        if (!(c[a] > 0.0)) return 0;
+    }
+    double det =
+        (double)m.m[0][0] * ((double)m.m[1][1]*m.m[2][2] - (double)m.m[1][2]*m.m[2][1])
+      - (double)m.m[0][1] * ((double)m.m[1][0]*m.m[2][2] - (double)m.m[1][2]*m.m[2][0])
+      + (double)m.m[0][2] * ((double)m.m[1][0]*m.m[2][1] - (double)m.m[1][1]*m.m[2][0]);
+    return fabs(det) / (c[0]*c[1]*c[2]) > 1e-4;
+}
+
+/* Choose an image's index->world (mm) transform with NIfTI precedence: prefer
+ * the sform when its code is >= the qform's, otherwise the qform; if the
+ * preferred form is unset or degenerate ("bogus"), fall back to whichever form
+ * is usable. Writes *out and returns 0 on success; returns 1 when neither the
+ * sform nor the qform yields a usable transform (caller should error out). */
+int al_image_xform(const nifti_image *nim, mat44 *out)
+{
+    mat44 s, q;
+    int shave = (nim->sform_code > 0);
+    int qhave = (nim->qform_code > 0);
+    if (shave) { s = dmat44_to_mat44(nim->sto_xyz); shave = al_mat44_usable(s); }
+    if (qhave) { q = dmat44_to_mat44(nim->qto_xyz); qhave = al_mat44_usable(q); }
+    if (shave && (!qhave || nim->sform_code >= nim->qform_code)) { *out = s; return 0; }
+    if (qhave) { *out = q; return 0; }
+    return 1;
+}
+
+/* Index->world (mm) transform with the SINGLE no-form fallback policy: al_image_xform's
+   coded sform/qform selection when a usable form exists, else a pixdim-centered frame
+   (al_pixdim_frame). This is the one policy used by every registration/geometry entry
+   point — al_register (base/source), the fast engine (coreg_fast), -sym, -com, -sagseed,
+   and apply (nii_apply_affine) — so a valid NIfTI/ANALYZE with both form codes 0 always
+   yields a usable frame instead of some callers erroring and others falling back. Never
+   fails (a centered frame is always constructible). Pass `who` (non-NULL) to log the
+   fallback; NULL for silent. Exposed non-static so coreg_fast.c shares the exact policy. */
+void al_image_xform_or_pixdim(const nifti_image *nim, mat44 *out, const char *who)
+{
+    if (al_image_xform(nim, out)) {
+        *out = al_pixdim_frame(nim->nx, nim->ny, nim->nz,
+                               (float)fabs(nim->dx), (float)fabs(nim->dy), (float)fabs(nim->dz));
+        if (who)
+            fprintf(stderr, " + [%s] no valid sform/qform: using pixdim-centered frame\n", who);
+    }
+}
+
 /* GCD */
 static int ga_gcd(int m, int n)
 {
@@ -410,14 +557,14 @@ static int ga_find_relprime_fixed(int n)
 
 /* Separable 3D Gaussian blur in-place.
    sigma is in the same units as dx/dy/dz (i.e., in voxel-size units). */
-static void gaussian_blur_3d(float *data, int nx, int ny, int nz,
-                             float dx, float dy, float dz, float sigma)
+static int gaussian_blur_3d(float *data, int nx, int ny, int nz,
+                            float dx, float dy, float dz, float sigma)
 {
     int krad, nxy, ii, jj, kk, rr;
     float *kernel, *buf;
     float sum, sigma_v, ksum;
 
-    if (data == NULL || sigma <= 0.0f) return;
+    if (data == NULL || sigma <= 0.0f) return 0;
     nxy = nx * ny;
 
     /* Blur along X */
@@ -427,27 +574,26 @@ static void gaussian_blur_3d(float *data, int nx, int ny, int nz,
         if (krad < 1) krad = 1;
         kernel = (float *)calloc(2 * krad + 1, sizeof(float));
         buf    = (float *)calloc(nx, sizeof(float));
-        if (kernel && buf) {
-            ksum = 0.0f;
-            for (rr = -krad; rr <= krad; rr++) {
-                float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
-                kernel[rr + krad] = v; ksum += v;
-            }
-            for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
+        if (!kernel || !buf) { free(kernel); free(buf); return 1; }
+        ksum = 0.0f;
+        for (rr = -krad; rr <= krad; rr++) {
+            float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
+            kernel[rr + krad] = v; ksum += v;
+        }
+        for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
 
-            for (kk = 0; kk < nz; kk++) {
-                for (jj = 0; jj < ny; jj++) {
-                    float *row = data + jj * nx + kk * nxy;
-                    memcpy(buf, row, sizeof(float) * nx);
-                    for (ii = 0; ii < nx; ii++) {
-                        sum = 0.0f;
-                        for (rr = -krad; rr <= krad; rr++) {
-                            int idx = ii + rr;
-                            if (idx < 0) idx = 0; else if (idx >= nx) idx = nx - 1;
-                            sum += buf[idx] * kernel[rr + krad];
-                        }
-                        row[ii] = sum;
+        for (kk = 0; kk < nz; kk++) {
+            for (jj = 0; jj < ny; jj++) {
+                float *row = data + jj * nx + kk * nxy;
+                memcpy(buf, row, sizeof(float) * nx);
+                for (ii = 0; ii < nx; ii++) {
+                    sum = 0.0f;
+                    for (rr = -krad; rr <= krad; rr++) {
+                        int idx = ii + rr;
+                        if (idx < 0) idx = 0; else if (idx >= nx) idx = nx - 1;
+                        sum += buf[idx] * kernel[rr + krad];
                     }
+                    row[ii] = sum;
                 }
             }
         }
@@ -461,27 +607,26 @@ static void gaussian_blur_3d(float *data, int nx, int ny, int nz,
         if (krad < 1) krad = 1;
         kernel = (float *)calloc(2 * krad + 1, sizeof(float));
         buf    = (float *)calloc(ny, sizeof(float));
-        if (kernel && buf) {
-            ksum = 0.0f;
-            for (rr = -krad; rr <= krad; rr++) {
-                float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
-                kernel[rr + krad] = v; ksum += v;
-            }
-            for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
+        if (!kernel || !buf) { free(kernel); free(buf); return 1; }
+        ksum = 0.0f;
+        for (rr = -krad; rr <= krad; rr++) {
+            float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
+            kernel[rr + krad] = v; ksum += v;
+        }
+        for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
 
-            for (kk = 0; kk < nz; kk++) {
-                for (ii = 0; ii < nx; ii++) {
-                    for (jj = 0; jj < ny; jj++)
-                        buf[jj] = data[ii + jj * nx + kk * nxy];
-                    for (jj = 0; jj < ny; jj++) {
-                        sum = 0.0f;
-                        for (rr = -krad; rr <= krad; rr++) {
-                            int idx = jj + rr;
-                            if (idx < 0) idx = 0; else if (idx >= ny) idx = ny - 1;
-                            sum += buf[idx] * kernel[rr + krad];
-                        }
-                        data[ii + jj * nx + kk * nxy] = sum;
+        for (kk = 0; kk < nz; kk++) {
+            for (ii = 0; ii < nx; ii++) {
+                for (jj = 0; jj < ny; jj++)
+                    buf[jj] = data[ii + jj * nx + kk * nxy];
+                for (jj = 0; jj < ny; jj++) {
+                    sum = 0.0f;
+                    for (rr = -krad; rr <= krad; rr++) {
+                        int idx = jj + rr;
+                        if (idx < 0) idx = 0; else if (idx >= ny) idx = ny - 1;
+                        sum += buf[idx] * kernel[rr + krad];
                     }
+                    data[ii + jj * nx + kk * nxy] = sum;
                 }
             }
         }
@@ -495,32 +640,32 @@ static void gaussian_blur_3d(float *data, int nx, int ny, int nz,
         if (krad < 1) krad = 1;
         kernel = (float *)calloc(2 * krad + 1, sizeof(float));
         buf    = (float *)calloc(nz, sizeof(float));
-        if (kernel && buf) {
-            ksum = 0.0f;
-            for (rr = -krad; rr <= krad; rr++) {
-                float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
-                kernel[rr + krad] = v; ksum += v;
-            }
-            for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
+        if (!kernel || !buf) { free(kernel); free(buf); return 1; }
+        ksum = 0.0f;
+        for (rr = -krad; rr <= krad; rr++) {
+            float v = expf(-0.5f * (rr * rr) / (sigma_v * sigma_v));
+            kernel[rr + krad] = v; ksum += v;
+        }
+        for (rr = 0; rr < 2 * krad + 1; rr++) kernel[rr] /= ksum;
 
-            for (jj = 0; jj < ny; jj++) {
-                for (ii = 0; ii < nx; ii++) {
-                    for (kk = 0; kk < nz; kk++)
-                        buf[kk] = data[ii + jj * nx + kk * nxy];
-                    for (kk = 0; kk < nz; kk++) {
-                        sum = 0.0f;
-                        for (rr = -krad; rr <= krad; rr++) {
-                            int idx = kk + rr;
-                            if (idx < 0) idx = 0; else if (idx >= nz) idx = nz - 1;
-                            sum += buf[idx] * kernel[rr + krad];
-                        }
-                        data[ii + jj * nx + kk * nxy] = sum;
+        for (jj = 0; jj < ny; jj++) {
+            for (ii = 0; ii < nx; ii++) {
+                for (kk = 0; kk < nz; kk++)
+                    buf[kk] = data[ii + jj * nx + kk * nxy];
+                for (kk = 0; kk < nz; kk++) {
+                    sum = 0.0f;
+                    for (rr = -krad; rr <= krad; rr++) {
+                        int idx = kk + rr;
+                        if (idx < 0) idx = 0; else if (idx >= nz) idx = nz - 1;
+                        sum += buf[idx] * kernel[rr + krad];
                     }
+                    data[ii + jj * nx + kk * nxy] = sum;
                 }
             }
         }
         free(kernel); free(buf);
     }
+    return 0;
 }
 
 /* Smooth a float image (FWHM-based radius like AFNI's GA_smooth).
@@ -537,7 +682,10 @@ static float *al_smooth(float *im, int nx, int ny, int nz,
     if (om == NULL) return NULL;
     memcpy(om, im, sizeof(float) * nvox);
     sigma = FWHM_TO_SIGMA(fwhm);
-    gaussian_blur_3d(om, nx, ny, nz, dx, dy, dz, sigma);
+    if (gaussian_blur_3d(om, nx, ny, nz, dx, dy, dz, sigma)) {
+        free(om);
+        return NULL;
+    }
     return om;
 }
 
@@ -824,6 +972,7 @@ static GA_BLOK_set *create_GA_BLOK_set(
     int pb, pt, qb, qt, rb, rt, pp, qq, rr, nblok, ii, nxy;
     int aa, bb, cc, dd, ss, np, nq, nr, npq;
     int *nelm, *nalm, **elm, ntot, nsav, ndup;
+    int alloc_failed = 0;
 
     if (nx < 3 || ny < 3 || nz < 1) return NULL;
     if (dx <= 0.0f) dx = 1.0f;
@@ -922,10 +1071,8 @@ static GA_BLOK_set *create_GA_BLOK_set(
                             int new_nalm = (int)(1.5f * nalm[dd]) + 16;
                             int *new_elm = (int *)realloc(elm[dd], sizeof(int) * new_nalm);
                             if (new_elm == NULL) {
-                                free(elm[dd]);
-                                elm[dd] = NULL;
-                                nalm[dd] = nelm[dd] = 0;
-                                continue;
+                                alloc_failed = 1;
+                                goto blok_alloc_fail;
                             }
                             elm[dd] = new_elm;
                             nalm[dd] = new_nalm;
@@ -937,6 +1084,14 @@ static GA_BLOK_set *create_GA_BLOK_set(
             }
         }
         if (nsaved > 1) ndup++;
+    }
+
+blok_alloc_fail:
+    if (alloc_failed) {
+        fprintf(stderr, "allineate: BLOK set allocation failed\n");
+        for (dd = 0; dd < nblok; dd++) free(elm[dd]);
+        free(nalm); free(nelm); free(elm);
+        return NULL;
     }
 
     /* Compute minel if not specified */
@@ -1145,6 +1300,12 @@ static AL_TLOCAL float *al_xc = NULL, *al_yc = NULL, *al_xyc = NULL;
 static AL_TLOCAL float al_nww = 0.0f;
 static AL_TLOCAL int al_nbin = 0, al_nbp = 0, al_nbm = 0;
 static AL_TLOCAL int al_nbp_cap = 0;
+static AL_TLOCAL unsigned char *al_good = NULL;  /* build_2Dhist per-eval good[] mask, reused */
+static AL_TLOCAL int al_good_cap = 0;
+static AL_TLOCAL int al_hist_oom = 0;   /* set ONLY on a histogram-buffer alloc failure in
+                                           build_2Dhist, so the cost path can distinguish a real
+                                           OOM (reject → AL_BIGVAL) from a legitimately empty
+                                           histogram (n<=9 / constant range / no overlap → cost 0). */
 static double al_hpow = 0.33333333333;
 
 #undef  XYC
@@ -1169,7 +1330,8 @@ static void clear_2Dhist(void)
     if (al_xc)  { free(al_xc);  al_xc = NULL; }
     if (al_yc)  { free(al_yc);  al_yc = NULL; }
     if (al_xyc) { free(al_xyc); al_xyc = NULL; }
-    al_nbp_cap = 0;
+    if (al_good) { free(al_good); al_good = NULL; }
+    al_nbp_cap = 0; al_good_cap = 0;
     reset_2Dhist_state();
 }
 
@@ -1201,21 +1363,37 @@ static int ensure_2Dhist_capacity(int nbp)
    all data points in the histogram while concentrating resolution on the
    informative intensity range. */
 static void build_2Dhist(int n, float xbot, float xtop, float *x,
-                                float ybot, float ytop, float *y, float *w)
+                                float ybot, float ytop, float *y, float *w,
+                                float xmemtop, float ymemtop)
 {
     int ii, jj, kk, ngood;
     float xi, yi, xx, yy, x1, y1, ww;
     unsigned char *good;
     float xdbot, xdtop, ydbot, ydtop; /* actual data range */
 
+    al_hist_oom = 0;   /* cleared at entry; set below ONLY on a genuine malloc failure */
     if (n <= 9 || x == NULL || y == NULL) return;
 
     reset_2Dhist_state();
 
-    good = (unsigned char *)malloc(n);
-    if (!good) return;
+    /* Reuse the thread-local good[] mask across evals (build_2Dhist runs once per Hellinger cost
+       evaluation — a per-eval malloc/free in the hot path otherwise). Grow-only; freed by
+       clear_2Dhist() alongside the histogram buffers. */
+    if (al_good_cap < n) {
+        free(al_good);
+        al_good = (unsigned char *)malloc((size_t)n);
+        al_good_cap = al_good ? n : 0;
+    }
+    good = al_good;
+    if (!good) { al_hist_oom = 1; return; }   /* OOM, not a legitimately empty histogram */
+    /* Histogram MEMBERSHIP: drop any pair with a value above its image's mri_topclip
+       (xmemtop/ymemtop). This is AFNI's `good[]` over [min, topclip] — it excludes bright
+       outliers (e.g. a T2 source's CSF/fat/orbits, non-brain the T1 base lacks) so they can't
+       bias the fit toward a shrunk overlap. xmemtop<=0 disables the drop for that axis. */
     for (ii = 0; ii < n; ii++)
-        good[ii] = GOODVAL(x[ii]) && GOODVAL(y[ii]);
+        good[ii] = GOODVAL(x[ii]) && GOODVAL(y[ii])
+                   && (xmemtop <= 0.0f || x[ii] <= xmemtop)
+                   && (ymemtop <= 0.0f || y[ii] <= ymemtop);
 
     /* Find actual data range */
     xdbot = WAY_BIG; xdtop = -WAY_BIG;
@@ -1227,7 +1405,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
         if (y[ii] > ydtop) ydtop = y[ii];
         if (y[ii] < ydbot) ydbot = y[ii];
     }
-    if (xdbot >= xdtop || ydbot >= ydtop) { free(good); return; }
+    if (xdbot >= xdtop || ydbot >= ydtop) { return; }
 
     /* Count good values in actual data range */
     memset(good, 0, n);
@@ -1236,7 +1414,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
             good[ii] = 1; ngood++;
         }
     }
-    if (ngood == 0) { free(good); return; }
+    if (ngood == 0) { return; }
 
     /* Compute number of bins from total n (matches AFNI) */
     al_nbin = (int)pow((double)n, al_hpow);
@@ -1245,7 +1423,7 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
     al_nbp = al_nbin + 1;
     al_nbm = al_nbin - 1;
 
-    if (ensure_2Dhist_capacity(al_nbp)) { free(good); return; }
+    if (ensure_2Dhist_capacity(al_nbp)) { al_hist_oom = 1; return; }   /* histogram-buffer OOM */
     memset(al_xc, 0, (size_t)al_nbp * sizeof(float));
     memset(al_yc, 0, (size_t)al_nbp * sizeof(float));
     memset(al_xyc, 0, (size_t)al_nbp * (size_t)al_nbp * sizeof(float));
@@ -1308,7 +1486,6 @@ static void build_2Dhist(int n, float xbot, float xtop, float *x,
             XYC(jj + 1, kk + 1) += xx * (yy * ww);
         }
     }
-    free(good);
 }
 
 static void normalize_2Dhist(void)
@@ -1326,14 +1503,15 @@ static void normalize_2Dhist(void)
 typedef struct { float a, b, c, d; } float_quad;
 
 static float_quad al_helmicra(int n, float xbot, float xtop, float *x,
-                              float ybot, float ytop, float *y, float *w)
+                              float ybot, float ytop, float *y, float *w,
+                              float xmemtop, float ymemtop)
 {
     int ii, jj;
     float hel, pq, vv, uu;
     float cyvar, uyvar, yrat, xrat;
     float_quad hmc = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    build_2Dhist(n, xbot, xtop, x, ybot, ytop, y, w);
+    build_2Dhist(n, xbot, xtop, x, ybot, ytop, y, w, xmemtop, ymemtop);
     if (al_nbin <= 0 || al_nww <= 0) return hmc;
     normalize_2Dhist();
 
@@ -1455,8 +1633,12 @@ static mat44 GA_setup_affine(int npar, float *parvec)
     /* Scaling */
     a = b = c = 1.0f;
     if (npar >= 7) { a = parvec[6]; if (a <= 0.10f || a >= 10.0f) a = 1.0f; }
-    if (npar >= 8) { b = parvec[7]; if (b <= 0.10f || b >= 10.0f) b = 1.0f; }
-    if (npar >= 9) { c = parvec[8]; if (c <= 0.10f || c >= 10.0f) c = 1.0f; }
+    if (al_zoom_isotropic) {
+        b = c = a;   /* -zoom: y,z scale follow x-scale -> one global isotropic factor */
+    } else {
+        if (npar >= 8) { b = parvec[7]; if (b <= 0.10f || b >= 10.0f) b = 1.0f; }
+        if (npar >= 9) { c = parvec[8]; if (c <= 0.10f || c >= 10.0f) c = 1.0f; }
+    }
     dd = mat44_diag(a, b, c);
 
     /* Shear (lower triangular by default) */
@@ -1694,8 +1876,8 @@ static void GA_warp_interp_fused(mat44 gam, const float * restrict aim, int anx,
     float my0 = gam.m[1][0], my1 = gam.m[1][1], my2 = gam.m[1][2], my3 = gam.m[1][3];
     float mz0 = gam.m[2][0], mz1 = gam.m[2][1], mz2 = gam.m[2][2], mz3 = gam.m[2][3];
 
-    int npt_total = bnx * bny * bnz;
 #ifdef _OPENMP
+    int npt_total = bnx * bny * bnz;
     #pragma omp parallel for schedule(static) if(npt_total > 100000)
 #endif
     for (int kk = 0; kk < bnz; kk++) {
@@ -1828,6 +2010,16 @@ static inline void al_clip_values(float * restrict v, int n, float lo, float hi)
         else if (v[ii] > hi) v[ii] = hi;
 }
 
+/* Clamp a warped OUTPUT image to the source range to suppress cubic overshoot. This is the
+   FALLBACK used only by al_scalar_warpone's GENERIC (non-affine) path — currently unreached,
+   since every al_scalar_warpone caller passes al_wfunc_affine (which takes the fused path,
+   clamped precisely in-FOV by al_clip_fused_cubic_infov) and cubic never routes here. Because
+   this variant cannot distinguish in-FOV samples from the AL_OUTVAL(0) fill, it extends the
+   clip range to include 0: this PRESERVES the fill (never clamps it to a positive source min)
+   but, as a known limitation of the whole-array approach, it leaves in-FOV under/overshoot
+   between 0 and the nearer source bound unclamped (e.g. a positive-only source's in-FOV
+   undershoot in [0,lo) is not pulled up to lo). The fused path does not have this limitation.
+   (The cost path clips via al_clip_values directly and is left untouched.) */
 static void al_clip_to_source_range(float * restrict v, int n,
                                     const float * restrict src, int nsrc)
 {
@@ -1835,8 +2027,10 @@ static void al_clip_to_source_range(float * restrict v, int n,
     float lo = src[0], hi = src[0];
     for (int ii = 1; ii < nsrc; ii++) {
         if (src[ii] < lo) lo = src[ii];
-        if (src[ii] > hi) hi = src[ii];
+        else if (src[ii] > hi) hi = src[ii];
     }
+    if (lo > AL_OUTVAL) lo = AL_OUTVAL;   /* never clamp the out-of-FOV fill upward */
+    if (hi < AL_OUTVAL) hi = AL_OUTVAL;
     al_clip_values(v, n, lo, hi);
 }
 
@@ -1889,16 +2083,18 @@ static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
         GA_warp_interp_fused(gam, aim, gstup->anx, gstup->any, gstup->anz,
                               gstup->bnx, gstup->bny, gstup->bnz,
                               gstup->interp_code, avm);
-        /* Clip for cubic */
+        /* Clip cubic overshoot to the original source range, matching the general path. */
         if (gstup->interp_code == AL_INTERP_CUBIC) {
             npt = gstup->bnx * gstup->bny * gstup->bnz;
-            al_clip_values(avm, npt, gstup->ajbot, gstup->ajtop);
+            al_clip_values(avm, npt, gstup->ajmin, gstup->ajmax);
         }
         return 0;
     }
 
-    /* Space for control points */
-    if (mpar == NULL || gstup->im_ar == NULL) {
+    /* Space for control points. Snapshot the mode once: allocation, use, and cleanup
+       must agree even if this function is later reused in a less strictly serial host. */
+    int alloc_ijk = (mpar == NULL || gstup->im_ar == NULL);
+    if (alloc_ijk) {
         npt = gstup->bnx * gstup->bny * gstup->bnz;
         nall = (nper < npt) ? nper : npt;
         imf = (float *)calloc(nall, sizeof(float));
@@ -1915,7 +2111,6 @@ static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
         tl_wbuf = (float *)malloc(nall * 3 * sizeof(float));
         tl_wbuf_len = tl_wbuf ? nall * 3 : 0;  /* only update length on success */
     }
-    int alloc_ijk = (mpar == NULL || gstup->im_ar == NULL);
     if (!tl_wbuf || (alloc_ijk && (!imf || !jmf || !kmf))) {
         if (alloc_ijk) { free(imf); free(jmf); free(kmf); }
         return 1;
@@ -1937,7 +2132,7 @@ static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
         npp = nall;
         if (npp > npt - pp) npp = npt - pp;
 
-        if (mpar == NULL || gstup->im_ar == NULL) {
+        if (alloc_ijk) {
             for (qq = 0; qq < npp; qq++) {
                 mm = pp + qq;
                 ii = mm % nx; kk = mm / nxy; jj = (mm - kk * nxy) / nx;
@@ -1958,7 +2153,7 @@ static int GA_get_warped_values(int nmpar, double *mpar, float *avm)
     }
 
     /* imw/jmw/kmw and wpar are thread-local — not freed per call */
-    if (mpar == NULL || gstup->im_ar == NULL) {
+    if (alloc_ijk) {
         free(kmf); free(jmf); free(imf);
     }
 
@@ -2163,8 +2358,10 @@ static double GA_scalar_costfun(int meth, int npt,
 
         case GA_MATCH_HELLINGER_SCALAR: { /* Hellinger only (fast, cross-modal) */
             float_quad hmc;
-            hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
-                                   gstup->bsbot, gstup->bsclip, bvm, wvm);
+            hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                   gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                   gstup->aj_topclip, gstup->bs_topclip);
+            if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject, not a cost-0 "win" */
             val = -(double)hmc.a; /* aligned → hmc.a > 0 → val negative → good for min */
         } break;
 
@@ -2187,8 +2384,10 @@ static double GA_scalar_costfun(int meth, int npt,
                 gstup->micho_nmi != 0.0 || gstup->micho_crA != 0.0) {
                 float_quad hmc;
                 float ovv;
-                hmc = al_helmicra(npt, gstup->ajbot, gstup->ajclip, avm,
-                                       gstup->bsbot, gstup->bsclip, bvm, wvm);
+                hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                       gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                       gstup->aj_topclip, gstup->bs_topclip);
+                if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject this eval */
                 val += -gstup->micho_hel * hmc.a - gstup->micho_mi * hmc.b
                        + gstup->micho_nmi * hmc.c + gstup->micho_crA * (1.0 - fabs(hmc.d));
 
@@ -2245,6 +2444,55 @@ static double GA_scalar_fitter(int npar, double *mpar)
 
     bvm = gstup->bvm;
     wvm = gstup->wvm;
+
+    /* AFNI set_2Dhist_xyclip (GA_scalar_fitter): on the first cost eval of a stage, compute the
+       histogram edge-bin clips from the LIVE sample distribution (warped source avm + base bvm)
+       and cache them, then clear the flag. This runs on the stage's first, SEQUENTIAL eval (the
+       coarse ransetup center eval / the refinement warm-up eval) — never inside the parallel
+       region — so the shared write is race-free and deterministic. Falls back to the image
+       clipate defaults on a degenerate clip. Recomputing on the live samples is why AFNI keeps
+       the cross-modal histogram resolution on the informative range as alignment improves. */
+    if (gstup->need_hist_setup) {
+        al_float_pair xc = al_clipate(npt, avm);
+        al_float_pair yc = al_clipate(npt, bvm);
+        if (xc.a < xc.b) { gstup->hxc_bot = xc.a; gstup->hxc_top = xc.b; }
+        if (yc.a < yc.b) { gstup->hyc_bot = yc.a; gstup->hyc_top = yc.b; }
+        gstup->need_hist_setup = 0;
+        if (getenv("AL_VERB"))
+            fprintf(stderr, "[AL_VERB hist] source clip %.4g .. %.4g; base clip %.4g .. %.4g\n",
+                    gstup->hxc_bot, gstup->hxc_top, gstup->hyc_bot, gstup->hyc_top);
+    }
+
+    /* -dark_automask: zero the weight of any matched pair whose base or warped-source
+       value is at that image's darkest value (background/pad). Folds into the existing
+       per-point weight, so it costs one pass over the (already-materialized) point
+       arrays and no extra work inside the cost functions. Fall back to the unmasked
+       weights if too few pairs survive (gross early misalignment), so the optimizer
+       still gets a usable gradient toward overlap. */
+    if (gstup->do_dark_automask) {
+        if (tl_weff_len < npt) {
+            free(tl_weff);
+            tl_weff = (float *)malloc(npt * sizeof(float));
+            tl_weff_len = tl_weff ? npt : 0;
+        }
+        if (tl_weff) {
+            float db = gstup->dark_base, dt = gstup->dark_targ;
+            int nsurv = 0;
+            for (int ii = 0; ii < npt; ii++) {
+                if (avm[ii] > dt && bvm[ii] > db) {
+                    tl_weff[ii] = wvm ? wvm[ii] : 1.0f; nsurv++;
+                } else {
+                    tl_weff[ii] = 0.0f;
+                }
+            }
+            /* Keep the masked weights only if enough pairs survive for a stable cost;
+               otherwise fall back to unmasked (gross early misalignment). Scale the
+               floor with npt so the mask isn't silently a no-op on tiny point sets
+               (npt < 64) while still requiring ~64 for large ones. */
+            int min_surv = (npt < 256) ? (npt / 4) : 64;
+            if (nsurv >= min_surv) wvm = tl_weff;
+        }
+    }
 
     val = GA_scalar_costfun(gstup->match_code, gstup->npt_match, avm, bvm, wvm);
 #ifdef AL_PROFILE
@@ -2323,6 +2571,7 @@ static void al_scalar_setup(GA_setup *stup)
         stup->bsims = al_smooth(stup->bsim, nx, ny, nz,
                                 stup->bdx, stup->bdy, stup->bdz,
                                 stup->smooth_radius_base);
+        if (stup->bsims == NULL) return;
     } else {
         if (stup->bsims) { free(stup->bsims); stup->bsims = NULL; }
     }
@@ -2333,6 +2582,7 @@ static void al_scalar_setup(GA_setup *stup)
         stup->ajims = al_smooth(stup->ajim, stup->anx, stup->any, stup->anz,
                                 stup->adx, stup->ady, stup->adz,
                                 stup->smooth_radius_targ);
+        if (stup->ajims == NULL) return;
     } else {
         if (stup->ajims) { free(stup->ajims); stup->ajims = NULL; }
     }
@@ -2354,6 +2604,17 @@ static void al_scalar_setup(GA_setup *stup)
         }
     }
 
+    /* The topclip-membership + live sample-clip (need_hist_setup) machinery is consumed ONLY by
+       the histogram costs (Hellinger, and the -DAL_LPC_MICHO helper terms). For ls/lpc/lpa it is
+       pure wasted work — a full-image quantile per axis, a per-stage sample clipate, and a
+       discarded sequential warm-up eval. Gate it on the cost so those paths skip it. The default
+       (Hellinger) is byte-for-byte unchanged (hist_cost == 1). */
+    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR);
+#ifdef AL_LPC_MICHO
+    hist_cost = hist_cost || stup->match_code == GA_MATCH_LPC_MICHO_SCALAR
+                          || stup->match_code == GA_MATCH_LPA_MICHO_SCALAR;
+#endif
+
     /* Get min/max and CLEQWD clip levels for source image */
     {
         float *src = (stup->ajims != NULL) ? stup->ajims : stup->ajim;
@@ -2366,8 +2627,18 @@ static void al_scalar_setup(GA_setup *stup)
         stup->ajmin = stup->ajbot;  /* preserve original data range */
         stup->ajmax = stup->ajtop;
         stup->ajclip = stup->ajtop;
-        /* Apply CLEQWD clipping for histogram-based cost functions */
-        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+        /* AFNI mri_topclip = MIN(3.11*THD_cliplevel(0.511), max) for non-negative images:
+           the histogram-MEMBERSHIP top (pairs with a value above this are DROPPED, matching
+           AFNI). Negative images (e.g. CT) keep the full range. Distinct from the clipate
+           edge-bin clip below — collapsing the two lets bright cross-modal outliers (T2 CSF/
+           fat) bias the fit toward shrinking overlap (see AGENTS.md). */
+        stup->aj_topclip = stup->ajmax;
+        if (hist_cost && stup->ajmin >= 0.0f) {
+            float tc = 3.11f * al_cliplevel(nvox, src, 0.511f);
+            if (tc < stup->aj_topclip) stup->aj_topclip = tc;
+        }
+        /* CLEQWD edge-bin clips are consumed only by histogram costs. */
+        if (hist_cost) {
             al_float_pair cp = al_clipate(nvox, src);
             if (cp.a < cp.b) { stup->ajbot = cp.a; stup->ajclip = cp.b; }
         }
@@ -2383,12 +2654,23 @@ static void al_scalar_setup(GA_setup *stup)
             if (bas[ii] > stup->bstop) stup->bstop = bas[ii];
         }
         stup->bsclip = stup->bstop;
-        /* Apply CLEQWD clipping for histogram-based cost functions */
-        if (stup->match_code != GA_MATCH_PEARSON_SCALAR) {
+        /* AFNI mri_topclip membership top for the base (see source block above). */
+        stup->bs_topclip = stup->bstop;
+        if (hist_cost && stup->bsbot >= 0.0f) {
+            float tc = 3.11f * al_cliplevel(nvox, bas, 0.511f);
+            if (tc < stup->bs_topclip) stup->bs_topclip = tc;
+        }
+        /* CLEQWD edge-bin clips are consumed only by histogram costs. */
+        if (hist_cost) {
             al_float_pair cp = al_clipate(nvox, bas);
             if (cp.a < cp.b) { stup->bsbot = cp.a; stup->bsclip = cp.b; }
         }
     }
+    /* Edge-bin clips default to the image clipate (the fallback); the stage's first cost eval
+       refreshes them from the live sample distribution (AFNI set_2Dhist_xyclip). */
+    stup->hxc_bot = stup->ajbot; stup->hxc_top = stup->ajclip;
+    stup->hyc_bot = stup->bsbot; stup->hyc_top = stup->bsclip;
+    stup->need_hist_setup = hist_cost;   /* refresh live sample clips only for histogram costs */
 
     /* Determine number of matching points */
     nmatch = stup->npt_match;
@@ -2397,6 +2679,13 @@ static void al_scalar_setup(GA_setup *stup)
     if (stup->nmask > 0 && nmatch > stup->nmask)
         nmatch = stup->nmask;
     stup->npt_match = nmatch;
+    if (getenv("AL_VERB"))
+        fprintf(stderr, "[AL_VERB setup] smooth=%.2f npt_match=%d nmask=%d | "
+                "src range %.4g..%.4g clip %.4g..%.4g topclip %.4g | "
+                "base range %.4g..%.4g clip %.4g..%.4g topclip %.4g\n",
+                stup->smooth_radius_base, stup->npt_match, stup->nmask,
+                stup->ajmin, stup->ajmax, stup->ajbot, stup->ajclip, stup->aj_topclip,
+                stup->bsbot, stup->bstop, stup->bsbot, stup->bsclip, stup->bs_topclip);
 
     /* Free old control point arrays */
     if (stup->im_ar) { free(stup->im_ar); stup->im_ar = NULL; }
@@ -2430,6 +2719,12 @@ static void al_scalar_setup(GA_setup *stup)
                 stup->km_ar[qq] = (float)kk;
                 qq++;
             }
+          }
+          if (qq != nmatch) {
+              free(stup->im_ar); stup->im_ar = NULL;
+              free(stup->jm_ar); stup->jm_ar = NULL;
+              free(stup->km_ar); stup->km_ar = NULL;
+              return;  /* inconsistent mask count: leave setup invalid and fail closed */
           }
         }
     } else {
@@ -2522,7 +2817,12 @@ static int al_scalar_optim(GA_setup *stup, double rstart, double rend, int nstep
 
     nfunc = powell_newuoa(stup->wfunc_numfree, wpar, rstart, rend, nstep, GA_scalar_fitter);
     if (nfunc < 0) { free(wpar); return nfunc; }  /* optimizer OOM: don't accept unoptimized params */
-    stup->vbest = (float)GA_scalar_fitter(stup->wfunc_numfree, wpar);
+    double final_cost = GA_scalar_fitter(stup->wfunc_numfree, wpar);
+    if (!(final_cost < (double)AL_BIGVAL)) {
+        free(wpar);
+        return -4;  /* invalid/failed final evaluation: do not report an unscored fit */
+    }
+    stup->vbest = (float)final_cost;
 
     /* Copy results back */
     for (ii = qq = 0; qq < stup->wfunc_numpar; qq++) {
@@ -2776,6 +3076,46 @@ ran_cleanup:
 #undef NKEEP
 }
 
+/* In-FOV cubic clamp for the FUSED final warp (al_scalar_warpone). GA_warp_interp_fused
+   wrote AL_OUTVAL for out-of-FOV output voxels and interpolated values for in-FOV ones;
+   cubic can overshoot the source range (ringing). This clamps ONLY the in-FOV voxels to
+   the full source range [lo,hi] — recomputing the exact FOV predicate the kernel used from
+   `gam` — and leaves the AL_OUTVAL fill untouched. So (unlike al_clip_to_source_range's
+   range-extension fallback) in-FOV under/overshoot toward zero IS clamped while the fill is
+   preserved. Touches neither GA_warp_interp_fused nor the cost path (whose clip is separate).
+   `gam` is the base-index -> source-index affine passed to the kernel. */
+static void al_clip_fused_cubic_infov(float * restrict war, mat44 gam,
+                                      const float * restrict src, int anx, int any, int anz,
+                                      int bnx, int bny, int bnz)
+{
+    size_t nsrc = (size_t)anx * any * anz;
+    if (!war || !src || nsrc < 1) return;
+    float lo = src[0], hi = src[0];
+    for (size_t i = 1; i < nsrc; i++) { if (src[i] < lo) lo = src[i]; else if (src[i] > hi) hi = src[i]; }
+    float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;   /* == kernel FOV bounds */
+    float mx0=gam.m[0][0], mx1=gam.m[0][1], mx2=gam.m[0][2], mx3=gam.m[0][3];
+    float my0=gam.m[1][0], my1=gam.m[1][1], my2=gam.m[1][2], my3=gam.m[1][3];
+    float mz0=gam.m[2][0], mz1=gam.m[2][1], mz2=gam.m[2][2], mz3=gam.m[2][3];
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((size_t)bnx*bny*bnz > 100000)
+#endif
+    for (int kk = 0; kk < bnz; kk++) {
+        for (int jj = 0; jj < bny; jj++) {
+            size_t ob = ((size_t)kk * bny + jj) * bnx;
+            float bx = mx1*jj + mx2*kk + mx3;
+            float by = my1*jj + my2*kk + my3;
+            float bz = mz1*jj + mz2*kk + mz3;
+            for (int ii = 0; ii < bnx; ii++) {
+                float xx = mx0*ii + bx, yy = my0*ii + by, zz = mz0*ii + bz;
+                if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+                    zz < -0.499f || zz > nzh) continue;   /* out-of-FOV: keep AL_OUTVAL fill */
+                float v = war[ob+ii];
+                if (v < lo) war[ob+ii] = lo; else if (v > hi) war[ob+ii] = hi;
+            }
+        }
+    }
+}
+
 /*--- Warp an entire image to base grid ---*/
 static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
                                 float *imtarg, int tnx, int tny, int tnz,
@@ -2797,7 +3137,7 @@ static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
         GA_warp_interp_fused(gam, imtarg, tnx, tny, tnz,
                               nnx, nny, nnz, icode, war);
         if (icode == AL_INTERP_CUBIC)
-            al_clip_to_source_range(war, npt, imtarg, tnx * tny * tnz);
+            al_clip_fused_cubic_infov(war, gam, imtarg, tnx, tny, tnz, nnx, nny, nnz);
         return war;
     }
 
@@ -2850,6 +3190,7 @@ static float *al_scalar_warpone(int npar, float *wpar, GA_warpfunc wfunc,
 static float *al_autoweight(float *basim, int nx, int ny, int nz,
                             float dx, float dy, float dz)
 {
+    if (!basim || nx < 1 || ny < 1 || nz < 1) return NULL;
     int nxyz = nx * ny * nz, ii, jj, kk, ff;
     int xfade, yfade, zfade;
     float *wf, clip, mx;
@@ -2894,7 +3235,10 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
 
     /* Gaussian blur */
     sigma = 2.25f * (dx + dy + dz) / 3.0f;
-    gaussian_blur_3d(wf, nx, ny, nz, dx, dy, dz, sigma);
+    if (gaussian_blur_3d(wf, nx, ny, nz, dx, dy, dz, sigma)) {
+        free(wf);
+        return NULL;
+    }
 
     /* Threshold */
     mx = 0.0f;
@@ -2915,38 +3259,41 @@ static float *al_autoweight(float *basim, int nx, int ny, int nz,
 
 /* --- Source-intensity percentile for the automask --------------------------
  * al_automask needs only the ~98th intensity percentile to set a background
- * threshold. The original sorted ALL voxels via libc qsort just to read one
- * value — O(n log n) with a heavy indirect comparator that is ~100x slower under
- * emscripten/musl than native (it effectively hangs the WASM build on large
- * volumes). Two O(n) replacements, selected at compile time:
- *   (default)                  al_pct98_robust     — FSL-style robust range
- *   -DAL_AUTOMASK_QUICKSELECT  al_pct98_quickselect — exact percentile (== old) */
+ * threshold. The old code sorted all voxels via libc qsort just to read one
+ * value. Default behavior below keeps that exact threshold while using O(n)
+ * quickselect instead of O(n log n) qsort. The robust histogram estimator is
+ * available only as an explicit behavior change via -DAL_AUTOMASK_ROBUST_RANGE. */
 
-#ifdef AL_AUTOMASK_QUICKSELECT
+#ifndef AL_AUTOMASK_ROBUST_RANGE
 /* Exact p-th percentile (p in 0..1) via 3-way quickselect on a scratch copy.
  * O(n) average; the 3-way (Dutch-flag) partition stays O(n) even when millions of
  * voxels share a value (image background) — the case that degrades 2-way schemes
  * and that a quicksort hits as worst-case. Returns the same value the old
  * sort-then-index did (sorted[(int)(p*nvox)]). */
-static float al_pct98_quickselect(const float *src, int nvox, float p)
+static int al_pct98_quickselect(const float *src, int nvox, float p, float *out)
 {
-    if (nvox < 1) return 0.0f;
+    if (nvox < 1) { *out = 0.0f; return 0; }
     float *a = (float *)malloc(sizeof(float) * nvox);
-    if (!a) return 0.0f;
-    memcpy(a, src, sizeof(float) * nvox);
-    int k = (int)(p * nvox); if (k >= nvox) k = nvox - 1; if (k < 0) k = 0;
-    float v = al_select_rank(a, nvox, k);   /* same value the old sort-then-index gave */
+    if (!a) return 1;   /* OOM: signal failure so the caller can fail closed */
+    /* Copy only finite values: al_select_rank's total-order partition is broken by
+     * NaN (both `<` and `>` compare false), which would make the percentile — and
+     * thus the mask threshold — arbitrary. NaN voxels never pass `> thresh` anyway. */
+    int m = 0;
+    for (int i = 0; i < nvox; i++) if (al_finitef(src[i])) a[m++] = src[i];
+    if (m < 1) { free(a); *out = 0.0f; return 0; }   /* no finite data: empty mask */
+    int k = (int)(p * m); if (k >= m) k = m - 1; if (k < 0) k = 0;
+    *out = al_select_rank(a, m, k);   /* percentile over the finite values */
     free(a);
-    return v;
+    return 0;
 }
 #endif
 
+#ifdef AL_AUTOMASK_ROBUST_RANGE
 /* FSL-style robust "98th percentile" (port of nifti_robust_range for a float
  * array): 1001-bin histogram with zero handling + the binary-image expansion
  * trick. O(n), no sort/comparator — ideal for (effectively 16-bit) scan data and
- * immune to the emscripten qsort pathology. Outlier-aware, so generally a better
- * automask threshold than the raw percentile. ignoreZero=0 to match the original
- * automask (percentiled all voxels). */
+ * immune to the emscripten qsort pathology. This intentionally changes the mask
+ * threshold on some inputs, so it is opt-in. */
 static float al_pct98_robust(const float *src, int nvox)
 {
     const int ignoreZero = 0;
@@ -2955,7 +3302,7 @@ static float al_pct98_robust(const float *src, int nvox)
     size_t nZero = 0, nSkip = 0;
     for (int i = 0; i < nvox; i++) {
         float v = src[i];
-        if (!(v >= -FLT_MAX && v <= FLT_MAX)) { nSkip++; continue; }  /* NaN/inf */
+        if (!al_finitef(v)) { nSkip++; continue; }  /* NaN/inf */
         if (v == 0.0f) { nZero++; if (ignoreZero) continue; }
         if (v < mn) mn = v;
         if (v > mx) mx = v;
@@ -2971,7 +3318,7 @@ static float al_pct98_robust(const float *src, int nvox)
     int hist[NB]; for (int i = 0; i < NB; i++) hist[i] = 0;
     for (int i = 0; i < nvox; i++) {
         float v = src[i];
-        if (!(v >= -FLT_MAX && v <= FLT_MAX)) continue;
+        if (!al_finitef(v)) continue;
         if (ignoreZero && v == 0.0f) continue;
         int b = (int)((v - mn) * scl + 0.5f);
         if (b < 0) b = 0; else if (b >= NB) b = NB - 1;
@@ -2992,6 +3339,7 @@ static float al_pct98_robust(const float *src, int nvox)
     }
     return (float)hi / scl + mn;     /* pct98 */
 }
+#endif
 
 /* Compute simple source automask (binary): keep voxels above 10% of the ~98th
  * intensity percentile. See the percentile helpers above for the O(n) methods. */
@@ -2999,10 +3347,16 @@ static unsigned char *al_automask(float *srcim, int nvox)
 {
     unsigned char *mask = (unsigned char *)calloc(nvox, sizeof(unsigned char));
     if (!mask) return NULL;
-#ifdef AL_AUTOMASK_QUICKSELECT
-    float pct98 = al_pct98_quickselect(srcim, nvox, 0.98f);  /* exact (== old sort) */
+#ifdef AL_AUTOMASK_ROBUST_RANGE
+    float pct98 = al_pct98_robust(srcim, nvox);
 #else
-    float pct98 = al_pct98_robust(srcim, nvox);              /* FSL robust range (default) */
+    float pct98;
+    if (al_pct98_quickselect(srcim, nvox, 0.98f, &pct98)) {
+        /* Percentile scratch OOM: fail closed rather than returning a broad mask
+         * built from a bogus zero threshold (an observable, not silent, failure). */
+        free(mask);
+        return NULL;
+    }
 #endif
     float thresh = 0.10f * pct98;
     for (int ii = 0; ii < nvox; ii++)
@@ -3072,8 +3426,13 @@ static void al_center_of_mass(const float *data, int nx, int ny, int nz,
     for (int kk = 0; kk < nz; kk++)
         for (int jj = 0; jj < ny; jj++)
             for (int ii = 0; ii < nx; ii++) {
-                double v = (double)data[ii + jj * nx + kk * nx * ny];
-                if (v <= 0.0) continue;
+                float fv = data[ii + jj * nx + kk * nx * ny];
+                /* Skip non-finite voxels (NaN/±Inf reach the engine unvalidated and,
+                 * under -ffast-math, `NaN <= 0` is false, so a single NaN would poison
+                 * ws/xc and make nii_center_of_mass fold NaN into the sform/qform). The
+                 * magnitude guard (al_finitef, not isfinite) is required by -ffast-math. */
+                if (!al_finitef(fv) || fv <= 0.0f) continue;
+                double v = (double)fv;
                 ws += v; xc += v * ii; yc += v * jj; zc += v * kk;
             }
     if (ws > 0.0) { *cx = xc / ws; *cy = yc / ws; *cz = zc / ws; }
@@ -3166,6 +3525,33 @@ static float *nii_to_float(nifti_image *nim)
     return fdata;
 }
 
+/* Convert an image to *plain* float32 in place (datatype float32 with no pending
+ * scl_slope/scl_inter), updating ALL datatype metadata (datatype/nbyper/swapsize and
+ * clearing scale + cal_min/cal_max). Local mirror of miniCoreFLT's nii_ensure_float32
+ * kept inside this TU so allineate.c stays a clean niimath drop-in (miniCoreFLT is
+ * demo-only). The predicate matches aim_alias/nii_reslice_affine: a float32 image with
+ * a PENDING scale is still converted, so callers that read raw samples (e.g. the deface
+ * mask fill) see physical intensities and a negative slope can't invert min<->max.
+ * Returns 0 on success, -1 (message via `who`) on an unsupported datatype. */
+static int al_ensure_float32(nifti_image *nim, const char *who)
+{
+    if (nim->datatype == DT_FLOAT32 &&
+        (nim->scl_slope == 0.0f || (nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)))
+        return 0;
+    float *fdata = nii_to_float(nim);   /* applies any pending scl_slope/scl_inter */
+    if (!fdata) { fprintf(stderr, "%s: unsupported input datatype %d\n", who, nim->datatype); return -1; }
+    free(nim->data);
+    nim->data      = fdata;
+    nim->datatype  = DT_FLOAT32;
+    nim->nbyper    = sizeof(float);
+    nim->swapsize  = sizeof(float);
+    nim->scl_slope = 0.0f;
+    nim->scl_inter = 0.0f;
+    nim->cal_min   = 0.0f;
+    nim->cal_max   = 0.0f;
+    return 0;
+}
+
 /* Normalized distance between two parameter vectors (in [0..1] space) */
 static float param_dist(GA_setup *stup, float *p1, float *p2)
 {
@@ -3186,11 +3572,22 @@ static float param_dist(GA_setup *stup, float *p1, float *p2)
    match_code: GA_MATCH_* code for cost function.
    do_cmass: if nonzero, compute center-of-mass shift as initial alignment.
    do_src_automask: if nonzero, fill outside source automask with random noise.
+   do_dark_automask: if nonzero, drop matched pairs where the base or warped-source
+     value is at that image's darkest value (background/pad) from the cost.
+   relax_scale: if nonzero, widen the affine scale-parameter range to [0.5,2.0]
+     (from the default 0.711..1.406) — the caller (-zoom) is flagging abnormal size.
    wpar_out[12]: filled with optimized affine parameters on success.
    Returns 0 on success, nonzero on error. */
+/* free_mask (optional): when non-NULL, a 12-entry 0/1 selector of which affine
+   parameters are free (1) vs. permanently fixed (0), allowing a NON-contiguous
+   free set (e.g. -sagseed's in-MSP {1,2,4}). When NULL, the common
+   contiguous-prefix behavior applies: params[0 .. warp_dof-1] free, the rest
+   fixed. */
 static int al_register(nifti_image *source, nifti_image *base,
                        int match_code, int do_cmass, int do_src_automask,
-                       int fine_interp_code, int warp_dof, float wpar_out[12])
+                       int do_dark_automask, int relax_scale,
+                       int fine_interp_code, int warp_dof, float wpar_out[12],
+                       const int *free_mask)
 {
     int reg_rc = 0;   /* nonzero -> abort via al_cleanup (setup/optimizer OOM) */
     GA_setup stup;
@@ -3206,6 +3603,15 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     if (source == NULL || base == NULL) {
         fprintf(stderr, "allineate: NULL input image\n");
+        return 1;
+    }
+    /* Validate the DOF count for the contiguous-prefix path: warp_dof drives
+       `for (jj = warp_dof; jj < 12; ...) params[jj]...`, so warp_dof < 0 would write
+       out of bounds before params[0] and warp_dof == 0 leaves no free parameters.
+       The CLI clamps this, but a direct API caller may not; fail closed. When
+       free_mask is supplied it selects the free set and warp_dof is ignored. */
+    if (free_mask == NULL && (warp_dof < 1 || warp_dof > 12)) {
+        fprintf(stderr, "allineate: invalid warp DOF %d (must be 1..12)\n", warp_dof);
         return 1;
     }
 
@@ -3240,25 +3646,33 @@ static int al_register(nifti_image *source, nifti_image *base,
     nvox_base = (int)nvox_base_size;
     nvox_src  = (int)nvox_src_size;
 
-    /* --- 2. Get sform matrices --- */
-    if (base->sform_code > 0)
-        base_cmat = dmat44_to_mat44(base->sto_xyz);
-    else {
-        base_cmat = mat44_diag(bdx, bdy, bdz);
-        base_cmat.m[0][3] = -(bnx - 1) * 0.5f * bdx;
-        base_cmat.m[1][3] = -(bny - 1) * 0.5f * bdy;
-        base_cmat.m[2][3] = -(bnz - 1) * 0.5f * bdz;
+    /* -dark_automask: the darkest (minimum) value of each image, used to drop
+       background/pad matched pairs from the cost (see GA_scalar_fitter). Finite-aware
+       (skip NaN/Inf); if an image is entirely non-finite the threshold stays FLT_MAX
+       so every pair is masked and the survivor-floor fallback restores the unmasked
+       weights each eval — i.e. the feature is effectively off. Using each image's own minimum
+       (not a hardcoded 0) keeps it correct for signed data such as CT Hounsfield. */
+    float dark_base_val = 0.0f, dark_targ_val = 0.0f;
+    if (do_dark_automask) {
+        float bmin = FLT_MAX, amin = FLT_MAX;
+        for (ii = 0; ii < nvox_base; ii++)
+            if (al_finitef(bsim[ii]) && bsim[ii] < bmin) bmin = bsim[ii];
+        for (ii = 0; ii < nvox_src; ii++)
+            if (al_finitef(ajim[ii]) && ajim[ii] < amin) amin = ajim[ii];
+        dark_base_val = bmin; dark_targ_val = amin;
+        fprintf(stderr, " + Dark automask: dropping matched pairs at/below base=%.4g, source=%.4g\n",
+                bmin, amin);
     }
+
+    /* --- 2. Get index->world matrices (sform preferred when its code >= the
+       qform's, else qform; if neither form is coded/usable fall back to a
+       pixdim-centered frame — the same no-form policy nii_symmetry and
+       nii_center_of_mass use, so a valid NIfTI/ANALYZE with both codes 0 still
+       registers rather than erroring out). --- */
+    al_image_xform_or_pixdim(base, &base_cmat, NULL);
     base_imat = nifti_mat44_inverse(base_cmat);
 
-    if (source->sform_code > 0)
-        targ_cmat = dmat44_to_mat44(source->sto_xyz);
-    else {
-        targ_cmat = mat44_diag(adx, ady, adz);
-        targ_cmat.m[0][3] = -(anx - 1) * 0.5f * adx;
-        targ_cmat.m[1][3] = -(any - 1) * 0.5f * ady;
-        targ_cmat.m[2][3] = -(anz - 1) * 0.5f * adz;
-    }
+    al_image_xform_or_pixdim(source, &targ_cmat, NULL);
     targ_imat = nifti_mat44_inverse(targ_cmat);
 
     /* --- 3. Compute autoweight --- */
@@ -3295,6 +3709,8 @@ static int al_register(nifti_image *source, nifti_image *base,
     stup.anx = anx;       stup.any = any;        stup.anz = anz;
     stup.adx = adx;       stup.ady = ady;        stup.adz = adz;
     stup.ajmask = smask;
+    stup.do_dark_automask = do_dark_automask;
+    stup.dark_base = dark_base_val; stup.dark_targ = dark_targ_val;
     stup.base_cmat = base_cmat; stup.base_imat = base_imat;
     stup.targ_cmat = targ_cmat; stup.targ_imat = targ_imat;
     stup.base_di = mat44_colnorm(base_cmat, 0);
@@ -3314,6 +3730,16 @@ static int al_register(nifti_image *source, nifti_image *base,
             return 1;
         }
         stup.nmask = 0;
+        /* AFNI's default weight for the histogram/box-mode costs (Hellinger, MI, NMI, CR) is
+           `-autobox` (auto_weight=3): BINARIZE the weight so every in-mask voxel is weighted
+           equally. Only ls/lpc/lpa keep the graded intensity weight (auto_weight=1). A graded
+           weight down-weights the cortical periphery, which lets the fit shrink/expand the
+           overlap unpenalized (the T2w->T1 shrink: peripheral voxels pushed out of FOV cost
+           little); the binary weight anchors the full brain extent, so the fit contracts to
+           fill (det 0.94->0.74, matching AFNI's 0.72). See AGENTS.md. */
+        int box_weight = (match_code != GA_MATCH_PEARSON_SCALAR &&
+                          match_code != GA_MATCH_PEARSON_LOCALS &&
+                          match_code != GA_MATCH_PEARSON_LOCALA);
         float wmx = 0.0f;
         for (ii = 0; ii < nvox_base; ii++) if (wght[ii] > wmx) wmx = wght[ii];
         if (wmx > 0.0f) {
@@ -3321,7 +3747,7 @@ static int al_register(nifti_image *source, nifti_image *base,
             for (ii = 0; ii < nvox_base; ii++) {
                 wght[ii] = fabsf(wght[ii]) * inv;
                 stup.bmask[ii] = (wght[ii] > 0.0f) ? 1 : 0;
-                if (stup.bmask[ii]) stup.nmask++;
+                if (stup.bmask[ii]) { stup.nmask++; if (box_weight) wght[ii] = 1.0f; }
             }
         }
     }
@@ -3438,6 +3864,13 @@ static int al_register(nifti_image *source, nifti_image *base,
     strncpy(params[p].name, (nm), 31);           \
 } while(0)
 
+    /* Optional hard clamp on the shift range (nii_symmetry mirror registration). */
+    if (al_shift_max_override > 0.0f) {
+        if (xxx_m > al_shift_max_override) xxx_m = al_shift_max_override;
+        if (yyy_m > al_shift_max_override) yyy_m = al_shift_max_override;
+        if (zzz_m > al_shift_max_override) zzz_m = al_shift_max_override;
+    }
+
     SETPAR(0, "x-shift", -xxx_m, xxx_m, 0.0f);
     SETPAR(1, "y-shift", -yyy_m, yyy_m, 0.0f);
     SETPAR(2, "z-shift", -zzz_m, zzz_m, 0.0f);
@@ -3483,6 +3916,22 @@ static int al_register(nifti_image *source, nifti_image *base,
     SETPAR(11, "z/y-shear", -rval, rval, 0.0f);
 #undef SETPAR
 
+    /* Widen the scale-parameter range when the caller opts into abnormal sizes (-zoom).
+       The -sagseed isotropic seed (al_zoom_isotropic) frees only param[6] — 7/8 follow
+       it in GA_setup_affine; the main fit (relax_scale) frees all three, so widen 6..8.
+       Neither set → the tight default 0.711..1.406 regularization is kept, so ordinary
+       (adult) fits are unaffected. */
+    if (al_zoom_isotropic || relax_scale) {
+        const float zmin = 0.5f, zmax = 2.0f;   /* single source for both copies + the log */
+        params[6].min = zmin; params[6].max = zmax;
+        if (relax_scale) {   /* main fit frees all three; the isotropic seed only param[6] */
+            params[7].min = params[8].min = zmin;
+            params[7].max = params[8].max = zmax;
+            fprintf(stderr, " + Zoom: relaxed affine scale range to [%.2f, %.2f] (size flagged abnormal)\n",
+                    zmin, zmax);
+        }
+    }
+
     /* --- 8. BLOK set params (AFNI Jul 2021 defaults: TOHD, ~555 voxels/blok) --- */
     stup.bloktype = GA_BLOK_TOHD;
     { float vvv = stup.base_di * stup.base_dj * stup.base_dk;
@@ -3495,6 +3944,7 @@ static int al_register(nifti_image *source, nifti_image *base,
     /* ========== COARSE PASS (twopass) ========== */
     PROFILE_END(autoweight, "autoweight + setup");
     PROFILE_START(coarse);
+    double _coarse_t0 = al_wtime();   /* always-on coarse timer (see g_last_coarse_ms) */
     fprintf(stderr, " + *** Coarse pass begins ***\n");
 
     /* LPA gets more twobest candidates (AFNI 27 May 2021) */
@@ -3584,10 +4034,30 @@ static int al_register(nifti_image *source, nifti_image *base,
         reg_rc = 1; goto al_cleanup;
     }
 
-    /* Permanently fix params beyond warp DOF (fixed=2 survives unfreeze) */
-    int nparam_free = warp_dof;
-    for (jj = nparam_free; jj < 12; jj++)
-        params[jj].fixed = 2;
+    /* Permanently fix params outside the free set (fixed=2 survives unfreeze).
+       free_mask (when non-NULL) selects an arbitrary free subset for constrained
+       fits (e.g. -sagseed's non-contiguous {1,2,4}); NULL keeps the common
+       contiguous-prefix warp_dof behavior. nparam_free is the count of free
+       params either way, so the coarse-pass freeze below is unchanged. */
+    int nparam_free;
+    if (free_mask) {
+        nparam_free = 0;
+        for (jj = 0; jj < 12; jj++) {
+            params[jj].fixed = free_mask[jj] ? 0 : 2;
+            if (free_mask[jj]) nparam_free++;
+        }
+    } else {
+        nparam_free = warp_dof;
+        for (jj = nparam_free; jj < 12; jj++)
+            params[jj].fixed = 2;
+    }
+    /* Fail closed on an empty free set: an all-zero free_mask would hand NEWUOA a
+       zero-dimensional problem. Unreachable via the current callers (-sagseed frees
+       {1,2,4}; the warp_dof path is validated to [1,12]) but guards the free_mask API. */
+    if (nparam_free < 1) {
+        fprintf(stderr, "allineate: no free parameters to optimize\n");
+        reg_rc = 1; goto al_cleanup;
+    }
 
     /* Temporarily freeze params beyond first 6 for coarse search */
     int nptwo = (nparam_free < 6) ? nparam_free : 6;
@@ -3608,6 +4078,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     if (al_scalar_ransetup(&stup, nrand) != 0) {
         reg_rc = 1; goto al_cleanup;
     }
+    if (getenv("AL_VERB"))
+        fprintf(stderr, "[AL_VERB coarse] best rigid pose: shift=(%.1f,%.1f,%.1f) angle=(%.1f,%.1f,%.1f)\n",
+                stup.wfunc_param[0].val_init, stup.wfunc_param[1].val_init, stup.wfunc_param[2].val_init,
+                stup.wfunc_param[3].val_init, stup.wfunc_param[4].val_init, stup.wfunc_param[5].val_init);
 
     /* Restore full-resolution source for refinement rounds */
     if (ajim_ds) {
@@ -3693,6 +4167,12 @@ static int al_register(nifti_image *source, nifti_image *base,
             }
         }
 
+        /* Consume need_hist_setup (armed by al_scalar_setup above) with ONE sequential eval at
+           candidate 0 — refreshing the sample-based edge-bin clips before the parallel region,
+           so the shared write is race-free (AFNI refreshes on candidate 0, whose refinement it
+           runs first). */
+        if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr_ref, cand_wpar[0]);
+
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic)
 #endif
@@ -3728,6 +4208,11 @@ static int al_register(nifti_image *source, nifti_image *base,
             qsort_floatint(tfdone, tfcost, tfindx);
             for (int ib = 0; ib < tfdone; ib++)
                 memcpy(tfparm[ib], ffparm[tfindx[ib]], sizeof(float) * 12);
+            if (getenv("AL_VERB"))
+                fprintf(stderr, "[AL_VERB refine#%d] best cost=%.5f  scale=(%.3f,%.3f,%.3f) "
+                        "shear=(%.3f,%.3f,%.3f) shift=(%.1f,%.1f,%.1f) angle=(%.1f,%.1f,%.1f)\n", rr + 1, tfcost[0],
+                        tfparm[0][6], tfparm[0][7], tfparm[0][8], tfparm[0][9], tfparm[0][10], tfparm[0][11],
+                        tfparm[0][0], tfparm[0][1], tfparm[0][2], tfparm[0][3], tfparm[0][4], tfparm[0][5]);
 
             /* Cast out parameter sets too close to the best */
 #define CTHRESH 0.02f
@@ -3748,7 +4233,9 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     /* ========== FINE PASS ========== */
     PROFILE_END(coarse, "coarse pass");
+    g_last_coarse_ms = (al_wtime() - _coarse_t0) * 1000.0;
     PROFILE_START(fine);
+    double _fine_t0 = al_wtime();   /* always-on fine timer (see g_last_fine_ms) */
     fprintf(stderr, " + *** Fine pass begins ***\n");
 
     /* Fine pass: full resolution, no smoothing.
@@ -3800,6 +4287,10 @@ static int al_register(nifti_image *source, nifti_image *base,
         }
 
         gstup = &stup;
+        /* Consume need_hist_setup (armed by the fine-pass al_scalar_setup) with ONE sequential
+           eval at candidate 0 — refresh the sample-based clips before the parallel region so the
+           shared write stays race-free and p1==pN bit-identical. */
+        if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr, cand_wpar[0]);
         /* re-apply the main thread's thread-local sampling factors per worker */
         float fc_mfac, fc_afac; powell_get_mfac(&fc_mfac, &fc_afac);
 #ifdef _OPENMP
@@ -3888,6 +4379,12 @@ static int al_register(nifti_image *source, nifti_image *base,
     for (jj = 0; jj < 12; jj++) fprintf(stderr, " %.4f", wpar_out[jj]);
     fprintf(stderr, "\n");
 
+    /* Fine-pass timing lives here (success path only): the coarse-pass OOM gotos
+       jump over PROFILE_START(fine) straight to al_cleanup, so ending the timer in
+       the shared cleanup would read an uninitialized _prof_fine. */
+    PROFILE_END(fine, "fine pass total");
+    g_last_fine_ms = (al_wtime() - _fine_t0) * 1000.0;
+
     /* --- Cleanup --- */
 al_cleanup:
     /* If an OOM aborts during the downsampled coarse pass, the normal
@@ -3932,12 +4429,12 @@ al_cleanup:
     {
         clear_2Dhist();  /* each thread has its own AL_TLOCAL histogram */
         free(tl_avm);  tl_avm = NULL;  tl_avm_len = 0;
+        free(tl_weff); tl_weff = NULL; tl_weff_len = 0;
         free(tl_wpar); tl_wpar = NULL; tl_wpar_len = 0;
         free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
         powell_newuoa_free_threadlocal();  /* free this thread's NEWUOA workspace */
     }
 
-    PROFILE_END(fine, "fine pass total");
     if (reg_rc == 0)
         fprintf(stderr, " + Registration complete\n");
     return reg_rc;
@@ -3949,25 +4446,42 @@ static void al_adopt_geometry(nifti_image *s, const nifti_image *b)
 {
     s->datatype = DT_FLOAT32;
     s->nbyper = sizeof(float);
+    s->swapsize = sizeof(float);   /* keep element swap width consistent for write */
     s->scl_slope = 0.0f;
     s->scl_inter = 0.0f;
+    s->cal_min = 0.0f;
+    s->cal_max = 0.0f;
+    s->ndim = 3;
     s->nx = b->nx; s->ny = b->ny; s->nz = b->nz;
+    s->nt = s->nu = s->nv = s->nw = 1;
     s->dx = b->dx; s->dy = b->dy; s->dz = b->dz;
+    s->dt = b->dt; s->du = b->du; s->dv = b->dv; s->dw = b->dw;
+    s->dim[0] = 3;
     s->dim[1] = b->nx; s->dim[2] = b->ny; s->dim[3] = b->nz;
+    s->dim[4] = s->dim[5] = s->dim[6] = s->dim[7] = 1;
+    s->pixdim[0] = b->pixdim[0];
     s->pixdim[1] = b->pixdim[1];
     s->pixdim[2] = b->pixdim[2];
     s->pixdim[3] = b->pixdim[3];
-    /* Output is a single 3D volume — clear any stale higher-dim fields so the
-     * header can't advertise 4D+ over 3D bytes. (Callers already reject 4D, so
-     * this is belt-and-suspenders.) */
-    s->nt = s->nu = s->nv = s->nw = 1;
-    s->dim[0] = 3;
-    s->dim[4] = s->dim[5] = s->dim[6] = s->dim[7] = 1;
+    s->pixdim[4] = b->pixdim[4];
+    s->pixdim[5] = b->pixdim[5];
+    s->pixdim[6] = b->pixdim[6];
+    s->pixdim[7] = b->pixdim[7];
     s->nvox = (size_t)b->nx * b->ny * b->nz;
     s->sform_code = b->sform_code; s->sto_xyz = b->sto_xyz; s->sto_ijk = b->sto_ijk;
     s->qform_code = b->qform_code; s->qto_xyz = b->qto_xyz; s->qto_ijk = b->qto_ijk;
     s->quatern_b = b->quatern_b; s->quatern_c = b->quatern_c; s->quatern_d = b->quatern_d;
     s->qoffset_x = b->qoffset_x; s->qoffset_y = b->qoffset_y; s->qoffset_z = b->qoffset_z;
+    s->qfac = b->qfac;
+    s->xyz_units = b->xyz_units;
+    s->time_units = b->time_units;
+    s->freq_dim = b->freq_dim;
+    s->phase_dim = b->phase_dim;
+    s->slice_dim = b->slice_dim;
+    s->slice_code = b->slice_code;
+    s->slice_start = b->slice_start;
+    s->slice_end = b->slice_end;
+    s->slice_duration = b->slice_duration;
 }
 
 /* Validate a 3D image for resampling: an overflow-safe voxel count that fits int
@@ -4013,6 +4527,22 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
     float mx0=gam.m[0][0], mx1=gam.m[0][1], mx2=gam.m[0][2], mx3=gam.m[0][3];
     float my0=gam.m[1][0], my1=gam.m[1][1], my2=gam.m[1][2], my3=gam.m[1][3];
     float mz0=gam.m[2][0], mz1=gam.m[2][1], mz2=gam.m[2][2], mz3=gam.m[2][3];
+    /* Cubic interpolation can overshoot the source range (ringing); clamp each
+     * in-FOV interpolated value to [clo,chi]. This must NOT touch out-of-FOV
+     * voxels: those carry the caller's requested `fillv`, and clamping them to a
+     * positive source minimum would corrupt the fill (turning "remove"/0 into the
+     * source min — a defacing mask-safety hazard). So the clamp is applied inline
+     * to the interpolated value only, never to `fillv`. */
+    int clip_cubic = (interp == AL_INTERP_CUBIC);
+    float clo = 0.0f, chi = 0.0f;
+    if (clip_cubic) {
+        size_t nsrc = (size_t)anx * any * anz;
+        clo = chi = aim[0];
+        for (size_t i = 1; i < nsrc; i++) {
+            if (aim[i] < clo) clo = aim[i];
+            else if (aim[i] > chi) chi = aim[i];
+        }
+    }
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static) if(bnvox > 100000)
 #endif
@@ -4034,6 +4564,7 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
                            v = aim[ix + jy*anx + (long)kz*nxy_a]; }
                 } else if (interp == AL_INTERP_CUBIC) {
                     v = al_interp_cubic_checked(xx,yy,zz, nxh,nyh,nzh, anx1,any1,anz1, aim,anx,nxy_a, &oob);
+                    if (!oob) { if (v < clo) v = clo; else if (v > chi) v = chi; }
                 } else {
                     v = al_interp_linear_checked(xx,yy,zz, nxh,nyh,nzh, anx1,any1,anz1, aim,anx,nxy_a, &oob);
                 }
@@ -4048,9 +4579,59 @@ int nii_reslice_affine(nifti_image *source, const nifti_image *base,
     return 0;
 }
 
-int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
+/* Apply a saved world-space FIXED->MOVING affine (as written by -savemat's
+   `fixed_to_moving`) to reslice `input` (an image in the MOVING/source space of the
+   prior registration) onto `target`'s grid. Because `fixed_to_moving` is world-mm ->
+   world-mm, `target` may have any resolution / FOV / origin that shares the fixed
+   world frame. Builds the index->index map gam = S_input^{-1} * fixed_to_moving *
+   S_target and calls nii_reslice_affine (which replaces input->data with the resliced
+   volume and adopts target geometry). interp: AL_INTERP_*; out-of-FOV -> fillv.
+   Returns 0 on success, nonzero on error. */
+int nii_apply_affine(nifti_image *input, const nifti_image *target,
+                     mat44 fixed_to_moving, int interp, float fillv)
 {
-    double t_start = al_wtime();
+    if (input == NULL || target == NULL) { fprintf(stderr, "applymat: NULL image\n"); return 1; }
+    if (!al_mat44_usable(fixed_to_moving)) {
+        fprintf(stderr, "applymat: matrix is not finite/invertible\n");
+        return 1;
+    }
+    /* A valid affine's homogeneous bottom row is [0,0,0,1]. A corrupt or hand-edited
+       -savemat matrix (e.g. last row [1,2,3,4]) can be finite with an invertible 3x3 yet
+       is not an affine transform — it would silently produce garbage (an all-zero image).
+       Reject it here, once, at the apply boundary (not duplicated in the JSON parser).
+       Internally-computed transforms — GA_setup_affine / al_world_xform_from_params /
+       coreg_fast / seeded compositions of vox->world matrices — all carry [0,0,0,1]. */
+    /* al_mat44_usable only checks the upper 3 rows for finiteness, and `fabsf(nan) > x` is
+       false — so validate the bottom row's finiteness explicitly (a NaN there would otherwise
+       pass and write an all-NaN image) as well as the [0,0,0,1] affine pattern. */
+    if (!al_finitef(fixed_to_moving.m[3][0]) || !al_finitef(fixed_to_moving.m[3][1]) ||
+        !al_finitef(fixed_to_moving.m[3][2]) || !al_finitef(fixed_to_moving.m[3][3]) ||
+        fabsf(fixed_to_moving.m[3][0]) > 1e-4f || fabsf(fixed_to_moving.m[3][1]) > 1e-4f ||
+        fabsf(fixed_to_moving.m[3][2]) > 1e-4f || fabsf(fixed_to_moving.m[3][3] - 1.0f) > 1e-4f) {
+        fprintf(stderr, "applymat: matrix bottom row is not a finite [0,0,0,1] (not an affine transform)\n");
+        return 1;
+    }
+    mat44 S_in, S_tg;
+    al_image_xform_or_pixdim(input, &S_in, NULL);   /* no-form -> pixdim frame (unified policy) */
+    al_image_xform_or_pixdim(target, &S_tg, NULL);
+    mat44 gam = nifti_mat44_mul(nifti_mat44_inverse(S_in),
+                                nifti_mat44_mul(fixed_to_moving, S_tg));
+    return nii_reslice_affine(input, target, gam, interp, fillv);
+}
+
+static mat44 al_world_xform_from_params(int npar, float *wpar);  /* defined below */
+
+/* Estimate-only registration: fit the affine and return BOTH the raw 12-DOF warp
+   params (wpar_out, for the fused final reslice) AND the world-mm FIXED(base)->MOVING
+   (source) "pull" transform (world_out, == what -savemat/nii_apply_affine consume),
+   WITHOUT reslicing or mutating either image. Prints the cost line; al_register prints
+   its own progress. This is the single estimation seam shared by nii_allineate (which
+   then reslices onto base), the -master wrapper, and future -savemat — so estimation and
+   application are separable and the moving image is never resliced-then-discarded.
+   Returns 0 on success, nonzero on failure (leaves *world_out untouched). */
+static int al_estimate(nifti_image *source, nifti_image *base, al_opts opts,
+                       float wpar_out[12], mat44 *world_out)
+{
     if (source == NULL || base == NULL) {
         fprintf(stderr, "allineate: NULL input image\n");
         return 1;
@@ -4066,9 +4647,33 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     fprintf(stderr, " + Cost function: %s, cmass: %s, warp: %s (%d DOF)\n", cost_name,
             opts.cmass ? "yes" : "no", al_warp_name(opts.warp), opts.warp);
 
-    float wpar[12];
     int ok = al_register(source, base, match_code, opts.cmass,
-                         opts.source_automask, opts.interp, opts.warp, wpar);
+                         opts.source_automask, opts.dark_automask, opts.zoom /*relax_scale*/,
+                         opts.interp, opts.warp, wpar_out, NULL);
+    if (ok) return ok;
+    *world_out = al_world_xform_from_params(12, wpar_out);
+    return 0;
+}
+
+/* Public estimate-only entry: fit source->base and return the world-mm FIXED->MOVING
+   affine without touching image data. Used by -master (estimate once, apply once onto
+   the requested grid) and available for -savemat. Serial-only. Returns 0 on success. */
+int nii_allineate_estimate(nifti_image *source, nifti_image *base, al_opts opts,
+                           mat44 *fixed_to_moving)
+{
+    if (fixed_to_moving == NULL) { fprintf(stderr, "allineate: NULL output matrix\n"); return 1; }
+    float wpar[12];
+    return al_estimate(source, base, opts, wpar, fixed_to_moving);
+}
+
+int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
+{
+    double t_start = al_wtime();
+    g_last_affine_valid = 0;   /* invalidate up front: nii_last_affine() must reflect only
+                                  a COMPLETED fit, never a stale one or a partial failure */
+    float wpar[12];
+    mat44 world;
+    int ok = al_estimate(source, base, opts, wpar, &world);
     if (ok) return ok;
 
     /* Extract source float data for warping */
@@ -4086,7 +4691,8 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     const char *interp_name = (final_ic == AL_INTERP_NN) ? "nearest" :
                               (final_ic == AL_INTERP_LINEAR) ? "linear" : "cubic";
     long reg_ms = (long)((al_wtime() - t_start) * 1000.0 + 0.5);
-    fprintf(stderr, " + Registration completed in %ldms\n", reg_ms);
+    fprintf(stderr, " + Registration completed in %ldms (coarse %ldms; fine %ldms)\n",
+            reg_ms, (long)(g_last_coarse_ms + 0.5), (long)(g_last_fine_ms + 0.5));
 #ifdef _OPENMP
     int nthreads = omp_get_max_threads();
     if (nthreads > 1)
@@ -4110,6 +4716,25 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     source->data = warped;
     al_adopt_geometry(source, base);
 
+    /* Record the fitted world-space FIXED(base)->MOVING(source) affine only now that
+       the whole fit+warp succeeded, so nii_last_affine()/-savemat never expose a
+       partial result. `world` was computed by al_estimate (== al_world_xform_from_params
+       (12, wpar)). g_last_affine is retained for the shared standalone allineate project's
+       wired -savemat (which reads it via nii_last_affine); niimath's -master no longer
+       uses it — it takes the matrix directly from nii_allineate_estimate. */
+    g_last_affine = world;
+    g_last_affine_valid = 1;
+    return 0;
+}
+
+/* Copy the most recent nii_allineate() fit's world-space FIXED(base)->MOVING(source)
+   affine into *out. Returns 0 if a fit has run (valid), nonzero otherwise. Reflects
+   the moving image as passed to registration (after any -com/-sym header fold).
+   Serial-only (reads a process-global; see nii_allineate). */
+int nii_last_affine(mat44 *out)
+{
+    if (out == NULL || !g_last_affine_valid) return 1;
+    *out = g_last_affine;
     return 0;
 }
 
@@ -4123,14 +4748,7 @@ long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
      * preconditions callers rely on rather than trusting them. */
     if (input == NULL || warped_mask == NULL) { fprintf(stderr, "deface: NULL input/mask\n"); return -1; }
     if (al_dims_ok(input, "deface apply")) return -1;
-    if (input->datatype != DT_FLOAT32) {
-        float *fdata = nii_to_float(input);
-        if (!fdata) { fprintf(stderr, "deface: unsupported input datatype %d\n", input->datatype); return -1; }
-        free(input->data);
-        input->data = fdata;
-        input->datatype = DT_FLOAT32; input->nbyper = sizeof(float);
-        input->scl_slope = 0.0f; input->scl_inter = 0.0f;
-    }
+    if (al_ensure_float32(input, "deface")) return -1;
     size_t nvox = (size_t)input->nx * input->ny * input->nz;
     float *idata = (float *)input->data;
     if (input->data == NULL) { fprintf(stderr, "deface: input has no data\n"); return -1; }
@@ -4140,7 +4758,7 @@ long nii_apply_deface_mask(nifti_image *input, const float *warped_mask)
     float min_val = 0.0f; int have_min = 0;
     for (size_t i = 0; i < nvox; i++) {
         float v = idata[i];
-        if (v >= -FLT_MAX && v <= FLT_MAX && (!have_min || v < min_val)) { min_val = v; have_min = 1; }
+        if (al_finitef(v) && (!have_min || v < min_val)) { min_val = v; have_min = 1; }
     }
     long nmasked = 0;
     long nv = (long)nvox;
@@ -4179,19 +4797,7 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
      * 0 (al_register / nii_to_float use volume 0). Reject all three; fail closed. */
     if (al_dims_ok(input, label) || al_dims_ok(tmpl, "deface template")
         || al_dims_ok(mask, "deface mask")) return 1;
-    if (input->datatype != DT_FLOAT32) {
-        float *fdata = nii_to_float(input);
-        if (!fdata) {
-            fprintf(stderr, "%s: unsupported input datatype %d\n", label, input->datatype);
-            return 1;
-        }
-        free(input->data);
-        input->data = fdata;
-        input->datatype = DT_FLOAT32;
-        input->nbyper = sizeof(float);
-        input->scl_slope = 0.0f;
-        input->scl_inter = 0.0f;
-    }
+    if (al_ensure_float32(input, label)) return 1;
 
     int match_code;
     const char *cost_name;
@@ -4208,7 +4814,8 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
      * interpolated — the subject stays in its own space). */
     float wpar[12];
     int ok = al_register(input, tmpl, match_code, opts.cmass,
-                         opts.source_automask, opts.interp, opts.warp, wpar);
+                         opts.source_automask, opts.dark_automask, 0 /*relax_scale*/,
+                         opts.interp, opts.warp, wpar, NULL);
     if (ok) {
         fprintf(stderr, "%s: registration failed\n", label);
         return 1;
@@ -4248,5 +4855,478 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
 #endif
         fprintf(stderr, " + %s complete: %ld of %d voxels masked (%.1f%%; %ldms)\n",
                 label, nmasked, nvox, 100.0f * nmasked / nvox, elapsed_ms);
+    return 0;
+}
+
+/*==========================================================================*/
+/*=================== -sym: midsagittal alignment (MSP) ====================*/
+/*==========================================================================*/
+
+/* Compute H = T^(1/2) of a rigid mat44 T (rotation + translation), so H*H == T.
+   Rotation: quaternion half-angle, q_half = normalize(q + identity). Translation:
+   solve (R_half + I) * t_half = t. The two guards below are defensive: for a
+   proper-rotation input (which GA_setup_affine(6,·) always yields, scalar part
+   qw >= 0) neither can actually fire — hw = qw+1 >= 1 so nrm >= 1, and R_half+I is
+   non-singular for any real rotation. Returns 0 on success, 1 if degenerate (the
+   caller falls back to the identity correction). */
+static int al_half_transform(mat44 T, mat44 *H_out)
+{
+    /* Pure-rotation matrix from T's upper-left 3x3. */
+    mat44 R; memset(&R, 0, sizeof(R)); R.m[3][3] = 1.0f;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) R.m[i][j] = T.m[i][j];
+
+    float qb, qc, qd, qx, qy, qz, dx, dy, dz, qfac;
+    nifti_mat44_to_quatern(R, &qb, &qc, &qd, &qx, &qy, &qz, &dx, &dy, &dz, &qfac);
+    float qw = 1.0f - qb*qb - qc*qc - qd*qd;
+    qw = (qw > 0.0f) ? sqrtf(qw) : 0.0f;
+
+    /* Half-angle quaternion = normalize(q + identity). */
+    float hw = qw + 1.0f, hb = qb, hc = qc, hd = qd;
+    float nrm = sqrtf(hw*hw + hb*hb + hc*hc + hd*hd);
+    if (nrm <= 1.0e-7f) return 1;   /* defensive: unreachable for qw >= 0 */
+    float inv = 1.0f / nrm;
+    hb *= inv; hc *= inv; hd *= inv;
+    mat44 Rhalf = nifti_quatern_to_mat44(hb, hc, hd, 0.0f, 0.0f, 0.0f,
+                                         1.0f, 1.0f, 1.0f, qfac);
+
+    /* M = R_half + I (3x3, zero translation). */
+    mat44 M; memset(&M, 0, sizeof(M)); M.m[3][3] = 1.0f;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) M.m[i][j] = Rhalf.m[i][j];
+        M.m[i][i] += 1.0f;
+    }
+    float det = M.m[0][0]*(M.m[1][1]*M.m[2][2] - M.m[1][2]*M.m[2][1])
+              - M.m[0][1]*(M.m[1][0]*M.m[2][2] - M.m[1][2]*M.m[2][0])
+              + M.m[0][2]*(M.m[1][0]*M.m[2][1] - M.m[1][1]*M.m[2][0]);
+    if (fabsf(det) < 1.0e-6f) return 1;
+
+    mat44 Minv = nifti_mat44_inverse(M);   /* zero translation → pure linear */
+    float hx, hy, hz;
+    mat44_vec(Minv, T.m[0][3], T.m[1][3], T.m[2][3], &hx, &hy, &hz);
+
+    mat44 H = Rhalf;
+    H.m[0][3] = hx; H.m[1][3] = hy; H.m[2][3] = hz;
+    *H_out = H;
+    return 0;
+}
+
+/* Fold a world-space correction C into nim's header as an initial-estimate seed
+   for a subsequent registration. `S` is nim's currently-selected index->world
+   transform (the one C multiplies on the left: newS = C*S). sform is always
+   updated; qform is updated only when the input carried a valid qform
+   (qform_code > 0) — an sform-only input stays sform-only (no synthesized qform).
+   Shared by the -sym and -sagseed pre-steps. */
+/* Extract the pure world-space transform from fitted warp params: GA_setup_affine
+   normally folds the base/target befafter matrices into its result (index-space
+   warp); -sym and -sagseed want the bare world-space parameter matrix, so the
+   process-global aff_use_before/after must be transiently disabled around the call.
+   Centralized here so the subtle save/restore has one home. */
+static mat44 al_world_xform_from_params(int npar, float *wpar)
+{
+    int sb = aff_use_before, sa = aff_use_after;
+    aff_use_before = aff_use_after = 0;
+    mat44 M = GA_setup_affine(npar, wpar);
+    aff_use_before = sb; aff_use_after = sa;
+    return M;
+}
+
+/* Write world-space transform M into nim's sform (sto_xyz/ijk); the caller sets
+   sform_code per its own policy. Also syncs voxel sizes (dx/dy/dz + pixdim) to M's
+   column norms so pixdim stays consistent when M carries a scale (e.g. a -zoom
+   fold) — a no-op for a pure rigid M (column norms unchanged). Shared by
+   al_fold_correction_into_header and al_deoblique_frame. */
+static void al_write_sform(nifti_image *nim, mat44 M)
+{
+    nim->sto_xyz = mat44_to_dmat44(M);
+    nim->sto_ijk = nifti_dmat44_inverse(nim->sto_xyz);
+    nim->dx = nim->pixdim[1] = mat44_colnorm(M, 0);
+    nim->dy = nim->pixdim[2] = mat44_colnorm(M, 1);
+    nim->dz = nim->pixdim[3] = mat44_colnorm(M, 2);
+}
+
+/* Write world-space transform M into nim's qform (quaternion + qto_xyz/ijk); the
+   caller sets qform_code per its own policy. Pair to al_write_sform (which syncs
+   pixdim, the field the serialized qform scale is derived from). */
+static void al_write_qform(nifti_image *nim, mat44 M)
+{
+    float qb, qc, qd, qx, qy, qz, dx, dy, dz, qfac;
+    nifti_mat44_to_quatern(M, &qb, &qc, &qd, &qx, &qy, &qz, &dx, &dy, &dz, &qfac);
+    nim->quatern_b = qb; nim->quatern_c = qc; nim->quatern_d = qd;
+    nim->qoffset_x = qx; nim->qoffset_y = qy; nim->qoffset_z = qz;
+    nim->qfac = qfac;
+    nim->qto_xyz = mat44_to_dmat44(M);
+    nim->qto_ijk = nifti_dmat44_inverse(nim->qto_xyz);
+}
+
+static void al_fold_correction_into_header(nifti_image *nim, mat44 C, mat44 S)
+{
+    al_write_sform(nim, nifti_mat44_mul(C, S));
+    if (nim->sform_code <= 0) nim->sform_code = 1;
+    /* Update the qform only when the input carried a *usable* qform. A coded but
+       degenerate/NaN qform (the reader does not validate srow/quaternion) would
+       otherwise fold C into garbage and write back an invalid coded qform; drop
+       its code instead so downstream selectors fall through to the folded sform. */
+    if (nim->qform_code > 0) {
+        if (al_mat44_usable(dmat44_to_mat44(nim->qto_xyz)))
+            al_write_qform(nim, nifti_mat44_mul(C, dmat44_to_mat44(nim->qto_xyz)));
+        else
+            nim->qform_code = 0;   /* unusable coded qform: drop it, keep folded sform */
+    }
+}
+
+/* De-oblique: snap the image's index->world transform to the nearest axis-aligned
+   frame — a signed permutation of the voxel axes scaled by the voxel sizes — while
+   keeping the grid-center world position fixed. Header-only (voxel data untouched);
+   both sform and qform are rewritten to the snapped frame. This treats the
+   ACQUISITION GRID as the anatomical frame, appropriate for scans deliberately
+   acquired oblique-to-world (AC-PC angling, tilted infant/kyphotic positioning)
+   where the voxel axes are the anatomical axes and the oblique sform merely records
+   the scanner angle. Used by -symd so the mirror fit is not fooled into rotating an
+   already-grid-symmetric head onto the oblique world frame. */
+static void al_deoblique_frame(nifti_image *nim)
+{
+    mat44 S;
+    al_image_xform_or_pixdim(nim, &S, NULL);
+
+    float vs[3];
+    for (int j = 0; j < 3; j++)
+        vs[j] = sqrtf(S.m[0][j]*S.m[0][j] + S.m[1][j]*S.m[1][j] + S.m[2][j]*S.m[2][j]);
+
+    /* Snap S's 3x3 to the nearest ORIENTATION-PRESERVING signed permutation of the
+       voxel axes. Score all six permutations and fold the handedness constraint INTO
+       the score: a permutation whose natural per-column signs give the wrong
+       determinant sign must flip one column to stay proper, costing 2x that column's
+       alignment confidence, so its best achievable signed score is
+       (unsigned_score - 2*weakest_conf). Choosing the max over these *penalized* scores
+       — rather than the max unsigned score with a post-selection flip — yields the
+       globally nearest proper frame: a strong unsigned match with the wrong handedness
+       can lose to a slightly weaker permutation that is already correctly oriented.
+       (det S == 0: degenerate input, no handedness to preserve, so never penalize.) */
+    static const int   P[6][3]  = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    static const float Ppar[6]  = { 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f }; /* perm parity */
+    float detS = S.m[0][0] * (S.m[1][1]*S.m[2][2] - S.m[1][2]*S.m[2][1])
+               - S.m[0][1] * (S.m[1][0]*S.m[2][2] - S.m[1][2]*S.m[2][0])
+               + S.m[0][2] * (S.m[1][0]*S.m[2][1] - S.m[1][1]*S.m[2][0]);
+    float sdetS = (detS > 0.0f) ? 1.0f : (detS < 0.0f ? -1.0f : 0.0f);
+
+    int bp = 0, bflip = -1; float bscore = -FLT_MAX;
+    for (int p = 0; p < 6; p++) {
+        float uscore = 0.0f, weakc = FLT_MAX, sprod = 1.0f; int weakj = 0;
+        for (int j = 0; j < 3; j++) {
+            int bk = P[p][j];
+            float conf = (vs[j] > 0.0f) ? fabsf(S.m[bk][j]) / vs[j] : 0.0f;
+            uscore += conf;
+            sprod  *= (S.m[bk][j] >= 0.0f) ? 1.0f : -1.0f;
+            if (conf < weakc) { weakc = conf; weakj = j; }
+        }
+        int flip = (sdetS != 0.0f && Ppar[p] * sprod * sdetS < 0.0f) ? weakj : -1;
+        float sc = (flip >= 0) ? uscore - 2.0f * weakc : uscore;
+        if (sc > bscore) { bscore = sc; bp = p; bflip = flip; }
+    }
+
+    float sgn[3];
+    for (int j = 0; j < 3; j++)
+        sgn[j] = (S.m[P[bp][j]][j] >= 0.0f) ? 1.0f : -1.0f;
+    if (bflip >= 0) sgn[bflip] = -sgn[bflip];   /* restore input handedness */
+
+    mat44 Sd; memset(&Sd, 0, sizeof(Sd)); Sd.m[3][3] = 1.0f;
+    for (int j = 0; j < 3; j++)
+        Sd.m[P[bp][j]][j] = sgn[j] * (vs[j] > 0.0f ? vs[j] : 1.0f);
+
+    /* Keep the grid-center voxel at the same world position it had under S. */
+    float cx = (nim->nx - 1) * 0.5f, cy = (nim->ny - 1) * 0.5f, cz = (nim->nz - 1) * 0.5f;
+    float wx, wy, wz, dx, dy, dz;
+    mat44_vec(S,  cx, cy, cz, &wx, &wy, &wz);
+    mat44_vec(Sd, cx, cy, cz, &dx, &dy, &dz);   /* Sd translation still 0 here */
+    Sd.m[0][3] = wx - dx; Sd.m[1][3] = wy - dy; Sd.m[2][3] = wz - dz;
+
+    al_write_sform(nim, Sd);   /* also syncs pixdim to the snapped column norms */
+    nim->sform_code = 1;
+    al_write_qform(nim, Sd);
+    nim->qform_code = 1;
+    fprintf(stderr, " + [sym] de-obliqued starting frame (voxel grid treated as anatomical)\n");
+}
+
+/* Run the mirror-registration fit in nim's CURRENT frame and return the world-space
+   MSP correction C (= T^{-1/2}) and the selected index->world S (both used by the
+   caller to apply). Does not modify nim's data or header. Returns 0 on success. */
+static int al_sym_correction(nifti_image *nim, int dark_automask, mat44 *C_out, mat44 *S_out)
+{
+    mat44 S;
+    al_image_xform_or_pixdim(nim, &S, "sym");
+
+    /* Diagnostic: which voxel axis is most left-right (largest |world-X| column). */
+    {
+        int lr = 0; float best = fabsf(S.m[0][0]);
+        for (int j = 1; j < 3; j++) if (fabsf(S.m[0][j]) > best) { best = fabsf(S.m[0][j]); lr = j; }
+        fprintf(stderr, " + [sym] left-right voxel axis: %d (world-X polarity %+.0f)\n",
+                lr, S.m[0][lr] >= 0.0f ? 1.0f : -1.0f);
+    }
+
+    /* Source view: pin the selected frame S onto a shallow copy (al_register errors
+       on an image with no usable sform/qform; the pixdim fallback above needs this). */
+    nifti_image src = *nim;
+    src.sform_code = 1;
+    src.sto_xyz = mat44_to_dmat44(S);
+    src.sto_ijk = nifti_dmat44_inverse(src.sto_xyz);
+    src.qform_code = 0;
+
+    /* Mirror view: same voxel data, world-X reflected sform (F = diag(-1,1,1)). */
+    mat44 F = mat44_diag(-1.0f, 1.0f, 1.0f);
+    mat44 FS = nifti_mat44_mul(F, S);
+    nifti_image mir = *nim;
+    mir.sform_code = 1;
+    mir.sto_xyz = mat44_to_dmat44(FS);
+    mir.sto_ijk = nifti_dmat44_inverse(mir.sto_xyz);
+    mir.qform_code = 0;
+
+    /* Clamp the mirror-registration shift to a quarter of the longest FOV. */
+    float fov_x = nim->nx * (float)fabs(nim->dx);
+    float fov_y = nim->ny * (float)fabs(nim->dy);
+    float fov_z = nim->nz * (float)fabs(nim->dz);
+    float fov = fov_x; if (fov_y > fov) fov = fov_y; if (fov_z > fov) fov = fov_z;
+    al_shift_max_override = fov * 0.25f;
+
+    fprintf(stderr, " + [sym] mirror registration (ls, 6 DOF, cmass, shift<=%.1fmm)\n",
+            al_shift_max_override);
+    float wpar[12];
+    int ok = al_register(&src, &mir, GA_MATCH_PEARSON_SCALAR, 1 /*cmass*/,
+                         0 /*source_automask*/, dark_automask, 0 /*relax_scale*/,
+                         AL_INTERP_LINEAR, 6 /*warp*/, wpar, NULL);
+    al_shift_max_override = 0.0f;
+    if (ok) { fprintf(stderr, "sym: mirror registration failed\n"); return 1; }
+
+    /* Pure world transform T (base=mirror -> source=original); C = H^(-1) = T^(-1/2). */
+    mat44 T = al_world_xform_from_params(6, wpar);
+    mat44 H, C;
+    if (al_half_transform(T, &H)) {
+        fprintf(stderr, " + [sym] WARNING: half-transform degenerate; using identity correction\n");
+        C = mat44_diag(1.0f, 1.0f, 1.0f);
+    } else {
+        C = nifti_mat44_inverse(H);
+    }
+    if (fabsf(wpar[3]) > 29.0f || fabsf(wpar[4]) > 29.0f || fabsf(wpar[5]) > 29.0f)
+        fprintf(stderr, " + [sym] WARNING: fitted rotation near the ±30° guardrail;"
+                        " MSP correction may be incomplete\n");
+    *C_out = C; *S_out = S;
+    return 0;
+}
+
+/* -symb tie tolerance (deg): de-oblique must beat the world frame's correction
+   rotation by more than this to be chosen; otherwise the original frame is kept. */
+#define AL_SYMB_ROT_TOL_DEG 0.5f
+
+/* Rotation magnitude (deg) of a rigid correction's 3x3, for -symb frame selection. */
+static float al_correction_rot_deg(mat44 M)
+{
+    float tr = M.m[0][0] + M.m[1][1] + M.m[2][2];
+    float c = (tr - 1.0f) * 0.5f;
+    if (c > 1.0f) c = 1.0f; else if (c < -1.0f) c = -1.0f;
+    return (float)(acos((double)c) * 180.0 / 3.14159265358979323846);
+}
+
+/* Template-free midsagittal-plane (MSP) alignment.
+
+   Registers the image (source) to its world-X mirror (base) with a 6-DOF rigid
+   fit, takes the half transform H = T^(1/2) of the recovered rigid T, and forms
+   the correction C = H^(-1) (= T^(-1/2)). The direction is proven by the
+   translation-only phantom regression: a symmetric image shifted +10 mm in world
+   X yields C = a -10 mm shift (re-centering the MSP to X = 0).
+
+   nim:     image to reorient (must be 3D; float32 recommended).
+   C_out:   if non-NULL, receives the 4x4 world-space correction C.
+   reslice: nonzero -> resample the data so it is symmetric about world X = 0
+            (standalone use). zero -> fold C into the header (sform always; qform
+            only when the input carried a *usable* coded qform) as an
+            initial-estimate seed for a subsequent registration (pre-step use).
+   deoblique: 0 = -sym (fit in the image's own world frame); 1 = -symd (first snap the
+            frame to axis-aligned, treating the voxel grid as anatomical, so an
+            obliquely-acquired but grid-symmetric head is not rotated onto the oblique
+            world frame — see al_deoblique_frame); 2 = -symb (auto-compete: fit BOTH
+            frames and keep the one whose correction rotation is SMALLER — that frame's
+            X=0 is already closer to the true MSP, i.e. it is the native anatomical
+            frame, so -symb picks de-oblique for an oblique grid-symmetric head and the
+            world frame when the sform genuinely encodes anatomical axes).
+   The mirror fit uses the `ls`/Pearson cost (a Hellinger variant was tried and
+   removed — it gave the same result; the roll it was meant to fix was frame
+   obliquity, which -symd addresses).
+   dark_automask: nonzero (-dark_automask) -> drop background/pad matched pairs
+            (at the image minimum) from the mirror-fit cost.
+   Returns 0 on success, nonzero on error. */
+int nii_symmetry(nifti_image *nim, mat44 *C_out, int reslice, int deoblique, int dark_automask)
+{
+    if (nim == NULL) { fprintf(stderr, "sym: NULL image\n"); return 1; }
+    if (al_dims_ok(nim, "sym")) return 1;
+
+    /* De-oblique (modes 1/2) mutates nim's header up front; snapshot it so any
+       failure — or the -symb decision to keep the world frame — rolls the header
+       back. The data pointer is preserved across every restore, so nothing is
+       double-freed. */
+    nifti_image nim_hdr0 = *nim;
+    mat44 C, S;
+
+    if (deoblique == 2) {   /* -symb: auto-compete world vs de-obliqued frame */
+        mat44 C_ob, S_ob;
+        if (al_sym_correction(nim, dark_automask, &C_ob, &S_ob)) return 1;
+        float rot_ob = al_correction_rot_deg(C_ob);
+
+        al_deoblique_frame(nim);
+        mat44 C_de, S_de;
+        if (al_sym_correction(nim, dark_automask, &C_de, &S_de)) {
+            void *_d = nim->data; *nim = nim_hdr0; nim->data = _d;   /* undo de-oblique */
+            return 1;
+        }
+        float rot_de = al_correction_rot_deg(C_de);
+
+        /* Prefer the ORIGINAL world frame unless de-oblique is meaningfully better by a
+           tolerance. The frames' fit costs are near-tied (same data, mirror geometry),
+           so correction rotation is the discriminator — but on an already axis-aligned
+           image both rotations are identical, and switching to de-oblique there would
+           needlessly rewrite the header (e.g. MNI sform_code 4 -> scanner-anatomical 1)
+           for zero geometric gain. The tolerance makes the world frame win on ties. */
+        if (rot_de < rot_ob - AL_SYMB_ROT_TOL_DEG) {
+            C = C_de; S = S_de;   /* keep the de-obliqued frame (nim stays de-obliqued) */
+            fprintf(stderr, " + [symb] chose de-obliqued frame (correction %.1f deg vs world %.1f deg)\n",
+                    rot_de, rot_ob);
+        } else {
+            void *_d = nim->data; *nim = nim_hdr0; nim->data = _d;   /* restore world frame */
+            C = C_ob; S = S_ob;
+            fprintf(stderr, " + [symb] chose world frame (correction %.1f deg vs de-obliqued %.1f deg)\n",
+                    rot_ob, rot_de);
+        }
+    } else {
+        if (deoblique) al_deoblique_frame(nim);
+        if (al_sym_correction(nim, dark_automask, &C, &S)) {
+            if (deoblique) { void *_d = nim->data; *nim = nim_hdr0; nim->data = _d; }
+            return 1;
+        }
+    }
+
+    fprintf(stderr, " + [sym] correction matrix C:\n");
+    for (int i = 0; i < 3; i++)
+        fprintf(stderr, "     % 9.4f % 9.4f % 9.4f % 9.4f\n",
+                C.m[i][0], C.m[i][1], C.m[i][2], C.m[i][3]);
+
+    if (C_out) *C_out = C;
+
+    if (reslice) {
+        /* Standalone: resample so data is symmetric about world X = 0.
+           gam maps output(base)-index -> input(source)-index = S^(-1) * C^(-1) * S. */
+        mat44 Sinv = nifti_mat44_inverse(S);
+        mat44 Cinv = nifti_mat44_inverse(C);   /* = H */
+        mat44 gam = nifti_mat44_mul(Sinv, nifti_mat44_mul(Cinv, S));
+        if (nii_reslice_affine(nim, nim, gam, AL_INTERP_CUBIC, 0.0f)) {
+            fprintf(stderr, "sym: reslice failed\n");
+            void *_d = nim->data; *nim = nim_hdr0; nim->data = _d;   /* undo any de-oblique */
+            return 1;
+        }
+    } else {
+        /* Pre-step seed: fold C into the header (sform always; qform iff the input
+         * carried a valid qform). Shared with -sagseed. */
+        al_fold_correction_into_header(nim, C, S);
+    }
+    return 0;
+}
+
+/* -sagseed: in-MSP rigid seed (the complement of -sym). Precondition: -sym has
+   already folded its MSP correction into nim's header so the midsagittal plane
+   sits at world X = 0, and `tmpl` is an MSP-aligned template. Runs a 3-DOF-
+   constrained fit of nim to tmpl freeing ONLY the MSP-preserving isometries
+   {y-shift(1), z-shift(2), pitch = x-rotation(4)} — exactly the rigid DOF -sym is
+   blind to — and folds the resulting correction P^(-1) into nim's header, yielding
+   a full-rigid seed for the subsequent unconstrained nii_allineate. No reslice, no
+   standalone output; uses the user's -cost / -source_automask / -interp / -cmass.
+   Uses the process-global registration workspaces (serial-only, see nii_allineate).
+   Returns 0 on success, nonzero on error. */
+int nii_sagseed(nifti_image *nim, nifti_image *tmpl, al_opts opts)
+{
+    if (nim == NULL || tmpl == NULL) { fprintf(stderr, "sagseed: NULL image\n"); return 1; }
+    if (al_dims_ok(nim, "sagseed") || al_dims_ok(tmpl, "sagseed template")) return 1;
+
+    /* nim's current (post-sym) index->world transform; C is folded as newS = C*S. */
+    mat44 S;
+    al_image_xform_or_pixdim(nim, &S, "sagseed");
+
+    int match_code;
+    const char *cost_name;
+    al_resolve_cost(opts.cost, &match_code, &cost_name);
+
+    /* Free the in-MSP isometries: y-shift, z-shift, x-rotation (pitch); with -zoom,
+       also free param 6 (x-scale), which GA_setup_affine ties to y/z under
+       al_zoom_isotropic -> a single global isotropic zoom (helps extreme size
+       mismatches, e.g. an infant brain vs an adult template). */
+    static const int free_mask_rigid[12] = { 0,1,1, 0,1,0, 0,0,0, 0,0,0 };
+    static const int free_mask_zoom[12]  = { 0,1,1, 0,1,0, 1,0,0, 0,0,0 };
+    const int *free_mask = opts.zoom ? free_mask_zoom : free_mask_rigid;
+    fprintf(stderr, " + [sagseed] in-MSP seed (%s; free: y-shift, z-shift, pitch%s)\n",
+            cost_name, opts.zoom ? ", global zoom" : "");
+
+    /* Enable the isotropic-zoom tie for the seed fit AND the transform extraction
+       below; reset immediately after so the main nii_allineate() fit is unaffected. */
+    int prev_zoom = al_zoom_isotropic;
+    if (opts.zoom) al_zoom_isotropic = 1;
+
+    float wpar[12];
+    int ok = al_register(nim, tmpl, match_code, opts.cmass,
+                         opts.source_automask, opts.dark_automask, 0 /*relax_scale: seed uses the isotropic tie*/,
+                         opts.interp, 6 /*warp: ignored w/ mask*/,
+                         wpar, free_mask);
+    if (ok) { al_zoom_isotropic = prev_zoom; fprintf(stderr, "sagseed: constrained registration failed\n"); return 1; }
+
+    /* Pure world transform P (base=tmpl -> source=nim); the seed correction that
+       aligns nim to tmpl is P^(-1) (full inverse — direct fit, no -sym half). */
+    mat44 P = al_world_xform_from_params(12, wpar);
+    al_zoom_isotropic = prev_zoom;
+    mat44 C = nifti_mat44_inverse(P);
+
+    if (opts.zoom)
+        fprintf(stderr, " + [sagseed] recovered seed: y-shift %+.2f mm, z-shift %+.2f mm, pitch %+.2f deg, zoom %.3f\n",
+                wpar[1], wpar[2], wpar[4], wpar[6]);
+    else
+        fprintf(stderr, " + [sagseed] recovered seed: y-shift %+.2f mm, z-shift %+.2f mm, pitch %+.2f deg\n",
+                wpar[1], wpar[2], wpar[4]);
+
+    al_fold_correction_into_header(nim, C, S);
+    return 0;
+}
+
+/*==========================================================================*/
+/*==================== -com: center-of-mass origin =========================*/
+/*==========================================================================*/
+
+/* Set the image origin to its brightness center of mass: compute the
+   intensity-weighted centroid of the positive voxels (same estimator as -cmass),
+   map it to world coordinates through the selected index->world transform, and
+   fold the pure translation C = translate(-centroid_world) into the header so the
+   centroid lands at world (0,0,0). Header-only (no reslice), like the -sym
+   pre-step; a cheap origin reset that gives a good starting point for symmetric
+   images, intended to run early (right after -robustfov). Template-free, so a
+   pixdim-centered frame is the documented fallback when the input carries no usable
+   sform/qform. Returns 0 on success, nonzero on error. */
+int nii_center_of_mass(nifti_image *nim)
+{
+    if (nim == NULL) { fprintf(stderr, "com: NULL image\n"); return 1; }
+    if (al_dims_ok(nim, "com")) return 1;
+
+    /* S: index -> world (same selector/fallback as -sym; -com is template-free). */
+    mat44 S;
+    al_image_xform_or_pixdim(nim, &S, "com");
+
+    float *fdata = nii_to_float(nim);
+    if (!fdata) { fprintf(stderr, "com: failed to extract float data\n"); return 1; }
+    double cx, cy, cz;
+    al_center_of_mass(fdata, nim->nx, nim->ny, nim->nz, &cx, &cy, &cz);
+    free(fdata);
+
+    float wx, wy, wz;
+    mat44_vec(S, (float)cx, (float)cy, (float)cz, &wx, &wy, &wz);
+    fprintf(stderr, " + [com] brightness centroid: voxel (%.1f %.1f %.1f) -> world (%+.2f %+.2f %+.2f) mm\n",
+            cx, cy, cz, wx, wy, wz);
+
+    mat44 C = mat44_diag(1.0f, 1.0f, 1.0f);
+    C.m[0][3] = -wx; C.m[1][3] = -wy; C.m[2][3] = -wz;
+
+    al_fold_correction_into_header(nim, C, S);
     return 0;
 }

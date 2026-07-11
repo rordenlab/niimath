@@ -51,12 +51,12 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
     if(ENABLE_ALLINEATE)
         ADD_DEFINITIONS(-DHAVE_ALLINEATE)
-        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c)
-        # allineate benefits from fast-math (preserving NaN/Inf detection)
-        if(NOT MSVC)
-            set_source_files_properties(allineate.c powell_newuoa.c PROPERTIES
-                COMPILE_FLAGS "-ffast-math -fno-finite-math-only")
-        endif()
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c coreg_fast.c)
+        # fast-math is applied WHOLE-PROGRAM below (non-MSVC), matching the Makefile release
+        # build — the registration cost surface must round like the standalone allineate/
+        # fslmaths goldens, and scoping it to only these 3 TUs made CMake artifacts diverge
+        # numerically from the Make (release) build. See the whole-program block after the
+        # compiler branches.
     endif()
 
     # Optional GPL spm_coreg module (-spm_coreg/-spm_deface). OFF so default builds stay
@@ -94,17 +94,17 @@ elseif(${BUILD_FLAVOR} STREQUAL "tiny")
     endif()
 endif()
 
+# One OpenMP switch for every compiler: `cmake -DUSE_OPENMP=OFF ..` builds single-threaded
+# (needed for predictable serial diagnostics and Make/CMake parity). Default ON. The legacy
+# AppleClang-only OPENMP_XCODE is kept as an alias but is subordinate to USE_OPENMP.
+option(USE_OPENMP "Build with OpenMP support" ON)
+
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
-    #e.g.  cmake -DOPENMP_XCODE=ON ..
-    # Default ON when allineate is enabled (benefits from parallel coarse search)
-    if(ENABLE_ALLINEATE)
-        option(OPENMP_XCODE "Build with OpenMP support" ON)
-    else()
-        option(OPENMP_XCODE "Build with OpenMP support" OFF)
-    endif()
+    #e.g.  cmake -DOPENMP_XCODE=ON ..  (legacy alias; -DUSE_OPENMP=OFF also disables)
+    option(OPENMP_XCODE "Build with OpenMP support (legacy alias of USE_OPENMP)" ON)
     # using AppleClang
     add_definitions(-fno-caret-diagnostics)
-    if (OPENMP_XCODE)
+    if (USE_OPENMP AND OPENMP_XCODE)
         execute_process(COMMAND brew --prefix OUTPUT_VARIABLE HOMEBREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
         if(NOT EXISTS "${HOMEBREW_PREFIX}/opt/libomp/lib/libomp.a")
             message(FATAL_ERROR "Install Homebrew and run 'brew install libomp' to enable OpenMP")
@@ -118,9 +118,12 @@ if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
 elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
     # using GCC
     set(CMAKE_C_STANDARD 11)
-    find_package(OpenMP)
-    if (OPENMP_FOUND)
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+    if (USE_OPENMP)
+        find_package(OpenMP)
+        if (OPENMP_FOUND)
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_C_FLAGS}")
+        endif()
     endif()
 elseif(MSVC)
     # using Visual Studio C++
@@ -129,7 +132,18 @@ elseif(MSVC)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4244")   # 'initializing': conversion from 'double' to 'int', possible loss of data
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4267")   # 'initializing': conversion from 'size_t' to 'int', possible loss of data
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4305")   # 'argument': truncation from 'double' to 'float'
+    if (USE_OPENMP)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /openmp")
+    endif()
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")  # set "Stack Reserve Size" to 8MB (default value is 1MB)
+endif()
+
+# Whole-program fast-math (non-MSVC), matching the Makefile release build so ALL artifacts
+# (Make, CMake, notarize, WASM) share one FP contract. -fno-finite-math-only preserves
+# NaN/Inf detection. Registration must round like the standalone allineate/fslmaths goldens;
+# validated against the fslmaths canonical suite.
+if(NOT MSVC)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffast-math -fno-finite-math-only")
 endif()
 
 # Compiler dependent flags

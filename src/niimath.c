@@ -76,7 +76,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260703"
+#define kMTHdate "v1.0.20260711"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -340,10 +340,20 @@ int show_help( void ) {
 	printf("                                  -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
 	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                                  -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                                  -master <grid> reslice result onto <grid> (shares base world frame)\n");
+	printf("                                  -cost fast|fastcr fast SPM/FLIRT-inspired 12-DOF engine (fast=Hellinger, fastcr=corr-ratio)\n");
+	printf("                                  -savemat out.json  save the fitted world-space affine as JSON\n");
+	printf("                                  -applymat in.json  reslice onto base with a saved affine (no registration)\n");
+	printf("                                  -com  seed by resetting the origin to the brightness center of mass\n");
+	printf("                                  -sym|-symd|-symb  midsagittal-plane seed (symd de-obliques first; symb auto-competes)\n");
+	printf("                                  -nosagseed  disable the in-MSP rigid seed that -sym runs by default\n");
+	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template)\n");
 	printf("                            default cost: Hellinger; use -source_automask with lpc/lpa\n");
+	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
 	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; default Hellinger cost)\n");
 	printf("                              the mask determines what is removed: >=0.5 keep, <0.5 remove (brain mask keeps brain, face mask removes face)\n");
-	printf("                              opts: same as -allineate [default final: linear]\n");
+	printf("                              opts: -cost/-warp/-interp/-cmass/-source_automask/-dark_automask tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
+	printf("                                    (the -savemat/-applymat/-com/-sym*/-nosagseed/-zoom/-master/-cost fast workflow options are for -allineate only and are rejected here)\n");
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");

@@ -52,6 +52,25 @@ int nii_mul_size(size_t a, size_t b, size_t *out) {
 	return 0;
 }
 
+/* Core operators use int spatial offsets. Validate that invariant once after input,
+   before dispatch, instead of repeating overflow-prone nx*ny*nz expressions in every
+   operator. Pass-through copies intentionally bypass this computation-only limit. */
+int nii_nvox3d_int(const nifti_image *nim, int *out) {
+	if (!nim || !out || nim->nx < 1 || nim->ny < 1 || nim->nz < 1)
+		return 1;
+	if (nim->nvox < 1 || (uint64_t)nim->nvox > INT_MAX)
+		return 1;
+	if ((uint64_t)nim->nx > SIZE_MAX || (uint64_t)nim->ny > SIZE_MAX ||
+		(uint64_t)nim->nz > SIZE_MAX)
+		return 1;
+	size_t nxy, nxyz;
+	if (nii_mul_size((size_t)nim->nx, (size_t)nim->ny, &nxy) ||
+		nii_mul_size(nxy, (size_t)nim->nz, &nxyz) || nxyz > INT_MAX)
+		return 1;
+	*out = (int)nxyz;
+	return 0;
+}
+
 void *nii_calloc(size_t count, size_t size) {
 	size_t bytes;
 	if (nii_mul_size(count, size, &bytes) != 0)
@@ -180,6 +199,11 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	int nifti_type_in = nim->nifti_type;
 	char *hname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 8);
 	char *iname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 8);
+	if (hname == NULL || iname == NULL) {
+		free(hname); free(iname);
+		fprintf(stderr, "niimath: failed to allocate output filename\n");
+		return 1;
+	}
 	//char * hext = (char *)calloc(sizeof(char),8);
 	//char * iext = (char *)calloc(sizeof(char),8);
 	const char *ext; //input extension
@@ -267,7 +291,12 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	//append extensions...
 	nim->fname = hname;
 	nim->iname = iname;
-	nifti_image_write(nim);
+	/* nifti_image_write_status reports failures (open/short-write/compressor-close/
+	   disk-full/permission), so a failed or partial write — including a stale read-only
+	   target the writer could not replace — propagates instead of silently returning 0. */
+	int write_rc = nifti_image_write_status(nim);
+	if (write_rc)
+		fprintf(stderr, "niimath: failed to write output '%s' (check the directory exists and is writable)\n", hname);
 	free(hname);
 	if (nim->iname != NULL)
 		free(iname);
@@ -275,7 +304,7 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	nim->fname = fname_in;
 	nim->iname = iname_in;
 	nim->nifti_type = nifti_type_in;
-	return 0;
+	return write_rc ? 1 : 0;
 }
 
 mat44 xform(nifti_image *nim) {

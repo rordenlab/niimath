@@ -101,6 +101,254 @@ jobs:
             src/niimath /tmp/reg_${final}_1.nii.gz --compare /tmp/reg_${final}_4.nii.gz
           done
 
+      - name: Fast coreg engine (-cost fast/fastcr) quality, thread parity, and option contracts
+        run: |
+          set -e
+          # The fast engine (coreg_fast.c) is a second, explicitly-selected 12-DOF
+          # registration tier. It ships in BOTH the BSD and GPL builds; this runs on
+          # the allineate-enabled build above. MI (`-cost fast`) is imprecise on
+          # smooth synthetic phantoms by design, so the quality/parity checks use
+          # `-cost fastcr` (correlation ratio), per coreg_fast.h.
+          for nt in 1 4; do
+            OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fastcr /tmp/fast_$nt.nii.gz
+            python3 .github/scripts/reg_quality.py /tmp/fast_$nt.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+          done
+          # Deterministic across thread counts (fixed-order chunked reductions).
+          src/niimath /tmp/fast_1.nii.gz --compare /tmp/fast_4.nii.gz
+          # `-cost fast` (MI) must at least RUN and produce finite, non-empty output.
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast /tmp/fast_mi.nii.gz
+          # Start-frame selection: the fast engine auto-selects between the header affine and a
+          # COM-recentered frame by (1-cost)*coverage. `-com` forces the COM recenter, `-nocmass`
+          # forces the header frame; both must RUN and stay deterministic across thread counts
+          # (a thread-dependent seed CHOICE would break the byte-parity contract below).
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fastcr -nocmass /tmp/fast_nc.nii.gz
+          OMP_NUM_THREADS=1 src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fastcr -com /tmp/fast_com1.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fastcr -com /tmp/fast_com4.nii.gz
+          src/niimath /tmp/fast_com1.nii.gz --compare /tmp/fast_com4.nii.gz   # seed choice is deterministic
+          # Option contracts: the fast engine runs a fixed 12-DOF schedule with internal
+          # sampling and must REJECT (exit nonzero, no output) options it cannot honor,
+          # rather than silently ignoring an explicit request.
+          for opt in "-warp shr" "-interp cubic" "-source_automask" "-dark_automask"; do
+            if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast $opt /tmp/rej.nii.gz >/dev/null 2>e.txt; then
+              echo "fast + '$opt' should be rejected"; cat e.txt; exit 1; fi
+          done
+          # -cost is last-one-wins: a normal cost after `-cost fast` must run the ordinary
+          # engine (which prints "Cost function: Hellinger ... (12 DOF)"), not the fast one.
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -cost hel /tmp/low.nii.gz 2>low.txt
+          grep -qi 'Cost function: Hellinger' low.txt || { echo '-cost fast -cost hel should run the normal Hellinger engine'; exit 1; }
+          # -deface does not support the fast engine or -master: reject, do not no-op.
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast /tmp/dfj.nii.gz >/dev/null 2>df1.txt; then
+            echo '-deface -cost fast should be rejected'; exit 1; fi
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -master /tmp/ref.nii.gz /tmp/dfj2.nii.gz >/dev/null 2>df2.txt; then
+            echo '-deface -master should be rejected'; exit 1; fi
+
+      - name: No-form images register via the shared pixdim fallback
+        run: |
+          set -e
+          # A valid image with both sform_code and qform_code 0 must still register
+          # (unified al_image_xform_or_pixdim policy), on BOTH the normal and fast
+          # engines, not error out. reg_quality fails closed on empty/constant output.
+          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz /tmp/nf_norm.nii.gz
+          python3 .github/scripts/reg_quality.py /tmp/nf_norm.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
+          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz -cost fastcr /tmp/nf_fast.nii.gz
+          python3 .github/scripts/reg_quality.py /tmp/nf_fast.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
+
+      - name: Cubic reslice preserves out-of-FOV fill (defacing mask safety)
+        run: |
+          set -e
+          # A positive-only source resliced with -master onto a shifted grid must fill
+          # uncovered space with 0, not clamp it up to the source minimum (the cubic
+          # clip must skip the fill). Regression guard for the al_clip_to_source_range /
+          # nii_reslice_affine fill-clobber fix.
+          src/niimath /tmp/big.nii.gz -add 1000 /tmp/pos.nii.gz
+          src/niimath /tmp/pos.nii.gz -allineate /tmp/bigref.nii.gz -final cubic /tmp/poscub.nii.gz
+          python3 - <<'PY'
+          import nibabel as nib, numpy as np
+          d = nib.load('/tmp/poscub.nii.gz').get_fdata()
+          nzero = int((d == 0).sum())
+          assert nzero > 0, f"cubic reslice has no 0-fill voxels (min={d.min()}); fill was clobbered to source min"
+          print(f"OK: {nzero} out-of-FOV voxels correctly filled with 0 (min={d.min():.3f})")
+          PY
+
+      - name: Registration workflow options (-savemat/-applymat/-com/-sym) — niimath superset of allineate
+        run: |
+          set -e
+          # -savemat writes the fitted world affine; -applymat replays it (no registration).
+          # The registered output uses the fused warp and -applymat uses nii_reslice_affine
+          # (different kernels), so the round-trip matches within a small tolerance, not bit-
+          # exact — assert equivalence (r=1, sub-threshold max diff).
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -savemat /tmp/mat.json /tmp/reg.nii.gz
+          test -s /tmp/mat.json
+          grep -q '"fixed_to_moving"' /tmp/mat.json
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/mat.json /tmp/applied.nii.gz
+          src/niimath /tmp/reg.nii.gz --compare 0.01 /tmp/applied.nii.gz
+          # -applymat does NO registration: it must reject registration/seed options.
+          for bad in "-com" "-sym" "-cost fast" "-master /tmp/bigref.nii.gz" "-cmass"; do
+            if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/mat.json $bad /tmp/x.nii.gz >/dev/null 2>ea.txt; then
+              echo "-applymat + '$bad' should be rejected"; cat ea.txt; exit 1; fi
+          done
+          # A malformed matrix file is rejected (no crash, nonzero exit).
+          echo 'not a matrix' > /tmp/badmat.json
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/badmat.json /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo 'malformed -applymat json should be rejected'; exit 1; fi
+          # -com / -sym / -symd header seeds run and still register (reg_quality fails closed
+          # on empty/constant output). The fast engine rejects -sym.
+          for seed in "-com" "-sym" "-symd" "-sym -nosagseed"; do
+            src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz $seed /tmp/seed.nii.gz
+            python3 .github/scripts/reg_quality.py /tmp/seed.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+          done
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo '-cost fast -sym should be rejected'; exit 1; fi
+          # -master + -savemat: the saved matrix must reproduce the master-grid output (the
+          # -master path returns the affine from the estimate seam, not the g_last_affine global).
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -master /tmp/bigref.nii.gz -savemat /tmp/mm.json /tmp/mm.nii.gz
+          grep -q '"fixed_to_moving"' /tmp/mm.json
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/mm.json /tmp/mmapp.nii.gz
+          src/niimath /tmp/mm.nii.gz --compare 0.01 /tmp/mmapp.nii.gz
+
+      - name: Seeded -savemat replays correctly; -deface rejects workflow options
+        run: |
+          set -e
+          # A header-mutating seed (-com/-sym) fits relative to the SEEDED moving frame; the
+          # saved matrix must be composed back to the ORIGINAL frame so -applymat reproduces
+          # the result on the un-seeded input (regression guard for the seeded-replay bug —
+          # was corr ~0.5 before the S_orig*inv(S_seed)*M composition).
+          for seed in "-com" "-sym" "-symd" "-com -sym"; do
+            src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz $seed -savemat /tmp/sd.json /tmp/sdreg.nii.gz
+            src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/sd.json /tmp/sdapp.nii.gz
+            src/niimath /tmp/sdreg.nii.gz --compare 0.01 /tmp/sdapp.nii.gz
+          done
+          # -deface shares the -allineate parser but implements none of the workflow options —
+          # it must REJECT them (a silent no-op on a privacy command is unsafe), not ignore them.
+          for bad in "-savemat /tmp/x.json" "-applymat /tmp/sd.json" "-com" "-sym" "-zoom" "-nosagseed"; do
+            if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz $bad /tmp/dfx.nii.gz >/dev/null 2>edf.txt; then
+              echo "-deface + '$bad' should be rejected"; cat edf.txt; exit 1; fi
+          done
+
+      - name: Build-variant toggle without clean (OMP on -> OMP=0)
+        run: |
+          set -e
+          # The prebuilt registration objects (allineate.o/powell_newuoa.o/coreg_fast.o) must
+          # rebuild when object-affecting flags change, or `make` then `make OMP=0` reuses the
+          # OpenMP-compiled objects and the link fails on __kmpc_*/omp_*. Guard the flag-stamp.
+          make -C src >/dev/null
+          make -C src OMP=0 all >/dev/null   # must rebuild the .o and link cleanly, no `make -B`
+          make -C src >/dev/null             # and back to OpenMP
+
+      - name: 4D Gaussian smoothing is thread-parity-safe (typed backend race guard)
+        run: |
+          set -e
+          # The typed nifti_smooth_gauss_f32 backend replaced the old multi-volume smoother
+          # whose parallel-over-volumes loop raced on shared nx/ny/nz via the transpose. `-s`
+          # (op smth) drives it; a multi-volume input at 1 vs 4 threads must be byte-identical.
+          python3 - <<'PY'
+          import numpy as np, nibabel as nib
+          d = np.random.RandomState(0).rand(20, 20, 20, 8).astype('float32')   # 8-volume 4D
+          nib.Nifti1Image(d, np.diag([2., 2., 2., 1.]).astype('float32')).to_filename('/tmp/vol4d.nii.gz')
+          PY
+          OMP_NUM_THREADS=1 src/niimath /tmp/vol4d.nii.gz -s 3 /tmp/s1.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/vol4d.nii.gz -s 3 /tmp/s4.nii.gz
+          # This contract is byte-identical voxel data, not merely --compare's tolerance.
+          python3 - <<'PY'
+          import nibabel as nib, numpy as np
+          a = np.asanyarray(nib.load('/tmp/s1.nii.gz').dataobj)
+          b = np.asanyarray(nib.load('/tmp/s4.nii.gz').dataobj)
+          assert np.array_equal(a, b), f'smoothing thread mismatch: max abs {np.max(np.abs(a-b))}'
+          PY
+          # EDT previously had the same class of race: transposeXZ mutated shared nx/nz
+          # inside its parallel-over-volumes loop. Exercise the typed 4D path exactly.
+          OMP_NUM_THREADS=1 src/niimath /tmp/vol4d.nii.gz -thr 0.5 -bin -edt /tmp/e1.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/vol4d.nii.gz -thr 0.5 -bin -edt /tmp/e4.nii.gz
+          OMP_NUM_THREADS=4 src/niimath /tmp/vol4d.nii.gz -thr 0.5 -bin -sedt /tmp/se4.nii.gz
+          python3 - <<'PY'
+          import nibabel as nib, numpy as np
+          a = np.asanyarray(nib.load('/tmp/e1.nii.gz').dataobj)
+          b = np.asanyarray(nib.load('/tmp/e4.nii.gz').dataobj)
+          assert np.array_equal(a, b), f'EDT thread mismatch: max abs {np.max(np.abs(a-b))}'
+          s = np.asanyarray(nib.load('/tmp/se4.nii.gz').dataobj)
+          assert s.shape == a.shape and np.isfinite(s).all(), '4D signed EDT output invalid'
+          PY
+
+      - name: Output-write failure and malformed -applymat matrix are rejected (fail closed)
+        run: |
+          set -e
+          # A failed write (bad directory) must exit nonzero, not report success with no file.
+          if src/niimath /tmp/src.nii.gz -add 0 /tmp/no/such/dir/out.nii.gz >/dev/null 2>&1; then
+            echo 'write to nonexistent directory should fail'; exit 1; fi
+          test ! -e /tmp/no/such/dir/out.nii.gz
+          # A -savemat matrix with a corrupt homogeneous bottom row (not [0,0,0,1]) is not an
+          # affine transform and must be rejected, not silently produce an all-zero image.
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -savemat /tmp/ok.json /tmp/reg.nii.gz
+          python3 -c "s=open('/tmp/ok.json').read().replace('[0, 0, 0, 1]','[1, 2, 3, 4]',1); open('/tmp/bad.json','w').write(s)"
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/bad.json /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo 'malformed affine (bad bottom row) should be rejected'; exit 1; fi
+          # the valid matrix still applies
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/ok.json /tmp/good.nii.gz
+          # A stale, un-writable pre-existing output must fail (nifti_image_write_status returns the
+          # open failure; the stat-only workaround wrongly saw the stale file as success).
+          echo stale > /tmp/ro.nii.gz && chmod 0444 /tmp/ro.nii.gz
+          if src/niimath /tmp/big.nii.gz -add 0 /tmp/ro.nii.gz >/dev/null 2>&1; then
+            echo 'write to a read-only existing file should fail'; exit 1; fi
+          chmod 0644 /tmp/ro.nii.gz; rm -f /tmp/ro.nii.gz
+          # JSON parser: a NaN bottom row, an unterminated array, and an earlier value equal to
+          # the key must all be rejected/handled (finiteness + bracket-depth + continue-search).
+          python3 -c "s=open('/tmp/ok.json').read().replace('[0, 0, 0, 1]','[-nan, 0, 0, 1]',1); open('/tmp/nanrow.json','w').write(s)"
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/nanrow.json /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo 'NaN in the affine bottom row should be rejected'; exit 1; fi
+
+      - name: --compare fails on non-finite mismatches (oracle integrity)
+        run: |
+          set -e
+          # --compare must NOT report an all-NaN vs finite image as equal (it would let a
+          # regression that replaces values with NaN pass the canonical/thread-parity oracles).
+          python3 - <<'PY'
+          import numpy as np, nibabel as nib
+          nib.Nifti1Image(np.full((8,8,8), np.nan, np.float32), np.eye(4)).to_filename('/tmp/nan.nii.gz')
+          nib.Nifti1Image(np.ones((8,8,8), np.float32), np.eye(4)).to_filename('/tmp/one.nii.gz')
+          nib.Nifti1Image(np.full((8,8,8), np.inf, np.float32), np.eye(4)).to_filename('/tmp/pinf.nii.gz')
+          nib.Nifti1Image(np.full((8,8,8), -np.inf, np.float32), np.eye(4)).to_filename('/tmp/ninf.nii.gz')
+          vnan = np.zeros((8,8,8,3), np.float32); vone = vnan.copy()
+          vnan[0,0,0,0] = np.nan; vone[0,0,0,0] = 1
+          nib.Nifti1Image(vnan, np.eye(4)).to_filename('/tmp/vnan.nii.gz')
+          nib.Nifti1Image(vone, np.eye(4)).to_filename('/tmp/vone.nii.gz')
+          PY
+          if src/niimath /tmp/nan.nii.gz --compare /tmp/one.nii.gz >/dev/null 2>&1; then echo 'NaN-vs-finite must differ'; exit 1; fi
+          if src/niimath /tmp/pinf.nii.gz --compare /tmp/ninf.nii.gz >/dev/null 2>&1; then echo '+inf-vs--inf must differ'; exit 1; fi
+          if src/niimath /tmp/pinf.nii.gz --compare /tmp/one.nii.gz >/dev/null 2>&1; then echo 'inf-vs-finite must differ'; exit 1; fi
+          # Three-volume inputs take the vector-polarity equivalence path; non-finite
+          # mismatches must fail before NaN cross-products can be mistaken for parallel.
+          if src/niimath /tmp/vnan.nii.gz --compare /tmp/vone.nii.gz >/dev/null 2>&1; then echo '3-volume NaN-vs-finite must differ'; exit 1; fi
+          src/niimath /tmp/nan.nii.gz --compare /tmp/nan.nii.gz    # both-NaN equal
+          src/niimath /tmp/pinf.nii.gz --compare /tmp/pinf.nii.gz  # same-sign inf equal
+
+      - name: Fast-coreg handles a partial-FOV moving image (out-of-FOV exclusion)
+        run: |
+          set -e
+          # The moving image is a z-slab covering ~40% of the fixed FOV, at identity offset.
+          # With out-of-FOV samples EXCLUDED from HEL/CR (not filled with background), a correct
+          # fast fit recovers ~identity. Before the change, incomplete-coverage moving images
+          # were DISTORTED — the optimizer applied scale/shear to pull all fixed samples into
+          # the moving box. Assert both (a) the warped slab matches the fixed over the overlap
+          # and (b) the recovered transform is NEAR-RIGID (no shear, scales ~1) — the distortion
+          # signature — via -savemat.
+          for cost in fast fastcr; do
+            src/niimath /tmp/movslab.nii.gz -allineate /tmp/bigref.nii.gz -cost $cost -savemat /tmp/mov.json /tmp/movreg.nii.gz
+            python3 - <<'PY'
+          import numpy as np, nibabel as nib, json
+          w = nib.load('/tmp/movreg.nii.gz').get_fdata(); f = nib.load('/tmp/bigref.nii.gz').get_fdata()
+          m = w != 0; frac = m.mean(); r = np.corrcoef(w[m], f[m])[0, 1]
+          assert frac > 0.03, f"partial-FOV overlap collapsed to {frac:.3f} (optimizer gamed the FOV)"
+          assert r > 0.99, f"partial-FOV registration corr over overlap = {r:.4f} (< 0.99)"
+          A = np.array(json.load(open('/tmp/mov.json'))['fixed_to_moving'])[:3, :3]
+          sc = [np.linalg.norm(A[:, i]) for i in range(3)]
+          ang = [np.degrees(np.arccos(np.clip(A[:, i].dot(A[:, j]) / (sc[i]*sc[j]), -1, 1)))
+                 for i, j in [(0, 1), (0, 2), (1, 2)]]
+          assert all(0.8 < s < 1.25 for s in sc), f"distorted scales {sc} (expected ~1 near-rigid)"
+          assert all(abs(a - 90) < 15 for a in ang), f"sheared axes {ang} deg (expected ~90 near-rigid)"
+          print(f"OK: overlap {frac*100:.1f}%, corr {r:.4f}, scales {[round(s,3) for s in sc]}, angles {[round(a,1) for a in ang]}")
+          PY
+          done
+
       - name: 4D inputs are rejected (fail closed, no corrupt output)
         run: |
           set -e

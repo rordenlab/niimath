@@ -35,3 +35,7 @@ _skbuild/niimath/_dist_ver.py
 audit_temp.md
 audit_response.md
 coreg_plan.md
+
+# allineate object-flag signature stamp (Makefile flag-change detection)
+.al_obj_flags
+*.d

@@ -148,9 +148,9 @@ static int zst_compress_from_tmpfile(FILE *tmpf, const char *path)
    FILE *fout = fopen(path, "wb");
    if (!fout) { free(cbuf); return -1; }
    size_t written = fwrite(cbuf, 1, csize, fout);
-   fclose(fout);
+   int close_status = fclose(fout);
    free(cbuf);
-   if (written != csize) {
+   if (written != csize || close_status != 0) {
       fprintf(stderr, "** zstd write error: wrote %zu of %zu bytes\n", written, csize);
       return -1;
    }
@@ -229,6 +229,8 @@ static int nii_close(NIIFILE *fp)
    if ((*fp)->nzfptr) {
       if ((*fp)->nzfptr != stdout && (*fp)->nzfptr != stdin)
          ret = fclose((*fp)->nzfptr);
+      else if ((*fp)->nzfptr == stdout)
+         ret = fflush(stdout);
    }
    free(*fp);
    *fp = NULL;
@@ -266,7 +268,7 @@ static size_t nii_write(const void *buf, size_t size, size_t nmemb, NIIFILE f)
       while (remain > 0) {
          unsigned n2w = (remain < ZNZ_MAX_BLOCK_SIZE) ? (unsigned)remain : ZNZ_MAX_BLOCK_SIZE;
          int nw = gzwrite(f->zfptr, cbuf, n2w);
-         if (nw < 0) return (size_t)nw;
+         if (nw < 0) return 0;
          remain -= nw;
          cbuf += nw;
          if (nw < (int)n2w) break;
@@ -2013,9 +2015,32 @@ static int isStdOutFcn(nifti_image *nim)
 
 #ifdef PIGZ
 #ifdef HAVE_ZLIB
+/* popen invokes a shell. Reject metacharacters and fall back to the built-in gzip writer;
+   quoted filenames alone are insufficient because command substitution remains active
+   inside double quotes. This intentionally accepts the common portable path subset. */
+static int pigz_path_is_safe(const char *path)
+{
+   if (!path || !*path) return 0;
+   for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+      unsigned char c = *p;
+      if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '/' || c == '\\' || c == ':' ||
+          c == '.' || c == '_' || c == '-' || c == '+' || c == ' ')
+         continue;
+      return 0;
+   }
+   return 1;
+}
+
 static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
 {
    FILE *pigzPipe;
+   if (nim->nbyper <= 0 || nim->nvox <= 0 ||
+      (uint64_t)nim->nvox > SIZE_MAX / (size_t)nim->nbyper)
+      return -1;
+   if (!pigz_path_is_safe(nim->fname)) return -1;
+   size_t ntot = (size_t)nim->nbyper * (size_t)nim->nvox;
+   if (strlen(nim->fname) > SIZE_MAX - 32) return -1;
    size_t cmdlen = strlen(nim->fname) + 32;
    char *command = (char *)malloc(cmdlen);
    if (!command) return -1;
@@ -2027,8 +2052,9 @@ static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
 #endif
    free(command);
    if (!pigzPipe) return -1;
+   int failed = 0;
    /* Write header */
-   fwrite(hdr, 1, hdrsize, pigzPipe);
+   if (fwrite(hdr, 1, (size_t)hdrsize, pigzPipe) != (size_t)hdrsize) failed = 1;
    /* Write extensions via wrapper */
    NIIFILE wfp = (NIIFILE)calloc(1, sizeof(*wfp));
 #ifdef _MSC_VER
@@ -2038,22 +2064,25 @@ static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
 #endif
    wfp->nzfptr = pigzPipe;
    if (nim->nifti_type != NIFTI_FTYPE_ANALYZE)
-      nifti_write_extensions(wfp, nim);
+      if (nifti_write_extensions(wfp, nim) < 0) failed = 1;
    /* Write data */
-   if (nim->data)
-      fwrite(nim->data, 1, (size_t)nim->nbyper * nim->nvox, pigzPipe);
+   if (nim->data && fwrite(nim->data, 1, ntot, pigzPipe) != ntot) failed = 1;
    free(wfp);
 #ifdef _MSC_VER
-   _pclose(pigzPipe);
+   if (_pclose(pigzPipe) != 0) failed = 1;
 #else
-   pclose(pigzPipe);
+   if (pclose(pigzPipe) != 0) failed = 1;
 #endif
-   return 0;
+   return failed ? -1 : 0;
 }
 #endif
 #endif
 
-void nifti_image_write(nifti_image *nim)
+/* Status-returning companion to the established void API. Returns 0 on success, 1 on any
+   failure (invalid image, header conversion, open, short header/data write, or a compressor/
+   close/pclose error such as disk-full flushing). niimath uses this to fail closed without
+   changing nifti_image_write's public signature for other nifti_io consumers. */
+int nifti_image_write_status(nifti_image *nim)
 {
    nifti_1_header n1hdr;
    nifti_2_header n2hdr;
@@ -2061,19 +2090,19 @@ void nifti_image_write(nifti_image *nim)
    int nver = 1;
    int hsize = (int)sizeof(nifti_1_header);
 
-   if (!nim || !nifti_validfilename(nim->fname)) return;
-   if (!nim->data) return;
+   if (!nim || !nifti_validfilename(nim->fname)) return 1;
+   if (!nim->data) return 1;
 
    int isStdOut = isStdOutFcn(nim);
 
    if (nim->nifti_type == NIFTI_FTYPE_NIFTI2_1 || nim->nifti_type == NIFTI_FTYPE_NIFTI2_2) {
       nifti_set_iname_offset(nim, 2);
-      if (nifti_convert_nim2n2hdr(nim, &n2hdr)) return;
+      if (nifti_convert_nim2n2hdr(nim, &n2hdr)) return 1;
       nver = 2;
       hsize = (int)sizeof(nifti_2_header);
    } else {
       nifti_set_iname_offset(nim, 1);
-      if (nifti_convert_nim2n1hdr(nim, &n1hdr)) return;
+      if (nifti_convert_nim2n1hdr(nim, &n1hdr)) return 1;
    }
 
    /* ensure iname is set for 2-file formats */
@@ -2081,7 +2110,7 @@ void nifti_image_write(nifti_image *nim)
       if (nim->iname && strcmp(nim->iname, nim->fname) == 0) { free(nim->iname); nim->iname = NULL; }
       if (!nim->iname) {
          nim->iname = nifti_makeimgname(nim->fname, nim->nifti_type, 0, 0);
-         if (!nim->iname) return;
+         if (!nim->iname) return 1;
       }
    }
 
@@ -2094,7 +2123,7 @@ void nifti_image_write(nifti_image *nim)
          const char *val = getenv("AFNI_COMPRESSOR");
          if (val && strstr(val, "PIGZ")) {
             void *hdr = (nver == 2) ? (void *)&n2hdr : (void *)&n1hdr;
-            if (doPigz_write(nim, hdr, hsize) == 0) return;
+            if (doPigz_write(nim, hdr, hsize) == 0) return 0;  /* pigz wrote it successfully */
          }
       }
 #endif
@@ -2110,31 +2139,47 @@ void nifti_image_write(nifti_image *nim)
    } else {
       fp = nii_open(nim->fname, "wb", nifti_is_gzfile(nim->fname));
    }
-   if (!fp) return;
+   if (!fp) return 1;
 
    /* write header */
    size_t ss;
    if (nver == 2) ss = nii_write(&n2hdr, 1, hsize, fp);
    else           ss = nii_write(&n1hdr, 1, hsize, fp);
-   if ((int)ss < hsize) { nii_close(&fp); return; }
+   if ((int)ss < hsize) { nii_close(&fp); return 1; }
 
    /* write extensions */
    if (nim->nifti_type != NIFTI_FTYPE_ANALYZE)
-      nifti_write_extensions(fp, nim);
+      if (nifti_write_extensions(fp, nim) < 0) { nii_close(&fp); return 1; }
 
    /* for 2-file format, close header file and open image file */
    if (nim->nifti_type != NIFTI_FTYPE_NIFTI1_1 && nim->nifti_type != NIFTI_FTYPE_NIFTI2_1) {
-      nii_close(&fp);
+      if (nii_close(&fp)) return 1;
       fp = nii_open(nim->iname, "wb", nifti_is_gzfile(nim->iname));
-      if (!fp) return;
+      if (!fp) return 1;
    }
 
    /* seek to data offset and write data */
-   nii_seek(fp, (long)nim->iname_offset, SEEK_SET);
-   int64_t ntot = (int64_t)nim->nbyper * nim->nvox;
-   nii_write(nim->data, 1, ntot, fp);
+   if (!isStdOut && nii_seek(fp, (long)nim->iname_offset, SEEK_SET) < 0) {
+      nii_close(&fp);
+      return 1;
+   }
+   if (nim->nbyper <= 0 || nim->nvox <= 0 ||
+       (uint64_t)nim->nvox > SIZE_MAX / (size_t)nim->nbyper) {
+      nii_close(&fp);
+      return 1;
+   }
+   size_t ntot = (size_t)nim->nbyper * (size_t)nim->nvox;
+   size_t dw = nii_write(nim->data, 1, ntot, fp);
    nim->byteorder = nifti_short_order();
-   nii_close(&fp);
+   /* a short data write, or a compressor/close error (disk full flushes here), is a failure */
+   int cerr = nii_close(&fp);
+   if (dw != ntot || cerr) return 1;
+   return 0;
+}
+
+void nifti_image_write(nifti_image *nim)
+{
+   (void)nifti_image_write_status(nim);
 }
 
 /*========== Free / infodump ==========*/

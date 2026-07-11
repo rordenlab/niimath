@@ -74,3 +74,29 @@ for path, data in big.items():
     img.header.set_qform(affbig, code=1)
     nib.save(img, path)
     print("wrote", path, data.shape)
+
+# No-form pair for the "both sform_code and qform_code are 0" registration policy:
+# a valid image with neither form must still register via the shared pixdim-centered
+# fallback (al_image_xform_or_pixdim), not error out. Same phantoms, form codes zeroed.
+for src_path, nf_path in [("/tmp/big.nii.gz", "/tmp/noform.nii.gz"),
+                          ("/tmp/bigref.nii.gz", "/tmp/noformref.nii.gz")]:
+    im = nib.load(src_path)
+    h = im.header.copy()
+    h["sform_code"] = 0
+    h["qform_code"] = 0
+    nib.Nifti1Image(np.asarray(im.dataobj), None, h).to_filename(nf_path)
+    print("wrote", nf_path, "(no sform/qform)")
+
+# Partial-FOV moving image for the fast-coreg out-of-FOV-exclusion change: a z-slab of the
+# fixed (its FOV covers only ~40% of the fixed), at the SAME world coordinates, so a correct
+# fast registration recovers ~identity and the warped slab matches the fixed over the overlap.
+# Guards the FOV change against a regression where the optimizer shrinks onto a tiny overlap.
+_bigref = nib.load("/tmp/bigref.nii.gz")
+_d = _bigref.get_fdata().astype(np.float32)
+_aff = _bigref.affine.copy()
+_z0, _z1 = 20, 44
+_slab = _d[:, :, _z0:_z1].copy()
+_aff2 = _aff.copy()
+_aff2[:3, 3] = _aff[:3, :3] @ np.array([0, 0, _z0]) + _aff[:3, 3]
+nib.Nifti1Image(_slab, _aff2).to_filename("/tmp/movslab.nii.gz")
+print("wrote /tmp/movslab.nii.gz", _slab.shape, "(partial-FOV z-slab of bigref)")

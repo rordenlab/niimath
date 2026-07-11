@@ -1119,7 +1119,7 @@ static int render_and_write_png(const nifti_image *nim,
 	int have_nim2 = 0;
 	float *data2 = NULL;
 	if (nim2) {
-		if (!(isfinite(opts->cal_min2) && isfinite(opts->cal_min2) && opts->cal_min2 < opts->cal_max2)) {
+		if (!(isfinite(opts->cal_min2) && isfinite(opts->cal_max2) && opts->cal_min2 < opts->cal_max2)) {
 			fprintf(stderr, "render: overlay (nim2) cal_min and cal_max must be finite and cal_min < cal_max (%g %g)\n",
 					opts->cal_min2, opts->cal_max2);
 			return -1;

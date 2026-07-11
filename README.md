@@ -70,6 +70,7 @@ The default build includes OpenMP for all operations. On macOS this requires `br
 OMP=0 make             # Disable OpenMP
 CF=1 make              # CloudFlare accelerated zlib
 make debug             # Debug build (-g, no optimization)
+make ubsan             # Lightweight undefined-behavior checks (OpenMP-safe on macOS)
 make sanitize          # AddressSanitizer build
 AL=0 make              # Disable allineate registration
 ZSTD=0 make            # Disable zstd compression support
@@ -161,8 +162,13 @@ niimath has a few features not provided by fslmaths:
    - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass` `-source_automask`
    - `-warp XX` (sho, shr, srs, aff [default]) `-interp XX` (NN, linear [default], cubic)
    - `-final XX` (NN, linear, cubic [default]) or `-nearest` `-linear` `-cubic`
+   - `-master <grid>`: estimate at the base resolution but reslice the result onto `<grid>` (must share the base world frame, e.g. a higher-resolution template)
+   - `-savemat out.json`: save the fitted world-space `fixed_to_moving` affine (and its inverse) as self-describing JSON. `-applymat in.json`: reslice the moving image onto `base` using a saved affine, doing **no** registration (exclusive with the registration/seed options; use `-nearest` for label/atlas volumes)
+   - Registration seeds (applied to the moving image before the fit): `-com` (reset the origin to the brightness center of mass), `-sym`/`-symd`/`-symb` (fold a midsagittal-plane correction into the header; `-symd` de-obliques the frame first, `-symb` auto-competes both), `-nosagseed` (disable the in-MSP rigid seed `-sym` runs by default), `-zoom` (relax the scale range for abnormal-size subjects, e.g. infant vs adult template)
+   - Skull-stripping is `deface` with a brain mask; to crop the field of view first, chain `-robustfov` before `-allineate`. Together these make niimath a superset of the standalone `allineate` registration tool.
+   - **Fast engine:** `-cost fast` (Hellinger/MI, robust cross-modal) or `-cost fastcr` (correlation-ratio) select an independent, SPM/FLIRT-inspired multiresolution 12-DOF estimator that is typically several times faster. It runs a fixed schedule with internal sampling, so it rejects `-warp`/`-interp`/`-source_automask`/`-dark_automask`/`-sym`/`-zoom` (use a normal `-cost` for those). Default/`-cmass` chooses the supplied-affine or COM-recentered initialization from initial dependence×overlap, `-com` forces COM, and `-nocmass` forces the supplied affine; `-final`/`-master`/`-savemat` are also honored. `-cost` is last-one-wins.
  - `deface <tmpl> <mask> [opts]`: remove voxels using a template-space mask. Registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and zeros voxels where the warped mask < 0.5 (the input itself is never resampled). `mask` is in `tmpl` space: ≥0.5 = keep, <0.5 = remove. The mask determines what is removed — supply a brain mask to skull-strip (keep the brain) or a face mask to deface (remove the face).
-   - opts: same as allineate (default final: linear)
+   - opts: the tuning + output-interpolation options only — `-cost`/`-warp`/`-interp`/`-cmass`/`-nocmass`/`-source_automask`/`-dark_automask` and `-final`/`-nearest`/`-linear`/`-cubic` (default final: linear). The registration-workflow options (`-savemat`/`-applymat`/`-com`/`-sym`/`-symd`/`-symb`/`-nosagseed`/`-zoom`/`-master`/`-cost fast`) apply to `-allineate` only and are **rejected** here (deface registers with the ordinary engine and reslices the mask onto the input's own grid)
    - **Breaking change:** the former `-skullstrip <tmpl> <mask>` command was removed — it ran the identical operation. Replace `-skullstrip` with `-deface` (supply your brain mask); the result is unchanged.
  - `spm_coreg <ref> [opts]`: SPM rigid-body coregistration of the chain image to `ref` (optional GPL module, see below)
    - opts: `-cost XX` (nmi [default], mi, ecc, ncc, ls) `-sep` `-fwhm` `-dither 0|1` `-coarse sparse|downsample` `-verbose 0|1`
