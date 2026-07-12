@@ -228,9 +228,14 @@ describe("multi-input: allineate/deface", () => {
   // and -cost hel) is not byte-reproducible across builds — NEWUOA/pyramid + -ffast-math land on
   // a neighboring, equally-valid optimum under different codegen — so the resliced mask flips a
   // thin shell of BOUNDARY voxels between native and WASI. We assert the two agree everywhere
-  // except that small shell (and that a substantial region was actually removed), rather than
-  // byte identity. The realistic simbrain phantom (multi-tissue head) is what lets fast converge
-  // to essentially the same defacing as native; a lone Gaussian blob did not.
+  // except that small shell, plus that the mask actually removed the identifiable NON-BRAIN head
+  // tissue (face/scalp/skull), rather than byte identity. The realistic 24-object simbrain head
+  // (js/src/wasi/simbrain.py) is what lets fast converge to essentially the same defacing as
+  // native (fast-vs-hel KEPT Dice ~0.999); a lone Gaussian blob did not. NOTE on the removal
+  // metric: the brain mask keeps only ~15% of the volume and zeros the rest, but ~67% of the
+  // volume is air (already 0), so voxels VISIBLY changed by defacing (~19%) are exactly the
+  // removed non-air head tissue — the privacy-critical part. We threshold on that, not on a
+  // ">50% of voxels" count that would merely be re-zeroing background.
   for (const [label, extra] of [["fast (default)", []], ["-cost hel", ["-cost", "hel"]]] as const) {
     test(`deface ${label} native/WASI agree within tolerance (privacy parity)`, async () => {
       const ref = tmp(`parity_deface_${label.includes("hel") ? "hel" : "fast"}.nii`);
@@ -251,12 +256,17 @@ describe("multi-input: allineate/deface", () => {
       expect(out.every((v) => Number.isFinite(v))).toBe(true);
       let removed = 0, disagree = 0;
       for (let i = 0; i < out.length; i++) {
-        if (out[i] !== mov[i]) removed++;                 // voxel altered by defacing
+        if (out[i] !== mov[i]) removed++;                 // non-air head tissue zeroed by defacing
         if (Math.abs(out[i] - nat[i]) > 1e-3) disagree++; // native vs WASI mismatch
       }
-      expect(removed / out.length).toBeGreaterThan(0.5);  // the mask genuinely removed a large region
-      // Native/WASI agree except a thin registration-sensitive boundary shell (<2% of voxels).
-      expect(disagree / out.length).toBeLessThan(0.02);
+      console.log(`[deface ${label}] removed(non-air)=${(100 * removed / out.length).toFixed(1)}% native/WASI-disagree=${(100 * disagree / out.length).toFixed(2)}%`);
+      // Identifiable non-brain head tissue (face/scalp/skull) was actually removed (~19% of the
+      // volume on this phantom; a no-op would be ~0), not just background re-zeroed.
+      expect(removed / out.length).toBeGreaterThan(0.10);
+      // Native/WASI agree except a thin registration-sensitive boundary shell. Measured on this
+      // corrected phantom: 0.07% (fast) / 0.09% (hel) disagreement; the 1% bound keeps ~10x margin
+      // for platform codegen variation while still catching a gross reslice/transform regression.
+      expect(disagree / out.length).toBeLessThan(0.01);
     }, 30000); // -cost hel runs a full NEWUOA fit single-threaded in WASI; allow headroom
   }
 });
