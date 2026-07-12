@@ -6243,8 +6243,12 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	}
 	/* Default cost is the fast SPM/FLIRT-inspired engine: a bare -allineate with no explicit
 	   -cost selects `-cost fast` (Hellinger). An explicit -cost (fast/fastcr or hel/lpc/lpa/ls)
-	   is honored as given. -cmass/-nocmass/-com apply to the fast engine too. */
-	if (!opts.fast && !(opts.cli_set & AL_CLI_COST))
+	   is honored as given. -cmass/-nocmass/-com apply to the fast engine too. When fast is the
+	   DEFAULT (not an explicit -cost fast), a fast failure falls back to the robust Hellinger
+	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
+	   fast multiresolution pyramid (e.g. tiny synthetic volumes). */
+	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST);
+	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 	int ok;
 	if (opts.fast) {
@@ -6286,7 +6290,16 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		coreg_fast_result res;
 		ok = coreg_fast_estimate(nim, base, &cfo, &res);
-		if (ok)
+		if (ok && fast_default && !opts.com && !opts.sym) {
+			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
+			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
+			   regresses. An explicit -cost fast/fastcr, or a seeded (-com/-sym) fast run, still
+			   errors rather than silently switching engines. nim is not mutated by the failed
+			   estimate (and no -com/-sym seed was applied here), so the normal path below is clean. */
+			fprintf(stderr, " + fast registration failed; falling back to -cost hel\n");
+			opts.fast = 0;
+			opts.cost = AL_COST_HELLINGER;
+		} else if (ok)
 			printfx("** fast registration failed\n");
 		else {
 			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp, 0.0f);
@@ -6305,8 +6318,10 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
 			}
 		}
-	} else {
-		/* Normal allineate engine, with optional header-seed pre-steps applied to the
+	}
+	if (!opts.fast) {
+		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback above),
+		   with optional header-seed pre-steps applied to the
 		   moving image (nim) before the fit (superset of the standalone allineate):
 		   -com resets the origin to the brightness center of mass; -sym/-symd/-symb fold a
 		   midsagittal-plane correction into the header; -sagseed (default on) then recovers
