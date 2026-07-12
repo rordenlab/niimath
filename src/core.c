@@ -376,7 +376,19 @@ float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2) {
 	vec4 vx = setVec4(x, y, z);
 	vec4 pos = nifti_vect44mat44_mul(vx, m);
 	vec4 pos2 = nifti_vect44mat44_mul(vx, m2);
-	return sqrt(sqr(pos.v[0] - pos2.v[0]));
+	return sqrt(sqr(pos.v[0] - pos2.v[0]) + sqr(pos.v[1] - pos2.v[1]) +
+	            sqr(pos.v[2] - pos2.v[2]));
+}
+
+static double xyz_units_to_mm(int xyz_units) {
+	// NIfTI spatial coordinates are expressed in xyz_units; normalize to
+	// millimetres so callers can apply fixed-mm thresholds. Unknown/unspecified
+	// units are assumed to be mm (the overwhelmingly common case).
+	switch (xyz_units) {
+		case NIFTI_UNITS_METER:  return 1000.0;
+		case NIFTI_UNITS_MICRON: return 0.001;
+		default:                 return 1.0; // NIFTI_UNITS_MM or unspecified
+	}
 }
 
 float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
@@ -384,6 +396,14 @@ float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	// used to detect if two volumes are aligned
 	mat44 m = xform(nim);	//4x4 matrix includes translations
 	mat44 m2 = xform(nim2); //4x4 matrix includes translations
+	// xform() yields world coordinates in each image's own xyz_units; scale the
+	// spatial rows to millimetres so the returned displacement is truly in mm
+	// regardless of whether a header stores metres or microns (mm -> factor 1.0,
+	// so mm images are byte-identical to the prior behaviour).
+	double f1 = xyz_units_to_mm(nim->xyz_units);
+	double f2 = xyz_units_to_mm(nim2->xyz_units);
+	for (int i = 0; i < 3; i++)
+		for (int j = 0; j < 4; j++) { m.m[i][j] *= f1; m2.m[i][j] *= f2; }
 	float mx = vertexDisplacement(0, 0, 0, m, m2);
 	mx = MAX(mx, vertexDisplacement(nim->nx - 1, 0, 0, m, m2));
 	mx = MAX(mx, vertexDisplacement(nim->nx - 1, nim->ny - 1, 0, m, m2));

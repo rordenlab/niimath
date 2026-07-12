@@ -5275,8 +5275,9 @@ staticx int nifti_binary(nifti_image *nim, char *fin, enum eOp op) {
 		nifti_image_free(nim2);
 		return 1;
 	}
-	if (max_displacement_mm(nim, nim2) > 0.5) { // fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
-		printfx("WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
+	float displacement_mm = max_displacement_mm(nim, nim2);
+	if (displacement_mm > 0.5) { // fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
+		printfx("WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", displacement_mm);
 		printfx(" Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
 	}
 	in_hdr ihdr = set_input_hdr(nim2);
@@ -5600,8 +5601,9 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 		nifti_image_free(nim2);
 		exit(1);
 	}
-	if (max_displacement_mm(nim, nim2) > 0.5) { // fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
-		printfx("WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", max_displacement_mm(nim, nim2));
+	float displacement_mm = max_displacement_mm(nim, nim2);
+	if (displacement_mm > 0.5) { // fslmaths appears to use mm not voxel difference to determine alignment, threshold ~0.5mm
+		printfx("WARNING:: Inconsistent orientations for individual images in pipeline! (%gmm)\n", displacement_mm);
 		printfx(" Will use voxel-based orientation which is probably incorrect - *PLEASE CHECK*!\n");
 	}
 	in_hdr ihdr = set_input_hdr(nim2);

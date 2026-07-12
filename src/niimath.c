@@ -26,6 +26,9 @@
 #ifdef HAVE_64BITS
 	#include "core64.h" //all 64-bit functions
 #endif
+#ifdef HAVE_QC
+	#include "qc.h"
+#endif
 #ifdef HAVE_DTIFIT
 	#include "dtifit.h"
 #endif
@@ -428,6 +431,9 @@ int show_help( void ) {
 #ifdef HAVE_DTIFIT
 	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
 #endif
+#ifdef HAVE_QC
+	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv] : MRIQC-style hard-mask QC (CJV, CNR-noair, SNR, WM2MAX, EFC-brain, ICV) to TSV\n");
+#endif
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");
 	printf(" filename.nii             : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image\n");
@@ -585,6 +591,10 @@ int main(int argc, char * argv[]) {
 #ifdef HAVE_DTIFIT
 	if (!strcmp(argv[1], "--dtifit"))
 		return nii_dtifit(argc, argv);
+#endif
+#ifdef HAVE_QC
+	if (!strcmp(argv[1], "--qc"))
+		return nii_qc(argc, argv);
 #endif
 
 	int dtCalc = DT_FLOAT32; //data type for calculation

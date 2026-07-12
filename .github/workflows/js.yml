@@ -28,3 +28,12 @@ jobs:
         run: bun run prebuild
       - name: Type-check generated definitions
         run: ./node_modules/.bin/tsc --noEmit
+      # prebuild builds the WASM into src/ but not the dist bundles the runtime
+      # tests load. Build dist via esbuild DIRECTLY (not `bun run build`, which would
+      # re-trigger the prebuild lifecycle hook), then run the WASM runtime tests so
+      # the --qc/BSD/GPL callMain paths actually get CI protection. The GPL suite
+      # self-skips (describe.skip) when dist/niimath-gpl.js was not built.
+      - name: Build dist bundles (esbuild)
+        run: bun run esbuild.config.ts
+      - name: Run WASM runtime tests
+        run: bun run test

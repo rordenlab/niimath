@@ -45,6 +45,7 @@ export function makeNifti(side = 8, fill: (i: number) => number = (i) => i): Uin
   dv.setInt16(72, 32, true); // bitpix
   for (let i = 0; i < 8; i++) dv.setFloat32(76 + i * 4, 1, true); // pixdim = 1mm iso
   dv.setFloat32(108, 352, true); // vox_offset
+  dv.setUint8(123, 2); // xyzt_units = millimetres
   // sform: an affine is required by some ops (e.g. -spm_coreg). Identity rotation,
   // 1mm spacing on the diagonal (srow_x/y/z at offsets 280/296/312).
   dv.setInt16(254, 1, true); // sform_code = NIFTI_XFORM_SCANNER_ANAT

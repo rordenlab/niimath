@@ -39,6 +39,30 @@ describe('BSD build (@niivue/niimath)', () => {
     expect(voxel(r.output!, 5)).toBeCloseTo(5, 5);
   });
 
+  test('--qc computes a TSV from a T1 and hard segmentation', async () => {
+    const side = 8;
+    const t1 = { name: 't1.nii', data: makeNifti(side, (i) => 20 + (i % 17)) };
+    const seg = {
+      name: 'seg.nii',
+      data: makeNifti(side, (i) => {
+        const x = i % side;
+        return x < 2 ? 1 : x < 6 ? 2 : 3;
+      }),
+    };
+    const r = await run(
+      mod, log, [t1, seg],
+      ['--qc', 't1.nii', '--seg', 'seg.nii', '--csf', '1', '--wm', '3', '--erode', '0', '--out', 'qc.tsv'],
+      'qc.tsv',
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.output).not.toBeNull();
+    const rows = new TextDecoder().decode(r.output!).trim().split('\n');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toContain('cjv\tcnr_noair\tsnr_csf');
+    expect(rows[0]).toContain('summary_wm_n');
+    expect(rows[1].split('\t')).toHaveLength(rows[0].split('\t').length);
+  });
+
   test('-allineate registers a volume onto a base (BSD, public-domain)', async () => {
     // Register a volume onto itself — must converge with exit 0.
     const moving = { name: 'a.nii', data: makeNifti(8, (i) => i % 9) };

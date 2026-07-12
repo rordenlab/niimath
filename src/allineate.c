@@ -95,8 +95,7 @@ static nifti_dmat44 mat44_to_dmat44(mat44 f) {
    cross-modal / offset case (T2w->avg152T1, header centroids ~25 mm apart) the noisy coarse
    Hellinger landed in a wrong rotation/translation basin from the header start, needing
    -cmass to recover (0.760 -> 0.840 L-R symmetry). Restoring AFNI's 98765 makes the coarse
-   surface clean enough to find the right basin WITHOUT -cmass (0.833, matching AFNI's 0.826),
-   with negligible added time (the coarse pass is 2x-downsampled and a small fraction of total). */
+   surface clean enough to find the right basin WITHOUT -cmass (0.833, matching AFNI's 0.826). */
 #define AL_NPT_MATCH_MIN      98765
 
 /* Cost function method codes (subset of AFNI's full list) */
@@ -158,7 +157,7 @@ static nifti_dmat44 mat44_to_dmat44(mat44 f) {
 
 #define NPER 262144  /* max points to warp at once */
 
-#define PARAM_MAXTRIAL 15 /* max number of trial parameter sets to save */
+#define PARAM_MAXTRIAL 29 /* AFNI maximum number of trial parameter sets */
 
 /*==========================================================================*/
 /*========================== TYPE DEFINITIONS ==============================*/
@@ -689,52 +688,6 @@ static float *al_smooth(float *im, int nx, int ny, int nz,
     return om;
 }
 
-/* 2x downsample: box-average 2×2×2 neighborhoods.
-   Output dimensions are (nx/2, ny/2, nz/2). Caller frees the result.
-   Updates *onx,*ony,*onz with output dims and *cmat_out with adjusted
-   voxel-to-world matrix (columns doubled, origin shifted by half voxel). */
-static float *al_downsample_2x(const float *im, int nx, int ny, int nz,
-                                mat44 cmat, int *onx, int *ony, int *onz,
-                                mat44 *cmat_out)
-{
-    int nx2 = nx / 2, ny2 = ny / 2, nz2 = nz / 2;
-    if (nx2 < 2 || ny2 < 2 || nz2 < 2) return NULL;
-    int nxy = nx * ny, nvox = nx2 * ny2 * nz2;
-    float *out = (float *)malloc(sizeof(float) * nvox);
-    if (!out) return NULL;
-
-    for (int k = 0; k < nz2; k++) {
-        int k0 = 2 * k, k1 = k0 + 1;
-        for (int j = 0; j < ny2; j++) {
-            int j0 = 2 * j, j1 = j0 + 1;
-            for (int i = 0; i < nx2; i++) {
-                int i0 = 2 * i, i1 = i0 + 1;
-                float v = im[i0 + j0*nx + k0*nxy] + im[i1 + j0*nx + k0*nxy]
-                        + im[i0 + j1*nx + k0*nxy] + im[i1 + j1*nx + k0*nxy]
-                        + im[i0 + j0*nx + k1*nxy] + im[i1 + j0*nx + k1*nxy]
-                        + im[i0 + j1*nx + k1*nxy] + im[i1 + j1*nx + k1*nxy];
-                out[i + j*nx2 + k*nx2*ny2] = v * 0.125f;
-            }
-        }
-    }
-
-    *onx = nx2; *ony = ny2; *onz = nz2;
-
-    /* Adjust voxel-to-world matrix: double the column vectors (2x voxel size),
-       shift origin to center of the 2×2×2 block = original voxel (0.5,0.5,0.5) */
-    mat44 m;
-    for (int r = 0; r < 3; r++) {
-        m.m[r][0] = 2.0f * cmat.m[r][0];
-        m.m[r][1] = 2.0f * cmat.m[r][1];
-        m.m[r][2] = 2.0f * cmat.m[r][2];
-        m.m[r][3] = cmat.m[r][0] * 0.5f + cmat.m[r][1] * 0.5f
-                   + cmat.m[r][2] * 0.5f + cmat.m[r][3];
-    }
-    m.m[3][0] = m.m[3][1] = m.m[3][2] = 0.0f; m.m[3][3] = 1.0f;
-    *cmat_out = m;
-    return out;
-}
-
 /*==========================================================================*/
 /*==================== SECTION 5: INTERPOLATION FUNCTIONS =================*/
 /*==========================================================================*/
@@ -1239,6 +1192,61 @@ static float al_cliplevel(int n, const float *ar, float mfrac)
 
     free(hist);
     return (float)ncut / sfac;
+}
+
+/* AFNI zero-pads the fixed image so supra-threshold content has at least
+   max(8,n/8) background voxels on every face. Return those six pad widths so
+   the compact engine can derive AFNI's expanded translation range. */
+static void al_fixed_pad_widths(const float *im, int nx, int ny, int nz,
+                                int *pxm, int *pxp, int *pym, int *pyp,
+                                int *pzm, int *pzp)
+{
+    *pxm = *pxp = *pym = *pyp = *pzm = *pzp = 0;
+    if (im == NULL || nx < 1 || ny < 1 || nz < 1) return;
+
+    size_t nvox = (size_t)nx * ny * nz;
+    if (nvox > INT_MAX) return;
+    float cv = 0.33f * al_cliplevel((int)nvox, im, 0.33f);
+    int xlo = nx, ylo = ny, zlo = nz, xhi = -1, yhi = -1, zhi = -1;
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        float v = im[x + (size_t)y * nx + (size_t)z * nx * ny];
+        /* MRI_autobbox sees the thresholded image, so a true zero is not content
+           even in the degenerate cv==0 case. */
+        if (!al_finitef(v) || v == 0.0f || v < cv) continue;
+        if (x < xlo) xlo = x; if (x > xhi) xhi = x;
+        if (y < ylo) ylo = y; if (y > yhi) yhi = y;
+        if (z < zlo) zlo = z; if (z > zhi) zhi = z;
+    }
+    if (xhi < xlo || yhi < ylo || zhi < zlo) return;
+
+    int mpad = 8;
+    if (nx / 8 > mpad) mpad = nx / 8;
+    if (ny / 8 > mpad) mpad = ny / 8;
+    if (nz / 8 > mpad) mpad = nz / 8;
+    *pxm = mpad - xlo; if (*pxm < 0) *pxm = 0;
+    *pym = mpad - ylo; if (*pym < 0) *pym = 0;
+    *pzm = mpad - zlo; if (*pzm < 0) *pzm = 0;
+    *pxp = mpad - (nx - 1 - xhi); if (*pxp < 0) *pxp = 0;
+    *pyp = mpad - (ny - 1 - yhi); if (*pyp < 0) *pyp = 0;
+    *pzp = mpad - (nz - 1 - zhi); if (*pzp < 0) *pzp = 0;
+    if (nz == 1) *pzm = *pzp = 0;  /* AFNI does not pad through-plane in 2D. */
+}
+
+static void al_shift_range_mm(mat44 cmat, int nx, int ny, int nz,
+                              float *xmm, float *ymm, float *zmm)
+{
+    float x = 0.321f * (nx - 1), y = 0.321f * (ny - 1), z = 0.321f * (nz - 1);
+    *xmm = *ymm = *zmm = 0.01f;
+    for (int ii = -1; ii <= 1; ii += 2)
+        for (int jj = -1; jj <= 1; jj += 2)
+            for (int kk = -1; kk <= 1; kk += 2) {
+                float xp = fabsf(cmat.m[0][0]*(ii*x) + cmat.m[0][1]*(jj*y) + cmat.m[0][2]*(kk*z));
+                float yp = fabsf(cmat.m[1][0]*(ii*x) + cmat.m[1][1]*(jj*y) + cmat.m[1][2]*(kk*z));
+                float zp = fabsf(cmat.m[2][0]*(ii*x) + cmat.m[2][1]*(jj*y) + cmat.m[2][2]*(kk*z));
+                if (xp > *xmm) *xmm = xp;
+                if (yp > *ymm) *ymm = yp;
+                if (zp > *zmm) *zmm = zp;
+            }
 }
 
 /* Compute the p-th quantile (0 <= p <= 1) of an array.
@@ -3836,24 +3844,36 @@ static int al_register(nifti_image *source, nifti_image *base,
     /* Set up befafter matrices */
     al_setup_befafter(base_cmat, targ_imat);
 
-    /* Compute shift ranges (about 1/3 of base FOV in each direction) */
-    float xxx = 0.321f * (bnx - 1);
-    float yyy = 0.321f * (bny - 1);
-    float zzz = 0.321f * (bnz - 1);
-    /* Transform to mm space for shift range */
-    float xxx_m = 0.01f, yyy_m = 0.01f, zzz_m = 0.01f;
-    for (ii = -1; ii <= 1; ii += 2)
-        for (jj = -1; jj <= 1; jj += 2)
-            for (int kk2 = -1; kk2 <= 1; kk2 += 2) {
-                float xp, yp, zp;
-                xp = base_cmat.m[0][0]*(ii*xxx) + base_cmat.m[0][1]*(jj*yyy) + base_cmat.m[0][2]*(kk2*zzz);
-                yp = base_cmat.m[1][0]*(ii*xxx) + base_cmat.m[1][1]*(jj*yyy) + base_cmat.m[1][2]*(kk2*zzz);
-                zp = base_cmat.m[2][0]*(ii*xxx) + base_cmat.m[2][1]*(jj*yyy) + base_cmat.m[2][2]*(kk2*zzz);
-                xp = fabsf(xp); yp = fabsf(yp); zp = fabsf(zp);
-                if (xp > xxx_m) xxx_m = xp;
-                if (yp > yyy_m) yyy_m = yp;
-                if (zp > zzz_m) zzz_m = zp;
-            }
+    /* AFNI derives shift limits from a zero-padded fixed FOV. Expanding every
+       case perturbs this compact port's normalized random search, so preserve the
+       established range unless the brightness-centroid displacement approaches
+       an unpadded boundary. This changes the allowed search, not the starting pose:
+       -cmass/-nocmass retain their explicit semantics. */
+    float xxx_m, yyy_m, zzz_m;
+    al_shift_range_mm(base_cmat, bnx, bny, bnz, &xxx_m, &yyy_m, &zzz_m);
+    int pxm, pxp, pym, pyp, pzm, pzp;
+    al_fixed_pad_widths(bsim, bnx, bny, bnz, &pxm, &pxp, &pym, &pyp, &pzm, &pzp);
+    size_t pnxz = (size_t)bnx + pxm + pxp;
+    size_t pnyz = (size_t)bny + pym + pyp;
+    size_t pnzz = (size_t)bnz + pzm + pzp;
+    if (pnxz <= INT_MAX && pnyz <= INT_MAX && pnzz <= INT_MAX &&
+        (pnxz != (size_t)bnx || pnyz != (size_t)bny || pnzz != (size_t)bnz)) {
+        int pnx = (int)pnxz, pny = (int)pnyz, pnz = (int)pnzz;
+        double bxc, byc, bzc, axc, ayc, azc;
+        float bx, by, bz, ax, ay, az;
+        al_center_of_mass(bsim, bnx, bny, bnz, &bxc, &byc, &bzc);
+        al_center_of_mass(ajim, anx, any, anz, &axc, &ayc, &azc);
+        mat44_vec(base_cmat, (float)bxc, (float)byc, (float)bzc, &bx, &by, &bz);
+        mat44_vec(targ_cmat, (float)axc, (float)ayc, (float)azc, &ax, &ay, &az);
+        float cmx = ax - bx, cmy = ay - by, cmz = az - bz;
+        if (fabsf(cmx) > 0.9f * xxx_m || fabsf(cmy) > 0.9f * yyy_m ||
+            fabsf(cmz) > 0.9f * zzz_m) {
+            al_shift_range_mm(base_cmat, pnx, pny, pnz, &xxx_m, &yyy_m, &zzz_m);
+            if (getenv("AL_VERB"))
+                fprintf(stderr, "[AL_VERB range] centroid=(%+.1f,%+.1f,%+.1f) mm; AFNI padded dims %dx%dx%d -> %dx%dx%d\n",
+                        cmx, cmy, cmz, bnx, bny, bnz, pnx, pny, pnz);
+        }
+    }
 
     /* DEFPAR macro equivalent */
 #define SETPAR(p,nm,bb,tt,id) do {          \
@@ -3949,6 +3969,11 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     /* LPA gets more twobest candidates (AFNI 27 May 2021) */
     int tbest = 5;
+    {
+        double vol_src = (double)anx * adx * any * ady * anz * adz;
+        double vol_base = (double)bnx * bdx * bny * bdy * bnz * bdz;
+        if (vol_src > 1.3 * vol_base) tbest = PARAM_MAXTRIAL;
+    }
     if (METH_IS_LPA(match_code) && tbest < DEFAULT_TBEST_LPA)
         tbest = DEFAULT_TBEST_LPA;
 
@@ -3994,39 +4019,6 @@ static int al_register(nifti_image *source, nifti_image *base,
     stup.smooth_code = GA_SMOOTH_GAUSSIAN;
     stup.smooth_radius_base = stup.smooth_radius_targ =
         (sm_rad > 0.0f) ? sm_rad : 7.777f;
-
-    /* Downsample source image 2x for coarse grid search (better cache coherency) */
-    float *ajim_orig_ptr = stup.ajim;
-    int anx_orig = stup.anx, any_orig = stup.any, anz_orig = stup.anz;
-    float adx_orig = stup.adx, ady_orig = stup.ady, adz_orig = stup.adz;
-    mat44 targ_cmat_orig = stup.targ_cmat, targ_imat_orig = stup.targ_imat;
-    float targ_di_orig = stup.targ_di, targ_dj_orig = stup.targ_dj, targ_dk_orig = stup.targ_dk;
-    unsigned char *ajmask_orig = stup.ajmask;
-    int ajmask_ranfill_orig = stup.ajmask_ranfill;
-    float aj_ubot_orig = stup.aj_ubot, aj_usiz_orig = stup.aj_usiz;
-    float *ajim_orig_backup = stup.ajim_orig;
-
-    int ds_anx, ds_any, ds_anz;
-    mat44 ds_targ_cmat;
-    float *ajim_ds = al_downsample_2x(ajim, anx, any, anz, targ_cmat,
-                                       &ds_anx, &ds_any, &ds_anz, &ds_targ_cmat);
-    if (ajim_ds) {
-        mat44 ds_targ_imat = nifti_mat44_inverse(ds_targ_cmat);
-        stup.ajim = ajim_ds;
-        stup.anx = ds_anx; stup.any = ds_any; stup.anz = ds_anz;
-        stup.adx = adx * 2.0f; stup.ady = ady * 2.0f; stup.adz = adz * 2.0f;
-        stup.targ_cmat = ds_targ_cmat; stup.targ_imat = ds_targ_imat;
-        stup.targ_di = mat44_colnorm(ds_targ_cmat, 0);
-        stup.targ_dj = mat44_colnorm(ds_targ_cmat, 1);
-        stup.targ_dk = mat44_colnorm(ds_targ_cmat, 2);
-        /* Disable source automask noise fill for downsampled grid search */
-        stup.ajmask = NULL;
-        stup.ajmask_ranfill = 0;
-        stup.ajim_orig = NULL;
-        al_setup_befafter(stup.base_cmat, ds_targ_imat);
-        fprintf(stderr, " + Source downsampled 2x for grid search: %dx%dx%d → %dx%dx%d\n",
-                anx, any, anz, ds_anx, ds_any, ds_anz);
-    }
 
     al_scalar_setup(&stup);
     if (stup.setup != AL_SMAGIC) {  /* setup OOM (im_ar/bvm/wvm): fail closed */
@@ -4082,23 +4074,6 @@ static int al_register(nifti_image *source, nifti_image *base,
         fprintf(stderr, "[AL_VERB coarse] best rigid pose: shift=(%.1f,%.1f,%.1f) angle=(%.1f,%.1f,%.1f)\n",
                 stup.wfunc_param[0].val_init, stup.wfunc_param[1].val_init, stup.wfunc_param[2].val_init,
                 stup.wfunc_param[3].val_init, stup.wfunc_param[4].val_init, stup.wfunc_param[5].val_init);
-
-    /* Restore full-resolution source for refinement rounds */
-    if (ajim_ds) {
-        free(ajim_ds);
-        ajim_ds = NULL;
-        if (stup.ajims) { free(stup.ajims); stup.ajims = NULL; }
-        stup.ajim = ajim_orig_ptr;
-        stup.anx = anx_orig; stup.any = any_orig; stup.anz = anz_orig;
-        stup.adx = adx_orig; stup.ady = ady_orig; stup.adz = adz_orig;
-        stup.targ_cmat = targ_cmat_orig; stup.targ_imat = targ_imat_orig;
-        stup.targ_di = targ_di_orig; stup.targ_dj = targ_dj_orig; stup.targ_dk = targ_dk_orig;
-        stup.ajmask = ajmask_orig;
-        stup.ajmask_ranfill = ajmask_ranfill_orig;
-        stup.aj_ubot = aj_ubot_orig; stup.aj_usiz = aj_usiz_orig;
-        stup.ajim_orig = ajim_orig_backup;
-        al_setup_befafter(stup.base_cmat, targ_imat_orig);
-    }
 
     /* Unfreeze temporarily frozen params */
     for (jj = 0; jj < stup.wfunc_numpar; jj++)
@@ -4259,14 +4234,14 @@ static int al_register(nifti_image *source, nifti_image *base,
         int kb = 0;
         float cbest = 1.e+33f;
         int num_rtb = 99;
-        float cand_cost[PARAM_MAXTRIAL];
+        float cand_cost[PARAM_MAXTRIAL + 2];
 
         rad = (tfdone > 2) ? 0.0333 : 0.0444;
 
         /* Prepare per-candidate parameter arrays (normalized 0-1 for powell) */
         int nfr = stup.wfunc_numfree;
-        double *cand_wpar[PARAM_MAXTRIAL] = {0};
-        int cand_rtb[PARAM_MAXTRIAL];
+        double *cand_wpar[PARAM_MAXTRIAL + 2] = {0};
+        int cand_rtb[PARAM_MAXTRIAL + 2];
         for (int ib = 0; ib < tfdone; ib++) {
             cand_wpar[ib] = (double *)calloc(nfr, sizeof(double));
             if (!cand_wpar[ib]) {
@@ -4351,7 +4326,6 @@ static int al_register(nifti_image *source, nifti_image *base,
         double save_hel = stup.micho_hel;
         double save_ov  = stup.micho_ov;
         stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
-
         fprintf(stderr, " + +ZZ refinal (pure %s)\n",
                 METH_IS_LPA(match_code) ? "lpa" : "lpc");
         rad = 0.0666;
@@ -4387,23 +4361,6 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     /* --- Cleanup --- */
 al_cleanup:
-    /* If an OOM aborts during the downsampled coarse pass, the normal
-       full-resolution restore block above has not run yet. Restore enough state
-       here so the standard cleanup below frees the right buffers and backup. */
-    if (ajim_ds && stup.ajim == ajim_ds) {
-        free(ajim_ds);
-        ajim_ds = NULL;
-        if (stup.ajims) { free(stup.ajims); stup.ajims = NULL; }
-        stup.ajim = ajim_orig_ptr;
-        stup.anx = anx_orig; stup.any = any_orig; stup.anz = anz_orig;
-        stup.adx = adx_orig; stup.ady = ady_orig; stup.adz = adz_orig;
-        stup.targ_cmat = targ_cmat_orig; stup.targ_imat = targ_imat_orig;
-        stup.targ_di = targ_di_orig; stup.targ_dj = targ_dj_orig; stup.targ_dk = targ_dk_orig;
-        stup.ajmask = ajmask_orig;
-        stup.ajmask_ranfill = ajmask_ranfill_orig;
-        stup.aj_ubot = aj_ubot_orig; stup.aj_usiz = aj_usiz_orig;
-        stup.ajim_orig = ajim_orig_backup;
-    }
     /* Restore original source data if noise-filled, before freeing */
     if (stup.ajim_orig) {
         memcpy(ajim, stup.ajim_orig, sizeof(float) * nvox_src);
