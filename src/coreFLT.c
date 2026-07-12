@@ -6247,7 +6247,15 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	   DEFAULT (not an explicit -cost fast), a fast failure falls back to the robust Hellinger
 	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
 	   fast multiresolution pyramid (e.g. tiny synthetic volumes). */
-	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST);
+	/* Default-fast engages only when the user gave nothing the fast engine cannot honor.
+	   -sym/-symd/-symb/-zoom/-warp/-interp/-source_automask/-dark_automask are ordinary-engine
+	   features the fast block rejects; if any is present WITHOUT an explicit -cost fast, stay on
+	   the ordinary engine rather than defaulting to fast and erroring. -com IS compatible with the
+	   fast engine, so it does not disable default-fast. An explicit -cost fast + such an option
+	   still errors (opts.fast is CLI-set, not defaulted). */
+	int fast_incompatible = opts.sym || opts.zoom || opts.source_automask || opts.dark_automask ||
+	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
+	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST) && !fast_incompatible;
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 	int ok;
