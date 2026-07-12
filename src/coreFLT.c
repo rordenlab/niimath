@@ -6248,16 +6248,49 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
 	   fast multiresolution pyramid (e.g. tiny synthetic volumes). */
 	/* Default-fast engages only when the user gave nothing the fast engine cannot honor.
-	   -sym/-symd/-symb/-zoom/-warp/-interp/-source_automask/-dark_automask are ordinary-engine
-	   features the fast block rejects; if any is present WITHOUT an explicit -cost fast, stay on
-	   the ordinary engine rather than defaulting to fast and erroring. -com IS compatible with the
-	   fast engine, so it does not disable default-fast. An explicit -cost fast + such an option
-	   still errors (opts.fast is CLI-set, not defaulted). */
-	int fast_incompatible = opts.sym || opts.zoom || opts.source_automask || opts.dark_automask ||
+	   -zoom/-warp/-interp/-source_automask/-dark_automask are ordinary-engine features the fast
+	   block rejects; if any is present WITHOUT an explicit -cost fast, stay on the ordinary engine
+	   rather than defaulting to fast and erroring. -com and -sym/-symd/-symb are header-only seeds
+	   applied below to BOTH engines (the fast engine just starts from the seeded pose), so they do
+	   NOT disable default-fast. An explicit -cost fast + a rejected option still errors (opts.fast
+	   is CLI-set, not defaulted). */
+	int fast_incompatible = opts.zoom || opts.source_automask || opts.dark_automask ||
 	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST) && !fast_incompatible;
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
+
+	/* Header-seed pre-steps applied to the moving image (nim) BEFORE the fit and consumed by
+	   EITHER engine (superset of the standalone allineate): -com resets the origin to the
+	   brightness center of mass; -sym/-symd/-symb fold a midsagittal-plane correction into the
+	   header, and -sagseed (default on) then recovers the 3 in-MSP DOF -sym is blind to via a
+	   constrained fit to the base. The seeds are header-only (no data reslice), so the fast
+	   engine's coreg_fast_estimate and the ordinary engine both simply start from the seeded pose.
+	   A header-mutating seed (-com/-sym) fits a matrix relative to the SEEDED moving world frame;
+	   for -savemat we capture the original frame first and compose the saved matrix back to it
+	   (M' = S_orig*inv(S_seed)*M, identity if unseeded) so -applymat reproduces on the ORIGINAL
+	   un-seeded input. */
+	int seeded = opts.savemat && (opts.com || opts.sym);
+	mat44 S_orig, S_seed;
+	if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);
+	if (opts.com && nii_center_of_mass(nim)) {
+		printfx("** -com failed\n");
+		nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+	}
+	if (opts.sym) {
+		/* nim is already DT_FLOAT32 here (niimath converts the chain image to the calc
+		   datatype before the op loop), so no float32 conversion is needed. */
+		if (nii_symmetry(nim, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
+			printfx("** -sym failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.sagseed && nii_sagseed(nim, base, opts)) {
+			printfx("** -sagseed failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+	}
+	if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+
 	int ok;
 	if (opts.fast) {
 		/* Fast SPM/FLIRT-inspired engine (-cost fast = Hellinger, -cost fastcr = CR):
@@ -6277,20 +6310,12 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			printfx("** -cost fast/fastcr does not support -source_automask/-dark_automask (internal masking)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
-		if (opts.sym || opts.zoom) {
-			printfx("** -cost fast/fastcr does not support -sym/-symd/-symb/-zoom\n");
+		if (opts.zoom) {
+			printfx("** -cost fast/fastcr does not support -zoom (it relaxes the affine scale range, which the fast engine's fixed scale capture cannot do; use -cost hel)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
-		/* -com is a strict header-recentered initialization. Capture both frames before
-		   registration so -savemat can compose the seeded fit back to the original input. */
-		int seeded_com = opts.com && opts.savemat;
-		mat44 S_orig, S_seed;
-		if (seeded_com) al_image_xform_or_pixdim(nim, &S_orig, NULL);
-		if (opts.com && nii_center_of_mass(nim)) {
-			printfx("** -com failed\n");
-			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-		}
-		if (seeded_com) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+		/* -com/-sym header seeds were already applied to nim above (shared with the ordinary
+		   engine); the fast estimate simply starts from the seeded pose. */
 		coreg_fast_opts cfo = coreg_fast_opts_default();
 		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
@@ -6298,12 +6323,13 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		coreg_fast_result res;
 		ok = coreg_fast_estimate(nim, base, &cfo, &res);
-		if (ok && fast_default && !opts.com && !opts.sym) {
+		if (ok && fast_default) {
 			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
 			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
-			   regresses. An explicit -cost fast/fastcr, or a seeded (-com/-sym) fast run, still
-			   errors rather than silently switching engines. nim is not mutated by the failed
-			   estimate (and no -com/-sym seed was applied here), so the normal path below is clean. */
+			   regresses. An explicit -cost fast/fastcr still errors rather than silently switching
+			   engines. Any -com/-sym header seed was applied to nim above (not by the failed
+			   estimate, which does not mutate nim), so the ordinary path below starts from the same
+			   seeded pose. */
 			fprintf(stderr, " + fast registration failed; falling back to -cost hel\n");
 			opts.fast = 0;
 			opts.cost = AL_COST_HELLINGER;
@@ -6313,7 +6339,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp, 0.0f);
 			if (!ok && opts.savemat) {
 				mat44 save_mat = res.fixed_to_moving;
-				if (seeded_com) {
+				if (seeded) {
 					mat44 seeded_to_original = nifti_mat44_mul(S_orig, nifti_mat44_inverse(S_seed));
 					save_mat = nifti_mat44_mul(seeded_to_original, save_mat);
 				}
@@ -6328,39 +6354,11 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		}
 	}
 	if (!opts.fast) {
-		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback above),
-		   with optional header-seed pre-steps applied to the
-		   moving image (nim) before the fit (superset of the standalone allineate):
-		   -com resets the origin to the brightness center of mass; -sym/-symd/-symb fold a
-		   midsagittal-plane correction into the header; -sagseed (default on) then recovers
-		   the 3 in-MSP DOF -sym is blind to via a constrained fit to the base. (-robustfov is
-		   a separate chainable niimath op — run it before -allineate to crop first.)
-		   A header-mutating seed (-com/-sym) fits a matrix relative to the SEEDED moving world
-		   frame; for -savemat we capture the original frame first and compose the saved matrix
-		   back to it (below) so -applymat reproduces the result on the ORIGINAL, un-seeded input. */
-		int seeded = (opts.savemat && (opts.com || opts.sym));
-		mat44 S_orig, S_seed;
-		if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);   /* pre-seed moving world frame */
-		if (opts.com && nii_center_of_mass(nim)) {
-			printfx("** -com failed\n");
-			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-		}
-		if (opts.sym) {
-			/* nim is already DT_FLOAT32 here (niimath converts the chain image to the calc
-			   datatype before the op loop), so no float32 conversion is needed. */
-			if (nii_symmetry(nim, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
-				printfx("** -sym failed\n");
-				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-			}
-			if (opts.sagseed && nii_sagseed(nim, base, opts)) {
-				printfx("** -sagseed failed\n");
-				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-			}
-		}
-		/* Seeded moving world frame, captured before the fit reslices nim in place (the seeds
-		   are header-only — no data reslice — so composing S_orig*inv(S_seed)*M below reproduces
-		   the seeded-fit sampling when applied to the original input). */
-		if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback
+		   above). The -com/-sym/-sagseed header seeds were applied to nim above (shared with the
+		   fast engine); nim is already seeded, and S_orig/S_seed hold the frames for -savemat
+		   composition back to the ORIGINAL, un-seeded input. (-robustfov is a separate chainable
+		   niimath op — run it before -allineate to crop first.) */
 		mat44 fitmat; int have_fit = 0;
 		if (master) {
 			/* -master: estimate the affine ONCE without reslicing (the moving image is left

@@ -202,13 +202,19 @@ jobs:
           if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/badmat.json /tmp/x.nii.gz >/dev/null 2>&1; then
             echo 'malformed -applymat json should be rejected'; exit 1; fi
           # -com / -sym / -symd header seeds run and still register (reg_quality fails closed
-          # on empty/constant output). The fast engine rejects -sym.
+          # on empty/constant output). These are header-only seeds consumed by BOTH engines, so
+          # a bare (default-fast) invocation applies the seed then runs the fast engine.
           for seed in "-com" "-sym" "-symd" "-sym -nosagseed"; do
             src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz $seed /tmp/seed.nii.gz
             python3 .github/scripts/reg_quality.py /tmp/seed.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
           done
-          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/x.nii.gz >/dev/null 2>&1; then
-            echo '-cost fast -sym should be rejected'; exit 1; fi
+          # The fast engine now ACCEPTS the -com/-sym header seeds (they only re-pose the moving
+          # header before the fixed fast schedule); it still rejects -zoom, whose whole purpose is
+          # to relax the affine scale range the fast pyramid cannot widen.
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/fsym.nii.gz
+          python3 .github/scripts/reg_quality.py /tmp/fsym.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -zoom /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo '-cost fast -zoom should be rejected'; exit 1; fi
           # -master + -savemat: the saved matrix must reproduce the master-grid output (the
           # -master path returns the affine from the estimate seam, not the g_last_affine global).
           src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -master /tmp/bigref.nii.gz -savemat /tmp/mm.json /tmp/mm.nii.gz

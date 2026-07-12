@@ -350,7 +350,8 @@ int show_help( void ) {
 	printf("                                  -com  seed by resetting the origin to the brightness center of mass\n");
 	printf("                                  -sym|-symd|-symb  midsagittal-plane seed (symd de-obliques first; symb auto-competes)\n");
 	printf("                                  -nosagseed  disable the in-MSP rigid seed that -sym runs by default\n");
-	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template)\n");
+	printf("                                    (-com/-sym seeds work with every cost, incl. -cost fast)\n");
+	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template; needs a normal -cost, not fast)\n");
 	printf("                            default cost: fast (no -cost == -cost fast); use -source_automask with lpc/lpa\n");
 	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
 	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; fast engine by default)\n");
