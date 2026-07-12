@@ -6513,7 +6513,7 @@ int main64(int argc, char *argv[]) {
 					goto fail;
 				}
 				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
-					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", (long long)nim->nx, (long long)nim->ny, (long long)nim->nz, (long long)nim2->nx, (long long)nim2->ny, (long long)nim2->nz);
 					nifti_image_free(nim2);
 					goto fail;
 				}
