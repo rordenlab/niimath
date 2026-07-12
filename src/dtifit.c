@@ -297,7 +297,12 @@ int nii_dtifit(int argc, char *argv[]) {
 
 	// --- save ---
 	char outfull[4096];
-	snprintf(outfull, sizeof(outfull), "%s.nii.gz", obase);
+	// Use a plain ".nii" seed extension (always recognised by nifti_makebasename, even in a
+	// zlib-free build) rather than ".nii.gz" (only stripped when HAVE_ZLIB): the seed is
+	// immediately stripped back to `obase`, and the real .nii vs .nii.gz choice is made by
+	// gzMode/FSLOUTPUTTYPE in nifti_save. Seeding ".nii.gz" left the ".gz" unstripped without
+	// zlib, yielding malformed "<base>.nii.gz_FA.nii" names.
+	snprintf(outfull, sizeof(outfull), "%s.nii", obase);
 	if (nifti_set_filenames(nim, outfull, 0, 1)) {
 		printf("dtifit: cannot set output name '%s'\n", outfull);
 		free(tensor); free(out); nifti_image_free(nim); return EXIT_FAILURE;

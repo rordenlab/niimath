@@ -13,19 +13,23 @@
 
 /* Cost function codes (user-facing subset) */
 #define AL_COST_LPC      0  /* lpc (cross-modal, e.g. fMRI→T1) */
-#define AL_COST_LPA      1  /* lpa (cross-modal, default for deface) */
-#define AL_COST_HELLINGER 2  /* Hellinger (default for allineate) */
-#define AL_COST_PEARSON   3  /* Global Pearson correlation (within-modality, fast) */
+#define AL_COST_LPA      1  /* lpa (cross-modal) */
+#define AL_COST_HELLINGER 2  /* Hellinger — the ORDINARY engine's cost (-cost hel). The CLI
+                                default cost is the fast engine (see AL_ENGINE_* below); these
+                                AL_COST_* codes select the ordinary AFNI-style engine. */
+#define AL_COST_PEARSON   3  /* Global Pearson correlation (within-modality) */
 
 /* Center-of-mass modes */
 #define AL_CMASS_NONE     0  /* No center-of-mass alignment */
 #define AL_CMASS_YES      1  /* Use center-of-mass for initial shift */
 
-/* Registration engine selector (al_opts.fast). The fast engine is a second, explicitly
-   selected estimator (coreg_fast.c); the value also carries which fast cost to use. */
-#define AL_ENGINE_ALLINEATE 0  /* default allineate engine (nii_allineate) */
+/* Registration engine selector (al_opts.fast). The fast engine (coreg_fast.c) is a distinct
+   estimator that is the CLI DEFAULT (via `-cost fast`); the value also carries which fast cost
+   to use. The CLI default lives in the dispatch, not here — `al_opts_default()` leaves
+   `.fast = 0` and the command dispatch sets AL_ENGINE_FAST_HEL when no -cost is given. */
+#define AL_ENGINE_ALLINEATE 0  /* ordinary AFNI-style allineate engine (nii_allineate; -cost hel/lpc/lpa/ls) */
 #define AL_ENGINE_FAST_CR   1  /* fast engine, correlation-ratio cost  (-cost fastcr) */
-#define AL_ENGINE_FAST_HEL  2  /* fast engine, Hellinger cost          (-cost fast) */
+#define AL_ENGINE_FAST_HEL  2  /* fast engine, Hellinger cost          (-cost fast; the default) */
 
 /* al_opts.cli_set bits — which override options the user explicitly passed. Split
    matching-interp (-interp) from output-interp (-final/-nearest/-linear/-cubic): the
@@ -40,7 +44,7 @@
    Each command passes its capabilities so an option it does not honor is rejected AT PARSE
    TIME (before images load) rather than silently ignored (the `-deface` silent-no-op bug
    class). Intra-command mode restrictions (e.g. the fast engine within -allineate rejecting
-   -warp/-sym) are separate and enforced at dispatch. */
+   -warp/-zoom — it DOES honor the -com/-sym header seeds) are separate and enforced at dispatch. */
 #define AL_CAP_TUNING  0x1u   /* -cost <normal>/-warp/-interp/-cmass/-nocmass/-source_automask/-dark_automask */
 #define AL_CAP_FINAL   0x2u   /* -final / -nearest / -linear / -cubic (output interpolation) */
 #define AL_CAP_FAST    0x4u   /* -cost fast / -cost fastcr (fast engine) */
@@ -199,7 +203,8 @@ static inline const char *al_cost_name(int cost) {
    1 on a malformed sub-option. Records which overrides the user passed in
    `opts->cli_set` so a distinct engine (the fast path) can reject what it cannot honor.
    `caps` is the command's AL_CAP_* capability set: an option outside it is rejected at
-   parse time (`-allineate` passes AL_CAP_ALL; `-deface` passes AL_CAP_TUNING|AL_CAP_FINAL),
+   parse time (`-allineate` passes AL_CAP_ALL; `-deface` passes
+   AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST — deface supports the fast engine and defaults to it),
    so a command can never silently accept an option it does not implement. */
 static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
                                    const char *cmd_name, unsigned caps) {

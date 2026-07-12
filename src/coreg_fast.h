@@ -3,8 +3,10 @@
 
 /* Fast affine coregistration path (`-cost fast`/`-cost fastcr`) — an SPM/FLIRT-inspired, but
  * independently implemented, multiresolution 12-DOF affine estimator for 3D adult
- * human brain images. It is a second, explicitly selected registration tier that
- * does NOT change nii_allineate()'s API, defaults, or numerical behavior.
+ * human brain images. It is a distinct registration tier — selected via `-cost fast`,
+ * which is the CLI default, but a SEPARATE estimator that does NOT change nii_allineate()'s
+ * API or numerical behavior: nii_allineate() remains the ordinary AFNI-style engine, reached
+ * with `-cost hel`/`lpc`/`lpa`/`ls`. (The CLI default lives in the dispatch, not here.)
  *
  * Contract:
  *  - coreg_fast_estimate() does NOT mutate its inputs. It returns a world-mm

@@ -7,7 +7,7 @@
 It is said that `imitation is the sincerest form of flattery`. This project emulates the popular [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) tool. fslmaths is a `general image calculator` and is not only one of the foundational tools for FSL's brain imaging pipelines (such as [FEAT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FEAT)), but has also been widely adopted by many tools. This popularity suggests that it fulfills an important niche. While scientists are often encouraged to discover novel solutions, it sometimes seems that replication is undervalued. Here are some specific reasons for creating this tool:
 
 1. While fslmaths is provided without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects, in particular for commercial exploitation.
-2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. n.b. Subsequently, we helped update [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) that allows recent FSL releases to use this library,  improving the speed for all FSL tools.
+2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, an accelerated zlib ([zlib-ng](https://github.com/zlib-ng/zlib-ng), the release baseline) provides dramatically faster performance than the public domain library used by fslmaths. n.b. We previously helped update the [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) fork that allows recent FSL releases to use an accelerated library, improving the speed for all FSL tools; niimath's releases now default to zlib-ng, which is also fast on arm64 and correct on Windows.
 3. Minimal dependencies allow easy distribution, compilation and development. For example, it can be compiled for MacOS, Linux and Windows (fsl can not target Windows).
 4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)).
 5. Most programs are developed organically, with new features added as need arises. Cloning an existing tool provides a full specification, which can lead to optimization. niimath uses explicit single and double precision pipelines that allow the compiler to better use advanced instructions (every x86_64 CPU provides SSE, but high level code has trouble optimizing these routines). The result is that modern compilers are able to create operations that are limited by memory bandwidth, obviating the need for [hand tuning](https://github.com/neurolabusc/simd) the code.
@@ -68,13 +68,15 @@ The default build includes OpenMP for all operations. On macOS this requires `br
 
 ```
 OMP=0 make             # Disable OpenMP
-CF=1 make              # CloudFlare accelerated zlib
+# zlib: CMake release builds default to zlib-ng (ZLIB_IMPLEMENTATION); plain make uses system -lz
 make debug             # Debug build (-g, no optimization)
 make ubsan             # Lightweight undefined-behavior checks (OpenMP-safe on macOS)
 make sanitize          # AddressSanitizer build
 AL=0 make              # Disable allineate registration
 ZSTD=0 make            # Disable zstd compression support
 make wasm              # Emscripten/WebAssembly target
+make wasm-wasi         # Experimental zlib-free WASI compute backend (needs Zig)
+make wasm-emcc-core    # Feature-matched zlib-free Emscripten build (WASI benchmark baseline)
 ```
 
 You can also compile this project to Web Assembly so it can be embedded in a web page, as shown in the [live demo](https://niivue.github.io/niivue-niimath/).
@@ -159,16 +161,16 @@ niimath has a few features not provided by fslmaths:
  - `sform <code>`          : set sform code
  - `unifize`               : bias field correction (adapted from AFNI 3dUnifize)
  - `allineate <base> [opts]`: affine registration to match 'base' (from AFNI 3dAllineate)
-   - opts: `-cost XX` (hel [default], lpc, lpa, ls) `-cmass` `-nocmass` `-source_automask`
+   - opts: `-cost XX` (fast [default], fastcr, hel, lpc, lpa, ls) `-cmass` `-nocmass` `-source_automask`
    - `-warp XX` (sho, shr, srs, aff [default]) `-interp XX` (NN, linear [default], cubic)
    - `-final XX` (NN, linear, cubic [default]) or `-nearest` `-linear` `-cubic`
    - `-master <grid>`: estimate at the base resolution but reslice the result onto `<grid>` (must share the base world frame, e.g. a higher-resolution template)
    - `-savemat out.json`: save the fitted world-space `fixed_to_moving` affine (and its inverse) as self-describing JSON. `-applymat in.json`: reslice the moving image onto `base` using a saved affine, doing **no** registration (exclusive with the registration/seed options; use `-nearest` for label/atlas volumes)
    - Registration seeds (applied to the moving image before the fit): `-com` (reset the origin to the brightness center of mass), `-sym`/`-symd`/`-symb` (fold a midsagittal-plane correction into the header; `-symd` de-obliques the frame first, `-symb` auto-competes both), `-nosagseed` (disable the in-MSP rigid seed `-sym` runs by default), `-zoom` (relax the scale range for abnormal-size subjects, e.g. infant vs adult template)
    - Skull-stripping is `deface` with a brain mask; to crop the field of view first, chain `-robustfov` before `-allineate`. Together these make niimath a superset of the standalone `allineate` registration tool.
-   - **Fast engine:** `-cost fast` (Hellinger/MI, robust cross-modal) or `-cost fastcr` (correlation-ratio) select an independent, SPM/FLIRT-inspired multiresolution 12-DOF estimator that is typically several times faster. It runs a fixed schedule with internal sampling, so it rejects `-warp`/`-interp`/`-source_automask`/`-dark_automask`/`-sym`/`-zoom` (use a normal `-cost` for those). Default/`-cmass` chooses the supplied-affine or COM-recentered initialization from initial dependence×overlap, `-com` forces COM, and `-nocmass` forces the supplied affine; `-final`/`-master`/`-savemat` are also honored. `-cost` is last-one-wins.
- - `deface <tmpl> <mask> [opts]`: remove voxels using a template-space mask. Registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and zeros voxels where the warped mask < 0.5 (the input itself is never resampled). `mask` is in `tmpl` space: ≥0.5 = keep, <0.5 = remove. The mask determines what is removed — supply a brain mask to skull-strip (keep the brain) or a face mask to deface (remove the face).
-   - opts: the tuning + output-interpolation options only — `-cost`/`-warp`/`-interp`/`-cmass`/`-nocmass`/`-source_automask`/`-dark_automask` and `-final`/`-nearest`/`-linear`/`-cubic` (default final: linear). The registration-workflow options (`-savemat`/`-applymat`/`-com`/`-sym`/`-symd`/`-symb`/`-nosagseed`/`-zoom`/`-master`/`-cost fast`) apply to `-allineate` only and are **rejected** here (deface registers with the ordinary engine and reslices the mask onto the input's own grid)
+   - **Fast engine (the default):** `-cost fast` (Hellinger/MI, robust cross-modal) is the default cost; `-cost fastcr` (correlation-ratio) is its same-modality variant. Both select an independent, SPM/FLIRT-inspired multiresolution 12-DOF estimator that is typically several times faster; `-cost hel`/`lpc`/`lpa`/`ls` select the ordinary AFNI-style engine instead. It runs a fixed schedule with internal sampling, so it rejects `-warp`/`-interp`/`-source_automask`/`-dark_automask`/`-zoom` (use a normal `-cost` for those) — but the `-com`/`-sym`/`-symd`/`-symb` header seeds DO work with it (they only re-pose the moving header before the fast fit). Default/`-cmass` chooses the supplied-affine or COM-recentered initialization from initial dependence×overlap, `-com` forces COM, and `-nocmass` forces the supplied affine; `-final`/`-master`/`-savemat` are also honored. `-cost` is last-one-wins.
+ - `deface <tmpl> <mask> [opts]`: remove voxels using a template-space mask. Registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and sets voxels where the warped mask < 0.5 to the image's finite minimum (≈0 for typical MRI; the input itself is never resampled). `mask` is in `tmpl` space: ≥0.5 = keep, <0.5 = remove. The mask determines what is removed — supply a brain mask to skull-strip (keep the brain) or a face mask to deface (remove the face).
+   - opts: `-cost XX` (fast [default], fastcr, hel, lpc, lpa, ls) `-cmass`/`-nocmass` tuning + `-final`/`-nearest`/`-linear`/`-cubic` (default final: linear). Like `-allineate`, deface defaults to the fast engine; `-cost hel` selects the ordinary AFNI-style engine. Fast cannot honor `-warp`/`-interp`/`-source_automask`/`-dark_automask` (use `-cost hel`). The seed/matrix/master workflow options (`-savemat`/`-applymat`/`-com`/`-sym`/`-symd`/`-symb`/`-nosagseed`/`-zoom`/`-master`) apply to `-allineate` only and are **rejected** here
    - **Breaking change:** the former `-skullstrip <tmpl> <mask>` command was removed — it ran the identical operation. Replace `-skullstrip` with `-deface` (supply your brain mask); the result is unchanged.
  - `spm_coreg <ref> [opts]`: SPM rigid-body coregistration of the chain image to `ref` (optional GPL module, see below)
    - opts: `-cost XX` (nmi [default], mi, ecc, ncc, ls) `-sep` `-fwhm` `-dither 0|1` `-coarse sparse|downsample` `-verbose 0|1`
@@ -240,6 +242,8 @@ Here are the same testson a desktop computer with twelve cores (24 threads, Ryze
 | fslmaths rest -Tmean -mul -1 -add rest out : 32 (186)  | 1.7x (2.5x)   | 1.8x (7.6x)   |
 |  niimath rest -demean out (same output as above)       | 2.6x (2.6x)   | 3.0x (10.8x)  |
 | fslmaths rest -bptf 77 8.68 out : 887 (1019)           | 2.6x (2.5x)   | 23x (23.0x)   |
+
+Gaussian smoothing (`-s`/`-dog`/`unsharp`) uses a contiguous vectorizable kernel in every build (native, WASM, and the shared registration pyramid). Neighborhood mean, minimum, maximum, and erosion filters keep their local gathers but evaluate adjacent interior outputs in SIMD lanes, avoiding the non-finite propagation errors of separable running-sum and deque filters.
 
 ## Converting voxelwise images to a triangulated mesh
 

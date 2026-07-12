@@ -81,6 +81,22 @@ void *nii_calloc(size_t count, size_t size) {
 	return ptr;
 }
 
+// Fail-closed UN-zeroed sibling of nii_calloc: same overflow check + exit-on-NULL, but does not
+// clear the buffer. Use ONLY for a nim->data buffer that the caller fully overwrites before use
+// (e.g. the datatype-conversion output loops). Skipping the zero-fill is a large win — especially
+// in WASM, where memory.grow already returns zeroed pages, so calloc redundantly re-zeros them
+// (measured ~2.5x faster on a datatype-converting op). Plain malloc, so nifti_image_free()/free()
+// still release it. If a code path could leave any voxel unwritten, use nii_calloc instead.
+void *nii_malloc(size_t count, size_t size) {
+	size_t bytes;
+	if (nii_mul_size(count, size, &bytes) != 0)
+		nii_allocation_failure("allocation size overflow");
+	void *ptr = malloc(bytes);
+	if (ptr == NULL && bytes != 0)
+		nii_allocation_failure("failed to allocate memory");
+	return ptr;
+}
+
 int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
@@ -90,6 +106,11 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		printfx("nii_otsu error: nBin (%d) is too large for safe indexing\n", nBin);
 		return 0;
 	}
+	// 2D index into the nBin×nBin P/S matrices. The (row*nBin) product is computed in
+	// size_t so it cannot overflow int. At -O3, gcc's -Waggressive-loop-optimizations
+	// otherwise treats the guarded nBin<=32767 boundary as potential signed-overflow UB
+	// and warns (a false positive in practice: the sole caller passes nBin=256).
+	#define OT2(row, col) ((size_t)(row) * nBin + (col))
 	int thresh = 0;
 	*dark = 0;
 	*mid = 0;
@@ -110,27 +131,27 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	}
 	for (int u = 1; u < nBin; u++) {
 		for (int v = u; v < nBin; v++) {
-			P[(u*nBin)+v] = P[v]-P[u-1];
-			S[(u*nBin)+v] = S[v]-S[u-1];
+			P[OT2(u, v)] = P[v]-P[u-1];
+			S[OT2(u, v)] = S[v]-S[u-1];
 		}
 	}
 	//result is eq 29 from Liao
 	for (int u = 0; u < nBin; u++) {
 		for (int v = u; v < nBin; v++) {
-			if (P[(u*nBin)+v] != 0) //avoid divide by zero errors...
-				P[(u*nBin)+v] = (S[(u*nBin)+v]*S[(u*nBin)+v]) / P[(u*nBin)+v];
+			if (P[OT2(u, v)] != 0) //avoid divide by zero errors...
+				P[OT2(u, v)] = (S[OT2(u, v)]*S[OT2(u, v)]) / P[OT2(u, v)];
 		}
 	}
 	if ((mode == 1) || (mode == 5)) {
 		int lo = (int)(0.25*nBin);
 		int mi = (int)(0.50*nBin);
 		int hi = (int)(0.75*nBin);
-		double max = P[lo] + P[((lo+1)*nBin)+mi] + P[((mi+1)*nBin)+hi] + P[((hi+1)*nBin)+(nBin-1)];
+		double max = P[lo] + P[OT2(lo+1, mi)] + P[OT2(mi+1, hi)] + P[OT2(hi+1, nBin-1)];
 		for (int l = 0; l < (nBin-3); l++) {
 			for (int m = l + 1; m < (nBin-2); m++) {
 				for (int h = m + 1; h < (nBin-1); h++) {
 					//double v = P[0][l]+P[l+1][h]+P[h+1][nBin-1];
-					double v = P[l] + P[((l+1)*nBin)+m] + P[((m+1)*nBin)+h] + P[((h+1)*nBin)+(nBin-1)];
+					double v = P[l] + P[OT2(l+1, m)] + P[OT2(m+1, h)] + P[OT2(h+1, nBin-1)];
 					if (v > max) {
 						lo = l;
 						mi = m;
@@ -150,10 +171,10 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	} else if ((mode == 2) || (mode == 4)) {
 		int lo = (int)(0.33*nBin);
 		int hi = (int)(0.67*nBin);
-		double max = P[lo] + P[((lo+1)*nBin)+hi] + P[((hi+1)*nBin)+nBin-1];
+		double max = P[lo] + P[OT2(lo+1, hi)] + P[OT2(hi+1, nBin-1)];
 		for (int l = 0; l < (nBin-2); l++) {
 			for (int h = l + 1; h < (nBin-1); h++) {
-				double v = P[l]+P[((l+1)*nBin)+h]+P[((h+1)*nBin)+nBin-1];
+				double v = P[l]+P[OT2(l+1, h)]+P[OT2(h+1, nBin-1)];
 				if (v > max) {
 					lo = l;
 					hi = h;
@@ -170,10 +191,10 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		*bright = hi;
 	} else { //two levels:
 		thresh = (int)(0.25*nBin); //nBin / 2;
-		double max = P[thresh]+P[((thresh+1)*nBin)+nBin-1];
+		double max = P[thresh]+P[OT2(thresh+1, nBin-1)];
 		//exhaustively search
 		for (int i = 0; i < (nBin-1); i++) {
-			double v = P[i]+P[((i+1)*nBin)+nBin-1];
+			double v = P[i]+P[OT2(i+1, nBin-1)];
 			if (v > max) {
 				thresh = i;
 				max = v;
@@ -183,6 +204,7 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		*mid = thresh;
 		*bright = thresh;
 	}
+	#undef OT2
 	free(P);
 	free(S);
 	return thresh;
@@ -479,7 +501,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		int nComponents = 3;
 		if (idt == DT_RGBA32)
 			nComponents = 4;
-		void *dat = (void *)calloc(1, nComponents * nim->nvox * sizeof(uint8_t));
+		void *dat = nii_calloc((size_t)nComponents, (size_t)nim->nvox);
 		uint8_t *o8 = (uint8_t *)dat;
 		size_t j = 0;
 		for (size_t i = 0; i < nim->nvox; i++) {
@@ -532,7 +554,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		nim->nvox = nvox3D;
 		nim->datatype = dt;
 		nim->nbyper = nComponents;
-		void *dat = (void *)calloc(1, nComponents * nim->nvox * sizeof(uint8_t));
+		void *dat = nii_calloc((size_t)nComponents, (size_t)nim->nvox);
 		uint8_t *o8 = (uint8_t *)dat;
 		size_t j = 0;
 		for (size_t i = 0; i < nim->nvox; i++) {
@@ -566,7 +588,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(double));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(double)); // fully overwritten by convert loop
 		double *o64 = (double *)dat;
 		if (idt == DT_FLOAT32) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -630,7 +652,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(float));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(float)); // fully overwritten by convert loop
 		o32 = (float *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -640,12 +662,12 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 		if (idt == DT_UINT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (u64[i] * scl) + inter;
-			return 0;
+			ok = 0;
 		}
 		if (idt == DT_INT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				o32[i] = (i64[i] * scl) + inter;
-			return 0;
+			ok = 0;
 		}
 		if (idt == DT_UINT16) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -694,7 +716,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(int32_t));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(int32_t)); // fully overwritten by convert loop
 		o32 = (int32_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -743,7 +765,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(int16_t));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(int16_t)); // fully overwritten by convert loop
 		o16 = (int16_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -792,7 +814,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(int16_t));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(int16_t)); // fully overwritten by convert loop
 		o16 = (uint16_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -841,7 +863,7 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 			return 0;
 		}
 		//following change nbyper
-		void *dat = (void *)calloc(1, nim->nvox * sizeof(uint8_t));
+		void *dat = (void *)nii_malloc(nim->nvox, sizeof(uint8_t)); // fully overwritten by convert loop
 		o8 = (uint8_t *)dat;
 		if (idt == DT_FLOAT64) {
 			for (size_t i = 0; i < nim->nvox; i++)
@@ -885,9 +907,15 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 		printfx("make_kernel_file: failed to read NIfTI image '%s'\n", fin);
 		return NULL;
 	}
-	int x = nim2->nx;
-	int y = nim2->ny;
-	int z = nim2->nz;
+	int nvox3D;
+	if (nii_nvox3d_int(nim2, &nvox3D) || nim2->nvox != nvox3D) {
+		printfx("make_kernel_file: kernel must be a supported 3D image\n");
+		nifti_image_free(nim2);
+		return NULL;
+	}
+	int x = (int)nim2->nx;
+	int y = (int)nim2->ny;
+	int z = (int)nim2->nz;
 	int xlo = (int)(-x / 2);
 	int ylo = (int)(-y / 2);
 	int zlo = (int)(-z / 2);
@@ -899,16 +927,43 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 	int n = 0;
 	float *f32 = (float *)nim2->data;
 	double sum = 0.0;
-	for (int i = 0; i < nim2->nvox; i++) {
+	for (int i = 0; i < nvox3D; i++) {
+		if (!(f32[i] >= -FLT_MAX && f32[i] <= FLT_MAX)) {
+			printfx("make_kernel_file: kernel contains a non-finite value\n");
+			nifti_image_free(nim2);
+			return NULL;
+		}
 		if (f32[i] == 0)
 			continue;
 		sum += fabs(f32[i]);
 		n++;
 	}
-	if ((sum == 0.0) || (n == 0))
+	if ((sum == 0.0) || (n == 0)) {
+		nifti_image_free(nim2);
 		return NULL;
+	}
+	// The kernel is 4 parallel int arrays of length n (offset, x, y, weight), indexed with plain
+	// int (`i + n + n + n`) in the fill and filter loops. Validate the layout ONCE here, before
+	// committing *nkernel or allocating: reject a huge sparse kernel whose element count overflows
+	// int (4*n-1 > INT_MAX) or whose byte size overflows size_t (32-bit) — otherwise malloc could
+	// return a non-NULL undersized buffer and the loops would index/write out of bounds.
+	if (n > INT_MAX / 4) {
+		printfx("make_kernel_file: kernel has too many non-zero voxels (%d)\n", n);
+		nifti_image_free(nim2);
+		return NULL;
+	}
+	size_t kbytes;
+	if (nii_mul_size((size_t)n * 4, sizeof(int), &kbytes) != 0) {
+		printfx("make_kernel_file: kernel allocation size overflow\n");
+		nifti_image_free(nim2);
+		return NULL;
+	}
 	*nkernel = n;
-	int *kernel = (int *)malloc((n * 4) * sizeof(int)); //4 values: offset, xpos, ypos, weight
+	int *kernel = (int *)malloc(kbytes); //4 values: offset, xpos, ypos, weight
+	if (!kernel) {
+		nifti_image_free(nim2);
+		return NULL;
+	}
 	//for evenly weighted voxels:
 	//int kernelWeight = (int)((double)INT_MAX/(double)n); //requires <limits.h>
 	double kernelWeight = (double)INT_MAX / sum;
@@ -920,7 +975,16 @@ int *make_kernel_file(nifti_image *nim, int *nkernel, char *fin) {
 				vx++;
 				if (f32[vx] == 0)
 					continue;
-				kernel[i] = xi + (yi * nim->nx) + (zi * nim->nx * nim->ny);
+				// Compute the flat voxel offset in int64 and reject if it exceeds the int layout slot
+				// (a large sparse kernel over a large target image can go out of int range).
+				int64_t koff = (int64_t)xi + (int64_t)yi * nim->nx + (int64_t)zi * nim->nx * nim->ny;
+				if (koff < INT_MIN || koff > INT_MAX) {
+					printfx("make_kernel_file: kernel voxel offset out of int range\n");
+					free(kernel);
+					nifti_image_free(nim2);
+					return NULL;
+				}
+				kernel[i] = (int)koff;
 				kernel[i + n] = xi; //left-right wrap detection
 				kernel[i + n + n] = yi; //anterior-posterior wrap detection
 				kernel[i + n + n + n] = (int)(kernelWeight * f32[vx]); //kernel height (weight)

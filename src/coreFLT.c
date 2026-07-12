@@ -921,6 +921,62 @@ staticx int nifti_hollow(nifti_image *nim, flt threshold, flt wallThickness) {
 // Gaussian blur, https://github.com/neurolabusc/niiSmooth
 /* Blur the leading dimension of contiguous rows. Allocate all scratch before
    modifying the image so allocation failure leaves the input unchanged. */
+// Blur one contiguous row via a full symmetric contiguous kernel (kc[i], NOT k[abs(i)]). Keep the
+// variable-bound borders scalar, and process eight adjacent interior outputs per tap loop. The eight
+// independent accumulators let the SLP vectorizer use SIMD lanes across output voxels, avoiding the
+// horizontal lane reduction that wasm otherwise emits for every voxel. Same taps and accumulation
+// order per output as the scalar path.
+staticx void blur_row(const flt *tmp, flt *row, int nx, int cutoffvox, const flt *kc,
+					   const int *kStart, const int *kEnd, const flt *kWeight) {
+	int xlo = MIN(cutoffvox, nx);
+	int xhi = MAX(nx - cutoffvox, xlo);
+	int x = 0;
+	for (; x < xlo; x++) {
+		flt sum = 0;
+		for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * kc[i];
+		row[x] = sum * kWeight[x];
+	}
+	for (; (xhi - x) >= 8; x += 8) {
+		flt sum0 = 0;
+		flt sum1 = 0;
+		flt sum2 = 0;
+		flt sum3 = 0;
+		flt sum4 = 0;
+		flt sum5 = 0;
+		flt sum6 = 0;
+		flt sum7 = 0;
+		for (int i = -cutoffvox; i <= cutoffvox; i++) {
+			flt w = kc[i];
+			sum0 += tmp[x + i] * w;
+			sum1 += tmp[x + i + 1] * w;
+			sum2 += tmp[x + i + 2] * w;
+			sum3 += tmp[x + i + 3] * w;
+			sum4 += tmp[x + i + 4] * w;
+			sum5 += tmp[x + i + 5] * w;
+			sum6 += tmp[x + i + 6] * w;
+			sum7 += tmp[x + i + 7] * w;
+		}
+		row[x] = sum0 * kWeight[x];
+		row[x + 1] = sum1 * kWeight[x + 1];
+		row[x + 2] = sum2 * kWeight[x + 2];
+		row[x + 3] = sum3 * kWeight[x + 3];
+		row[x + 4] = sum4 * kWeight[x + 4];
+		row[x + 5] = sum5 * kWeight[x + 5];
+		row[x + 6] = sum6 * kWeight[x + 6];
+		row[x + 7] = sum7 * kWeight[x + 7];
+	}
+	for (; x < xhi; x++) {
+		flt sum = 0;
+		for (int i = -cutoffvox; i <= cutoffvox; i++) sum += tmp[x + i] * kc[i];
+		row[x] = sum * kWeight[x];
+	}
+	for (; x < nx; x++) {
+		flt sum = 0;
+		for (int i = kStart[x]; i <= kEnd[x]; i++) sum += tmp[x + i] * kc[i];
+		row[x] = sum * kWeight[x];
+	}
+}
+
 staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 								 flt sigma_mm, flt kernelWid, int parallel) {
 	if ((xmm == 0) || (nx < 2) || (nRow < 1) || (sigma_mm <= 0.0))
@@ -931,10 +987,18 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 					: (kernelWid < 0) ? (int)lround(radius) : (int)ceil(radius);
 	cutoffvox = MAX(cutoffvox, 1);
 
-	flt *k = (flt *)malloc((size_t)(cutoffvox + 1) * sizeof(flt));
-	int *kStart = (int *)malloc((size_t)nx * sizeof(int));
-	int *kEnd = (int *)malloc((size_t)nx * sizeof(int));
-	flt *kWeight = (flt *)malloc((size_t)nx * sizeof(flt));
+	size_t kBytes, indexBytes, rowBytes, kfullBytes;
+	size_t kCount = (size_t)cutoffvox + 1;
+	size_t kfullCount = ((size_t)2 * (size_t)cutoffvox) + 1;
+	if (nii_mul_size(kCount, sizeof(flt), &kBytes) ||
+		nii_mul_size((size_t)nx, sizeof(int), &indexBytes) ||
+		nii_mul_size((size_t)nx, sizeof(flt), &rowBytes) ||
+		nii_mul_size(kfullCount, sizeof(flt), &kfullBytes))
+		return 1;
+	flt *k = (flt *)malloc(kBytes);
+	int *kStart = (int *)malloc(indexBytes);
+	int *kEnd = (int *)malloc(indexBytes);
+	flt *kWeight = (flt *)malloc(rowBytes);
 	if (!k || !kStart || !kEnd || !kWeight) {
 		free(k);
 		free(kStart);
@@ -943,8 +1007,16 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 		return 1;
 	}
 	flt expd = 2 * sigma * sigma;
-	for (int i = 0; i <= cutoffvox; i++)
+	for (size_t i = 0; i < kCount; i++)
 		k[i] = FLT_EXP(-1.0f * ((flt)i * (flt)i) / expd);
+	// Contiguous symmetric kernel so blur_row reads weights contiguously (kc[i]).
+	flt *kfull = (flt *)malloc(kfullBytes);
+	if (!kfull) { free(k); free(kStart); free(kEnd); free(kWeight); return 1; }
+	for (size_t i = 0; i < kfullCount; i++) {
+		size_t distance = (i < (size_t)cutoffvox) ? (size_t)cutoffvox - i : i - (size_t)cutoffvox;
+		kfull[i] = k[distance];
+	}
+	const flt *kc = kfull + cutoffvox;
 	for (int i = 0; i < nx; i++) {
 		kStart[i] = MAX(-cutoffvox, -i);
 		kEnd[i] = MIN(cutoffvox, nx - i - 1);
@@ -967,7 +1039,7 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 			failed = 1;
 		else {
 			for (int t = 0; t < nthreads; t++) {
-				scratch[t] = (flt *)malloc((size_t)nx * sizeof(flt));
+				scratch[t] = (flt *)malloc(rowBytes);
 				if (!scratch[t]) {
 					failed = 1;
 					break;
@@ -978,13 +1050,8 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 				for (int y = 0; y < nRow; y++) {
 					flt *tmp = scratch[omp_get_thread_num()];
 					flt *row = img + ((size_t)nx * y);
-					xmemcpy(tmp, row, (size_t)nx * sizeof(flt));
-					for (int x = 0; x < nx; x++) {
-						flt sum = 0;
-						for (int i = kStart[x]; i <= kEnd[x]; i++)
-							sum += tmp[x + i] * k[abs(i)];
-						row[x] = sum * kWeight[x];
-					}
+					xmemcpy(tmp, row, rowBytes);
+					blur_row(tmp, row, nx, cutoffvox, kc, kStart, kEnd, kWeight);
 				}
 			}
 			for (int t = 0; t < nthreads; t++)
@@ -996,19 +1063,14 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 	(void)parallel;
 #endif
 	{
-		flt *tmp = (flt *)malloc((size_t)nx * sizeof(flt));
+		flt *tmp = (flt *)malloc(rowBytes);
 		if (!tmp)
 			failed = 1;
 		else {
 			flt *row = img;
 			for (int y = 0; y < nRow; y++) {
-				xmemcpy(tmp, row, (size_t)nx * sizeof(flt));
-				for (int x = 0; x < nx; x++) {
-					flt sum = 0;
-					for (int i = kStart[x]; i <= kEnd[x]; i++)
-						sum += tmp[x + i] * k[abs(i)];
-					row[x] = sum * kWeight[x];
-				}
+				xmemcpy(tmp, row, rowBytes);
+				blur_row(tmp, row, nx, cutoffvox, kc, kStart, kEnd, kWeight);
 				row += nx;
 			}
 			free(tmp);
@@ -1016,6 +1078,7 @@ staticx int smooth_gauss_blur1d(flt *img, int nx, int nRow, flt xmm,
 	}
 
 	free(k);
+	free(kfull);
 	free(kStart);
 	free(kEnd);
 	free(kWeight);
@@ -1260,13 +1323,21 @@ staticx int nifti_robust_range(nifti_image *nim, flt *pct2, flt *pct98, int igno
 
 staticx flt *padImg3D(flt *imgIn, int *nx, int *ny, int *nz) {
 	// create an image with new first and last columns, rows, slices
+	if (!imgIn || !nx || !ny || !nz || *nx < 1 || *ny < 1 || *nz < 1 ||
+		*nx > INT_MAX - 2 || *ny > INT_MAX - 2 || *nz > INT_MAX - 2)
+		return NULL;
 	int nxIn = (*nx);
 	int nxOut = (*nx) + 2;
 	int nyOut = (*ny) + 2;
 	int nzOut = (*nz) + 2;
-	int nvox3D = nxOut * nyOut * nzOut;
-	flt *imgOut = (flt *)malloc(nvox3D * sizeof(flt));
-	memset(imgOut, 0, nvox3D * sizeof(flt)); // zero array
+	size_t nxy, nvox3D, bytes;
+	if (nii_mul_size((size_t)nxOut, (size_t)nyOut, &nxy) ||
+		nii_mul_size(nxy, (size_t)nzOut, &nvox3D) || nvox3D > INT_MAX ||
+		nii_mul_size(nvox3D, sizeof(flt), &bytes))
+		return NULL;
+	flt *imgOut = (flt *)calloc(nvox3D, sizeof(flt));
+	if (!imgOut)
+		return NULL;
 	flt *imgOutP = imgOut;
 	flt *imgInP = imgIn;
 	imgOutP += 1;
@@ -3074,15 +3145,340 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 	free(inf32);
 } // kernel3D_dilall()
 
+typedef struct {
+	int xlo, xhi;
+	int ylo, yhi;
+	int zlo, zhi;
+} kernel_extents3d;
+
+/* Recover the relative-coordinate bounds already encoded in the four parallel kernel arrays.
+   Every in-tree kernel builder satisfies offset = dx + dy*nx + dz*nx*ny. If a future/custom
+   builder does not, the mean path simply retains the fully checked scalar loop everywhere. */
+staticx int kernel_get_extents3d(const int *kernel, int nkernel, int nx, int nxy,
+								  kernel_extents3d *e) {
+	if (!kernel || nkernel < 1 || nx < 1 || nxy < 1 || !e)
+		return 1;
+	e->xlo = e->xhi = kernel[nkernel];
+	e->ylo = e->yhi = kernel[nkernel + nkernel];
+	int64_t rem0 = (int64_t)kernel[0] - e->xlo - (int64_t)e->ylo * nx;
+	if ((rem0 % nxy) != 0)
+		return 1;
+	int64_t dz0 = rem0 / nxy;
+	if (dz0 < INT_MIN || dz0 > INT_MAX)
+		return 1;
+	e->zlo = e->zhi = (int)dz0;
+	for (int k = 1; k < nkernel; k++) {
+		int dx = kernel[k + nkernel];
+		int dy = kernel[k + nkernel + nkernel];
+		int64_t rem = (int64_t)kernel[k] - dx - (int64_t)dy * nx;
+		if ((rem % nxy) != 0)
+			return 1;
+		int64_t dz = rem / nxy;
+		if (dz < INT_MIN || dz > INT_MAX)
+			return 1;
+		e->xlo = MIN(e->xlo, dx);
+		e->xhi = MAX(e->xhi, dx);
+		e->ylo = MIN(e->ylo, dy);
+		e->yhi = MAX(e->yhi, dy);
+		e->zlo = MIN(e->zlo, (int)dz);
+		e->zhi = MAX(e->zhi, (int)dz);
+	}
+	return 0;
+}
+
+/* Checked border voxel. Kernel order and arithmetic match the historical gather exactly. */
+static inline flt kernel_mean_border(const flt *inf32, int i, int x, int y,
+								 int nx, int ny, int nVox3D, const int *kernel,
+								 const flt *kwt, int nkernel, int normalized) {
+	flt sum = 0.0;
+	flt wt = 0.0;
+	for (int k = 0; k < nkernel; k++) {
+		int64_t vx = (int64_t)i + kernel[k];
+		if (vx < 0 || vx >= nVox3D)
+			continue;
+		int dx = x + kernel[k + nkernel];
+		if (dx < 0 || dx >= nx)
+			continue;
+		int dy = y + kernel[k + nkernel + nkernel];
+		if (dy < 0 || dy >= ny)
+			continue;
+		sum += inf32[vx] * kwt[k];
+		if (normalized)
+			wt += kwt[k];
+	}
+	return normalized ? sum / wt : sum;
+}
+
+/* Weighted mean with a branch-free interior. Eight adjacent outputs share each kernel lookup and
+   expose contiguous loads to SLP/NEON/SIMD128, while every output retains the original kernel-tap
+   accumulation order. Borders use the checked local gather above. This remains O(k^3), so a NaN
+   or infinity can affect only voxels whose actual kernel contains it; unlike the archived running
+   sums in noncompliant.md, no non-finite value is added and later subtracted from shared state. */
+staticx int kernel3D_mean(flt *f32, const flt *inf32, int nx, int ny, int nz,
+						  const int *kernel, int nkernel, int normalized) {
+	size_t kwtBytes;
+	if (nii_mul_size((size_t)nkernel, sizeof(flt), &kwtBytes))
+		return 1;
+	flt *kwt = (flt *)malloc(kwtBytes);
+	if (!kwt)
+		return 1;
+	for (int k = 0; k < nkernel; k++)
+		kwt[k] = (flt)((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
+
+	int nxy = nx * ny;
+	int nVox3D = nxy * nz;
+	kernel_extents3d e;
+	int have_extents = kernel_get_extents3d(kernel, nkernel, nx, nxy, &e) == 0;
+	for (int z = 0; z < nz; z++) {
+		for (int y = 0; y < ny; y++) {
+			int row = z * nxy + y * nx;
+			int yz_interior = have_extents &&
+				((int64_t)y + e.ylo >= 0) && ((int64_t)y + e.yhi < ny) &&
+				((int64_t)z + e.zlo >= 0) && ((int64_t)z + e.zhi < nz);
+			if (!yz_interior) {
+				for (int x = 0; x < nx; x++)
+					f32[row + x] = kernel_mean_border(inf32, row + x, x, y, nx, ny,
+													 nVox3D, kernel, kwt, nkernel, normalized);
+				continue;
+			}
+
+			int xlo = (int)MIN((int64_t)nx, MAX((int64_t)0, -(int64_t)e.xlo));
+			int xhi = (int)MIN((int64_t)nx, MAX((int64_t)0, (int64_t)nx - e.xhi));
+			int x = 0;
+			for (; x < xlo; x++)
+				f32[row + x] = kernel_mean_border(inf32, row + x, x, y, nx, ny,
+												 nVox3D, kernel, kwt, nkernel, normalized);
+
+			for (; (xhi - x) >= 8; x += 8) {
+				flt sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+				flt sum4 = 0.0, sum5 = 0.0, sum6 = 0.0, sum7 = 0.0;
+				flt wt = 0.0;
+				int i = row + x;
+				for (int k = 0; k < nkernel; k++) {
+					const flt *p = inf32 + i + kernel[k];
+					flt w = kwt[k];
+					sum0 += p[0] * w;
+					sum1 += p[1] * w;
+					sum2 += p[2] * w;
+					sum3 += p[3] * w;
+					sum4 += p[4] * w;
+					sum5 += p[5] * w;
+					sum6 += p[6] * w;
+					sum7 += p[7] * w;
+					if (normalized)
+						wt += w;
+				}
+				if (normalized) {
+					f32[i] = sum0 / wt; f32[i + 1] = sum1 / wt;
+					f32[i + 2] = sum2 / wt; f32[i + 3] = sum3 / wt;
+					f32[i + 4] = sum4 / wt; f32[i + 5] = sum5 / wt;
+					f32[i + 6] = sum6 / wt; f32[i + 7] = sum7 / wt;
+				} else {
+					f32[i] = sum0; f32[i + 1] = sum1; f32[i + 2] = sum2; f32[i + 3] = sum3;
+					f32[i + 4] = sum4; f32[i + 5] = sum5; f32[i + 6] = sum6; f32[i + 7] = sum7;
+				}
+			}
+			for (; x < xhi; x++) {
+				flt sum = 0.0;
+				flt wt = 0.0;
+				int i = row + x;
+				for (int k = 0; k < nkernel; k++) {
+					sum += inf32[i + kernel[k]] * kwt[k];
+					if (normalized)
+						wt += kwt[k];
+				}
+				f32[i] = normalized ? sum / wt : sum;
+			}
+			for (; x < nx; x++)
+				f32[row + x] = kernel_mean_border(inf32, row + x, x, y, nx, ny,
+												 nVox3D, kernel, kwt, nkernel, normalized);
+		}
+	}
+	free(kwt);
+	return 0;
+}
+
+static inline flt kernel_extreme_border(const flt *inf32, int i, int x, int y,
+									int nx, int ny, int nVox3D, const int *kernel,
+									int nkernel, int isMax) {
+	flt value = inf32[i];
+	for (int k = 0; k < nkernel; k++) {
+		int64_t vx = (int64_t)i + kernel[k];
+		if (vx < 0 || vx >= nVox3D)
+			continue;
+		int dx = x + kernel[k + nkernel];
+		if (dx < 0 || dx >= nx)
+			continue;
+		int dy = y + kernel[k + nkernel + nkernel];
+		if (dy < 0 || dy >= ny)
+			continue;
+		flt sample = inf32[vx];
+		if (isMax) {
+			/* Preserve the historical unordered comparison: a NaN sample replaces the current
+			   value, then the next ordered sample can replace that NaN. Kernel order matters. */
+			if (!(sample <= value))
+				value = sample;
+		} else if (value > sample) {
+			/* MIN(value, sample): a NaN sample is ignored; a NaN center remains NaN. */
+			value = sample;
+		}
+	}
+	return value;
+}
+
+/* Maximum/minimum filters with the same independent-output SLP strategy as kernel3D_mean.
+   Comparisons intentionally mirror the old scalar source instead of using fmin/fmax, whose NaN
+   selection rules differ from the long-standing niimath/FSL-compatible neighborhood behavior. */
+staticx void kernel3D_extreme(flt *f32, const flt *inf32, int nx, int ny, int nz,
+							 const int *kernel, int nkernel, int isMax) {
+	int nxy = nx * ny;
+	int nVox3D = nxy * nz;
+	kernel_extents3d e;
+	int have_extents = kernel_get_extents3d(kernel, nkernel, nx, nxy, &e) == 0;
+	for (int z = 0; z < nz; z++) {
+		for (int y = 0; y < ny; y++) {
+			int row = z * nxy + y * nx;
+			int yz_interior = have_extents &&
+				((int64_t)y + e.ylo >= 0) && ((int64_t)y + e.yhi < ny) &&
+				((int64_t)z + e.zlo >= 0) && ((int64_t)z + e.zhi < nz);
+			if (!yz_interior) {
+				for (int x = 0; x < nx; x++)
+					f32[row + x] = kernel_extreme_border(inf32, row + x, x, y, nx, ny,
+														nVox3D, kernel, nkernel, isMax);
+				continue;
+			}
+			int xlo = (int)MIN((int64_t)nx, MAX((int64_t)0, -(int64_t)e.xlo));
+			int xhi = (int)MIN((int64_t)nx, MAX((int64_t)0, (int64_t)nx - e.xhi));
+			int x = 0;
+			for (; x < xlo; x++)
+				f32[row + x] = kernel_extreme_border(inf32, row + x, x, y, nx, ny,
+													 nVox3D, kernel, nkernel, isMax);
+			for (; (xhi - x) >= 8; x += 8) {
+				int i = row + x;
+				flt v0 = inf32[i], v1 = inf32[i + 1], v2 = inf32[i + 2], v3 = inf32[i + 3];
+				flt v4 = inf32[i + 4], v5 = inf32[i + 5], v6 = inf32[i + 6], v7 = inf32[i + 7];
+				for (int k = 0; k < nkernel; k++) {
+					const flt *p = inf32 + i + kernel[k];
+					if (isMax) {
+						if (!(p[0] <= v0)) v0 = p[0]; if (!(p[1] <= v1)) v1 = p[1];
+						if (!(p[2] <= v2)) v2 = p[2]; if (!(p[3] <= v3)) v3 = p[3];
+						if (!(p[4] <= v4)) v4 = p[4]; if (!(p[5] <= v5)) v5 = p[5];
+						if (!(p[6] <= v6)) v6 = p[6]; if (!(p[7] <= v7)) v7 = p[7];
+					} else {
+						if (v0 > p[0]) v0 = p[0]; if (v1 > p[1]) v1 = p[1];
+						if (v2 > p[2]) v2 = p[2]; if (v3 > p[3]) v3 = p[3];
+						if (v4 > p[4]) v4 = p[4]; if (v5 > p[5]) v5 = p[5];
+						if (v6 > p[6]) v6 = p[6]; if (v7 > p[7]) v7 = p[7];
+					}
+				}
+				f32[i] = v0; f32[i + 1] = v1; f32[i + 2] = v2; f32[i + 3] = v3;
+				f32[i + 4] = v4; f32[i + 5] = v5; f32[i + 6] = v6; f32[i + 7] = v7;
+			}
+			for (; x < xhi; x++) {
+				int i = row + x;
+				flt value = inf32[i];
+				for (int k = 0; k < nkernel; k++) {
+					flt sample = inf32[i + kernel[k]];
+					if (isMax) {
+						if (!(sample <= value)) value = sample;
+					} else if (value > sample) value = sample;
+				}
+				f32[i] = value;
+			}
+			for (; x < nx; x++)
+				f32[row + x] = kernel_extreme_border(inf32, row + x, x, y, nx, ny,
+													 nVox3D, kernel, nkernel, isMax);
+		}
+	}
+}
+
+static inline flt kernel_ero_border(const flt *inf32, int i, int x, int y,
+								int nx, int ny, int nVox3D, const int *kernel, int nkernel) {
+	if (inf32[i] == 0.0)
+		return 0.0;
+	for (int k = 0; k < nkernel; k++) {
+		int64_t vx = (int64_t)i + kernel[k];
+		if (vx < 0 || vx >= nVox3D || inf32[vx] != 0.0)
+			continue;
+		int dx = x + kernel[k + nkernel];
+		if (dx < 0 || dx >= nx)
+			continue;
+		int dy = y + kernel[k + nkernel + nkernel];
+		if (dy >= 0 && dy < ny)
+			return 0.0;
+	}
+	return inf32[i];
+}
+
+/* Binary erosion: each lane independently records whether its center or any valid kernel sample
+   is exactly zero. NaN and infinities remain non-zero, matching the historical gather and FSL. */
+staticx void kernel3D_ero(flt *f32, const flt *inf32, int nx, int ny, int nz,
+						 const int *kernel, int nkernel) {
+	int nxy = nx * ny;
+	int nVox3D = nxy * nz;
+	kernel_extents3d e;
+	int have_extents = kernel_get_extents3d(kernel, nkernel, nx, nxy, &e) == 0;
+	for (int z = 0; z < nz; z++) {
+		for (int y = 0; y < ny; y++) {
+			int row = z * nxy + y * nx;
+			int yz_interior = have_extents &&
+				((int64_t)y + e.ylo >= 0) && ((int64_t)y + e.yhi < ny) &&
+				((int64_t)z + e.zlo >= 0) && ((int64_t)z + e.zhi < nz);
+			if (!yz_interior) {
+				for (int x = 0; x < nx; x++)
+					f32[row + x] = kernel_ero_border(inf32, row + x, x, y, nx, ny,
+												 nVox3D, kernel, nkernel);
+				continue;
+			}
+			int xlo = (int)MIN((int64_t)nx, MAX((int64_t)0, -(int64_t)e.xlo));
+			int xhi = (int)MIN((int64_t)nx, MAX((int64_t)0, (int64_t)nx - e.xhi));
+			int x = 0;
+			for (; x < xlo; x++)
+				f32[row + x] = kernel_ero_border(inf32, row + x, x, y, nx, ny,
+											 nVox3D, kernel, nkernel);
+			for (; (xhi - x) >= 8; x += 8) {
+				int i = row + x;
+				int keep0 = inf32[i] != 0.0, keep1 = inf32[i + 1] != 0.0;
+				int keep2 = inf32[i + 2] != 0.0, keep3 = inf32[i + 3] != 0.0;
+				int keep4 = inf32[i + 4] != 0.0, keep5 = inf32[i + 5] != 0.0;
+				int keep6 = inf32[i + 6] != 0.0, keep7 = inf32[i + 7] != 0.0;
+				for (int k = 0; k < nkernel; k++) {
+					const flt *p = inf32 + i + kernel[k];
+					keep0 &= p[0] != 0.0; keep1 &= p[1] != 0.0;
+					keep2 &= p[2] != 0.0; keep3 &= p[3] != 0.0;
+					keep4 &= p[4] != 0.0; keep5 &= p[5] != 0.0;
+					keep6 &= p[6] != 0.0; keep7 &= p[7] != 0.0;
+				}
+				f32[i] = keep0 ? inf32[i] : 0.0; f32[i + 1] = keep1 ? inf32[i + 1] : 0.0;
+				f32[i + 2] = keep2 ? inf32[i + 2] : 0.0; f32[i + 3] = keep3 ? inf32[i + 3] : 0.0;
+				f32[i + 4] = keep4 ? inf32[i + 4] : 0.0; f32[i + 5] = keep5 ? inf32[i + 5] : 0.0;
+				f32[i + 6] = keep6 ? inf32[i + 6] : 0.0; f32[i + 7] = keep7 ? inf32[i + 7] : 0.0;
+			}
+			for (; x < xhi; x++) {
+				int i = row + x;
+				int keep = inf32[i] != 0.0;
+				for (int k = 0; k < nkernel; k++)
+					keep &= inf32[i + kernel[k]] != 0.0;
+				f32[i] = keep ? inf32[i] : 0.0;
+			}
+			for (; x < nx; x++)
+				f32[row + x] = kernel_ero_border(inf32, row + x, x, y, nx, ny,
+											 nVox3D, kernel, nkernel);
+		}
+	}
+}
+
 staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int vol) {
 	int nVox3D = nim->nx * nim->ny * nim->nz;
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
 	flt *inf32 = (flt *)malloc(nVox3D * sizeof(flt));
+	if (!inf32) { printfx("** kernel3D: out of memory\n"); return 1; }
 	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 	int nxy = nim->nx * nim->ny;
 	if (op == fmediank) {
 		flt *vxls = (flt *)malloc((nkernel) * sizeof(flt));
+		if (!vxls) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; // offset
 			for (int y = 0; y < nim->ny; y++) {
@@ -3118,6 +3514,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 	} else if (op == dilDk) { // Modal Dilation of non-zero voxels
 		// for ties, choose larger value
 		flt *vxls = (flt *)malloc((nkernel) * sizeof(flt));
+		if (!vxls) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; // offset
 			for (int y = 0; y < nim->ny; y++) {
@@ -3198,86 +3595,19 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 			} // for y
 		} // for z
 	} else if (op == dilFk) { // Maximum filtering of all voxels
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; // offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					flt mx = inf32[i];
-					for (int k = 0; k < nkernel; k++) {
-						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] <= mx) || (inf32[vx] == NAN))
-							continue;
-						// next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; // wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; // wrapped anterior-posterior
-						mx = inf32[vx];
-						// if (mx < 0) continue; //with dilF, do not make a zero voxel darker than 0
-					} // for k
-					f32[i] = mx;
-				} // for x
-			} // for y
-		} // for z
+		kernel3D_extreme(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel, 1);
 	} else if (op == dilallk) { //	-dilall : Apply -dilM repeatedly until the entire FOV is covered");
 		kernel3D_dilall(nim, kernel, nkernel, vol);
 	} else if (op == eroFk) { // Minimum filtering of all voxels
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; // offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					for (int k = 0; k < nkernel; k++) {
-						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
-							continue;
-						// next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; // wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; // wrapped anterior-posterior
-						f32[i] = MIN(f32[i], inf32[vx]);
-					} // for k
-				} // for x
-			} // for y
-		} // for z
+		kernel3D_extreme(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel, 0);
 	} else if (op == fmeank) { // Mean filtering, kernel weighted (conventionally used with gauss kernel) //u22a
-		flt *kwt = (flt *)malloc(nkernel * sizeof(flt));
-		for (int k = 0; k < nkernel; k++)
-			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; // offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					flt sum = 0.0f;
-					flt wt = 0.0f;
-					for (int k = 0; k < nkernel; k++) {
-						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
-							continue;
-						// next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; // wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; // wrapped anterior-posterior
-						sum += (inf32[vx] * kwt[k]);
-						wt += kwt[k];
-					} // for k
-					f32[i] = sum / wt;
-				} // for x
-			} // for y
-		} // for z
-		free(kwt);
+		if (kernel3D_mean(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel, 1)) {
+			free(inf32);
+			return 1;
+		}
 	} else if (op == fmeanzerok) { // Mean filtering, kernel weighted (negative and positive samples sume to zero: laplacian kernel) //u22a
 		flt *kwt = (flt *)malloc(nkernel * sizeof(flt));
+		if (!kwt) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int k = 0; k < nkernel; k++)
 			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
 		for (int z = 0; z < nim->nz; z++) {
@@ -3319,62 +3649,12 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 		} // for z
 		free(kwt);
 	} else if (op == fmeanuk) { // Mean filtering, kernel weighted, un-normalized (gives edge effects)
-		flt *kwt = (flt *)malloc(nkernel * sizeof(flt));
-		for (int k = 0; k < nkernel; k++)
-			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; // offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					flt sum = 0.0f;
-					// flt wt = 0.0f;
-					for (int k = 0; k < nkernel; k++) {
-						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
-							continue;
-						// next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; // wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; // wrapped anterior-posterior
-						sum += (inf32[vx] * kwt[k]);
-						// wt += kwt[k];
-					} // for k
-					// f32[i] = sum / wt;
-					f32[i] = sum;
-				} // for x
-			} // for y
-		} // for z
-		free(kwt);
+		if (kernel3D_mean(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel, 0)) {
+			free(inf32);
+			return 1;
+		}
 	} else if (op == erok) {
-		// Erode by zeroing non-zero voxels when zero voxels found in kernel
-		for (int z = 0; z < nim->nz; z++) {
-			int i = (z * nxy) - 1; // offset
-			for (int y = 0; y < nim->ny; y++) {
-				for (int x = 0; x < nim->nx; x++) {
-					i++;
-					if (inf32[i] == 0.0)
-						continue;
-					for (int k = 0; k < nkernel; k++) {
-						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] != 0.0) || (inf32[vx] == NAN))
-							continue;
-						// next handle edge cases
-						int dx = x + kernel[k + nkernel];
-						if ((dx < 0) || (dx >= nim->nx))
-							continue; // wrapped left-right
-						int dy = y + kernel[k + nkernel + nkernel];
-						if ((dy < 0) || (dy >= nim->ny))
-							continue; // wrapped anterior-posterior
-						f32[i] = 0.0;
-
-					} // for k
-				} // for x
-			} // for y
-		} // for z
+		kernel3D_ero(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel);
 	} else {
 		printfx("kernel3D: Unsupported operation\n");
 		free(inf32);
@@ -3411,18 +3691,21 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
 	int nVol = nim->nvox / nvox3D;
 	flt *inimg4D = (flt *)nim->data;
-#pragma omp parallel for
+	int failed = 0;
+#pragma omp parallel for reduction(|:failed)
 	for (int v = 0; v < nVol; v++) {
 		flt *inimg = inimg4D + (v * nvox3D);
 		int nx = nim->nx;
 		int ny = nim->ny;
 		int nz = nim->nz;
 		flt *img = padImg3D(inimg, &nx, &ny, &nz);
-		memset(inimg, 0, nvox3D * sizeof(flt)); // zero array
+		if (!img) {
+			failed = 1;
+			continue;
+		}
 		int xi = 1;
 		int yj = nx;
 		int zk = nx * ny;
-		int64_t nxyz = nx * ny * nz;
 		// orient: only look for edges in 2D, ignore on dimension
 		if (orient == 1)
 			xi = yj;
@@ -3431,24 +3714,27 @@ staticx int nifti_zero_crossing(nifti_image *nim, int orient) {
 		if (orient == 3)
 			zk = 1;
 		int nxy = nx * ny;
+		// The padded-grid interior maps one-to-one onto the output. All neighbor offsets are
+		// in bounds, so write each 0/1 result directly instead of pre-zeroing the full volume.
 		for (int z = 1; z < (nz - 1); z++)
 			for (int y = 1; y < (ny - 1); y++)
 				for (size_t x = 1; x < (nx - 1); x++) {
 					int64_t i = x + (y * nx) + (z * nxy);
-					if (((i - zk) < 0) || ((i + zk) >= nxyz))
-						continue;
 					flt val = img[i];
 					flt ival = -val;
+					flt edge = 0.0;
 					// logic: opposite polarities cause negative sign: pos*neg = neg; pos*pos=pos; neg*neg=pos
 					// check six neighbors that share a face
-					if ((val > 0.0) && ((img[i - xi] <= ival) || (img[i + xi] <= ival) || (img[i - yj] <= ival) || (img[i + yj] <= ival) || (img[i - zk] <= ival) || (img[i + zk] <= ival)))
-						inimg[0] = 1.0;
-					if ((val < 0.0) && ((img[i - xi] > ival) || (img[i + xi] > ival) || (img[i - yj] > ival) || (img[i + yj] > ival) || (img[i - zk] > ival) || (img[i + zk] > ival)))
-						inimg[0] = 1.0;
-					inimg++;
+					if (val > 0.0)
+						edge = (img[i - xi] <= ival) || (img[i + xi] <= ival) || (img[i - yj] <= ival) || (img[i + yj] <= ival) || (img[i - zk] <= ival) || (img[i + zk] <= ival);
+					else if (val < 0.0)
+						edge = (img[i - xi] > ival) || (img[i + xi] > ival) || (img[i - yj] > ival) || (img[i + yj] > ival) || (img[i - zk] > ival) || (img[i + zk] > ival);
+					*inimg++ = edge;
 				}
 		free(img);
 	}
+	if (failed)
+		return 1;
 	nim->scl_inter = 0.0;
 	nim->scl_slope = 1.0;
 	nim->cal_min = 0.0;
@@ -3472,8 +3758,9 @@ staticx int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int orie
 	// Difference of Gaussians (DoG): difference ratio of 1.6 approximates a Laplacian of Gaussian
 	//  https://homepages.inf.ed.ac.uk/rbf/HIPR2/log.htm
 	flt kKernelWid = 2.5; // ceil(2.5)
-	int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-	if ((nvox3D < 3) || (nim->nx < 1) || (nim->ny < 1) || (nim->nz < 1) || (nim->datatype != DT_CALC)) {
+	int nvox3D;
+	if (nii_nvox3d_int(nim, &nvox3D) || (nvox3D < 3) ||
+		(nim->nvox % nvox3D) || (nim->datatype != DT_CALC)) {
 		printfx("Image dimensions too small for Difference of Gaussian.\n");
 		return 1;
 	}
@@ -3496,22 +3783,34 @@ staticx int nifti_dog(nifti_image *nim, flt SigmammPos, flt SigmammNeg, int orie
 	// https://computergraphics.stackexchange.com/questions/256/is-doing-multiple-gaussian-blurs-the-same-as-doing-one-larger-blur
 	sigmaMx = sqrt((sigmaMx * sigmaMx) - (sigmaMn * sigmaMn));
 	flt *inimg = (flt *)nim->data;
-	int nVol = nim->nvox / nvox3D;
-	int64_t nvox4D = nvox3D * nVol;
 	int ret = nifti_smooth_gauss(nim, sigmaMn, sigmaMn, sigmaMn, kKernelWid);
 	if (ret != 0) {
 		printfx("Gaussian smooth failed.\n");
 		return ret;
 	}
-	flt *imgMn = (flt *)malloc(nvox4D * sizeof(flt));
-	for (int64_t i = 0; i < nvox4D; i++)
-		imgMn[i] = inimg[i];
+	size_t mnBytes;
+	size_t nvox4D = (size_t)nim->nvox;
+	if (nii_mul_size(nvox4D, sizeof(flt), &mnBytes) != 0) {
+		printfx("Difference of Gaussian: allocation size overflow.\n");
+		return 1;
+	}
+	flt *imgMn = (flt *)malloc(mnBytes);
+	if (!imgMn) {
+		printfx("Difference of Gaussian: out of memory.\n");
+		return 1;
+	}
+	xmemcpy(imgMn, inimg, mnBytes); // was a scalar copy loop
 	ret = nifti_smooth_gauss(nim, sigmaMx, sigmaMx, sigmaMx, kKernelWid);
+	if (ret != 0) {
+		printfx("Gaussian smooth failed.\n");
+		free(imgMn);
+		return ret;
+	}
 	if (SigmammPos > SigmammNeg) {
-		for (int64_t i = 0; i < nvox4D; i++)
+		for (size_t i = 0; i < nvox4D; i++)
 			inimg[i] = inimg[i] - imgMn[i];
 	} else {
-		for (int64_t i = 0; i < nvox4D; i++)
+		for (size_t i = 0; i < nvox4D; i++)
 			inimg[i] = imgMn[i] - inimg[i];
 	}
 	free(imgMn);
@@ -5946,6 +6245,56 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			return 1;
 		}
 	}
+	/* Default cost is the fast SPM/FLIRT-inspired engine: a bare -allineate with no explicit
+	   -cost selects `-cost fast` (Hellinger). An explicit -cost (fast/fastcr or hel/lpc/lpa/ls)
+	   is honored as given. -cmass/-nocmass/-com apply to the fast engine too. When fast is the
+	   DEFAULT (not an explicit -cost fast), a fast failure falls back to the robust Hellinger
+	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
+	   fast multiresolution pyramid (e.g. tiny synthetic volumes). */
+	/* Default-fast engages only when the user gave nothing the fast engine cannot honor.
+	   -zoom/-warp/-interp/-source_automask/-dark_automask are ordinary-engine features the fast
+	   block rejects; if any is present WITHOUT an explicit -cost fast, stay on the ordinary engine
+	   rather than defaulting to fast and erroring. -com and -sym/-symd/-symb are header-only seeds
+	   applied below to BOTH engines (the fast engine just starts from the seeded pose), so they do
+	   NOT disable default-fast. An explicit -cost fast + a rejected option still errors (opts.fast
+	   is CLI-set, not defaulted). */
+	int fast_incompatible = opts.zoom || opts.source_automask || opts.dark_automask ||
+	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
+	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST) && !fast_incompatible;
+	if (fast_default)
+		opts.fast = AL_ENGINE_FAST_HEL;
+
+	/* Header-seed pre-steps applied to the moving image (nim) BEFORE the fit and consumed by
+	   EITHER engine (superset of the standalone allineate): -com resets the origin to the
+	   brightness center of mass; -sym/-symd/-symb fold a midsagittal-plane correction into the
+	   header, and -sagseed (default on) then recovers the 3 in-MSP DOF -sym is blind to via a
+	   constrained fit to the base. The seeds are header-only (no data reslice), so the fast
+	   engine's coreg_fast_estimate and the ordinary engine both simply start from the seeded pose.
+	   A header-mutating seed (-com/-sym) fits a matrix relative to the SEEDED moving world frame;
+	   for -savemat we capture the original frame first and compose the saved matrix back to it
+	   (M' = S_orig*inv(S_seed)*M, identity if unseeded) so -applymat reproduces on the ORIGINAL
+	   un-seeded input. */
+	int seeded = opts.savemat && (opts.com || opts.sym);
+	mat44 S_orig, S_seed;
+	if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);
+	if (opts.com && nii_center_of_mass(nim)) {
+		printfx("** -com failed\n");
+		nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+	}
+	if (opts.sym) {
+		/* nim is already DT_FLOAT32 here (niimath converts the chain image to the calc
+		   datatype before the op loop), so no float32 conversion is needed. */
+		if (nii_symmetry(nim, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
+			printfx("** -sym failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+		if (opts.sagseed && nii_sagseed(nim, base, opts)) {
+			printfx("** -sagseed failed\n");
+			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+		}
+	}
+	if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+
 	int ok;
 	if (opts.fast) {
 		/* Fast SPM/FLIRT-inspired engine (-cost fast = Hellinger, -cost fastcr = CR):
@@ -5965,20 +6314,12 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			printfx("** -cost fast/fastcr does not support -source_automask/-dark_automask (internal masking)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
-		if (opts.sym || opts.zoom) {
-			printfx("** -cost fast/fastcr does not support -sym/-symd/-symb/-zoom\n");
+		if (opts.zoom) {
+			printfx("** -cost fast/fastcr does not support -zoom (it relaxes the affine scale range, which the fast engine's fixed scale capture cannot do; use -cost hel)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
-		/* -com is a strict header-recentered initialization. Capture both frames before
-		   registration so -savemat can compose the seeded fit back to the original input. */
-		int seeded_com = opts.com && opts.savemat;
-		mat44 S_orig, S_seed;
-		if (seeded_com) al_image_xform_or_pixdim(nim, &S_orig, NULL);
-		if (opts.com && nii_center_of_mass(nim)) {
-			printfx("** -com failed\n");
-			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-		}
-		if (seeded_com) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+		/* -com/-sym header seeds were already applied to nim above (shared with the ordinary
+		   engine); the fast estimate simply starts from the seeded pose. */
 		coreg_fast_opts cfo = coreg_fast_opts_default();
 		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
@@ -5986,13 +6327,23 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		coreg_fast_result res;
 		ok = coreg_fast_estimate(nim, base, &cfo, &res);
-		if (ok)
+		if (ok && fast_default) {
+			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
+			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
+			   regresses. An explicit -cost fast/fastcr still errors rather than silently switching
+			   engines. Any -com/-sym header seed was applied to nim above (not by the failed
+			   estimate, which does not mutate nim), so the ordinary path below starts from the same
+			   seeded pose. */
+			fprintf(stderr, " + fast registration failed; falling back to -cost hel\n");
+			opts.fast = 0;
+			opts.cost = AL_COST_HELLINGER;
+		} else if (ok)
 			printfx("** fast registration failed\n");
 		else {
 			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp, 0.0f);
 			if (!ok && opts.savemat) {
 				mat44 save_mat = res.fixed_to_moving;
-				if (seeded_com) {
+				if (seeded) {
 					mat44 seeded_to_original = nifti_mat44_mul(S_orig, nifti_mat44_inverse(S_seed));
 					save_mat = nifti_mat44_mul(seeded_to_original, save_mat);
 				}
@@ -6005,39 +6356,13 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
 			}
 		}
-	} else {
-		/* Normal allineate engine, with optional header-seed pre-steps applied to the
-		   moving image (nim) before the fit (superset of the standalone allineate):
-		   -com resets the origin to the brightness center of mass; -sym/-symd/-symb fold a
-		   midsagittal-plane correction into the header; -sagseed (default on) then recovers
-		   the 3 in-MSP DOF -sym is blind to via a constrained fit to the base. (-robustfov is
-		   a separate chainable niimath op — run it before -allineate to crop first.)
-		   A header-mutating seed (-com/-sym) fits a matrix relative to the SEEDED moving world
-		   frame; for -savemat we capture the original frame first and compose the saved matrix
-		   back to it (below) so -applymat reproduces the result on the ORIGINAL, un-seeded input. */
-		int seeded = (opts.savemat && (opts.com || opts.sym));
-		mat44 S_orig, S_seed;
-		if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);   /* pre-seed moving world frame */
-		if (opts.com && nii_center_of_mass(nim)) {
-			printfx("** -com failed\n");
-			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-		}
-		if (opts.sym) {
-			/* nim is already DT_FLOAT32 here (niimath converts the chain image to the calc
-			   datatype before the op loop), so no float32 conversion is needed. */
-			if (nii_symmetry(nim, NULL, 0 /*seed header, no reslice*/, opts.sym_deoblique, opts.dark_automask)) {
-				printfx("** -sym failed\n");
-				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-			}
-			if (opts.sagseed && nii_sagseed(nim, base, opts)) {
-				printfx("** -sagseed failed\n");
-				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-			}
-		}
-		/* Seeded moving world frame, captured before the fit reslices nim in place (the seeds
-		   are header-only — no data reslice — so composing S_orig*inv(S_seed)*M below reproduces
-		   the seeded-fit sampling when applied to the original input). */
-		if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
+	}
+	if (!opts.fast) {
+		/* Normal allineate engine (an explicit non-fast -cost, or the default-fast fallback
+		   above). The -com/-sym/-sagseed header seeds were applied to nim above (shared with the
+		   fast engine); nim is already seeded, and S_orig/S_seed hold the frames for -savemat
+		   composition back to the ORIGINAL, un-seeded input. (-robustfov is a separate chainable
+		   niimath op — run it before -allineate to crop first.) */
 		mat44 fitmat; int have_fit = 0;
 		if (master) {
 			/* -master: estimate the affine ONCE without reslicing (the moving image is left
@@ -6080,10 +6405,11 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 
 staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
-	/* -deface uses the ordinary Hellinger allineate engine and reslices the mask onto the
-	   subject's native grid. The fast engine, -master, and the seed/matrix workflow options
-	   are rejected at PARSE time (the -deface dispatch passes AL_CAP_TUNING|AL_CAP_FINAL to
-	   al_parse_subopts), so they cannot reach here — no post-hoc guard needed. */
+	/* -deface registers the subject to the template (fast engine by default, or the ordinary
+	   Hellinger engine with -cost hel) and reslices the mask onto the subject's native grid.
+	   -master and the seed/matrix workflow options are rejected at PARSE time (the dispatch
+	   passes AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST to al_parse_subopts), so they cannot reach
+	   here — no post-hoc guard needed. */
 	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
 	if (!tmpl) {
 		printfx("** failed to read template image from '%s'\n", tmplfile);
@@ -6513,7 +6839,7 @@ int main64(int argc, char *argv[]) {
 					goto fail;
 				}
 				if ((nim->nx != nim2->nx) || (nim->ny != nim2->ny) || (nim->nz != nim2->nz)) {
-					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", nim->nx, nim->ny, nim->nz, nim2->nx, nim2->ny, nim2->nz);
+					printfx("overlay dimensions do not match %lld×%lld×%lld != %lld×%lld×%lld \n", (long long)nim->nx, (long long)nim->ny, (long long)nim->nz, (long long)nim2->nx, (long long)nim2->ny, (long long)nim2->nz);
 					nifti_image_free(nim2);
 					goto fail;
 				}
@@ -6783,10 +7109,23 @@ int main64(int argc, char *argv[]) {
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			/* -deface implements only cost/warp/interp/cmass/automask tuning + final interp;
-			   the seed/matrix/master/fast workflow options are rejected at parse time. */
-			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd, AL_CAP_TUNING | AL_CAP_FINAL))
+			/* -deface implements cost tuning + final interp AND the fast engine; the
+			   seed/matrix/master workflow options are rejected at parse time. Fast is the
+			   DEFAULT cost (as for -allineate): a bare -deface runs the fast engine; -cost
+			   hel/lpc/lpa/ls selects the ordinary AFNI-style engine. */
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd, AL_CAP_TUNING | AL_CAP_FINAL | AL_CAP_FAST))
 				goto fail;
+			/* Fast cannot honor -warp/-interp/-source_automask/-dark_automask. If any is
+			   present WITHOUT an explicit -cost fast, stay on the ordinary engine; if -cost
+			   fast was explicit, reject (a privacy command must not silently drop tuning). */
+			int df_fast_incompat = df_opts.source_automask || df_opts.dark_automask ||
+			                       (df_opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
+			if (!df_opts.fast && !(df_opts.cli_set & AL_CLI_COST) && !df_fast_incompat)
+				df_opts.fast = AL_ENGINE_FAST_HEL;
+			if (df_opts.fast && df_fast_incompat) {
+				printfx("** -deface -cost fast/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
+				goto fail;
+			}
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
 #endif

@@ -91,9 +91,12 @@ jobs:
           # Cover both fused final-warp interpolation paths (linear and cubic in
           # al_scalar_warpone) plus the generic path (nearest), at two thread
           # counts, so a regression in any reslice path or in convergence fails CI.
+          # Force the ORDINARY engine with -cost hel: the fused final warp and its
+          # thread-parity guard are ordinary-engine paths (the default fast engine
+          # reslices via nii_apply_affine, exercised separately below).
           for final in linear cubic nearest; do
             for nt in 1 4; do
-              OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -final $final /tmp/reg_${final}_$nt.nii.gz
+              OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost hel -final $final /tmp/reg_${final}_$nt.nii.gz
               python3 .github/scripts/reg_quality.py /tmp/reg_${final}_$nt.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
             done
             # nt=1 and nt=4 of the SAME build must be byte-identical (regression
@@ -136,9 +139,19 @@ jobs:
           # engine (which prints "Cost function: Hellinger ... (12 DOF)"), not the fast one.
           src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -cost hel /tmp/low.nii.gz 2>low.txt
           grep -qi 'Cost function: Hellinger' low.txt || { echo '-cost fast -cost hel should run the normal Hellinger engine'; exit 1; }
-          # -deface does not support the fast engine or -master: reject, do not no-op.
-          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast /tmp/dfj.nii.gz >/dev/null 2>df1.txt; then
-            echo '-deface -cost fast should be rejected'; exit 1; fi
+          # -deface now supports the fast engine, which is its DEFAULT cost. A bare -deface
+          # runs "fast (Hellinger)"; -cost hel selects the ordinary AFNI-style engine.
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/dfdef.nii.gz 2>dfdef.txt
+          grep -qi 'using fast' dfdef.txt || { echo 'bare -deface should default to the fast engine'; cat dfdef.txt; exit 1; }
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast /tmp/dfj.nii.gz 2>dfj.txt
+          test -s /tmp/dfj.nii.gz
+          grep -qi 'using fast' dfj.txt || { echo '-deface -cost fast should run the fast engine'; cat dfj.txt; exit 1; }
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost hel /tmp/dfhel.nii.gz 2>dfhel.txt
+          grep -qi 'using Hellinger' dfhel.txt || { echo '-deface -cost hel should run the ordinary engine'; cat dfhel.txt; exit 1; }
+          # Fast cannot honor -warp/-interp/-source_automask/-dark_automask: reject, do not no-op.
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast -source_automask /tmp/dfj3.nii.gz >/dev/null 2>df3.txt; then
+            echo '-deface -cost fast -source_automask should be rejected'; exit 1; fi
+          # -deface still rejects -master (no output-grid override for a privacy command).
           if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -master /tmp/ref.nii.gz /tmp/dfj2.nii.gz >/dev/null 2>df2.txt; then
             echo '-deface -master should be rejected'; exit 1; fi
 
@@ -146,9 +159,10 @@ jobs:
         run: |
           set -e
           # A valid image with both sform_code and qform_code 0 must still register
-          # (unified al_image_xform_or_pixdim policy), on BOTH the normal and fast
+          # (unified al_image_xform_or_pixdim policy), on BOTH the ordinary and fast
           # engines, not error out. reg_quality fails closed on empty/constant output.
-          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz /tmp/nf_norm.nii.gz
+          # -cost hel forces the ordinary engine; -cost fastcr/fast the fast engine.
+          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz -cost hel /tmp/nf_norm.nii.gz
           python3 .github/scripts/reg_quality.py /tmp/nf_norm.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
           src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz -cost fastcr /tmp/nf_fast.nii.gz
           python3 .github/scripts/reg_quality.py /tmp/nf_fast.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
@@ -192,13 +206,26 @@ jobs:
           if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/badmat.json /tmp/x.nii.gz >/dev/null 2>&1; then
             echo 'malformed -applymat json should be rejected'; exit 1; fi
           # -com / -sym / -symd header seeds run and still register (reg_quality fails closed
-          # on empty/constant output). The fast engine rejects -sym.
+          # on empty/constant output). These are header-only seeds consumed by BOTH engines, so
+          # a bare (default-fast) invocation applies the seed then runs the fast engine.
           for seed in "-com" "-sym" "-symd" "-sym -nosagseed"; do
             src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz $seed /tmp/seed.nii.gz
             python3 .github/scripts/reg_quality.py /tmp/seed.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
           done
-          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/x.nii.gz >/dev/null 2>&1; then
-            echo '-cost fast -sym should be rejected'; exit 1; fi
+          # The fast engine now ACCEPTS the -com/-sym header seeds (they only re-pose the moving
+          # header before the fixed fast schedule); it still rejects -zoom, whose whole purpose is
+          # to relax the affine scale range the fast pyramid cannot widen.
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/fsym.nii.gz
+          python3 .github/scripts/reg_quality.py /tmp/fsym.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+          # fast + -sym + -savemat: the seed is a header mutation, so the saved matrix must be
+          # composed back to the ORIGINAL frame (M' = S_orig*inv(S_seed)*M); -applymat on the
+          # un-seeded input then reproduces the seeded fast result (round-trip within tolerance).
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym -savemat /tmp/fsm.json /tmp/fsreg.nii.gz
+          grep -q '"fixed_to_moving"' /tmp/fsm.json
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/fsm.json /tmp/fsapp.nii.gz
+          src/niimath /tmp/fsreg.nii.gz --compare 0.01 /tmp/fsapp.nii.gz
+          if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -zoom /tmp/x.nii.gz >/dev/null 2>&1; then
+            echo '-cost fast -zoom should be rejected'; exit 1; fi
           # -master + -savemat: the saved matrix must reproduce the master-grid output (the
           # -master path returns the affine from the estimate seam, not the g_last_affine global).
           src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -master /tmp/bigref.nii.gz -savemat /tmp/mm.json /tmp/mm.nii.gz
