@@ -199,7 +199,8 @@ static inline const char *al_cost_name(int cost) {
    1 on a malformed sub-option. Records which overrides the user passed in
    `opts->cli_set` so a distinct engine (the fast path) can reject what it cannot honor.
    `caps` is the command's AL_CAP_* capability set: an option outside it is rejected at
-   parse time (`-allineate` passes AL_CAP_ALL; `-deface` passes AL_CAP_TUNING|AL_CAP_FINAL),
+   parse time (`-allineate` passes AL_CAP_ALL; `-deface` passes
+   AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST — deface supports the fast engine and defaults to it),
    so a command can never silently accept an option it does not implement. */
 static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts,
                                    const char *cmd_name, unsigned caps) {

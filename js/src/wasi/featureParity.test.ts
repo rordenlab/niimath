@@ -224,13 +224,16 @@ describe("multi-input: allineate/deface", () => {
     expect(out.length).toBe(tmpl.length);                    // resliced onto the base (template) grid
     expect(out.every((v) => Number.isFinite(v))).toBe(true); // valid output, no NaN/garbage
   });
-  test("deface applies the mask and matches native byte-stable output (privacy parity)", async () => {
-    // -deface reslices via nii_reslice_affine, which is byte-stable across builds (CLAUDE.md),
-    // so WASI must match native exactly; and it must actually modify the input (mask applied).
-    const ref = tmp("parity_deface.nii");
-    nativeRaw([`${FX}/mov_small.nii`, "-deface", `${FX}/tmpl_small.nii`, `${FX}/mask_small.nii`, ref]);
+  test("deface -cost hel matches native byte-stable output (privacy parity)", async () => {
+    // Byte-exact cross-build parity requires the ORDINARY engine: -deface -cost hel converges
+    // identically here and reslices via nii_reslice_affine, which is byte-stable across builds
+    // (CLAUDE.md). The DEFAULT fast engine's registration is NOT byte-reproducible across builds
+    // (independent SIMD/codegen -> a neighboring optimum), so it is checked for agreement, not
+    // identity, in the next test. This must also actually modify the input (mask applied).
+    const ref = tmp("parity_deface_hel.nii");
+    nativeRaw([`${FX}/mov_small.nii`, "-deface", `${FX}/tmpl_small.nii`, `${FX}/mask_small.nii`, "-cost", "hel", ref]);
     const r = await runner.runFiles({
-      argv: ["mov.nii", "-deface", "tmpl.nii", "mask.nii", "out.nii"],
+      argv: ["mov.nii", "-deface", "tmpl.nii", "mask.nii", "-cost", "hel", "out.nii"],
       inputs: {
         "mov.nii": rd(`${FX}/mov_small.nii`),
         "tmpl.nii": rd(`${FX}/tmpl_small.nii`),
@@ -244,7 +247,39 @@ describe("multi-input: allineate/deface", () => {
     let changed = 0;
     for (let i = 0; i < out.length; i++) if (out[i] !== mov[i]) changed++;
     expect(changed).toBeGreaterThan(0); // the mask actually removed/altered content
-    expect(maxAbsDiff(out, payloadFloat(rd(ref)))).toBe(0); // byte-stable parity with native
+    expect(maxAbsDiff(out, payloadFloat(rd(ref)))).toBe(0); // byte-stable parity with native (ordinary engine)
+  });
+  test("default (fast) deface removes the same region as native (privacy agreement)", async () => {
+    // Default -deface uses the fast engine (not byte-reproducible across builds). Assert a
+    // privacy-MEANINGFUL agreement rather than byte identity: WASI and native remove nearly the
+    // same voxels (high overlap of the removed set), not merely "some voxels changed".
+    const ref = tmp("parity_deface_fast.nii");
+    nativeRaw([`${FX}/mov_small.nii`, "-deface", `${FX}/tmpl_small.nii`, `${FX}/mask_small.nii`, ref]);
+    const r = await runner.runFiles({
+      argv: ["mov.nii", "-deface", "tmpl.nii", "mask.nii", "out.nii"],
+      inputs: {
+        "mov.nii": rd(`${FX}/mov_small.nii`),
+        "tmpl.nii": rd(`${FX}/tmpl_small.nii`),
+        "mask.nii": rd(`${FX}/mask_small.nii`),
+      },
+      outputs: ["out.nii"],
+    });
+    expect(r.exitCode).toBe(0);
+    const out = payloadFloat(r.files["out.nii"]);
+    const nat = payloadFloat(rd(ref));
+    const mov = payloadFloat(rd(`${FX}/mov_small.nii`));
+    expect(out.every((v) => Number.isFinite(v))).toBe(true);
+    // Removed set = voxels the deface changed from the original. Compare WASI vs native.
+    let inter = 0, uni = 0, wasiRemoved = 0;
+    for (let i = 0; i < out.length; i++) {
+      const a = out[i] !== mov[i];
+      const b = nat[i] !== mov[i];
+      if (a) wasiRemoved++;
+      if (a && b) inter++;
+      if (a || b) uni++;
+    }
+    expect(wasiRemoved).toBeGreaterThan(0);       // the mask was actually applied
+    expect(inter / uni).toBeGreaterThan(0.9);     // same region removed as native (Jaccard > 0.9)
   });
 });
 

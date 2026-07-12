@@ -3473,10 +3473,12 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 	flt *f32 = (flt *)nim->data;
 	f32 += (nVox3D * vol);
 	flt *inf32 = (flt *)malloc(nVox3D * sizeof(flt));
+	if (!inf32) { printfx("** kernel3D: out of memory\n"); return 1; }
 	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
 	int nxy = nim->nx * nim->ny;
 	if (op == fmediank) {
 		flt *vxls = (flt *)malloc((nkernel) * sizeof(flt));
+		if (!vxls) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; // offset
 			for (int y = 0; y < nim->ny; y++) {
@@ -3512,6 +3514,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 	} else if (op == dilDk) { // Modal Dilation of non-zero voxels
 		// for ties, choose larger value
 		flt *vxls = (flt *)malloc((nkernel) * sizeof(flt));
+		if (!vxls) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; // offset
 			for (int y = 0; y < nim->ny; y++) {
@@ -3604,6 +3607,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 		}
 	} else if (op == fmeanzerok) { // Mean filtering, kernel weighted (negative and positive samples sume to zero: laplacian kernel) //u22a
 		flt *kwt = (flt *)malloc(nkernel * sizeof(flt));
+		if (!kwt) { free(inf32); printfx("** kernel3D: out of memory\n"); return 1; }
 		for (int k = 0; k < nkernel; k++)
 			kwt[k] = ((double)kernel[k + nkernel + nkernel + nkernel] / (double)INT_MAX);
 		for (int z = 0; z < nim->nz; z++) {

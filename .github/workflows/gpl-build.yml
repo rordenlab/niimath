@@ -91,9 +91,12 @@ jobs:
           # Cover both fused final-warp interpolation paths (linear and cubic in
           # al_scalar_warpone) plus the generic path (nearest), at two thread
           # counts, so a regression in any reslice path or in convergence fails CI.
+          # Force the ORDINARY engine with -cost hel: the fused final warp and its
+          # thread-parity guard are ordinary-engine paths (the default fast engine
+          # reslices via nii_apply_affine, exercised separately below).
           for final in linear cubic nearest; do
             for nt in 1 4; do
-              OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -final $final /tmp/reg_${final}_$nt.nii.gz
+              OMP_NUM_THREADS=$nt src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost hel -final $final /tmp/reg_${final}_$nt.nii.gz
               python3 .github/scripts/reg_quality.py /tmp/reg_${final}_$nt.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
             done
             # nt=1 and nt=4 of the SAME build must be byte-identical (regression
@@ -156,9 +159,10 @@ jobs:
         run: |
           set -e
           # A valid image with both sform_code and qform_code 0 must still register
-          # (unified al_image_xform_or_pixdim policy), on BOTH the normal and fast
+          # (unified al_image_xform_or_pixdim policy), on BOTH the ordinary and fast
           # engines, not error out. reg_quality fails closed on empty/constant output.
-          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz /tmp/nf_norm.nii.gz
+          # -cost hel forces the ordinary engine; -cost fastcr/fast the fast engine.
+          src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz -cost hel /tmp/nf_norm.nii.gz
           python3 .github/scripts/reg_quality.py /tmp/nf_norm.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
           src/niimath /tmp/noform.nii.gz -allineate /tmp/noformref.nii.gz -cost fastcr /tmp/nf_fast.nii.gz
           python3 .github/scripts/reg_quality.py /tmp/nf_fast.nii.gz /tmp/noformref.nii.gz /tmp/noform.nii.gz
@@ -213,6 +217,13 @@ jobs:
           # to relax the affine scale range the fast pyramid cannot widen.
           src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym /tmp/fsym.nii.gz
           python3 .github/scripts/reg_quality.py /tmp/fsym.nii.gz /tmp/bigref.nii.gz /tmp/big.nii.gz
+          # fast + -sym + -savemat: the seed is a header mutation, so the saved matrix must be
+          # composed back to the ORIGINAL frame (M' = S_orig*inv(S_seed)*M); -applymat on the
+          # un-seeded input then reproduces the seeded fast result (round-trip within tolerance).
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -sym -savemat /tmp/fsm.json /tmp/fsreg.nii.gz
+          grep -q '"fixed_to_moving"' /tmp/fsm.json
+          src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -applymat /tmp/fsm.json /tmp/fsapp.nii.gz
+          src/niimath /tmp/fsreg.nii.gz --compare 0.01 /tmp/fsapp.nii.gz
           if src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -zoom /tmp/x.nii.gz >/dev/null 2>&1; then
             echo '-cost fast -zoom should be rejected'; exit 1; fi
           # -master + -savemat: the saved matrix must reproduce the master-grid output (the
