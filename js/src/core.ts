@@ -176,9 +176,11 @@ class ImageProcessor {
     return this;
   }
 
-  // Affine defacing (BSD allineate): -deface <tmpl> <mask>
-  deface(tmpl: File, mask: File): this {
-    return this._addFileCommand('-deface', [tmpl, mask]);
+  // Affine defacing (BSD allineate): -deface <tmpl> <mask> [opts]
+  // Opts follow the template/mask argv tokens, e.g. ['-cost', 'hel'] to select the
+  // ordinary AFNI-style engine; omit for the default fast (SPM/FLIRT-inspired) engine.
+  deface(tmpl: File, mask: File, opts: (string | number)[] = []): this {
+    return this._addFileCommand('-deface', [tmpl, mask], opts);
   }
 
   // SPM rigid-body defacing (GPL spm_coreg): -spm_deface <tmpl> <mask> [opts]
@@ -345,7 +347,7 @@ class ImageProcessor {
 // so they are absent from the generated ImageProcessorMethods. Declare them here
 // (NOT in the regenerated types.ts) so consumers get a complete typed API.
 interface FileOperandMethods {
-  deface(tmpl: File, mask: File): this;
+  deface(tmpl: File, mask: File, opts?: (string | number)[]): this;
   spmDeface(tmpl: File, mask: File, opts?: (string | number)[]): this;
   spmcoreg(ref: File, opts?: (string | number)[]): this;
   allineate(base: File, opts?: (string | number)[]): this;

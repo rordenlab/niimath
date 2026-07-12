@@ -141,20 +141,22 @@ def gen_qc():
 
 
 def gen_allineate():
-    rng = np.random.default_rng(SEED + 2)
-    n = 24
-    zz, yy, xx = np.mgrid[0:n, 0:n, 0:n].astype(float)
-    c = n / 2.0
-    def blob(dx, dy, dz):
-        r2 = (xx - c - dx) ** 2 + (yy - c - dy) ** 2 + (zz - c - dz) ** 2
-        return (1000.0 * np.exp(-r2 / (2 * 5.0 ** 2))).astype("<f4")
-    tmpl = blob(0, 0, 0)
-    mov = blob(2.0, -1.5, 1.0)  # translated -> registration should recover it
-    write1(os.path.join(FX, "tmpl_small.nii"), tmpl, 16, 32)
-    write1(os.path.join(FX, "mov_small.nii"), mov, 16, 32)
-    mask = (np.sqrt((xx - c) ** 2 + (yy - c) ** 2 + (zz - c) ** 2) < 5.0).astype("<i2")
-    write1(os.path.join(FX, "mask_small.nii"), mask, 4, 16)
-    print("allineate fixtures written")
+    # Realistic T1w phantom via the stdlib-only simbrain.py (repo root) instead of a single
+    # Gaussian blob: the fast engine is tuned for real brain resolution/contrast, and on a lone
+    # blob it lands on a neighboring optimum (fast-vs-hel deface agreed to <0.90); on this
+    # multi-tissue head it agrees to ~0.98. tmpl = canonical pose (+ a GM/WM brain mask); mov =
+    # the SAME anatomy under a KNOWN rigid transform (2,-1.5,1 vox; small rotations) with
+    # independent noise, so registration has a ground truth to recover.
+    import subprocess, sys
+    simbrain = os.path.join(os.path.dirname(os.path.abspath(__file__)), "simbrain.py")
+    common = [sys.executable, simbrain, "--dim", "48", "--pixdim", "3", "--dtype", "float32"]
+    subprocess.run(common + ["--seed", "1",
+                             "--out", os.path.join(FX, "tmpl_small.nii"),
+                             "--mask", os.path.join(FX, "mask_small.nii")], check=True)
+    subprocess.run(common + ["--seed", "2", "--translate", "2", "-1.5", "1",
+                             "--rotate", "2", "-3", "5",
+                             "--out", os.path.join(FX, "mov_small.nii")], check=True)
+    print("allineate fixtures written (simbrain phantom)")
 
 
 def gen_nifti2():

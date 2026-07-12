@@ -20,7 +20,7 @@
   "scripts": {
     "test": "bun test ./tests",
     "test:wasi:fixtures": "bun run scripts/wasi-fixtures.ts",
-    "test:wasi": "bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
+    "test:wasi": "make -C ../src && bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
     "build": "bun run esbuild.config.ts",
     "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
