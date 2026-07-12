@@ -42,13 +42,22 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
-if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
-    option(OPENMP_XCODE "Build with OpenMP support" OFF)
-endif()
-
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
 option(BUILD_BMP "Build bitmap (PNG) output support" ON)
 option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
+# These mirror src/CMakeLists.txt options; declare and forward them here so the
+# documented top-level build (cmake .. on the repo root) actually honours them
+# instead of silently reporting an unused variable.
+option(USE_OPENMP "Build with OpenMP support" ON)
+option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
+# OPENMP_XCODE is the AppleClang-only legacy alias (src/CMakeLists.txt gates OpenMP
+# on `USE_OPENMP AND OPENMP_XCODE`). Its DEFAULT follows USE_OPENMP so a plain
+# top-level build enables OpenMP on Apple (matching the docs), but it stays an
+# explicit, consumed override: the macOS universal-release scripts pass
+# `-DOPENMP_XCODE=OFF` to disable OpenMP for the cross-arch slices, where the
+# single-arch Homebrew libomp cannot link into a universal binary. Declared after
+# USE_OPENMP so its default can reference it; forwarded as ${OPENMP_XCODE} below.
+option(OPENMP_XCODE "AppleClang OpenMP (defaults to USE_OPENMP; set OFF for universal builds)" ${USE_OPENMP})
 
 include(ExternalProject)
 
@@ -92,6 +101,8 @@ ExternalProject_Add(src
         -DZSTD_ROOT:PATH=${ZSTD_ROOT}
         -DCMAKE_PREFIX_PATH:STRING=${CMAKE_PREFIX_PATH}
         -DENABLE_GPL:BOOL=${ENABLE_GPL}
+        -DUSE_OPENMP:BOOL=${USE_OPENMP}
+        -DENABLE_QC:BOOL=${ENABLE_QC}
         -DBUILD_BMP:BOOL=${BUILD_BMP}
         # forward static runtime and static linking
         -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}

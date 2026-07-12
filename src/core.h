@@ -127,6 +127,7 @@ typedef struct {                   /** x4 vector struct **/
 
 int nii_mul_size(size_t a, size_t b, size_t *out);
 void *nii_calloc(size_t count, size_t size); // zeroed nim->data buffer; see definition in core.c for the MSVC allocator contract
+int nii_nvox3d_int(const nifti_image *nim, int *out); // validates int-sized spatial and total counts
 int nifti_save(nifti_image * nim, const char *postfix, gzModes gzMode);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);

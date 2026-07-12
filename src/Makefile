@@ -21,7 +21,7 @@ endif
 #Affine registration (from AFNI 3dAllineate, public domain)
 AFASTMATH= -ffast-math -fno-finite-math-only
 AFLAGS= -DHAVE_ALLINEATE
-ALOBJS= allineate.o powell_newuoa.o
+ALOBJS= allineate.o powell_newuoa.o coreg_fast.o
 
 #Zlib flags
 ZFLAGS= -DHAVE_ZLIB -lz
@@ -46,9 +46,14 @@ BFLAGS= -DHAVE_BUTTERWORTH bw.c
 TFILES= -DHAVE_TENSOR tensor.c
 #Diffusion tensor fit (linear, emulates FSL dtifit; fit math from AFNI 3dDWItoDT, public domain; needs TFILES)
 DTFLAGS= -DHAVE_DTIFIT dtifit.c
+#Anatomical QC metrics (MRIQC-style IQMs from a T1 + segmentation; self-contained)
+QCFLAGS= -DHAVE_QC qc.c
 #dtifit's dependencies for the WASM target (which otherwise ships no tensor support);
 #grouped so "DTIFIT=0 make wasm" restores the original tensor-free WASM build
 DT_WASM= $(TFILES) $(DTFLAGS)
+#QC metrics for the WASM target; grouped so "QC=0 make wasm" drops it (qc.c is
+#self-contained and wasm-safe: only core.h helpers, comparator-free quickselect, no OpenMP)
+QC_WASM= $(QCFLAGS)
 #Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spm_coreg. OFF by
 #default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
 #provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).
@@ -70,7 +75,7 @@ endif
 WASM_AL=
 WASM_AL_PREREQ=
 ifneq "$(AL)" "0"
-    WASM_AL= $(AFLAGS) al_wasm.o pn_wasm.o
+    WASM_AL= $(AFLAGS) al_wasm.o pn_wasm.o cf_wasm.o
     WASM_AL_PREREQ= wasm_al_objs
 endif
 
@@ -102,6 +107,15 @@ else
 	LDFLAGS+= $(OMPLINK)
 endif
 
+# Whole-program fast-math (release builds). The standalone allineate project builds ALL of
+# its sources with -ffast-math, and the registration calls shared nifti_io matrix helpers
+# (nifti_mat44_inverse / nifti_mat44_mul) DURING the fit. Compiling nifti_io strict-FP while
+# allineate.o is fast-FP made those 4x4 ops round differently, so on the flat cross-modal cost
+# surface NEWUOA settled at a slightly different optimum and niimath's -allineate diverged from
+# the allineate standard. Matching the fast-math build makes the registration bit-identical.
+# (The `debug` target re-assigns CFLAGS, so it stays strict.)
+CFLAGS+= $(AFASTMATH)
+
 #run "MESH=0 make" for minimal compile without nii2mesh functions
 ifeq "$(MESH)" "0"
 	MFLAGS=
@@ -125,50 +139,80 @@ ifeq "$(DTIFIT)" "0"
 	DT_WASM=
 endif
 
+#run "QC=0 make" for compile without anatomical QC metrics (--qc)
+ifeq "$(QC)" "0"
+	QCFLAGS=
+endif
+
 ifeq ($(UNAME_S),Darwin)
 	# macOS linker does not support --gc-sections
 	LDFLAGS =
 endif
 
 all: $(ALOBJS)
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
-# NOTE: these .o targets depend only on their sources, not on $(OMPFLAGS), so make
-# does NOT rebuild them when you toggle OMP=0/OMP=1 on the command line. Switching
-# OMP on an existing tree leaves a stale object (e.g. an OpenMP-compiled allineate.o
-# fails to link under OMP=0, missing libomp). Force a rebuild when toggling: make -B
-# (or rm -f allineate.o powell_newuoa.o). Only the .o-based `all`/`static` targets are
-# affected; the inline-$(ALSRC) targets (wasm/debug/sanitize/verbose) recompile anyway.
-allineate.o: allineate.c allineate.h
-	$(CNAME) $(CFLAGS) $(AFASTMATH) $(OMPFLAGS) -c allineate.c -o allineate.o
+# The prebuilt registration objects are compiled with flags that depend on command-line
+# toggles (OMP=0, GPL=1, CNAME, feature flags), but make keys rebuilds on source timestamps
+# only. Without a flag dependency, `make` then `make OMP=0` reuses the OpenMP-compiled objects
+# and the link FAILS (unresolved __kmpc_*/omp_* in allineate.o). Fix: a flag-signature stamp.
+# `.al_obj_flags` is regenerated every build but only its CONTENTS change (and thus its mtime)
+# when the signature changes, so the three .o rebuild exactly when — and only when — the
+# object-affecting flags change. No `make -B` needed.
+AL_OBJ_SIG := $(CNAME)|$(CFLAGS)|$(AFLAGS)
+.PHONY: force_al_flags
+force_al_flags: ;
+.al_obj_flags: force_al_flags
+	@printf '%s' '$(AL_OBJ_SIG)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(AL_OBJ_SIG)' > $@
 
-powell_newuoa.o: powell_newuoa.c
-	$(CNAME) $(CFLAGS) $(AFASTMATH) $(OMPFLAGS) -c powell_newuoa.c -o powell_newuoa.o
+# -MMD -MP emits a .d file listing every header each object actually includes (nifti_io.h,
+# mat44/nifti_image definitions, core32.h, ...), so a changed struct ABI rebuilds the object
+# — the manual `.h` prerequisites below only cover the direct headers. The .d files are
+# -included at the bottom of this Makefile. Combined with the .al_obj_flags stamp (flag
+# changes) this makes the prebuilt objects rebuild on both source/header AND flag changes.
+allineate.o: allineate.c allineate.h .al_obj_flags
+	$(CNAME) $(CFLAGS) -MMD -MP -c allineate.c -o allineate.o
+
+powell_newuoa.o: powell_newuoa.c .al_obj_flags
+	$(CNAME) $(CFLAGS) -MMD -MP -c powell_newuoa.c -o powell_newuoa.o
+
+# Fast SPM/FLIRT-inspired coreg engine (-allineate ... -cost fast/fastcr). Calls
+# nifti_smooth_gauss_f32 (generated by core32.c) and the allineate API.
+coreg_fast.o: coreg_fast.c coreg_fast.h core32.h allineate.h .al_obj_flags
+	$(CNAME) $(CFLAGS) -MMD -MP -c coreg_fast.c -o coreg_fast.o
+
+# Auto-generated header dependencies for the prebuilt registration objects (from -MMD).
+-include allineate.d powell_newuoa.d coreg_fast.d
 
 #allineate source files for non-default targets (compiled directly, not as separate .o)
 ALSRC=
 ifneq "$(AL)" "0"
-ALSRC= allineate.c powell_newuoa.c
+ALSRC= allineate.c powell_newuoa.c coreg_fast.c
 endif
 
 #issue30: static build
 static:
-	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
-	$(CNAME) -O3 -ffunction-sections -fdata-sections $(MFLAGS) $(UFLAGS) $(LDFLAGS) $(ZFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O3 -ffunction-sections -fdata-sections $(AFASTMATH) $(MFLAGS) $(UFLAGS) $(LDFLAGS) $(ZFLAGS) $(BMPFLAGS) -o niimath
 
 # tiny without nii2mesh (no OpenMP)
 nano:
-	$(CNAME) -O3 -ffunction-sections -fdata-sections $(UFLAGS) $(LDFLAGS) -o niimath
+	$(CNAME) -O3 -ffunction-sections -fdata-sections $(AFASTMATH) $(UFLAGS) $(LDFLAGS) -o niimath
 
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
-	$(CNAME) $(CFLAGS) $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+
+# Lightweight undefined-behavior diagnostics. Unlike the Apple-Clang ASan target below,
+# UBSan is safe with Homebrew libomp on Apple Silicon and retains the normal OpenMP paths.
+ubsan:
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
@@ -176,9 +220,16 @@ verbose:
 # interpolation thrashes ASan shadow memory — >100x, not specific to these flags;
 # OMP=0 and MallocNanoZone=0 do not help). For memory validation use a small image
 # (the 64^3 CI fixture runs clean in <1s) plus `leaks`; full-size ASan is impractical.
-# Run with: MallocNanoZone=0 ASAN_OPTIONS=detect_leaks=1 make sanitize
+# macOS/Apple-Clang note: OpenMP is intentionally OMITTED here. Apple Clang + Homebrew
+# libomp + -fsanitize=address deadlocks at OpenMP runtime init (even a trivial parallel
+# region hangs; OMP_NUM_THREADS=1 does NOT help — the deadlock is at libomp load). Dropping
+# the OpenMP flags makes every `#pragma omp` a no-op, so ASan runs serial with no deadlock.
+# LeakSanitizer is unavailable on Apple Silicon macOS: for leaks use a normal (non-ASan)
+# build with `MallocNanoZone=0 leaks --atExit -- ./niimath ...`. For ASan+OpenMP together,
+# build a separate target with Homebrew LLVM clang (/opt/homebrew/opt/llvm/bin/clang).
+# Run with: MallocNanoZone=0 make sanitize
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,
@@ -186,10 +237,12 @@ sanitize:
 # powell_newuoa.c are pre-built (wasm_al_objs) WITH -ffast-math to match the native
 # build: that reassociation is load-bearing for the registration cost reduction —
 # WITHOUT it the optimizer converges to a worse local minimum in WASM (verified:
-# -deface masked 37% vs 60% native; fast-math restores 60%). Scoped to allineate/
-# powell only so the GPL spm_coreg golden match and the BSD-default wasm are untouched.
-# Every OpenMP construct in those files is #ifdef _OPENMP-guarded and _OPENMP is never
-# set here, so the scalar fallbacks compile.
+# -deface masked 37% vs 60% native; fast-math restores 60%). As of the whole-program
+# fast-math decision the MAIN wasm link line also compiles -ffast-math -fno-finite-math-only
+# (matching Make/CMake/notarize), so every wasm TU — core ops, the GPL spm_coreg module, and
+# the pre-built allineate objects — shares one FP contract; the pre-built objects remain (the
+# link consumes al_wasm.o/pn_wasm.o/cf_wasm.o, not the .c). Every OpenMP construct in those
+# files is #ifdef _OPENMP-guarded and _OPENMP is never set here, so the scalar fallbacks compile.
 # STACK_SIZE is raised from emcc's 64 KB default because the GPL cost function keeps a
 # 256x256 joint histogram (double H[65536] = 512 KB) on the stack (cost.c); the default
 # overflows into a RuntimeError. Harmless for non-GPL builds (just reserves more).
@@ -199,6 +252,7 @@ sanitize:
 wasm_al_objs:
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c allineate.c -o al_wasm.o
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c powell_newuoa.c -o pn_wasm.o
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c coreg_fast.c -o cf_wasm.o
 
 # WASM_OUT names the emitted ES6 module (emcc derives the sibling .wasm from it).
 # Default is the BSD ../js/src/niimath.js; the GPL build overrides it to
@@ -207,7 +261,7 @@ wasm_al_objs:
 WASM_OUT= ../js/src/niimath.js
 
 wasm: $(WASM_AL_PREREQ)
-	emcc -O3 -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(ZFLAGS) $(BMPFLAGS) -s USE_ZLIB=1 -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 

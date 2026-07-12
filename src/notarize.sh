@@ -23,17 +23,16 @@ cd "$(dirname "$0")"
 
 mkdir ${APP_DIR}
 
-DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE"
-SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c dtifit.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c"
-AL_SRCS="allineate.c powell_newuoa.c"
+DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE"
+SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c dtifit.c qc.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c"
+AL_SRCS="allineate.c powell_newuoa.c coreg_fast.c"
 
 build_arch() {
     local target="$1" minver="$2" output="$3"
-    # Compile allineate separately with -ffast-math (scoped)
-    gcc -O3 -ffast-math -fno-finite-math-only ${DFLAGS} -target "$target" -mmacosx-version-min="$minver" -c ${AL_SRCS}
-    # Compile everything else without -ffast-math, link allineate objects
-    gcc -sectcreate TEXT info_plist Info.plist -O3 ${DFLAGS} ${SRCS} allineate.o powell_newuoa.o -lm -lz -target "$target" -mmacosx-version-min="$minver" -o "$output"
-    rm -f allineate.o powell_newuoa.o
+    # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
+    # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
+    # (allineate no longer needs a separate scoped compile — everything is fast-math now.)
+    gcc -sectcreate TEXT info_plist Info.plist -O3 -ffast-math -fno-finite-math-only ${DFLAGS} ${SRCS} ${AL_SRCS} -lm -lz -target "$target" -mmacosx-version-min="$minver" -o "$output"
     strip "./$output"
 }
 

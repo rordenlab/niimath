@@ -307,6 +307,7 @@ int nii_dtifit(int argc, char *argv[]) {
 	nim->scl_slope = 1.0f;
 	nim->scl_inter = 0.0f;
 	gzModes gz = GZ_ENVIRONMENT;
+	int save_rc = 0;   /* OR of every write status: a single failed output fails the command */
 
 	// cmin/cmax set viewer display range (cal_min/cal_max); 0,0 lets viewers auto-scale.
 	#define SAVE_SCALAR(buf, suffix, cmin, cmax)           \
@@ -315,7 +316,7 @@ int nii_dtifit(int argc, char *argv[]) {
 			nim->nvox = nvox3D; nim->data = (void *)(buf); \
 			nim->cal_min = (cmin); nim->cal_max = (cmax);  \
 			nim->intent_code = NIFTI_INTENT_NONE;          \
-			nifti_save(nim, suffix, gz);                   \
+			save_rc |= nifti_save(nim, suffix, gz);        \
 		} while (0)
 	// Eigenvector volumes are tagged as RGB vectors (intent_code 2003, matching
 	// FSL dtifit) so viewers like NiiVue render them as directionally-encoded
@@ -327,14 +328,14 @@ int nii_dtifit(int argc, char *argv[]) {
 			nim->nvox = nvox3D * 3; nim->data = (void *)(buf); \
 			nim->cal_min = -1; nim->cal_max = 1;           \
 			nim->intent_code = NIFTI_INTENT_RGB_VECTOR;    \
-			nifti_save(nim, suffix, gz);                   \
+			save_rc |= nifti_save(nim, suffix, gz);        \
 		} while (0)
 
 	// tensor (6 vols, FSL upper-triangle order)
 	nim->ndim = 4; nim->nt = 6; nim->nu = nim->nv = nim->nw = 1;
 	nim->nvox = nvox3D * 6; nim->data = (void *)tensor;
 	nim->cal_min = 0; nim->cal_max = 0;
-	nifti_save(nim, "_tensor", gz);
+	save_rc |= nifti_save(nim, "_tensor", gz);
 
 	SAVE_SCALAR(out + 0 * nvox3D, "_L1", 0, 0);
 	SAVE_SCALAR(out + 1 * nvox3D, "_L2", 0, 0);
@@ -351,6 +352,10 @@ int nii_dtifit(int argc, char *argv[]) {
 	nifti_image_free(nim);
 	free(tensor);
 	free(out);
+	if (save_rc) {
+		fprintf(stderr, "dtifit: one or more of %s_{FA,MD,L1,L2,L3,V1,V2,V3,S0,MO,tensor} failed to write\n", obase);
+		return EXIT_FAILURE;
+	}
 	printf("dtifit: wrote %s_{FA,MD,L1,L2,L3,V1,V2,V3,S0,MO,tensor}\n", obase);
 	return EXIT_SUCCESS;
 }

@@ -26,6 +26,9 @@
 #ifdef HAVE_64BITS
 	#include "core64.h" //all 64-bit functions
 #endif
+#ifdef HAVE_QC
+	#include "qc.h"
+#endif
 #ifdef HAVE_DTIFIT
 	#include "dtifit.h"
 #endif
@@ -76,7 +79,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260703"
+#define kMTHdate "v1.0.20260711"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -340,10 +343,20 @@ int show_help( void ) {
 	printf("                                  -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
 	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                                  -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                                  -master <grid> reslice result onto <grid> (shares base world frame)\n");
+	printf("                                  -cost fast|fastcr fast SPM/FLIRT-inspired 12-DOF engine (fast=Hellinger, fastcr=corr-ratio)\n");
+	printf("                                  -savemat out.json  save the fitted world-space affine as JSON\n");
+	printf("                                  -applymat in.json  reslice onto base with a saved affine (no registration)\n");
+	printf("                                  -com  seed by resetting the origin to the brightness center of mass\n");
+	printf("                                  -sym|-symd|-symb  midsagittal-plane seed (symd de-obliques first; symb auto-competes)\n");
+	printf("                                  -nosagseed  disable the in-MSP rigid seed that -sym runs by default\n");
+	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template)\n");
 	printf("                            default cost: Hellinger; use -source_automask with lpc/lpa\n");
+	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
 	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; default Hellinger cost)\n");
 	printf("                              the mask determines what is removed: >=0.5 keep, <0.5 remove (brain mask keeps brain, face mask removes face)\n");
-	printf("                              opts: same as -allineate [default final: linear]\n");
+	printf("                              opts: -cost/-warp/-interp/-cmass/-source_automask/-dark_automask tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
+	printf("                                    (the -savemat/-applymat/-com/-sym*/-nosagseed/-zoom/-master/-cost fast workflow options are for -allineate only and are rejected here)\n");
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
@@ -417,6 +430,9 @@ int show_help( void ) {
 	printf(" -dogz <sPos> <sNeg>      : as dog, zero-crossing for 2D axial slices\n");
 #ifdef HAVE_DTIFIT
 	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
+#endif
+#ifdef HAVE_QC
+	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv] : MRIQC-style hard-mask QC (CJV, CNR-noair, SNR, WM2MAX, EFC-brain, ICV) to TSV\n");
 #endif
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");
@@ -575,6 +591,10 @@ int main(int argc, char * argv[]) {
 #ifdef HAVE_DTIFIT
 	if (!strcmp(argv[1], "--dtifit"))
 		return nii_dtifit(argc, argv);
+#endif
+#ifdef HAVE_QC
+	if (!strcmp(argv[1], "--qc"))
+		return nii_qc(argc, argv);
 #endif
 
 	int dtCalc = DT_FLOAT32; //data type for calculation

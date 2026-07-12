@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import math
 import os
 import shutil
 import struct
@@ -43,28 +44,285 @@ def require_success(result: subprocess.CompletedProcess[str], label: str) -> Non
         raise AssertionError(f"{label} failed with exit {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
 
-def nifti_header(dims: tuple[int, int, int], datatype: int, bitpix: int) -> bytes:
+def nifti_header(
+    dims: tuple[int, int, int],
+    datatype: int,
+    bitpix: int,
+    offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    xyz_units: int = 2,  # NIFTI_UNITS_MM
+    scale: float = 1.0,  # voxel size in xyz_units (pixdim + sform diagonal)
+) -> bytes:
+    # Defaults (xyz_units=2 mm, scale=1.0) reproduce the historic mm/unit-voxel
+    # header exactly; scale/xyz_units let a fixture describe the SAME physical grid
+    # in metres (scale=0.001, xyz_units=1) or microns to exercise unit normalization.
     hdr = bytearray(348)
     struct.pack_into("<i", hdr, 0, 348)
     struct.pack_into("<8h", hdr, 40, 3, dims[0], dims[1], dims[2], 1, 1, 1, 1)
     struct.pack_into("<h", hdr, 70, datatype)
     struct.pack_into("<h", hdr, 72, bitpix)
-    struct.pack_into("<8f", hdr, 76, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    struct.pack_into("<8f", hdr, 76, 1.0, scale, scale, scale, 0.0, 0.0, 0.0, 0.0)
     struct.pack_into("<f", hdr, 108, 352.0)
     struct.pack_into("<f", hdr, 112, 1.0)
+    hdr[123] = xyz_units
     struct.pack_into("<h", hdr, 252, 3)
     struct.pack_into("<h", hdr, 254, 3)
-    struct.pack_into("<4f", hdr, 280, 1.0, 0.0, 0.0, 0.0)
-    struct.pack_into("<4f", hdr, 296, 0.0, 1.0, 0.0, 0.0)
-    struct.pack_into("<4f", hdr, 312, 0.0, 0.0, 1.0, 0.0)
+    struct.pack_into("<3f", hdr, 268, *offset)
+    struct.pack_into("<4f", hdr, 280, scale, 0.0, 0.0, offset[0])
+    struct.pack_into("<4f", hdr, 296, 0.0, scale, 0.0, offset[1])
+    struct.pack_into("<4f", hdr, 312, 0.0, 0.0, scale, offset[2])
     hdr[344:348] = b"n+1\0"
     return bytes(hdr) + b"\0\0\0\0"
 
 
-def write_uint8_nifti(path: Path, dims: tuple[int, int, int] = (8, 8, 8)) -> None:
+def write_uint8_nifti(
+    path: Path,
+    dims: tuple[int, int, int] = (8, 8, 8),
+    offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
     nvox = dims[0] * dims[1] * dims[2]
     data = bytes((i % 251 for i in range(nvox)))
-    path.write_bytes(nifti_header(dims, datatype=2, bitpix=8) + data)
+    path.write_bytes(nifti_header(dims, datatype=2, bitpix=8, offset=offset) + data)
+
+
+def write_float32_nifti(
+    path: Path,
+    dims: tuple[int, int, int],
+    data: list[float],
+    offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    nvox = dims[0] * dims[1] * dims[2]
+    if len(data) != nvox:
+        raise AssertionError(f"{path}: expected {nvox} values, got {len(data)}")
+    payload = struct.pack(f"<{nvox}f", *data)
+    path.write_bytes(nifti_header(dims, datatype=16, bitpix=32, offset=offset) + payload)
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    rank = fraction * (len(ordered) - 1)
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    return ordered[lo] + (rank - lo) * (ordered[hi] - ordered[lo])
+
+
+def qc_stats(values: list[float]) -> dict[str, float]:
+    n = len(values)
+    mean = sum(values) / n
+    m2 = sum((value - mean) ** 2 for value in values) / n
+    m4 = sum((value - mean) ** 4 for value in values) / n
+    median = percentile(values, 0.5)
+    return {
+        "mean": mean,
+        "stdv": math.sqrt(m2),
+        "median": median,
+        "mad": percentile([abs(value - median) for value in values], 0.5) / 0.6744897501960817,
+        "p05": percentile(values, 0.05),
+        "p95": percentile(values, 0.95),
+        "k": m4 / (m2 * m2) - 3.0,
+        "n": float(n),
+    }
+
+
+def assert_close(actual: float, expected: float, label: str) -> None:
+    if not math.isclose(actual, expected, rel_tol=3e-5, abs_tol=1e-5):
+        raise AssertionError(f"{label}: expected {expected:.12g}, saw {actual:.12g}")
+
+
+def exercise_qc(exe: str, tmp: Path) -> None:
+    dims = (12, 12, 12)
+    t1_values: list[float] = []
+    seg_values: list[int] = []
+    tissues: dict[str, list[float]] = {"csf": [], "gm": [], "wm": []}
+    for index in range(dims[0] * dims[1] * dims[2]):
+        x = index % dims[0]
+        if x < 4:
+            tissue, label, value = "csf", 1, 20.0 + 0.5 * (index % 7)
+        elif x < 8:
+            tissue, label, value = "gm", 2, 80.0 + 0.75 * (index % 11)
+        else:
+            tissue, label, value = "wm", 3, 120.0 + 0.25 * (index % 13)
+        t1_values.append(value)
+        seg_values.append(label)
+        tissues[tissue].append(value)
+
+    t1 = tmp / "qc_t1.nii"
+    seg = tmp / "qc_seg.nii"
+    out = tmp / "qc.tsv"
+    write_float32_nifti(t1, dims, t1_values)
+    seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8) + bytes(seg_values))
+    result = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(out)],
+    )
+    require_success(result, "anatomical QC")
+    rows = out.read_text(encoding="utf-8").splitlines()
+    if len(rows) != 2:
+        raise AssertionError(f"QC TSV should contain two rows, saw {len(rows)}")
+    names = rows[0].split("\t")
+    values = rows[1].split("\t")
+    if len(names) != len(values) or len(set(names)) != len(names):
+        raise AssertionError("QC TSV columns are missing, duplicated, or misaligned")
+    observed = {name: float(value) for name, value in zip(names, values)}
+
+    stats = {name: qc_stats(data) for name, data in tissues.items()}
+    delta = abs(stats["wm"]["median"] - stats["gm"]["median"])
+    expected = {
+        "cjv": (stats["wm"]["mad"] + stats["gm"]["mad"]) / delta,
+        "cnr_noair": delta / math.sqrt(stats["wm"]["stdv"] ** 2 + stats["gm"]["stdv"] ** 2),
+        "wm2max": stats["wm"]["median"] / percentile(t1_values, 0.9995),
+    }
+    snrs = {}
+    for tissue in ("csf", "wm", "gm"):
+        n = stats[tissue]["n"]
+        snrs[tissue] = stats[tissue]["median"] / (stats[tissue]["stdv"] * math.sqrt(n / (n - 1.0)))
+        expected[f"snr_{tissue}"] = snrs[tissue]
+    expected["snr_total"] = sum(snrs.values()) / 3.0
+    energy = math.sqrt(sum(value * value for value in t1_values))
+    efc_max = math.sqrt(len(t1_values)) * math.log(1.0 / math.sqrt(len(t1_values)))
+    expected["efc_brain"] = sum((value / energy) * math.log((value + 1e-16) / energy) for value in t1_values) / efc_max
+    for tissue in ("csf", "gm", "wm"):
+        expected[f"icvs_{tissue}"] = 1.0 / 3.0
+        expected[f"vol_{tissue}_mm3"] = float(len(tissues[tissue]))
+        for metric, value in stats[tissue].items():
+            expected[f"summary_{tissue}_{metric}"] = value
+    if set(observed) != set(expected):
+        raise AssertionError(f"QC TSV schema mismatch: expected {sorted(expected)}, saw {sorted(observed)}")
+    for name, value in expected.items():
+        assert_close(observed[name], value, f"QC {name}")
+
+    # Exercise the DEFAULT six-neighbour erosion path (the run above uses --erode 0).
+    # Each tissue is a full 4-wide x-slab, so erosion keeps only its interior:
+    # x in {1,2}/{5,6}/{9,10} and y,z in [1,10] -> exactly 2*10*10 = 200 voxels.
+    # ICV fractions and mm3 volumes must still use the RAW 4*12*12 = 576 counts,
+    # so they are identical to the --erode 0 run: this pins the raw-vs-eroded split.
+    eroded_out = tmp / "qc_erode.tsv"
+    eroded_run = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(eroded_out)],
+    )
+    require_success(eroded_run, "anatomical QC (erode)")
+    erows = eroded_out.read_text(encoding="utf-8").splitlines()
+    eobserved = dict(zip(erows[0].split("\t"), (float(v) for v in erows[1].split("\t"))))
+    for tissue in ("csf", "gm", "wm"):
+        if eobserved[f"summary_{tissue}_n"] != 200.0:
+            raise AssertionError(
+                f"QC erosion: summary_{tissue}_n expected 200, saw {eobserved[f'summary_{tissue}_n']:.12g}"
+            )
+        assert_close(eobserved[f"icvs_{tissue}"], 1.0 / 3.0, f"QC erode icvs_{tissue}")
+        assert_close(eobserved[f"vol_{tissue}_mm3"], 576.0, f"QC erode vol_{tissue}_mm3")
+
+    # Unit normalization: a physically identical grid stored in metres (voxel size
+    # 0.001 m, units code 1) must be ACCEPTED against the mm T1 -- max_displacement_mm
+    # normalises both to mm before the grid check, so a unit-code difference alone is
+    # not a mismatch.
+    meter_seg = tmp / "qc_seg_meter.nii"
+    meter_seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8, xyz_units=1, scale=0.001) + bytes(seg_values))
+    require_success(
+        run_niimath(exe, ["--qc", str(t1), "--seg", str(meter_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "meter.tsv")]),
+        "anatomical QC (mm image + same-grid metre segmentation)",
+    )
+    # ...but a genuine 5 mm shift expressed in metres (0.005 m) must still be REJECTED.
+    meter_shift = tmp / "qc_seg_meter_shift.nii"
+    meter_shift.write_bytes(nifti_header(dims, datatype=2, bitpix=8, offset=(0.005, 0.0, 0.0), xyz_units=1, scale=0.001) + bytes(seg_values))
+    shifted_meter = run_niimath(exe, ["--qc", str(t1), "--seg", str(meter_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "meter_shift.tsv")])
+    if shifted_meter.returncode == 0 or "spatial grid differs" not in (shifted_meter.stdout + shifted_meter.stderr):
+        raise AssertionError("QC should reject a 5 mm shift expressed in metre units")
+
+    # Same, for the least-used micron branch (voxel size 1000 um == 1 mm, units code 3).
+    micron_seg = tmp / "qc_seg_micron.nii"
+    micron_seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8, xyz_units=3, scale=1000.0) + bytes(seg_values))
+    require_success(
+        run_niimath(exe, ["--qc", str(t1), "--seg", str(micron_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "micron.tsv")]),
+        "anatomical QC (mm image + same-grid micron segmentation)",
+    )
+    micron_shift = tmp / "qc_seg_micron_shift.nii"
+    micron_shift.write_bytes(nifti_header(dims, datatype=2, bitpix=8, offset=(5000.0, 0.0, 0.0), xyz_units=3, scale=1000.0) + bytes(seg_values))
+    shifted_micron = run_niimath(exe, ["--qc", str(t1), "--seg", str(micron_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "micron_shift.tsv")])
+    if shifted_micron.returncode == 0 or "spatial grid differs" not in (shifted_micron.stdout + shifted_micron.stderr):
+        raise AssertionError("QC should reject a 5 mm shift expressed in micron units")
+
+    # Large exact count: summary_*_n must remain an exact integer above six significant
+    # figures. The old %.6g serializer would have written 1030301 as 1.03030e+06.
+    big_dims = (101, 101, 101)
+    nbig = big_dims[0] * big_dims[1] * big_dims[2]  # 1_030_301 voxels, all CSF
+    big_t1 = tmp / "qc_big_t1.nii"
+    big_seg = tmp / "qc_big_seg.nii"
+    big_t1.write_bytes(nifti_header(big_dims, datatype=16, bitpix=32) + struct.pack("<f", 100.0) * nbig)
+    big_seg.write_bytes(nifti_header(big_dims, datatype=2, bitpix=8) + b"\x03" * nbig)
+    require_success(
+        run_niimath(exe, ["--qc", str(big_t1), "--seg", str(big_seg), "--csf", "3", "--wm", "1", "--erode", "0", "--out", str(tmp / "big.tsv")]),
+        "anatomical QC (large exact count)",
+    )
+    big_rows = (tmp / "big.tsv").read_text(encoding="utf-8").splitlines()
+    big_n = dict(zip(big_rows[0].split("\t"), big_rows[1].split("\t")))["summary_csf_n"]
+    if big_n != str(nbig):
+        raise AssertionError(f"summary_csf_n must be the exact integer {nbig}, saw {big_n!r}")
+
+    # Erosion <QC_MIN_VOX fallback: a two-voxel-thick CSF slab (x in {0,1}) erodes to
+    # zero interior voxels, so its stats must fall back to the raw 2*8*8 = 128 count.
+    fdims = (8, 8, 8)
+    fseg_vals = bytes(
+        (1 if (i % fdims[0]) < 2 else 2 if (i % fdims[0]) < 5 else 3)
+        for i in range(fdims[0] * fdims[1] * fdims[2])
+    )
+    fb_t1 = tmp / "qc_fb_t1.nii"
+    fb_seg = tmp / "qc_fb_seg.nii"
+    fb_t1.write_bytes(nifti_header(fdims, datatype=16, bitpix=32) + b"".join(struct.pack("<f", 40.0 + (i % 7)) for i in range(fdims[0] * fdims[1] * fdims[2])))
+    fb_seg.write_bytes(nifti_header(fdims, datatype=2, bitpix=8) + fseg_vals)
+    fb = run_niimath(exe, ["--qc", str(fb_t1), "--seg", str(fb_seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(tmp / "fb.tsv")])
+    require_success(fb, "anatomical QC (erosion fallback)")
+    if "using un-eroded mask" not in (fb.stdout + fb.stderr):
+        raise AssertionError("QC should report the erosion fallback for a fully-eroded thin tissue")
+    fb_n = dict(zip((tmp / "fb.tsv").read_text().splitlines()[0].split("\t"), (tmp / "fb.tsv").read_text().splitlines()[1].split("\t")))["summary_csf_n"]
+    if fb_n != "128":
+        raise AssertionError(f"erosion fallback: summary_csf_n should be the raw 128, saw {fb_n!r}")
+
+    shifted_seg = tmp / "qc_seg_shifted.nii"
+    shifted_seg.write_bytes(
+        nifti_header(dims, datatype=2, bitpix=8, offset=(0.0, 1.0, 0.0)) + bytes(seg_values)
+    )
+    shifted = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(shifted_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "shifted.tsv")],
+    )
+    if shifted.returncode == 0 or "spatial grid differs" not in (shifted.stdout + shifted.stderr):
+        raise AssertionError("QC should reject a segmentation translated along the y axis")
+
+    fractional_seg = tmp / "qc_seg_fractional.nii"
+    fractional = [float(value) for value in seg_values]
+    fractional[0] = 1.5
+    write_float32_nifti(fractional_seg, dims, fractional)
+    invalid = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(fractional_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "invalid.tsv")],
+    )
+    if invalid.returncode == 0 or "integer labels" not in (invalid.stdout + invalid.stderr):
+        raise AssertionError("QC should reject a non-integer segmentation")
+
+    overlap = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "1", "--out", str(tmp / "overlap.tsv")],
+    )
+    if overlap.returncode == 0 or "both CSF and WM" not in (overlap.stdout + overlap.stderr):
+        raise AssertionError("QC should reject overlapping tissue label sets")
+
+    nonfinite_t1 = tmp / "qc_t1_nan.nii"
+    with_nan = list(t1_values)
+    with_nan[0] = math.nan
+    write_float32_nifti(nonfinite_t1, dims, with_nan)
+    invalid = run_niimath(
+        exe,
+        ["--qc", str(nonfinite_t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "nan.tsv")],
+    )
+    if invalid.returncode == 0 or "non-finite" not in (invalid.stdout + invalid.stderr):
+        raise AssertionError("QC should reject a non-finite T1")
+
+    unwritable = run_niimath(
+        exe,
+        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "missing" / "qc.tsv")],
+    )
+    if unwritable.returncode == 0 or "cannot open output" not in (unwritable.stdout + unwritable.stderr):
+        raise AssertionError("QC should propagate an output-open failure")
 
 
 def write_large_float_gz(path: Path) -> None:
@@ -143,7 +401,7 @@ def main() -> int:
         info = run_niimath(exe, [])
         require_success(info, "help/version")
         help_text = info.stdout + info.stderr
-        for token in ("-conform", "-allineate", "-deface", "--dtifit", "-bitmap", "-bandpass", "-mesh"):
+        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-bandpass", "-mesh"):
             if token not in help_text:
                 raise AssertionError(f"packaged binary help is missing {token}")
         if args.expect_bsd and " BSD " not in help_text:
@@ -168,6 +426,15 @@ def main() -> int:
             raise AssertionError("gzip output does not have a gzip header")
         assert_payload_size(gz_out, datatype=2, bitpix=8, dims=(8, 8, 8))
         require_success(run_niimath(exe, [str(gz_out)]), "read gzip output")
+
+        shifted = tmp / "small_shifted_y.nii"
+        write_uint8_nifti(shifted, offset=(0.0, 1.0, 0.0))
+        orientation = run_niimath(exe, [str(small), "-add", str(shifted), str(tmp / "shift_add.nii")])
+        require_success(orientation, "binary operation with shifted orientation")
+        if "Inconsistent orientations" not in (orientation.stdout + orientation.stderr):
+            raise AssertionError("binary operation failed to detect a y-axis spatial mismatch")
+
+        exercise_qc(exe, tmp)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
