@@ -120,6 +120,12 @@ The coarse random+grid search (`al_scalar_ransetup`, a port of AFNI's `mri_genal
 
 ## Testing & Benchmarking
 
+### Canonical local regression (`make test`)
+```bash
+cd src && make test        # build, then run .github/scripts/release_smoke.py on the fresh binary
+```
+`make test` is the quick, self-contained regression: it builds `niimath` and runs the stdlib-only release smoke test (synthesizes small NIfTI fixtures; exercises gzip read/write, `-conform`/`-gz 0`/`-odt char`, feature dispatch, optional zstd — no external data). Broader coverage lives in the separate `niimath_tests` repo (corner-case/conformance vs a reference) and, for the WASI backend, `bun run test:wasi` in `js/` (needs Zig; see the wasi_shim.c note).
+
 ### Benchmark suite (`benchmark/`)
 ```bash
 cd benchmark

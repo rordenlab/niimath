@@ -141,12 +141,12 @@ def gen_qc():
 
 
 def gen_allineate():
-    # Realistic T1w phantom via the stdlib-only simbrain.py (repo root) instead of a single
-    # Gaussian blob: the fast engine is tuned for real brain resolution/contrast, and on a lone
-    # blob it lands on a neighboring optimum (fast-vs-hel deface agreed to <0.90); on this
-    # multi-tissue head it agrees to ~0.98. tmpl = canonical pose (+ a GM/WM brain mask); mov =
-    # the SAME anatomy under a KNOWN rigid transform (2,-1.5,1 vox; small rotations) with
-    # independent noise, so registration has a ground truth to recover.
+    # Realistic 24-object T1w head via the stdlib-only simbrain.py (same directory) instead of a
+    # single Gaussian blob: the fast engine is tuned for real brain resolution/contrast, and on a
+    # lone blob it lands on a neighboring optimum (fast-vs-hel deface kept-set Dice was <0.90); on
+    # this multi-tissue head it is 0.9991. tmpl = canonical pose (+ a brain mask); mov = the SAME
+    # anatomy under a KNOWN rigid transform (2,-1.5,1 vox; small rotations) with independent noise,
+    # so registration has a ground truth to recover.
     import subprocess, sys
     simbrain = os.path.join(os.path.dirname(os.path.abspath(__file__)), "simbrain.py")
     common = [sys.executable, simbrain, "--dim", "48", "--pixdim", "3", "--dtype", "float32"]

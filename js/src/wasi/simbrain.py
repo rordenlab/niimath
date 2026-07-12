@@ -7,8 +7,9 @@ for the cranium, face, neck, cerebral and cerebellar tissues, ventricles, deep n
 eyes, and airways.  A rigid pose (translation + rotation) can be baked in so a
 moving/template PAIR
 with a KNOWN transform is trivial to generate for registration tests, and the field of
-view can be cropped to a sub-volume to exercise the partial-FOV case (where the fast
-engine's intersection-based cost beats an AFNI-style full-overlap assumption).
+view can be cropped to a sub-volume (``--fov-z``) to generate a partial-FOV moving image.
+(No engine "wins" this small synthetic partial-FOV case — real-data behavior differs;
+this is only a test-fixture generator, not a benchmark.)
 
 Examples
   # template (canonical pose) + a brain mask

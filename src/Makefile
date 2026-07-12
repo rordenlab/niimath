@@ -175,6 +175,16 @@ endif
 all: $(ALOBJS)
 	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
+# Canonical local regression: build, then run the stdlib-only release smoke test
+# (`.github/scripts/release_smoke.py`) against the freshly built binary. It synthesizes small
+# NIfTI fixtures and exercises the packaging-sensitive paths — gzip read/write, -conform/-gz 0/
+# -odt char, feature dispatch, optional zstd — with no external test data. Deeper coverage lives
+# elsewhere: the corner-case/conformance suite in the separate `niimath_tests` repo, and the WASI
+# feature-parity suite via `bun run test:wasi` in ../js (needs Zig).
+.PHONY: test
+test: all
+	python3 ../.github/scripts/release_smoke.py ./niimath
+
 # The prebuilt registration objects are compiled with flags that depend on command-line
 # toggles (OMP=0, GPL=1, CNAME, feature flags), but make keys rebuilds on source timestamps
 # only. Without a flag dependency, `make` then `make OMP=0` reuses the OpenMP-compiled objects
