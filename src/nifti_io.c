@@ -1006,7 +1006,7 @@ int nifti_set_filenames(nifti_image *nim, const char *prefix, int check, int set
 static int nifti_header_version(const char *buf, size_t nbytes)
 {
    nifti_1_header *n1p = (nifti_1_header *)buf;
-   nifti_2_header *n2p = (nifti_2_header *)buf;
+   const char *magic;
    int sizeof_hdr, sver, nver;
 
    if (!buf || nbytes < sizeof(nifti_1_header)) return -1;
@@ -1022,12 +1022,21 @@ static int nifti_header_version(const char *buf, size_t nbytes)
    }
 
    if (sver == 1) {
-      nver = NIFTI_VERSION(*n1p);
+      magic = n1p->magic;
+      nver = (magic[0] == 'n' && magic[3] == '\0' &&
+              (magic[1] == 'i' || magic[1] == '+') &&
+              magic[2] >= '1' && magic[2] <= '9') ? magic[2] - '0' : 0;
       if (nver == 0) return 0;  /* ANALYZE */
       if (nver == 1) return 1;  /* NIFTI-1 */
       return -1;
    } else if (sver == 2) {
-      nver = NIFTI_VERSION(*n2p);
+      /* Only the first NIfTI-1-sized probe has been read at this point. NIfTI-2 magic is at
+         byte 4, so inspect those four bytes directly instead of dereferencing a 540-byte
+         nifti_2_header through a 348-byte object. The caller reads the remainder after this. */
+      magic = buf + 4;
+      nver = (magic[0] == 'n' && magic[3] == '\0' &&
+              (magic[1] == 'i' || magic[1] == '+') &&
+              magic[2] >= '1' && magic[2] <= '9') ? magic[2] - '0' : 0;
       if (nver == 2) return 2;  /* NIFTI-2 */
       return -1;
    }
@@ -1949,10 +1958,21 @@ nifti_image *nifti_image_read(const char *hname, int read_data)
    if (read_data) {
       if (isStdIn) {
          nim->iname = nifti_strdup("-");
-         if (ni_ver != 1) { fprintf(stderr, "piped input only supports NIFTI-1\n"); return NULL; }
+         if (!nim->iname || ni_ver != 1) {
+            if (ni_ver != 1) fprintf(stderr, "piped input only supports NIFTI-1\n");
+            nifti_image_free(nim);
+            return NULL;
+         }
       }
       /* load image data */
-      int64_t ntot = (int64_t)nim->nbyper * nim->nvox;
+      if (nim->nbyper <= 0 || nim->nvox <= 0 ||
+          (uint64_t)nim->nvox > (uint64_t)INT64_MAX / (size_t)nim->nbyper ||
+          (uint64_t)nim->nvox > (uint64_t)SIZE_MAX / (size_t)nim->nbyper) {
+         fprintf(stderr, "** invalid image payload size\n");
+         nifti_image_free(nim);
+         return NULL;
+      }
+      size_t ntot = (size_t)nim->nbyper * (size_t)nim->nvox;
       NIIFILE dfp;
       if (isStdIn) {
          dfp = nii_open("-", "rb", 0);
@@ -1972,16 +1992,16 @@ nifti_image *nifti_image_read(const char *hname, int read_data)
          nim->data = calloc(1, ntot);
          if (!nim->data) { nii_close(&dfp); nifti_image_free(nim); return NULL; }
       }
-      int64_t nread = (int64_t)nii_read(nim->data, 1, ntot, dfp);
+      size_t nread = nii_read(nim->data, 1, ntot, dfp);
       if (nread < ntot) {
-         fprintf(stderr, "++ WARNING: read %" PRId64 " of %" PRId64 " bytes\n", nread, ntot);
+         fprintf(stderr, "++ WARNING: read %zu of %zu bytes\n", nread, ntot);
          nii_close(&dfp); free(nim->data); nim->data = NULL; nifti_image_free(nim); return NULL;
       }
       nii_close(&dfp);
 
       /* byte swap if needed */
       if (nim->swapsize > 1 && nim->byteorder != nifti_short_order())
-         nifti_swap_Nbytes(ntot / nim->swapsize, nim->swapsize, nim->data);
+         nifti_swap_Nbytes((int64_t)(ntot / (size_t)nim->swapsize), nim->swapsize, nim->data);
       nim->byteorder = nifti_short_order();
    } else {
       nim->data = NULL;

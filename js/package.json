@@ -19,9 +19,15 @@
   },
   "scripts": {
     "test": "bun test ./tests",
+    "test:wasi:fixtures": "bun run scripts/wasi-fixtures.ts",
+    "test:wasi": "bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
     "build": "bun run esbuild.config.ts",
     "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
+    "makeWasi": "make wasm-wasi -C ../src",
+    "makeWasmEmccCore": "make wasm-emcc-core -C ../src",
+    "wasiNodeSmoke": "bun run scripts/wasi-node-run.ts",
+    "wasiChromium": "bun run scripts/wasi-chromium.ts",
     "makeWasmGpl": "git submodule update --init ../src/GPL && make wasm GPL=1 WASM_OUT=../js/src/niimath-gpl.js -C ../src && bun run scripts/pre-build.ts -i src/niimath-gpl.js -o src/niimath-gpl.js",
     "parseHelpText": "bun run scripts/parseNiimathHelp.ts",
     "generateTypes": "bun run scripts/generateTypeDefinitions.ts",
@@ -50,6 +56,7 @@
   "devDependencies": {
     "@types/bun": "^1.3.0",
     "esbuild": "^0.23.1",
+    "playwright": "^1.61.1",
     "typescript": "^5.7.2"
   }
 }

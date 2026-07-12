@@ -7,7 +7,7 @@
 It is said that `imitation is the sincerest form of flattery`. This project emulates the popular [fslmaths](https://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/intro3/index.html) tool. fslmaths is a `general image calculator` and is not only one of the foundational tools for FSL's brain imaging pipelines (such as [FEAT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FEAT)), but has also been widely adopted by many tools. This popularity suggests that it fulfills an important niche. While scientists are often encouraged to discover novel solutions, it sometimes seems that replication is undervalued. Here are some specific reasons for creating this tool:
 
 1. While fslmaths is provided without charge, it is not [open source](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/Licence). This limits its inclusion in other projects, in particular for commercial exploitation.
-2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, the CloudFlare zlib provides dramatically faster performance than the public domain library used by fslmaths. n.b. Subsequently, we helped update [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) that allows recent FSL releases to use this library,  improving the speed for all FSL tools.
+2. Using an open source license allows niimath to build with open source libraries that the FSL team can not use. Specifically, an accelerated zlib ([zlib-ng](https://github.com/zlib-ng/zlib-ng), the release baseline) provides dramatically faster performance than the public domain library used by fslmaths. n.b. We previously helped update the [CloudFlare zlib](https://github.com/cloudflare/zlib/pull/19) fork that allows recent FSL releases to use an accelerated library, improving the speed for all FSL tools; niimath's releases now default to zlib-ng, which is also fast on arm64 and correct on Windows.
 3. Minimal dependencies allow easy distribution, compilation and development. For example, it can be compiled for MacOS, Linux and Windows (fsl can not target Windows).
 4. Designed from ground up to optionally use parallel processing (OpenMP and CloudFlare-enhanced [pigz](https://github.com/madler/pigz)).
 5. Most programs are developed organically, with new features added as need arises. Cloning an existing tool provides a full specification, which can lead to optimization. niimath uses explicit single and double precision pipelines that allow the compiler to better use advanced instructions (every x86_64 CPU provides SSE, but high level code has trouble optimizing these routines). The result is that modern compilers are able to create operations that are limited by memory bandwidth, obviating the need for [hand tuning](https://github.com/neurolabusc/simd) the code.
@@ -68,13 +68,15 @@ The default build includes OpenMP for all operations. On macOS this requires `br
 
 ```
 OMP=0 make             # Disable OpenMP
-CF=1 make              # CloudFlare accelerated zlib
+# zlib: CMake release builds default to zlib-ng (ZLIB_IMPLEMENTATION); plain make uses system -lz
 make debug             # Debug build (-g, no optimization)
 make ubsan             # Lightweight undefined-behavior checks (OpenMP-safe on macOS)
 make sanitize          # AddressSanitizer build
 AL=0 make              # Disable allineate registration
 ZSTD=0 make            # Disable zstd compression support
 make wasm              # Emscripten/WebAssembly target
+make wasm-wasi         # Experimental zlib-free WASI compute backend (needs Zig)
+make wasm-emcc-core    # Feature-matched zlib-free Emscripten build (WASI benchmark baseline)
 ```
 
 You can also compile this project to Web Assembly so it can be embedded in a web page, as shown in the [live demo](https://niivue.github.io/niivue-niimath/).
@@ -240,6 +242,8 @@ Here are the same testson a desktop computer with twelve cores (24 threads, Ryze
 | fslmaths rest -Tmean -mul -1 -add rest out : 32 (186)  | 1.7x (2.5x)   | 1.8x (7.6x)   |
 |  niimath rest -demean out (same output as above)       | 2.6x (2.6x)   | 3.0x (10.8x)  |
 | fslmaths rest -bptf 77 8.68 out : 887 (1019)           | 2.6x (2.5x)   | 23x (23.0x)   |
+
+Gaussian smoothing (`-s`/`-dog`/`unsharp`) uses a contiguous vectorizable kernel in every build (native, WASM, and the shared registration pyramid). Neighborhood mean, minimum, maximum, and erosion filters keep their local gathers but evaluate adjacent interior outputs in SIMD lanes, avoiding the non-finite propagation errors of separable running-sum and deque filters.
 
 ## Converting voxelwise images to a triangulated mesh
 
