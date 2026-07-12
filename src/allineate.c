@@ -55,6 +55,7 @@ static int al_mul_size(size_t a, size_t b, size_t *out)
 
 #include "nifti_io.h"
 #include "allineate.h"
+#include "coreg_fast.h"   /* fast SPM/FLIRT-inspired engine, shared by -allineate and -deface */
 
 /* Thread-local storage qualifier for OpenMP safety */
 #ifdef _OPENMP
@@ -4759,7 +4760,12 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
     int match_code;
     const char *cost_name;
     al_resolve_cost(opts.cost, &match_code, &cost_name);
-    fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, cost_name);
+
+    /* Default: linear for mask warping (cubic can ring). Out-of-FOV -> 0 so
+     * anything the mask does not cover is treated as "remove". */
+    int mask_interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_LINEAR : opts.final_interp;
+    const char *minterp_name = mask_interp == AL_INTERP_NN ? "NN" :
+                               mask_interp == AL_INTERP_CUBIC ? "cubic" : "linear";
 
     /* Register the SUBJECT (moving) to the TEMPLATE (fixed) — the well-posed
      * direction, identical to -allineate. It is robust because the template is
@@ -4768,37 +4774,60 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
      * poorly and mislocates the mask, because the subject's neck/shoulders/FOV
      * dominate the cost. We then INVERT the transform to pull the template-space
      * mask back onto the subject's native grid (so brain voxels are never
-     * interpolated — the subject stays in its own space). */
-    float wpar[12];
-    int ok = al_register(input, tmpl, match_code, opts.cmass,
-                         opts.source_automask, opts.dark_automask, 0 /*relax_scale*/,
-                         opts.interp, opts.warp, wpar, NULL);
-    if (ok) {
-        fprintf(stderr, "%s: registration failed\n", label);
-        return 1;
+     * interpolated — the subject stays in its own space). Both engines reslice
+     * the mask onto input's grid IN PLACE (mask->data becomes float on the input
+     * lattice), then the common nii_apply_deface_mask() below zeros the masked
+     * voxels. */
+    if (opts.fast) {
+        /* Fast SPM/FLIRT-inspired engine (default for -deface). coreg_fast_estimate
+         * returns the world-mm FIXED(template)->MOVING(subject) transform WITHOUT
+         * mutating inputs; INVERT it to pull the template-space mask onto the subject
+         * grid (nii_apply_affine consumes a world FIXED->MOVING affine and reslices its
+         * first arg — here the mask, treated as the FIXED-space image — onto the second
+         * arg's grid, so the inverse is the moving->fixed direction it needs). */
+        coreg_fast_opts cfo = coreg_fast_opts_default();
+        cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+        /* -nocmass forces the supplied affine; otherwise auto-select (the fast engine
+         * scores the supplied-affine and COM starts and keeps the better one). -deface
+         * exposes no -com seed, so there is no recentered-header case here. */
+        cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+        const char *fname = (opts.fast == AL_ENGINE_FAST_HEL) ? "fast (Hellinger)"
+                                                              : "fast (correlation-ratio)";
+        fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, fname);
+        coreg_fast_result res;
+        if (coreg_fast_estimate(input, tmpl, &cfo, &res)) {
+            fprintf(stderr, "%s: fast registration failed\n", label);
+            return 1;
+        }
+        fprintf(stderr, " + Warping mask to input space (%s interpolation)\n", minterp_name);
+        if (nii_apply_affine(mask, input, nifti_mat44_inverse(res.fixed_to_moving), mask_interp, 0.0f)) {
+            fprintf(stderr, "%s: failed to warp mask\n", label);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, cost_name);
+        float wpar[12];
+        int ok = al_register(input, tmpl, match_code, opts.cmass,
+                             opts.source_automask, opts.dark_automask, 0 /*relax_scale*/,
+                             opts.interp, opts.warp, wpar, NULL);
+        if (ok) {
+            fprintf(stderr, "%s: registration failed\n", label);
+            return 1;
+        }
+        /* gam maps template(base) voxels -> subject(source) voxels; invert to get
+         * subject -> template, the pull-warp that resamples the mask onto the input
+         * grid. nifti_mat44_inverse handles the translation/origin offset. */
+        mat44 gam = GA_setup_affine(12, wpar);
+        mat44 gam_inv = nifti_mat44_inverse(gam);
+        fprintf(stderr, " + Warping mask to input space (%s interpolation)\n", minterp_name);
+        if (nii_reslice_affine(mask, input, gam_inv, mask_interp, 0.0f)) {
+            fprintf(stderr, "%s: failed to warp mask\n", label);
+            return 1;
+        }
     }
 
     int inx = input->nx, iny = input->ny, inz = input->nz;
     int nvox = inx * iny * inz;
-
-    /* gam maps template(base) voxels -> subject(source) voxels; invert to get
-     * subject -> template, the pull-warp that resamples the mask onto the input
-     * grid. nifti_mat44_inverse handles the translation/origin offset. */
-    mat44 gam = GA_setup_affine(12, wpar);
-    mat44 gam_inv = nifti_mat44_inverse(gam);
-
-    /* Default: linear for mask warping (cubic can ring). Reuse the modular BSD
-     * reslicer (shared with -spm_coreg): it resamples the mask onto input's grid
-     * in place (mask->data becomes float on the input lattice). Out-of-FOV -> 0
-     * so anything the mask does not cover is treated as "remove". */
-    int mask_interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_LINEAR : opts.final_interp;
-    const char *minterp_name = mask_interp == AL_INTERP_NN ? "NN" :
-                               mask_interp == AL_INTERP_CUBIC ? "cubic" : "linear";
-    fprintf(stderr, " + Warping mask to input space (%s interpolation)\n", minterp_name);
-    if (nii_reslice_affine(mask, input, gam_inv, mask_interp, 0.0f)) {
-        fprintf(stderr, "%s: failed to warp mask\n", label);
-        return 1;
-    }
 
     long nmasked = nii_apply_deface_mask(input, (const float *)mask->data);
     if (nmasked < 0) return 1;

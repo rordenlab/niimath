@@ -353,10 +353,11 @@ int show_help( void ) {
 	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template)\n");
 	printf("                            default cost: fast (no -cost == -cost fast); use -source_automask with lpc/lpa\n");
 	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
-	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; default Hellinger cost)\n");
+	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; fast engine by default)\n");
 	printf("                              the mask determines what is removed: >=0.5 keep, <0.5 remove (brain mask keeps brain, face mask removes face)\n");
-	printf("                              opts: -cost/-warp/-interp/-cmass/-source_automask/-dark_automask tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
-	printf("                                    (the -savemat/-applymat/-com/-sym*/-nosagseed/-zoom/-master/-cost fast workflow options are for -allineate only and are rejected here)\n");
+	printf("                              opts: -cost XX (fast [default], fastcr, hel, lpc, lpa, ls) -cmass -nocmass tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
+	printf("                                    (fast is SPM/FLIRT-inspired; -cost hel is AFNI-style. -warp/-interp/-source_automask/-dark_automask need -cost hel)\n");
+	printf("                                    (the -savemat/-applymat/-com/-sym*/-nosagseed/-zoom/-master workflow options are for -allineate only and are rejected here)\n");
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");

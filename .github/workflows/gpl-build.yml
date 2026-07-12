@@ -136,9 +136,19 @@ jobs:
           # engine (which prints "Cost function: Hellinger ... (12 DOF)"), not the fast one.
           src/niimath /tmp/big.nii.gz -allineate /tmp/bigref.nii.gz -cost fast -cost hel /tmp/low.nii.gz 2>low.txt
           grep -qi 'Cost function: Hellinger' low.txt || { echo '-cost fast -cost hel should run the normal Hellinger engine'; exit 1; }
-          # -deface does not support the fast engine or -master: reject, do not no-op.
-          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast /tmp/dfj.nii.gz >/dev/null 2>df1.txt; then
-            echo '-deface -cost fast should be rejected'; exit 1; fi
+          # -deface now supports the fast engine, which is its DEFAULT cost. A bare -deface
+          # runs "fast (Hellinger)"; -cost hel selects the ordinary AFNI-style engine.
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz /tmp/dfdef.nii.gz 2>dfdef.txt
+          grep -qi 'using fast' dfdef.txt || { echo 'bare -deface should default to the fast engine'; cat dfdef.txt; exit 1; }
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast /tmp/dfj.nii.gz 2>dfj.txt
+          test -s /tmp/dfj.nii.gz
+          grep -qi 'using fast' dfj.txt || { echo '-deface -cost fast should run the fast engine'; cat dfj.txt; exit 1; }
+          src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost hel /tmp/dfhel.nii.gz 2>dfhel.txt
+          grep -qi 'using Hellinger' dfhel.txt || { echo '-deface -cost hel should run the ordinary engine'; cat dfhel.txt; exit 1; }
+          # Fast cannot honor -warp/-interp/-source_automask/-dark_automask: reject, do not no-op.
+          if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -cost fast -source_automask /tmp/dfj3.nii.gz >/dev/null 2>df3.txt; then
+            echo '-deface -cost fast -source_automask should be rejected'; exit 1; fi
+          # -deface still rejects -master (no output-grid override for a privacy command).
           if src/niimath /tmp/src.nii.gz -deface /tmp/ref.nii.gz /tmp/mask.nii.gz -master /tmp/ref.nii.gz /tmp/dfj2.nii.gz >/dev/null 2>df2.txt; then
             echo '-deface -master should be rejected'; exit 1; fi
 

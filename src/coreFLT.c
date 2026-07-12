@@ -6403,10 +6403,11 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 
 staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
-	/* -deface uses the ordinary Hellinger allineate engine and reslices the mask onto the
-	   subject's native grid. The fast engine, -master, and the seed/matrix workflow options
-	   are rejected at PARSE time (the -deface dispatch passes AL_CAP_TUNING|AL_CAP_FINAL to
-	   al_parse_subopts), so they cannot reach here — no post-hoc guard needed. */
+	/* -deface registers the subject to the template (fast engine by default, or the ordinary
+	   Hellinger engine with -cost hel) and reslices the mask onto the subject's native grid.
+	   -master and the seed/matrix workflow options are rejected at PARSE time (the dispatch
+	   passes AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST to al_parse_subopts), so they cannot reach
+	   here — no post-hoc guard needed. */
 	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
 	if (!tmpl) {
 		printfx("** failed to read template image from '%s'\n", tmplfile);
@@ -7106,10 +7107,23 @@ int main64(int argc, char *argv[]) {
 			}
 			char *tmpl_file = argv[ac]; ac++;
 			char *mask_file = argv[ac];
-			/* -deface implements only cost/warp/interp/cmass/automask tuning + final interp;
-			   the seed/matrix/master/fast workflow options are rejected at parse time. */
-			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd, AL_CAP_TUNING | AL_CAP_FINAL))
+			/* -deface implements cost tuning + final interp AND the fast engine; the
+			   seed/matrix/master workflow options are rejected at parse time. Fast is the
+			   DEFAULT cost (as for -allineate): a bare -deface runs the fast engine; -cost
+			   hel/lpc/lpa/ls selects the ordinary AFNI-style engine. */
+			if (al_parse_subopts(&ac, argc, argv, &df_opts, cmd, AL_CAP_TUNING | AL_CAP_FINAL | AL_CAP_FAST))
 				goto fail;
+			/* Fast cannot honor -warp/-interp/-source_automask/-dark_automask. If any is
+			   present WITHOUT an explicit -cost fast, stay on the ordinary engine; if -cost
+			   fast was explicit, reject (a privacy command must not silently drop tuning). */
+			int df_fast_incompat = df_opts.source_automask || df_opts.dark_automask ||
+			                       (df_opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
+			if (!df_opts.fast && !(df_opts.cli_set & AL_CLI_COST) && !df_fast_incompat)
+				df_opts.fast = AL_ENGINE_FAST_HEL;
+			if (df_opts.fast && df_fast_incompat) {
+				printfx("** -deface -cost fast/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
+				goto fail;
+			}
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
 #endif
