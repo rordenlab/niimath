@@ -31,9 +31,9 @@ for path, data in vols.items():
     nib.save(img, path)
     print("wrote", path, data.shape)
 
-# 4D fixture for the dimension-rejection regression: registration/defacing are
-# 3D-only, and a 4D input must fail closed (not silently use volume 0 or write a
-# corrupt header). See the "4D inputs are rejected" CI step.
+# 4D fixture for two CI steps: DEFACING must fail closed on 4D (privacy — never silently
+# deface only volume 0), while -allineate auto-crops a 4D subject to volume 0 (== -crop 0 1)
+# and succeeds. See the "4D DEFACING is rejected" and "4D -allineate auto-crops" CI steps.
 src3d = vols["/tmp/src.nii.gz"]
 src4d = np.stack([src3d, src3d], axis=-1)            # (24, 24, 24, 2)
 img4d = nib.Nifti1Image(src4d, aff)

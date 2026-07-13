@@ -89,12 +89,24 @@ def write_float32_nifti(
     dims: tuple[int, int, int],
     data: list[float],
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    nt: int = 1,
 ) -> None:
-    nvox = dims[0] * dims[1] * dims[2]
+    nvox = dims[0] * dims[1] * dims[2] * nt
     if len(data) != nvox:
         raise AssertionError(f"{path}: expected {nvox} values, got {len(data)}")
     payload = struct.pack(f"<{nvox}f", *data)
-    path.write_bytes(nifti_header(dims, datatype=16, bitpix=32, offset=offset) + payload)
+    header = bytearray(nifti_header(dims, datatype=16, bitpix=32, offset=offset))
+    if nt > 1:
+        struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
+    path.write_bytes(bytes(header) + payload)
+
+
+def read_float32_nifti(path: Path) -> list[float]:
+    blob = path.read_bytes()
+    dim = struct.unpack_from("<8h", blob, 40)
+    nvox = math.prod(dim[1 : dim[0] + 1])
+    offset = int(struct.unpack_from("<f", blob, 108)[0])
+    return list(struct.unpack_from(f"<{nvox}f", blob, offset))
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -420,6 +432,184 @@ def main() -> int:
 
         small = tmp / "small.nii"
         write_uint8_nifti(small)
+
+        # Unsafe huge work must be rejected from the header, before any multi-gigabyte payload
+        # allocation. The deliberately header-only file has 3,220,029,867 voxels.
+        huge_header = tmp / "huge_header_only.nii"
+        huge_header.write_bytes(nifti_header((32767, 32767, 3), datatype=16, bitpix=32))
+        huge_reject = run_niimath(exe, [str(huge_header), "-fmean", str(tmp / "huge_reject.nii")])
+        if huge_reject.returncode != 2 or "not huge-image capable" not in (huge_reject.stdout + huge_reject.stderr):
+            raise AssertionError("unsafe huge input was not rejected by header preflight")
+
+        # Dispatch accepts exact operator names only; formerly these substring variants ran a
+        # different operation and made the huge-safe admission grammar diverge from dispatch.
+        disguised_ops = [
+            ["x-otsu"],
+            ["-dogjunk", "1", "2"],
+            ["-Tmeanjunk"],
+        ]
+        for disguised in disguised_ops:
+            rejected = run_niimath(exe, [str(small), *disguised, str(tmp / "disguised.nii")])
+            message = rejected.stdout + rejected.stderr
+            rejected_exactly = any(
+                text in message for text in ("unsupported operation", "unknown dimensionality reduction operation")
+            )
+            if rejected.returncode == 0 or not rejected_exactly:
+                raise AssertionError(f"substring operator should be rejected: {disguised[0]}")
+
+        for exact, label in ((["-otsu", "2"], "otsu"), (["-dog", "1", "2"], "dog"), (["-Tmean"], "Tmean")):
+            require_success(
+                run_niimath(exe, [str(small), *exact, str(tmp / f"exact_{label}.nii")]),
+                f"exact {label} dispatch",
+            )
+
+        # reslice is 3D-only. This exact failure path previously continued after reslice() failed
+        # and read a second volume past the 3D mask buffer; sanitizer/guard-page runs of this smoke
+        # turn the clean rejection into a focused memory-safety regression.
+        reslice_4d = tmp / "reslice_mask_4d.nii"
+        reslice_mask = tmp / "reslice_mask_3d.nii"
+        write_float32_nifti(reslice_4d, (16, 16, 4), [float(i % 13) for i in range(2048)], nt=2)
+        write_float32_nifti(reslice_mask, (16, 16, 4), [1.0] * 1024)
+        reslice_reject = run_niimath(
+            exe,
+            [str(reslice_4d), "-reslice_mask", str(reslice_mask), str(tmp / "reslice_mask_4d_out.nii")],
+        )
+        if reslice_reject.returncode == 0 or "only for 3D data not 4D time series" not in (
+            reslice_reject.stdout + reslice_reject.stderr
+        ):
+            raise AssertionError("4D -reslice_mask input should fail cleanly before applying the 3D mask")
+
+        missing_operand = run_niimath(
+            exe,
+            [str(small), "-add", str(tmp / "missing_operand.nii"), str(tmp / "missing_out.nii")],
+        )
+        if missing_operand.returncode == 0 or "failed to read NIfTI image" not in (
+            missing_operand.stdout + missing_operand.stderr
+        ):
+            raise AssertionError("missing binary operand should fail cleanly")
+
+        # FSL assumes a representable robust range. Opposite finite extrema used to reach an
+        # undefined NaN-to-int histogram cast; keep the FSL-style operator arithmetic and only
+        # require that the commands complete without UB (the UBSan build runs this same smoke).
+        flt_max = 3.4028234663852886e38
+        extrema = tmp / "extrema.nii"
+        write_float32_nifti(extrema, (8, 4, 4), [flt_max if i % 2 == 0 else -flt_max for i in range(128)])
+        for case_index, pct_op in enumerate(
+            (["-thrp", "2"], ["-thrP", "2"], ["-uthrp", "90"], ["-uthrP", "90"],
+             ["-clamp", "25"], ["-uclamp", "75"])
+        ):
+            require_success(
+                run_niimath(exe, [str(extrema), *pct_op, str(tmp / f"extrema_{case_index}.nii")]),
+                f"robust-range {pct_op[0]} on finite extrema",
+            )
+
+        # Otsu is a niimath extension. Its histogram cannot represent this span, so reject it
+        # explicitly instead of inventing normalized semantics or performing a NaN-to-int cast.
+        otsu_extreme = run_niimath(exe, [str(extrema), "-otsu", "2", str(tmp / "otsu_extreme.nii")])
+        if otsu_extreme.returncode == 0 or "representable intensity range" not in (
+            otsu_extreme.stdout + otsu_extreme.stderr
+        ):
+            raise AssertionError("Otsu should reject an unrepresentable finite intensity span")
+
+        # FSL defines capital-P thresholds over POSITIVE voxels, not all nonzero voxels.
+        # With only 85 positive samples the robust range is exactly 10..20, hence 50% is 15.
+        positive_range = tmp / "positive_range.nii"
+        positive_values = [(-100.0, 10.0, 20.0)[i % 3] for i in range(128)]
+        write_float32_nifti(positive_range, (8, 4, 4), positive_values)
+        for op, keep in (
+            ("-thrP", lambda value: value if value >= 15.0 else 0.0),
+            ("-uthrP", lambda value: value if value <= 15.0 else 0.0),
+        ):
+            positive_out = tmp / f"positive_{op[1:]}.nii"
+            require_success(
+                run_niimath(exe, [str(positive_range), op, "50", "-gz", "0", str(positive_out)]),
+                f"{op} positive-voxel range",
+            )
+            expected = [keep(value) for value in positive_values]
+            if read_float32_nifti(positive_out) != expected:
+                raise AssertionError(f"{op} must derive its robust range from positive voxels")
+
+        # The case above has <100 positive samples, so it takes the endpoint shortcut. Exercise the
+        # 1000-BIN HISTOGRAM path with 180 positive samples (60 each of 10/30/50) + negatives. With
+        # well-separated discrete values the robust range is 10..50, so -uthrP 60 thresholds at ~34:
+        # the 50s are zeroed, the 30s/10s/negatives survive. (niimath's 1000-bin robust range is an
+        # approximation of FSL's iterative refinement; they can differ by a few voxels ONLY when
+        # samples land exactly on a bin cutoff — discrete inputs like this are exact.)
+        hist_range = tmp / "hist_range.nii"
+        hist_values = [(10.0, 30.0, 50.0)[i // 60] if i < 180 else -100.0 for i in range(256)]
+        write_float32_nifti(hist_range, (8, 8, 4), hist_values)
+        hist_out = tmp / "hist_uthrP.nii"
+        require_success(
+            run_niimath(exe, [str(hist_range), "-uthrP", "60", "-gz", "0", str(hist_out)]),
+            "-uthrP over the 1000-bin histogram path",
+        )
+        hist_expected = [v if v <= 30.0 else 0.0 for v in hist_values]
+        if read_float32_nifti(hist_out) != hist_expected:
+            raise AssertionError("-uthrP histogram path did not threshold the positive robust range")
+
+        # Exercise conversion-only parsing without making CI reserve the 12.9 GB payload declared
+        # by huge_header. FORCE/tiny and the opt-in huge suite cover the size boundary itself.
+        require_success(
+            run_niimath(exe, [str(small), str(tmp / "conv_only.nii"), "-odt", "float"]),
+            "conversion-only trailing -odt",
+        )
+
+        # RGB/RGBA is admitted by its EFFECTIVE scalar count (x3/x4 after expansion): a packed image
+        # at/below INT_MAX that expands above it must reject an unsafe op before allocating gigabytes.
+        rgb_header = tmp / "rgb_header_only.nii"  # 838,860,800 packed voxels -> 2.5e9 scalar (>INT_MAX)
+        rgb_bytes = bytearray(nifti_header((1024, 1024, 800), datatype=128, bitpix=24))
+        struct.pack_into("<h", rgb_bytes, 70, 128)  # DT_RGB24
+        struct.pack_into("<h", rgb_bytes, 72, 24)
+        rgb_header.write_bytes(bytes(rgb_bytes))
+        rgb_reject = run_niimath(exe, [str(rgb_header), "-fmean", str(tmp / "rgb_reject.nii")])
+        if rgb_reject.returncode != 2 or "not huge-image capable" not in (rgb_reject.stdout + rgb_reject.stderr):
+            raise AssertionError("huge-after-RGB-expansion input was not rejected before allocation")
+
+        # -roc must convert its truth/noise auxiliaries with their own header (a uint8 truth was
+        # previously reinterpreted byte-for-byte as float32 — an out-of-bounds read) and exit 0.
+        roc_obs = tmp / "roc_obs.nii"
+        roc_truth = tmp / "roc_truth.nii"
+        rdim = (16, 16, 16)
+        obs_vals, truth_vals = [], []
+        for z in range(16):
+            for y in range(16):
+                for x in range(16):
+                    sig = 1 if (6 <= x < 10 and 6 <= y < 10 and 6 <= z < 10) else 0
+                    truth_vals.append(sig)
+                    obs_vals.append(5.0 if sig else float((x + y + z) % 3))
+        write_float32_nifti(roc_obs, rdim, obs_vals)
+        roc_truth.write_bytes(nifti_header(rdim, datatype=2, bitpix=8) + bytes(truth_vals))  # uint8 truth
+        roc = run_niimath(exe, [str(roc_obs), "-roc", "-0.1", str(tmp / "roc.txt"), str(roc_truth), str(tmp / "roc_out.nii")])
+        require_success(roc, "-roc with uint8 truth")
+        roc_text = (tmp / "roc.txt").read_text()
+        if "nan" in roc_text.lower() or "inf" in roc_text.lower():
+            raise AssertionError("-roc produced non-finite output (datatype/validation defect)")
+
+        # Positive-threshold ROC: noise rank `i` must never index the observed array `k`. Use only
+        # two included truth voxels but ten noise volumes, so nvol > nTest deterministically.
+        ndims = (12, 12, 12)
+        nn3 = math.prod(ndims)
+        noise_obs = tmp / "roc_noise_obs.nii"
+        noise_truth = tmp / "roc_noise_truth.nii"
+        noise_stack = tmp / "roc_noise_stack.nii"
+        write_float32_nifti(noise_obs, ndims, [float(i % 17) for i in range(nn3)])
+        truth = [-1.0] * nn3
+        truth[5 + 12 * (5 + 12 * 5)] = 0.0
+        truth[6 + 12 * (5 + 12 * 5)] = 1.0
+        write_float32_nifti(noise_truth, ndims, truth)
+        noise_hdr = bytearray(nifti_header(ndims, datatype=2, bitpix=8))
+        struct.pack_into("<8h", noise_hdr, 40, 4, 12, 12, 12, 10, 1, 1, 1)
+        noise_stack.write_bytes(bytes(noise_hdr) + bytes((i % 251 for i in range(nn3 * 10))))
+        roc_noise = run_niimath(
+            exe,
+            [str(noise_obs), "-roc", "0.1", str(tmp / "roc_noise.txt"), str(noise_stack),
+             str(noise_truth), str(tmp / "roc_noise_out.nii")],
+        )
+        require_success(roc_noise, "positive -roc with nvol > nTest")
+        noise_text = (tmp / "roc_noise.txt").read_text().lower()
+        if "nan" in noise_text or "inf" in noise_text:
+            raise AssertionError("positive -roc produced non-finite output")
+
         gz_out = tmp / "roundtrip.nii.gz"
         require_success(run_niimath(exe, [str(small), "-add", "1", "-gz", "1", str(gz_out), "-odt", "char"]), "gzip round-trip write")
         if gz_out.read_bytes()[:2] != b"\x1f\x8b":

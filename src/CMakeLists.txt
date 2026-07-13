@@ -32,6 +32,13 @@ if(NOT BUILD_FLAVOR)
     set_property(CACHE BUILD_FLAVOR PROPERTY STRINGS  "all;tiny;nano")
 endif()
 
+# A 32-bit address space cannot hold a >INT_MAX scalar image. Keep CMake builds aligned with
+# wasm/WASI and the Makefile tiny target; BUILD_FLAVOR=tiny intentionally emulates that limit even
+# on a 64-bit development host.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR BUILD_FLAVOR STREQUAL "tiny")
+    ADD_DEFINITIONS(-DFORCE_INT32_MAX)
+endif()
+
 if(${BUILD_FLAVOR} STREQUAL "all")
     ADD_DEFINITIONS(-DHAVE_64BITS)
     set(ADDITIONAL_SRCS core64.c)
@@ -50,9 +57,6 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
-    ADD_DEFINITIONS(-DHAVE_CONFORM)
-    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c)
-    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} unifize.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
     if(ENABLE_ALLINEATE)
         ADD_DEFINITIONS(-DHAVE_ALLINEATE)
@@ -98,6 +102,12 @@ elseif(${BUILD_FLAVOR} STREQUAL "tiny")
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} MarchingCubes.c)
     endif()
 endif()
+
+# conform/RAS and unifize ship in every Makefile flavor. Bitmap dispatch also uses the RAS helper,
+# so keep these common sources outside the flavor branches instead of leaving tiny/nano with an
+# enabled -bitmap command that cannot compile.
+ADD_DEFINITIONS(-DHAVE_CONFORM)
+set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c unifize.c)
 
 # One OpenMP switch for every compiler: `cmake -DUSE_OPENMP=OFF ..` builds single-threaded
 # (needed for predictable serial diagnostics and Make/CMake parity). Default ON. The legacy

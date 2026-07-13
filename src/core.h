@@ -7,10 +7,34 @@ extern "C" {
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "nifti_io.h"
 #include <float.h> //FLT_EPSILON
 //#include <immintrin.h>
 #include <limits.h>
+
+/* Voxel COUNT and INDEX type. Signed on purpose: neighborhood/morphology/kernel math
+   produces negative intermediates (i-k, koff, reverse loops) that would wrap on an
+   unsigned size_t. Default int64 lifts the INT_MAX voxel-count limit so the core
+   calculator can process images with > INT_MAX voxels (issue #67). Build with
+   -DFORCE_INT32_MAX (wasm/32-bit targets: a > 4 GB image cannot be held there anyway)
+   to keep the narrower/faster int32 index and the historical > INT_MAX reject.
+   size_t remains appropriate for byte-size allocation and established forward-only
+   pointer loops; use nvox_t where signed offsets or a canonical wide count are needed. */
+#ifdef FORCE_INT32_MAX
+typedef int32_t nvox_t;
+#define NVOX_MAX INT32_MAX
+#else
+typedef int64_t nvox_t;
+#define NVOX_MAX INT64_MAX
+#endif
+/* printf an nvox_t as: printf("%lld", (long long)v) */
+
+typedef enum {
+    NII_NVOX_INVALID = -1,
+    NII_NVOX_INT_SAFE = 0,
+    NII_NVOX_HUGE = 1
+} nii_nvox_class;
 
 typedef enum {
     GZ_ENVIRONMENT, // Use the environment settings
@@ -128,7 +152,9 @@ typedef struct {                   /** x4 vector struct **/
 int nii_mul_size(size_t a, size_t b, size_t *out);
 void *nii_calloc(size_t count, size_t size); // zeroed nim->data buffer; see definition in core.c for the MSVC allocator contract
 void *nii_malloc(size_t count, size_t size); // UN-zeroed nim->data buffer for fully-overwritten targets (e.g. datatype convert); see core.c
-int nii_nvox3d_int(const nifti_image *nim, int *out); // validates int-sized spatial and total counts
+nii_nvox_class nii_nvox_classify(const nifti_image *nim, uint64_t *nvox3d); // common geometry validator and INT_MAX classifier
+int nii_nvox3d_int(const nifti_image *nim, int *out); // validates int-sized spatial and total counts (out-of-scope ops)
+int nii_nvox3d(const nifti_image *nim, nvox_t *out); // validates spatial+total counts in nvox_t (in-scope core calculator)
 int nifti_save(nifti_image * nim, const char *postfix, gzModes gzMode);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);

@@ -79,7 +79,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260712"
+#define kMTHdate "v1.0.20260713"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -354,6 +354,7 @@ int show_help( void ) {
 	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template; needs a normal -cost, not fast)\n");
 	printf("                            default cost: fast (no -cost == -cost fast); use -source_automask with lpc/lpa\n");
 	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
+	printf("                            4D input: registers the FIRST volume only (== -crop 0 1), with a warning; use -Tmean or -crop first to choose\n");
 	printf(" -deface <tmpl> <mask> [opts] : remove voxels using a template-space mask (affine registration; fast engine by default)\n");
 	printf("                              the mask determines what is removed: >=0.5 keep, <0.5 remove (brain mask keeps brain, face mask removes face)\n");
 	printf("                              opts: -cost XX (fast [default], fastcr, hel, lpc, lpa, ls) -cmass -nocmass tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
@@ -450,10 +451,10 @@ int show_help( void ) {
 	printf(" -mas <file>              : use (following image>0) to mask current image\n");
 	printf(" -thr <number>            : use following number to threshold current image (zero anything below the number)\n");
 	printf(" -thrp <input>>           : use following percentage (0-100) of ROBUST RANGE to threshold current image (zero anything below the number)\n");
-	printf(" -thrP <input>            : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold below\n");
+	printf(" -thrP <input>            : use following percentage (0-100) of ROBUST RANGE of positive voxels and threshold below\n");
 	printf(" -uthr <number>           : use following number to upper-threshold current image (zero anything above the number)\n");
 	printf(" -uthrp <input>           : use following percentage (0-100) of ROBUST RANGE to upper-threshold current image (zero anything above the number)\n");
-	printf(" -uthrP <input>           : use following percentage (0-100) of ROBUST RANGE of non-zero voxels and threshold above\n");
+	printf(" -uthrP <input>           : use following percentage (0-100) of ROBUST RANGE of positive voxels and threshold above\n");
 	printf(" -clamp <input>           : use following percentage (0-100) of ROBUST RANGE to threshold current image (anything below set to this threshold)\n");
 	printf(" -uclamp <input>          : use following percentage (0-100) of ROBUST RANGE to threshold current image (anything above set to this threshold)\n");
 	printf(" -max <input>             : take maximum of following input and current image\n");

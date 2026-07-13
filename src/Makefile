@@ -236,7 +236,7 @@ static:
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
-	$(CNAME) -O3 -ffunction-sections -fdata-sections $(AFASTMATH) $(MFLAGS) $(UFLAGS) $(LDFLAGS) $(ZFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O3 -ffunction-sections -fdata-sections -DFORCE_INT32_MAX $(AFASTMATH) $(MFLAGS) $(UFLAGS) $(LDFLAGS) $(ZFLAGS) $(BMPFLAGS) -o niimath
 
 # tiny without nii2mesh (no OpenMP)
 nano:
@@ -244,15 +244,15 @@ nano:
 
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
-	$(CNAME) $(CFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # Lightweight undefined-behavior diagnostics. Unlike the Apple-Clang ASan target below,
 # UBSan is safe with Homebrew libomp on Apple Silicon and retains the normal OpenMP paths.
 ubsan:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
@@ -269,7 +269,7 @@ ubsan:
 # build a separate target with Homebrew LLVM clang (/opt/homebrew/opt/llvm/bin/clang).
 # Run with: MallocNanoZone=0 make sanitize
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,
@@ -301,7 +301,7 @@ wasm_al_objs:
 WASM_OUT= ../js/src/niimath.js
 
 wasm: $(WASM_AL_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 
@@ -324,7 +324,7 @@ WASI_CC= zig cc -target wasm32-wasi
 # Verified to preserve allineate registration
 # quality (corr) and keep -deface byte-stable in conformance; every JS runtime (Bun/Node/Chromium)
 # has shipped wasm SIMD since 2021. ~+11% wasm size for a large filter speedup.
-WASI_CFLAGS= -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DNII_WASI -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH
+WASI_CFLAGS= -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DFORCE_INT32_MAX -DNII_WASI -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH
 # Scoped compute sources. niimath.c is compiled separately (with -Dmain=niimath_entry).
 WASI_SRCS= core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c wasi_shim.c
 WASI_EXPORTS= -Wl,--export=nii_run -Wl,--export=malloc -Wl,--export=free -Wl,--export=_initialize -Wl,--export-memory
@@ -351,7 +351,7 @@ wasm-wasi: wasi-toolcheck
 # host-side gzip path. Same scoped sources/defines as wasm-wasi; NO -sUSE_ZLIB (raw bytes only).
 EMCC_CORE_OUT= ../js/src/niimath-emcc-core.js
 wasm-emcc-core:
-	emcc -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DEMSCRIPTEN -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH \
+	emcc -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DEMSCRIPTEN -DFORCE_INT32_MAX -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH \
 	  niimath.c core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c \
 	  -s STACK_SIZE=4194304 -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 \
 	  -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","cwrap","FS_createDataFile","FS_readFile","FS_unlink","stringToUTF8","getValue","setValue"]' \
