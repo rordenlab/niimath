@@ -344,6 +344,7 @@ int show_help( void ) {
 	printf("                                  -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
 	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
 	printf("                                  -nearest -linear -cubic (shortcuts for -final)\n");
+	printf("                                  -fill XX  (auto,zero,nan) out-of-FOV fill [default: auto = 0, or darkest voxel if <0 for CT/HU]\n");
 	printf("                                  -master <grid> reslice result onto <grid> (shares base world frame)\n");
 	printf("                                  -savemat out.json  save the fitted world-space affine as JSON\n");
 	printf("                                  -applymat in.json  reslice onto base with a saved affine (no registration)\n");
@@ -352,6 +353,7 @@ int show_help( void ) {
 	printf("                                  -nosagseed  disable the in-MSP rigid seed that -sym runs by default\n");
 	printf("                                    (-com/-sym seeds work with every cost, incl. -cost fast)\n");
 	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template; needs a normal -cost, not fast)\n");
+	printf("                                  -weight <img>  base-space region weight (dims match base); fine-stage focus, fast engine only\n");
 	printf("                            default cost: fast (no -cost == -cost fast); use -source_automask with lpc/lpa\n");
 	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
 	printf("                            4D input: registers the FIRST volume only (== -crop 0 1), with a warning; use -Tmean or -crop first to choose\n");

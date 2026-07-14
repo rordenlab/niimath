@@ -39,6 +39,13 @@ typedef struct {
                           from initial dependence*overlap (default); 0 = use the
                           supplied frame only (-nocmass, or an already-applied -com) */
     int verbose;       /* nonzero: per-stage logging to stderr */
+    const nifti_image *weight; /* optional (-weight): a fixed(base)-space weight image with dims
+                          identical to `fixed`. When set, each fixed foreground sample's cost
+                          contribution is scaled by the weight at that voxel, applied ONLY at the
+                          fine pyramid levels (4/2 mm) so the coarse 8 mm capture + seed selection
+                          stay whole-head. Honored by the HEL and CR costs; rejected with CF_COST_LS
+                          (which does not read it). NULL (default) leaves the fit byte-for-byte
+                          unchanged. Not owned by the estimator (caller frees). */
     /* NOTE: the final reslice/interpolation is applied by the CALLER (main.c), not the
        estimator, so there is no interp field here — coreg_fast_estimate() only returns
        the world affine and does not touch image data. */
@@ -62,6 +69,7 @@ static inline coreg_fast_opts coreg_fast_opts_default(void) {
     o.max_dof = 12;
     o.use_cmass = 1;   /* auto-select supplied-affine vs COM initialization */
     o.verbose = 0;
+    o.weight = NULL;   /* no region weighting unless -weight supplies a fixed-space image */
     return o;
 }
 

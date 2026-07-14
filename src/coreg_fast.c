@@ -313,6 +313,12 @@ typedef struct {
     int    cost;               /* CF_COST_* */
     /* precomputed fixed sample set for the current level */
     int    ns; int32_t *sx, *sy, *sz; float *fval; int *fbin; int K;
+    const cf_level *Lw;        /* optional fixed-space weight level for THIS stage (shares Lf's
+                                  grid); NULL at the coarse level and when no -weight is given */
+    float *fwt;                /* per-sample weight (Lw sampled at each fixed voxel), or NULL for
+                                  unweighted — NULL makes every cost multiply-by-1.0 (bit-identical) */
+    double fwt_total;          /* sum of fwt over all samples (total weighted mass); used for the
+                                  weighted in-FOV support floor. 0 when unweighted. */
     double fvar, fmean;        /* fixed-sample variance/mean (LS) */
     double m_bg;               /* moving min: LS out-of-FOV fill + HEL binning origin */
     double m_top;              /* moving-level max (for CF_COST_HEL moving-axis binning) */
@@ -433,6 +439,7 @@ static double cf_cost_eval(const double p[12]) {
         double mspan = c->m_top - c->m_bg; if (!(mspan > 0.0)) mspan = 1.0;
         double minv = (NB - 1) / mspan;
         int Kf = c->K;
+        const float *fwt = c->fwt;   /* NULL -> weight 1.0 (default, bit-identical) */
 #ifdef _OPENMP
         int par = (ns > CF_CR_PAR_MIN);
         #pragma omp parallel for schedule(static) if(par)
@@ -447,10 +454,10 @@ static double cf_cost_eval(const double p[12]) {
                 int ok; float v = cf_trilerp(Lm, ix, iy, iz, &ok);
                 if (!ok) continue;
                 double mv = v;
-                lnin++;
+                lnin++;   /* raw in-FOV count for the overlap floor (weight-independent) */
                 int fb = (int)((long)c->fbin[s] * NB / Kf); if (fb < 0) fb = 0; if (fb >= NB) fb = NB-1;
                 int mb = (int)((mv - c->m_bg) * minv + 0.5); if (mb < 0) mb = 0; if (mb >= NB) mb = NB-1;
-                H[fb*NB + mb] += 1.0;
+                H[fb*NB + mb] += fwt ? fwt[s] : 1.0;
             }
             H[NB*NB] = (double)lnin;
         }
@@ -467,6 +474,11 @@ static double cf_cost_eval(const double p[12]) {
         for (int i = 0; i < NB; i++)
             for (int j = 0; j < NB; j++) { double h = acc[i*NB+j]; Pf[i] += h; Pm[j] += h; tot += h; }
         if (tot <= 0.0) return CF_PENALTY;
+        /* Weighted ROI support floor: `nin` above only counts in-FOV samples regardless of
+           weight, so a pose that pushes the high-weight ROI out of FOV could pass it on
+           zero-weight head voxels. Require the in-FOV weighted mass (tot) to be >=10% of the
+           total weighted mass. Only active when weighted (fwt_total>0); no effect unweighted. */
+        if (c->fwt && tot < 0.10 * c->fwt_total) return CF_PENALTY;
         double itot = 1.0/tot, bc = 0.0;
         for (int i = 0; i < NB; i++) {
             if (Pf[i] <= 0.0) continue;
@@ -489,6 +501,7 @@ static double cf_cost_eval(const double p[12]) {
     int K = c->K;
     int stride = 3*K + 4;
     const int NC = CF_CR_NCHUNK;
+    const float *fwt = c->fwt;   /* NULL -> weight 1.0 (default, bit-identical) */
     double *acc = c->cr_acc;
     memset(acc, 0, (size_t)NC * stride * sizeof(double));
 #ifdef _OPENMP
@@ -511,10 +524,11 @@ static double cf_cost_eval(const double p[12]) {
             int ok; float v = cf_trilerp(Lm, ix, iy, iz, &ok);
             if (!ok) continue;
             double mv = v;
-            lnin++;
+            lnin++;   /* raw in-FOV count for the overlap floor (weight-independent) */
             int k = c->fbin[s];
-            bn[k] += 1.0; bs[k] += mv; bq[k] += (double)mv*mv;
-            lN += 1.0; lSy += mv; lSyy += (double)mv*mv;
+            double w = fwt ? fwt[s] : 1.0, wmv = w * mv;
+            bn[k] += w; bs[k] += wmv; bq[k] += wmv*mv;
+            lN += w; lSy += wmv; lSyy += wmv*mv;
         }
         B[3*K] = lN; B[3*K+1] = lSy; B[3*K+2] = lSyy; B[3*K+3] = (double)lnin;
     }
@@ -526,11 +540,22 @@ static double cf_cost_eval(const double p[12]) {
     double *bn = acc, *bs = acc + K, *bq = acc + 2*K;
     double N = acc[3*K], Sy = acc[3*K+1], Syy = acc[3*K+2]; long nin = (long)acc[3*K+3];
     if (nin < (long)(0.10*ns) || nin < 16) return CF_PENALTY;
+    /* Weighted ROI support floor (see the HEL path): require the in-FOV weighted mass N to be
+       >=10% of the total sample weight so a pose can't push the high-weight ROI out of FOV and
+       pass the raw-count floor on zero-weight voxels. Also guards N==0 (all-weight-zero -> NaN
+       below). No effect unweighted (fwt NULL). */
+    if (c->fwt && N < 0.10 * c->fwt_total) return CF_PENALTY;
+    if (!(N > 0.0)) return CF_PENALTY;
     double varTot = Syy/N - (Sy/N)*(Sy/N);
-    if (varTot <= 1e-12) return CF_PENALTY;
+    if (!(varTot > 1e-12)) return CF_PENALTY;   /* '!(x>eps)' also rejects NaN (weighted N->0) */
     double within = 0.0;
     for (int k = 0; k < K; k++) {
-        if (bn[k] < 1.0) continue;
+        /* Drop only truly-empty iso-set bins. `<= 0.0` (not the old `< 1.0`) makes the CR cost
+           SCALE-INVARIANT for weighted bn[k] while staying bit-identical unweighted, where bn[k]
+           is an exact integer count (0 <-> empty either way). A positive-but-tiny weighted bin has
+           a well-defined vk; its bn[k]*vk contribution scales with the weight and cancels in the
+           final ratio, so multiplying the weight image by a constant leaves the fit unchanged. */
+        if (bn[k] <= 0.0) continue;
         double vk = bq[k]/bn[k] - (bs[k]/bn[k])*(bs[k]/bn[k]);
         if (vk < 0) vk = 0;
         within += bn[k]*vk;
@@ -581,22 +606,38 @@ static int cf_make_samples(cf_ctx *c, int K) {
     int ns = 0;
     for (size_t i = 0; i < nv; i++) if (Lf->data[i] > thr) ns++;
     if (ns < 16) return 1;
-    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin);
+    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->fwt);
+    c->fwt = NULL;
     c->sx = malloc(sizeof(int32_t)*ns); c->sy = malloc(sizeof(int32_t)*ns);
     c->sz = malloc(sizeof(int32_t)*ns); c->fval = malloc(sizeof(float)*ns);
     c->fbin = malloc(sizeof(int)*ns);
     if (!c->sx||!c->sy||!c->sz||!c->fval||!c->fbin) return 1;
+    /* Optional per-sample weight: the weight level shares Lf's grid, so the sample voxel
+       index below reads it directly. Absent (Lw==NULL) leaves fwt NULL -> unweighted. */
+    if (c->Lw) { c->fwt = malloc(sizeof(float)*ns); if (!c->fwt) return 1; }
     double inv = (mx > mn) ? (K - 1) / (mx - mn) : 0.0;
     int idx = 0; double sum = 0;
     for (int z = 0; z < Lf->nz; z++)
       for (int y = 0; y < Lf->ny; y++)
         for (int x = 0; x < Lf->nx; x++) {
-            float v = Lf->data[x + (size_t)y*Lf->nx + (size_t)z*Lf->nx*Lf->ny];
+            size_t vi = x + (size_t)y*Lf->nx + (size_t)z*Lf->nx*Lf->ny;
+            float v = Lf->data[vi];
             if (v <= thr) continue;
             c->sx[idx]=x; c->sy[idx]=y; c->sz[idx]=z; c->fval[idx]=v;
             int k = (int)((v - mn)*inv + 0.5); if (k<0) k=0; if (k>K-1) k=K-1;
-            c->fbin[idx]=k; sum += v; idx++;
+            c->fbin[idx]=k;
+            if (c->fwt) { float w = c->Lw->data[vi]; c->fwt[idx] = (w > 0.0f) ? w : 0.0f; }
+            sum += v; idx++;
         }
+    c->fwt_total = 0.0;
+    if (c->fwt) for (int s = 0; s < ns; s++) c->fwt_total += c->fwt[s];
+    /* Reject a weight with no positive support over the fixed foreground ONCE here, rather than
+       letting every cost eval return a penalty until the whole fit fails. The per-pose weighted-
+       coverage floor (N >= 10% of fwt_total) is retained for the fwt_total>0 case. */
+    if (c->fwt && !(c->fwt_total > 0.0)) {
+        fprintf(stderr, "coreg fast: -weight has no positive weight over the fixed foreground\n");
+        return 1;
+    }
     c->ns = ns; c->K = K;
     double mean = sum/ns; c->fmean = mean;
     double var = 0; for (int s=0;s<ns;s++){ double d=c->fval[s]-mean; var+=d*d; } var/=ns;
@@ -614,8 +655,8 @@ static int cf_make_samples(cf_ctx *c, int K) {
 }
 
 static void cf_free_samples(cf_ctx *c) {
-    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->cr_acc);
-    c->sx=NULL; c->sy=NULL; c->sz=NULL; c->fval=NULL; c->fbin=NULL; c->cr_acc=NULL;
+    free(c->sx); free(c->sy); free(c->sz); free(c->fval); free(c->fbin); free(c->cr_acc); free(c->fwt);
+    c->sx=NULL; c->sy=NULL; c->sz=NULL; c->fval=NULL; c->fbin=NULL; c->cr_acc=NULL; c->fwt=NULL;
 }
 
 /* Set the active free-dof subset for a stage. dof: 6/7/9/12. */
@@ -681,6 +722,21 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
     double t0 = cf_wtime();
     if (!moving || !fixed || !result) return 1;
     if (cf_dims_ok(fixed, "fixed") || cf_dims_ok(moving, "moving")) return 1;
+    /* The optional weight is a fixed(base)-space image: it must be a valid 3D volume with
+       dimensions identical to `fixed` so it shares the fixed pyramid grids voxel-for-voxel. */
+    if (O.weight && (cf_dims_ok(O.weight, "weight") ||
+                     O.weight->nx != fixed->nx || O.weight->ny != fixed->ny ||
+                     O.weight->nz != fixed->nz)) {
+        fprintf(stderr, "coreg fast: -weight image dims must match the fixed image\n");
+        return 1;
+    }
+    /* The LS cost does not read the per-sample weight (it is a diagnostic, not CLI-reachable).
+       Reject weight+LS at the boundary rather than silently ignoring the weight. */
+    if (O.weight && O.cost == CF_COST_LS) {
+        fprintf(stderr, "coreg fast: -weight is not supported with the LS cost\n");
+        return 1;
+    }
+    int have_weight = (O.weight != NULL);
     mat44 Sf, Sm;
     /* Unified no-form policy (shared with al_register/-sym/-com/apply): coded sform/qform
        when usable, else a pixdim-centered frame — so both-codes-zero inputs still register. */
@@ -689,6 +745,35 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 
     int fnx=fixed->nx, fny=fixed->ny, fnz=fixed->nz;
     int mnx=moving->nx, mny=moving->ny, mnz=moving->nz;
+
+    /* The weight shares the fixed grid VOXEL-FOR-VOXEL (its pyramid is built with Sf and it is
+       sampled by the fixed index, never resampled), so the two grids must be the SAME grid, not
+       merely close: a fractional-voxel origin offset would shift the physical ROI by up to a
+       voxel while still "covering" the FOV. Map the 8 fixed-index corners through each frame and
+       reject if any world position diverges by more than a small fraction of a voxel — a header-
+       rounding tolerance (a real stationary-space mask carries the fixed sform/qform and agrees
+       to FP noise; a resampled/reoriented/shifted one does not). */
+    if (have_weight) {
+        mat44 Sw; al_image_xform_or_pixdim(O.weight, &Sw, NULL);
+        double vx = cf_colnorm(&Sf,0), vy = cf_colnorm(&Sf,1), vz = cf_colnorm(&Sf,2);
+        double vmin = vx; if (vy < vmin) vmin = vy; if (vz < vmin) vmin = vz;
+        double tol = 0.05 * vmin; if (!(tol > 0.0)) tol = 0.05;   /* ~1/20 voxel: FP noise, not sub-voxel shift */
+        int bad = 0;
+        for (int c = 0; c < 8 && !bad; c++) {
+            double ix = (c&1)?fnx-1:0, iy = (c&2)?fny-1:0, iz = (c&4)?fnz-1:0;
+            double fx,fy,fz, wx,wy,wz;
+            cf_apply(&Sf, ix,iy,iz, &fx,&fy,&fz);
+            cf_apply(&Sw, ix,iy,iz, &wx,&wy,&wz);
+            double dx=fx-wx, dy=fy-wy, dz=fz-wz;
+            if (sqrt(dx*dx+dy*dy+dz*dz) > tol) bad = 1;
+        }
+        if (bad) {
+            fprintf(stderr, "coreg fast: -weight image is in a different world frame than the "
+                            "fixed image (matching dims but sform/qform disagree)\n");
+            g_cf = NULL;
+            return 1;
+        }
+    }
 
     cf_ctx ctx; memset(&ctx, 0, sizeof ctx);
     ctx.cost = O.cost;
@@ -713,7 +798,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        other image, so only ONE full-resolution volume is ever held at a time (plus the
        small pyramids and one blur scratch). The moving COM is taken from its full-res
        buffer just before that buffer is freed. */
-    cf_level Lf[3] = {{0}}, Lm[3] = {{0}};
+    cf_level Lf[3] = {{0}}, Lm[3] = {{0}}, Lwt[3] = {{0}};   /* Lwt: fine-level weight (if -weight) */
     double comm[3];
     int build_ok = 1, have_com_m = 0;
 #ifdef AL_PROFILE
@@ -744,8 +829,31 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
     }
     /* -nocmass (O.use_cmass==0) already zeroed have_com_m above by short-circuiting
        cf_com_world(), so the supplied-affine start is all that remains. */
+    /* Weight pyramid: only the FINE levels (4/2 mm) — the 8 mm coarse capture + seed
+       selection stay whole-head. The weight shares `fixed`'s dims and frame, so building it
+       with the same (Sf, SEP, FWHM) chain yields grids identical to Lf[2]/Lf[1] voxel-for-voxel
+       (blurring softens a binary mask, which is desirable). Level 2 is built from the full-res
+       weight, level 1 from level 2 (matching the fixed pyramid's hierarchical add-in-quadrature). */
+    if (build_ok && have_weight) {
+        float *wfull = cf_extract_float(O.weight, NULL);
+        if (!wfull) { build_ok = 0; fprintf(stderr, "coreg fast: weight unsupported datatype / OOM\n"); }
+        else {
+            /* Clamp negatives and NaN to 0 at FULL RESOLUTION, before the pyramid blur — a
+               negative sample would otherwise spread through the Gaussian and depress neighbouring
+               positive support (a weight is conceptually non-negative). `!(w > 0)` also maps NaN->0. */
+            size_t wnv = (size_t)fnx * fny * fnz;
+            for (size_t i = 0; i < wnv; i++) if (!(wfull[i] > 0.0f)) wfull[i] = 0.0f;
+            if (cf_build_level(wfull, fnx,fny,fnz, &Sf, SEP[2], FWHM[2], &Lwt[2])) build_ok = 0;
+            free(wfull);
+            if (build_ok) {
+                double add = sqrt(FWHM[1]*FWHM[1] - FWHM[2]*FWHM[2]);
+                if (cf_build_level(Lwt[2].data, Lwt[2].nx,Lwt[2].ny,Lwt[2].nz, &Lwt[2].v2w,
+                                   SEP[1], add, &Lwt[1])) build_ok = 0;
+            }
+        }
+    }
     if (!build_ok) {
-        for (int i=0;i<3;i++){ cf_free_level(&Lf[i]); cf_free_level(&Lm[i]); }
+        for (int i=0;i<3;i++){ cf_free_level(&Lf[i]); cf_free_level(&Lm[i]); cf_free_level(&Lwt[i]); }
         g_cf = NULL;
         fprintf(stderr, "coreg fast: pyramid construction failed\n");
         return 1;
@@ -758,6 +866,9 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
     /* ---- optimize coarse -> fine over the prebuilt pyramid ---- */
     for (int lv = 0; lv < nlv; lv++) {
         ctx.Lf=&Lf[lv]; ctx.Lm=&Lm[lv]; ctx.Sf_lvl=Lf[lv].v2w;
+        /* Weight only the fine levels (lv>=1); the coarse level and the unweighted default
+           both leave ctx.Lw NULL so cf_make_samples produces no per-sample weight. */
+        ctx.Lw = (have_weight && lv >= 1) ? &Lwt[lv] : NULL;
         { double mn = DBL_MAX, mx = -DBL_MAX; size_t mnv2 = (size_t)Lm[lv].nx*Lm[lv].ny*Lm[lv].nz;
           for (size_t i=0;i<mnv2;i++) { double v=Lm[lv].data[i]; if (v<mn) mn=v; if (v>mx) mx=v; }
           ctx.m_bg = (mn < DBL_MAX) ? mn : 0.0;
@@ -903,7 +1014,7 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
     }
     int opt_err = ctx.opt_err, total_evals = ctx.evals;
     cf_free_samples(&ctx);
-    for (int i=0;i<3;i++){ cf_free_level(&Lf[i]); cf_free_level(&Lm[i]); }
+    for (int i=0;i<3;i++){ cf_free_level(&Lf[i]); cf_free_level(&Lm[i]); cf_free_level(&Lwt[i]); }
     g_cf = NULL;
     powell_newuoa_free_threadlocal();  /* release the grow-only NEWUOA workspace */
 

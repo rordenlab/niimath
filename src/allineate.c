@@ -4454,6 +4454,78 @@ static int al_dims_ok(const nifti_image *n, const char *who)
     return 0;
 }
 
+/* Resolve an AL_FILL_* mode to the concrete out-of-FOV fill value (see allineate.h). */
+float al_resolve_fillv(int fillmode, const float *data, size_t n)
+{
+    if (fillmode == AL_FILL_ZERO) return 0.0f;
+    if (fillmode == AL_FILL_NAN)  return (float)NAN;
+    /* AL_FILL_AUTO: 0 unless the darkest (finite) voxel is negative, then that value.
+     * Magnitude guard (al_finitef) rather than isnan/isfinite because this TU is
+     * built with -ffast-math. An all-nonfinite or empty source yields 0. */
+    if (!data || n == 0) return 0.0f;
+    float mn = 0.0f; int have = 0;
+    for (size_t i = 0; i < n; i++) {
+        float v = data[i];
+        if (al_finitef(v) && (!have || v < mn)) { mn = v; have = 1; }
+    }
+    return (have && mn < 0.0f) ? mn : 0.0f;
+}
+
+/* al_resolve_fillv for a whole image of any datatype. Returns 0 on extraction failure. Used by
+   the CLI dispatch paths that reslice via nii_apply_affine (nii_allineate resolves from its own
+   float source). ZERO/NAN never touch the data. AUTO: an UNSCALED float32 image (the usual
+   niimath calc-chain case) is scanned in place — no allocation, matching nii_reslice_affine's
+   alias fast-path; only a scaled or non-float32 image takes the converting nii_to_float copy so
+   AUTO still sees true intensities (e.g. a raw int16 CT whose HU air is negative). */
+float al_image_fillv(int fillmode, nifti_image *nim)
+{
+    if (fillmode == AL_FILL_ZERO) return 0.0f;
+    if (fillmode == AL_FILL_NAN)  return (float)NAN;
+    if (nim == NULL || nim->data == NULL) return 0.0f;
+    size_t n = (size_t)nim->nx * nim->ny * nim->nz;
+    if (nim->datatype == DT_FLOAT32 &&
+        (nim->scl_slope == 0.0f || (nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)))
+        return al_resolve_fillv(AL_FILL_AUTO, (const float *)nim->data, n);
+    float *f = nii_to_float(nim);
+    if (!f) return 0.0f;
+    float v = al_resolve_fillv(AL_FILL_AUTO, f, n);
+    free(f);
+    return v;
+}
+
+/* Set every out-of-FOV output voxel of a fused-warp result to `fillv`, using the exact
+   FOV predicate the interpolation kernels use (coord < -0.499 || coord > dim-0.501). The
+   fused warp writes AL_FILL's 0 default; this rewrites only the out-of-FOV voxels (a
+   disjoint set from al_clip_fused_cubic_infov's in-FOV clamp, so order is irrelevant).
+   `gam` is the base-index -> source-index affine (== GA_setup_affine(12, wpar)). No-op
+   when fillv == 0 (the value the kernel already wrote). */
+static void al_fill_fused_oob(float * restrict war, mat44 gam,
+                              int anx, int any, int anz,
+                              int bnx, int bny, int bnz, float fillv)
+{
+    if (!war || fillv == 0.0f) return;
+    float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
+    float mx0=gam.m[0][0], mx1=gam.m[0][1], mx2=gam.m[0][2], mx3=gam.m[0][3];
+    float my0=gam.m[1][0], my1=gam.m[1][1], my2=gam.m[1][2], my3=gam.m[1][3];
+    float mz0=gam.m[2][0], mz1=gam.m[2][1], mz2=gam.m[2][2], mz3=gam.m[2][3];
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((size_t)bnx*bny*bnz > 100000)
+#endif
+    for (int kk = 0; kk < bnz; kk++) {
+        for (int jj = 0; jj < bny; jj++) {
+            size_t ob = ((size_t)kk * bny + jj) * bnx;
+            float bx = mx1*jj + mx2*kk + mx3;
+            float by = my1*jj + my2*kk + my3;
+            float bz = mz1*jj + mz2*kk + mz3;
+            for (int ii = 0; ii < bnx; ii++) {
+                float xx = mx0*ii + bx, yy = my0*ii + by, zz = mz0*ii + bz;
+                if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+                    zz < -0.499f || zz > nzh) war[ob+ii] = fillv;   /* out-of-FOV */
+            }
+        }
+    }
+}
+
 /* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index
  * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
  * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*
@@ -4658,6 +4730,11 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     else
 #endif
         fprintf(stderr, " + Applying final warp with %s interpolation\n", interp_name);
+    /* Resolve the out-of-FOV output fill from the source (before ajim is freed): AUTO
+       keeps 0 for positive-only images (MRI — byte-identical to before) but uses the
+       source minimum for signed data (CT/HU air). al_scalar_warpone writes 0 for
+       out-of-FOV voxels; the post-pass below rewrites them when fillv != 0. */
+    float fillv = al_resolve_fillv(opts.fillmode, ajim, (size_t)anx * any * anz);
     PROFILE_START(warp);
     float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
                                       ajim, anx, any, anz,
@@ -4668,6 +4745,8 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
         fprintf(stderr, "allineate: failed to warp image\n");
         return 1;
     }
+    al_fill_fused_oob(warped, GA_setup_affine(12, wpar), anx, any, anz,
+                      bnx, bny, bnz, fillv);
 
     /* Replace source->data with warped result, adopt base dims/transforms */
     free(source->data);

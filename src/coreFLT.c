@@ -699,9 +699,14 @@ staticx int nifti_dilate(nifti_image *nim, flt iso, flt dx) {
 	}
 	for (size_t i = 0; i < nim->nvox; i++) {
 		if (img[i] <= dx)
-			img[i] = imgIn[i];
+			// within dx of the iso-surface: dilated foreground. Newly grown voxels were
+			// background (imgIn = 0), so restoring imgIn here would leave them 0 (no growth);
+			// set them to at least `iso` so they survive a re-threshold at `iso` (matches
+			// -close's fmax(iso,..) fill), preserving any brighter original. iso must be the
+			// dilated value, not 1: a `-dilate 10 dx` grown voxel set to 1 stays below thr 10.
+			img[i] = fmax(iso, imgIn[i]);
 		else
-			img[i] = 0.0;
+			img[i] = imgIn[i]; // beyond dx: unchanged (dilation only adds, never removes)
 	}
 	free(imgIn);
 	return 0;
@@ -6319,7 +6324,8 @@ static void al_json_mat44(FILE *f, mat44 m, const char *key) {
 /* Save the fitted world-space FIXED->MOVING affine as self-describing JSON. Returns 0 on success. */
 static int al_write_affine_json(const char *path, mat44 fwd, const char *engine,
                                 int dof, const char *cost_name,
-                                const char *fixed_name, const char *moving_name) {
+                                const char *fixed_name, const char *moving_name,
+                                const char *weight_name) {
 	FILE *f = fopen(path, "w");
 	if (!f) { fprintf(stderr, "Failed to open '%s' for -savemat\n", path); return 1; }
 	mat44 inv = nifti_mat44_inverse(fwd);
@@ -6333,6 +6339,9 @@ static int al_write_affine_json(const char *path, mat44 fwd, const char *engine,
 	fprintf(f, "  \"cost\": "); al_json_str(f, cost_name); fprintf(f, ",\n");
 	fprintf(f, "  \"fixed\": "); al_json_str(f, fixed_name ? fixed_name : ""); fprintf(f, ",\n");
 	fprintf(f, "  \"moving\": "); al_json_str(f, moving_name ? moving_name : ""); fprintf(f, ",\n");
+	/* Record the fine-stage region weight so two materially different fits (whole-head vs
+	   ROI-weighted) have distinguishable provenance. Omitted entirely when unweighted. */
+	if (weight_name) { fprintf(f, "  \"weight\": "); al_json_str(f, weight_name); fprintf(f, ",\n"); }
 	/* NOTE: keep the literal token `fixed_to_moving` OUT of this comment value — al_read_affine_json
 	   locates the matrix by strstr("\"fixed_to_moving\"") and would match a comment occurrence first. */
 	fprintf(f, "  \"comment\": \"the saved matrix maps FIXED (stationary) world-mm to MOVING "
@@ -6421,15 +6430,16 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	if (opts.applymat) {
 		if (opts.fast || opts.savemat || opts.sym || opts.com || opts.master || opts.zoom || !opts.sagseed ||
 		    (opts.cli_set & (AL_CLI_COST | AL_CLI_WARP | AL_CLI_INTERP | AL_CLI_CMASS)) ||
-		    opts.source_automask || opts.dark_automask) {
-			printfx("** -applymat does no registration; it cannot be combined with registration/seed options (-cost/-warp/-interp/-cmass/-source_automask/-dark_automask/-savemat/-sym/-com/-master/-zoom/-nosagseed)\n");
+		    opts.source_automask || opts.dark_automask || opts.weight) {
+			printfx("** -applymat does no registration; it cannot be combined with registration/seed options (-cost/-warp/-interp/-cmass/-source_automask/-dark_automask/-weight/-savemat/-sym/-com/-master/-zoom/-nosagseed)\n");
 			return 1;
 		}
 		nifti_image *tgt = nifti_image_read(basefile, 0);   /* geometry only */
 		if (!tgt) { printfx("** failed to read -applymat target grid '%s'\n", basefile); return 1; }
 		mat44 ftm;
+		float amfill = al_image_fillv(opts.fillmode, nim);
 		int arc = al_read_affine_json(opts.applymat, &ftm) ||
-		          nii_apply_affine(nim, tgt, ftm, interp, 0.0f);
+		          nii_apply_affine(nim, tgt, ftm, interp, amfill);
 		nifti_image_free(tgt);
 		if (arc) { printfx("** -applymat failed\n"); return 1; }
 		return 0;
@@ -6492,6 +6502,19 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 
+	/* -weight (fast-engine fine-stage region focus) is only honored by the fast engine.
+	   Reject it for the ordinary engine rather than silently ignoring the region request. */
+	if (opts.weight && !opts.fast) {
+		printfx("** -weight is only supported with the fast engine (-cost fast / -cost fastcr)\n");
+		nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+	}
+	/* Reject stdin for -weight: only the moving image may be piped, and its cached buffer would
+	   otherwise be re-read and mistaken for a plausible weight when dims match. */
+	if (opts.weight && !strcmp(opts.weight, "-")) {
+		printfx("** -weight does not support stdin ('-'); give a weight-image file\n");
+		nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+	}
+
 	/* Header-seed pre-steps applied to the moving image (nim) BEFORE the fit and consumed by
 	   EITHER engine (superset of the standalone allineate): -com resets the origin to the
 	   brightness center of mass; -sym/-symd/-symb fold a midsagittal-plane correction into the
@@ -6523,6 +6546,10 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	}
 	if (seeded) al_image_xform_or_pixdim(nim, &S_seed, NULL);
 
+	/* Out-of-FOV output fill: resolved only on the paths that reslice via nii_apply_affine
+	   (the fast and -master branches below). The ordinary base-grid path uses nii_allineate,
+	   which resolves its own fill from the source it warps — so we do NOT compute it here
+	   (al_image_fillv would otherwise waste a full-image float copy + scan for AUTO). */
 	int ok;
 	if (opts.fast) {
 		/* Fast SPM/FLIRT-inspired engine (-cost fast = Hellinger, -cost fastcr = CR):
@@ -6553,22 +6580,38 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
 		cfo.use_cmass = !opts.com &&
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		/* -weight: a base-space region weight for the fast fine stage. Load here and free
+		   immediately after the estimate (which only reads it). The estimator boundary owns
+		   weight validation (dims + world frame + LS/3D) and its diagnostics. */
+		nifti_image *weight_img = NULL;
+		if (opts.weight) {
+			weight_img = nifti_image_read(opts.weight, 1);
+			if (!weight_img) {
+				printfx("** failed to read -weight image '%s'\n", opts.weight);
+				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+			}
+			cfo.weight = weight_img;
+			fprintf(stderr, " + Fine-stage region weighting from '%s'\n", opts.weight);
+		}
 		coreg_fast_result res;
 		ok = coreg_fast_estimate(nim, base, &cfo, &res);
-		if (ok && fast_default) {
+		nifti_image_free(weight_img); weight_img = NULL;
+		if (ok && fast_default && !opts.weight) {
 			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
 			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
 			   regresses. An explicit -cost fast/fastcr still errors rather than silently switching
 			   engines. Any -com/-sym header seed was applied to nim above (not by the failed
 			   estimate, which does not mutate nim), so the ordinary path below starts from the same
-			   seeded pose. */
+			   seeded pose. NOT when -weight was requested: the ordinary engine ignores it, so
+			   silently dropping to an unweighted fit would defeat the explicit region request. */
 			fprintf(stderr, " + fast registration failed; falling back to -cost hel\n");
 			opts.fast = 0;
 			opts.cost = AL_COST_HELLINGER;
 		} else if (ok)
 			printfx("** fast registration failed\n");
 		else {
-			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp, 0.0f);
+			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp,
+			                      al_image_fillv(opts.fillmode, nim));
 			if (!ok && opts.savemat) {
 				mat44 save_mat = res.fixed_to_moving;
 				if (seeded) {
@@ -6578,7 +6621,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 				const char *fc = (res.resolved_cost == CF_COST_LS) ? "ls" :
 				                 (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
 				if (al_write_affine_json(opts.savemat, save_mat, "coreg_fast",
-				                         res.resolved_dof, fc, basefile, moving_name))
+				                         res.resolved_dof, fc, basefile, moving_name, opts.weight))
 					ok = 1;
 				else
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
@@ -6599,7 +6642,8 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			   path does NOT set the g_last_affine global — nii_allineate does), so -savemat
 			   below reads `fitmat` here rather than nii_last_affine(). */
 			ok = nii_allineate_estimate(nim, base, opts, &fitmat);
-			if (!ok) { have_fit = 1; ok = nii_apply_affine(nim, master, fitmat, interp, 0.0f); }
+			if (!ok) { have_fit = 1; ok = nii_apply_affine(nim, master, fitmat, interp,
+			                                               al_image_fillv(opts.fillmode, nim)); }
 		} else {
 			ok = nii_allineate(nim, base, opts);
 			if (!ok) have_fit = (nii_last_affine(&fitmat) == 0);
@@ -6614,7 +6658,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 				    ? nifti_mat44_mul(S_orig, nifti_mat44_mul(nifti_mat44_inverse(S_seed), fitmat))
 				    : fitmat;
 				if (al_write_affine_json(opts.savemat, outmat, "allineate", opts.warp,
-				                         al_cost_name(opts.cost), basefile, moving_name))
+				                         al_cost_name(opts.cost), basefile, moving_name, NULL))
 					ok = 1;
 				else
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
@@ -7509,6 +7553,8 @@ int main64(int argc, char *argv[]) {
 			}
 			char *al_basefile = argv[ac];
 			al_opts al_options = al_opts_default();
+			/* All sub-options (incl. -weight, gated by AL_CAP_WEIGHT) go through the single shared
+			   parser choke-point, which stops (backing up) at the first token it does not recognize. */
 			if (al_parse_subopts(&ac, argc, argv, &al_options, "-allineate", AL_CAP_ALL))
 				goto fail;
 			ok = nifti_allineate_wrap(nim, al_basefile, fin, al_options);

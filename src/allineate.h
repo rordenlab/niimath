@@ -51,7 +51,9 @@
 #define AL_CAP_MASTER  0x8u   /* -master <grid> */
 #define AL_CAP_MATRIX  0x10u  /* -savemat / -applymat */
 #define AL_CAP_SEED    0x20u  /* -com / -sym / -symd / -symb / -nosagseed / -zoom */
-#define AL_CAP_ALL     (AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST|AL_CAP_MASTER|AL_CAP_MATRIX|AL_CAP_SEED)
+#define AL_CAP_FILL    0x40u  /* -fill zero/nan/auto (out-of-FOV output fill; not for -deface) */
+#define AL_CAP_WEIGHT  0x80u  /* -weight <img> (fast-engine fine-stage region weight; not for -deface) */
+#define AL_CAP_ALL     (AL_CAP_TUNING|AL_CAP_FINAL|AL_CAP_FAST|AL_CAP_MASTER|AL_CAP_MATRIX|AL_CAP_SEED|AL_CAP_FILL|AL_CAP_WEIGHT)
 
 /* Warp type codes (number of free parameters) */
 #define AL_WARP_SHIFT_ONLY          3  /* shift_only / sho: 3 DOF */
@@ -65,6 +67,15 @@
 #define AL_INTERP_CUBIC    3  /* Tricubic */
 #define AL_INTERP_DEFAULT -1  /* Use mode-appropriate default (cubic for allineate, linear for deface) */
 
+/* Out-of-FOV fill for the -allineate OUTPUT reslice (al_opts.fillmode). Resolved to a
+   concrete float by al_resolve_fillv(). AUTO is the default: it keeps the historical 0
+   fill for positive-only images (e.g. MRI, background 0 — output stays byte-identical),
+   but for images whose darkest voxel is negative (CT/X-ray Hounsfield units, where air ≈
+   -1000) it fills with that darkest value so out-of-FOV reads as air, not soft tissue. */
+#define AL_FILL_AUTO  0  /* 0 unless the source minimum is < 0, then the source minimum (default) */
+#define AL_FILL_ZERO  1  /* always 0 */
+#define AL_FILL_NAN   2  /* NaN */
+
 /* Options for nii_allineate and nii_deface */
 typedef struct {
     int cost;              /* AL_COST_* code (default: AL_COST_HELLINGER) */
@@ -74,6 +85,7 @@ typedef struct {
                               source value is at that image's darkest value (background/pad) */
     int interp;            /* AL_INTERP_* for fine-pass matching (default: LINEAR) */
     int final_interp;      /* AL_INTERP_* for output reslicing (default: AL_INTERP_DEFAULT) */
+    int fillmode;          /* AL_FILL_* out-of-FOV output fill (default: AL_FILL_AUTO) */
     int warp;              /* AL_WARP_* DOF count (default: AL_WARP_AFFINE_GENERAL = 12) */
     /* --- CLI-workflow fields below: interpreted by the host's pre-/post-processing chain
        (niimath's nifti_allineate_wrap in coreFLT.c, and the standalone allineate main.c),
@@ -85,6 +97,10 @@ typedef struct {
        standalone's flag, provided in niimath by -deface with a brain mask). Splitting the
        estimator options from CLI state is a possible future refactor. --- */
     const char *skullstrip; /* CLI-only: -skullstrip brain mask (NULL = normal registration) */
+    const char *weight;     /* CLI-only: -weight fixed(stationary)-space weight image (dims match
+                               the stationary). Fast engine only: scales each fixed sample's cost
+                               contribution at the FINE levels so the fit optimizes a region (e.g.
+                               the brain) rather than whole-head features. NULL = unweighted. */
     double robustfov;       /* CLI-only: -robustfov crop mm applied to the moving image (0 = off) */
     const char *savemat;    /* CLI-only: -savemat path; main.c saves the fitted affine as JSON
                                (via nii_last_affine()). NULL = don't save. */
@@ -123,8 +139,10 @@ static inline al_opts al_opts_default(void) {
     o.dark_automask = 0;
     o.interp = AL_INTERP_LINEAR;
     o.final_interp = AL_INTERP_DEFAULT;
+    o.fillmode = AL_FILL_AUTO;
     o.warp = AL_WARP_AFFINE_GENERAL;
     o.skullstrip = NULL;
+    o.weight = NULL;
     o.robustfov = 0.0;
     o.savemat = NULL;
     o.applymat = NULL;
@@ -159,6 +177,15 @@ static inline int al_parse_interp(const char *name, int *code_out) {
         { *code_out = AL_INTERP_LINEAR; return 0; }
     if (!strcmp(name, "cubic") || !strcmp(name, "tricubic"))
         { *code_out = AL_INTERP_CUBIC; return 0; }
+    return 1;
+}
+
+/* Parse out-of-FOV fill mode name into AL_FILL_* code.
+   Returns 0 on success, 1 on unrecognized name. */
+static inline int al_parse_fill(const char *name, int *fill_out) {
+    if (!strcmp(name, "auto"))                        { *fill_out = AL_FILL_AUTO; return 0; }
+    if (!strcmp(name, "zero") || !strcmp(name, "0"))  { *fill_out = AL_FILL_ZERO; return 0; }
+    if (!strcmp(name, "nan") || !strcmp(name, "NaN")) { *fill_out = AL_FILL_NAN;  return 0; }
     return 1;
 }
 
@@ -270,6 +297,17 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 return 1;
             }
             opts->cli_set |= AL_CLI_FINAL;
+        } else if (!strcmp(argv[*ac], "-fill")) {
+            AL_NEED(AL_CAP_FILL, "-fill");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -fill requires a mode (auto, zero, nan)\n", cmd_name);
+                return 1;
+            }
+            if (al_parse_fill(argv[*ac], &opts->fillmode)) {
+                fprintf(stderr, "Unknown fill '%s' (use: auto, zero, nan)\n", argv[*ac]);
+                return 1;
+            }
         } else if (!strcmp(argv[*ac], "-master")) {
             AL_NEED(AL_CAP_MASTER, "-master");
             (*ac)++;
@@ -278,6 +316,14 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 return 1;
             }
             opts->master = argv[*ac];
+        } else if (!strcmp(argv[*ac], "-weight")) {
+            AL_NEED(AL_CAP_WEIGHT, "-weight");
+            (*ac)++;
+            if (*ac >= argc) {
+                fprintf(stderr, "%s -weight requires a weight-image filename (base/fixed-space)\n", cmd_name);
+                return 1;
+            }
+            opts->weight = argv[*ac];
         } else if (!strcmp(argv[*ac], "-savemat")) {
             AL_NEED(AL_CAP_MATRIX, "-savemat");
             (*ac)++;
@@ -325,9 +371,11 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
             if (!strcmp(argv[*ac], "fast")) {
                 AL_NEED(AL_CAP_FAST, "-cost fast");
                 opts->fast = AL_ENGINE_FAST_HEL;
+                opts->cli_set &= ~AL_CLI_COST;   /* fast overrides an earlier ordinary -cost (symmetric last-one-wins) */
             } else if (!strcmp(argv[*ac], "fastcr")) {
                 AL_NEED(AL_CAP_FAST, "-cost fastcr");
                 opts->fast = AL_ENGINE_FAST_CR;
+                opts->cli_set &= ~AL_CLI_COST;
             } else if (al_parse_cost(argv[*ac], &opts->cost)) {
                 fprintf(stderr, "Unknown cost function '%s' (use: fast, fastcr, lpc, lpa, hel, ls)\n",
                         argv[*ac]);
@@ -389,6 +437,17 @@ int nii_allineate_estimate(nifti_image *source, nifti_image *base, al_opts opts,
    and reflects the moving image as passed to registration (after any -com/-sym fold).
    Serial-only (reads a process-global, like the rest of the engine). */
 int nii_last_affine(mat44 *out);
+
+/* Resolve an AL_FILL_* mode to the concrete out-of-FOV fill value for a float32
+ * source of `n` voxels: AL_FILL_ZERO -> 0, AL_FILL_NAN -> NaN, AL_FILL_AUTO -> 0
+ * unless the source minimum is negative (CT/HU air), then that minimum. Uses a
+ * finite (non-NaN/Inf) guard on the scan. Shared BSD; used by -allineate's output
+ * reslice so the fill matches wherever the reslice happens (fused warp or nii_apply_affine). */
+float al_resolve_fillv(int fillmode, const float *data, size_t n);
+
+/* al_resolve_fillv for a whole image of ANY datatype (extracts float internally so AUTO
+ * detects negative Hounsfield air in a raw int16 CT). Returns 0 on extraction failure. */
+float al_image_fillv(int fillmode, nifti_image *nim);
 
 /* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index
  * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the

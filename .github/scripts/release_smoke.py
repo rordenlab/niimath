@@ -400,6 +400,97 @@ def assert_payload_size(path: Path, datatype: int, bitpix: int, dims: tuple[int,
         raise AssertionError(f"{path}: expected {expected_size} bytes from header, saw {len(blob)}")
 
 
+def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
+    """Regression for the -allineate -fill / -weight options and the -dilate fix — the
+    niimath-only dispatch, chain integration, and CLI parsing that the shared allineate
+    suite does not cover. Skips cleanly on a build without registration (e.g. nano)."""
+    if "-allineate" not in help_text:
+        return
+
+    n = 32
+
+    def blob() -> list[float]:
+        # A volume-filling smooth blob plus a gradient: foreground exists at every pyramid
+        # level so the fast engine's coarse sample build succeeds deterministically (a small
+        # sparse cube collapses to too few samples at 8 mm and fails the build).
+        data = [0.0] * (n * n * n)
+        for z in range(n):
+            for y in range(n):
+                for x in range(n):
+                    r2 = (x - 16) ** 2 + (y - 16) ** 2 + (z - 16) ** 2
+                    data[x + y * n + z * n * n] = 100.0 * math.exp(-r2 / 200.0) + 0.1 * (x + y + z) + 1.0
+        return data
+
+    base = tmp / "al_base.nii"
+    moving = tmp / "al_mov.nii"
+    weight = tmp / "al_weight.nii"
+    write_float32_nifti(base, (n, n, n), blob())
+    write_float32_nifti(moving, (n, n, n), blob())
+    write_float32_nifti(
+        weight, (n, n, n),
+        [1.0 if (8 <= x < 24 and 8 <= y < 24 and 8 <= z < 24) else 0.0
+         for z in range(n) for y in range(n) for x in range(n)],
+    )
+
+    # -dilate with a threshold > 1: grown voxels must reach at least `iso`. The prior
+    # fmax(1.0, ..) left a `-dilate 10 dx` grow at value 1 — below the requested threshold.
+    seed = [0.0] * (12 * 12 * 12)
+    seed[6 + 6 * 12 + 6 * 144] = 10.0
+    seed_path = tmp / "al_seed10.nii"
+    write_float32_nifti(seed_path, (12, 12, 12), seed)
+    dil = tmp / "al_dil.nii"
+    require_success(run_niimath(exe, [str(seed_path), "-dilate", "10", "2", "-gz", "0", str(dil)]), "-dilate iso>1")
+    grown = [v for v in read_float32_nifti(dil) if v > 0.0]
+    if len(grown) <= 1:
+        raise AssertionError("-dilate 10 2 did not grow the seed")
+    if any(v < 10.0 for v in grown):
+        raise AssertionError(f"-dilate 10 2 grew voxels below the threshold (iso=10): {sorted(set(grown))}")
+
+    # -applymat does no registration, so -weight must be rejected (not silently ignored).
+    ident = tmp / "al_ident.json"
+    ident.write_text('{"fixed_to_moving": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]}')
+    rej = run_niimath(exe, [str(moving), "-allineate", str(base), "-applymat", str(ident),
+                            "-weight", str(weight), "-gz", "0", str(tmp / "al_rej.nii")])
+    if rej.returncode == 0 or "cannot be combined" not in (rej.stdout + rej.stderr):
+        raise AssertionError("-applymat combined with -weight was not rejected")
+
+    # -weight interleaved with other sub-options (exercises the shared parser + AL_CAP_WEIGHT)
+    # and its provenance recorded by -savemat.
+    prov = tmp / "al_prov.json"
+    require_success(
+        run_niimath(exe, [str(moving), "-allineate", str(base), "-weight", str(weight),
+                          "-final", "linear", "-savemat", str(prov), "-gz", "0", str(tmp / "al_w.nii")]),
+        "-allineate -weight with saved provenance",
+    )
+    if '"weight"' not in prov.read_text():
+        raise AssertionError("-savemat did not record the -weight provenance")
+
+    # Out-of-FOV fill: a full-X translation maps every target voxel outside the (all -5)
+    # source, so the whole output is the fill value — a clean auto/zero/nan distinction.
+    neg = tmp / "al_neg.nii"
+    grid = tmp / "al_grid.nii"
+    write_float32_nifti(neg, (8, 8, 8), [-5.0] * 512)
+    write_float32_nifti(grid, (8, 8, 8), [0.0] * 512)
+    shift = tmp / "al_shift.json"
+    shift.write_text('{"fixed_to_moving": [1,0,0,100, 0,1,0,0, 0,0,1,0, 0,0,0,1]}')
+
+    def fill_out(mode: str) -> list[float]:
+        out = tmp / f"al_fill_{mode}.nii"
+        require_success(
+            run_niimath(exe, [str(neg), "-allineate", str(grid), "-applymat", str(shift),
+                              "-fill", mode, "-gz", "0", str(out)]),
+            f"-applymat -fill {mode}",
+        )
+        return read_float32_nifti(out)
+
+    if any(v != 0.0 for v in fill_out("zero")):
+        raise AssertionError("-fill zero left a non-zero out-of-FOV voxel")
+    if any(abs(v + 5.0) > 1e-3 for v in fill_out("auto")):
+        raise AssertionError("-fill auto did not fill with the negative source minimum (-5)")
+    if not all(v != v for v in fill_out("nan")):
+        raise AssertionError("-fill nan did not write NaN out-of-FOV")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("exe", nargs="?", default=shutil.which("niimath") or "niimath")
@@ -625,6 +716,8 @@ def main() -> int:
             raise AssertionError("binary operation failed to detect a y-axis spatial mismatch")
 
         exercise_qc(exe, tmp)
+
+        exercise_allineate(exe, tmp, help_text)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
