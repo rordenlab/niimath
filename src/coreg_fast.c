@@ -79,6 +79,18 @@ static double g_prof_blur = 0.0, g_prof_resample = 0.0;
 #define CF_PS_SCALE 0.01   /* fractional scale per unit (1%) */
 #define CF_PS_SHEAR 0.01   /* shear per unit */
 
+/* -weight background floor (AFNI-style whole-head anchor). A supplied region weight is mapped
+ * to [CF_WEIGHT_FLOOR, 1] over the whole fixed grid rather than zeroed outside the ROI, so
+ * out-of-ROI head voxels still anchor global scale. The ROI:background emphasis ratio is
+ * 1/CF_WEIGHT_FLOOR (2:1 here). 0.5 is the smallest floor that stays degeneracy-free across
+ * every benchmark pair AND both compilers (clang/gcc): lower floors (0.35, 0.2) still let a
+ * cross-modal fit collapse into the scalp-shrink basin, and the collapse is ill-conditioned so
+ * it surfaces compiler-dependently. Higher floors wash the ROI emphasis back toward unweighted.
+ * NB: because the floor lifts every foreground voxel to >=0.5, a weight CANNOT exclude a region
+ * (a user-zeroed lesion still contributes at the floor) — that is a deliberate soft-focus scope;
+ * region exclusion would need an SPM-style scale/shear prior instead. See the weight build. */
+#define CF_WEIGHT_FLOOR 0.5f
+
 /* Guardrails (normalized units), wider than the supported capture envelope so a
  * valid fit is never clipped; a fit landing on a guardrail is reported as failure.
  * Translation needs more room than the nominal capture range: an oblique/reoriented
@@ -630,12 +642,22 @@ static int cf_make_samples(cf_ctx *c, int K) {
             sum += v; idx++;
         }
     c->fwt_total = 0.0;
-    if (c->fwt) for (int s = 0; s < ns; s++) c->fwt_total += c->fwt[s];
-    /* Reject a weight with no positive support over the fixed foreground ONCE here, rather than
-       letting every cost eval return a penalty until the whole fit fails. The per-pose weighted-
-       coverage floor (N >= 10% of fwt_total) is retained for the fwt_total>0 case. */
-    if (c->fwt && !(c->fwt_total > 0.0)) {
-        fprintf(stderr, "coreg fast: -weight has no positive weight over the fixed foreground\n");
+    double fwt_max = 0.0;
+    if (c->fwt) for (int s = 0; s < ns; s++) { c->fwt_total += c->fwt[s];
+                                               if (c->fwt[s] > fwt_max) fwt_max = c->fwt[s]; }
+    /* Reject a weight with no meaningful support over the fixed foreground ONCE here, rather than
+       letting the fit silently degrade. Under the AFNI-style floor EVERY foreground sample is
+       lifted to >=CF_WEIGHT_FLOOR, so a nonzero `fwt_total` no longer proves the ROI touches the
+       foreground: a mask whose positive voxels lie only in the fixed BACKGROUND leaves the
+       foreground reading a uniform floor and would pass on that alone. Require instead that at
+       least one foreground sample exceeds the floor — i.e. the ROI, after the pyramid blur,
+       actually reaches the foreground (a real ROI reads ~1.0, well clear of the 1e-3 margin,
+       so legitimate weighted fits are bit-identical). This subsumes the all-zero-weight case
+       (`wmax==0` in the driver skips the remap, so `fwt_max==0`). The per-pose weighted-coverage
+       floor (N >= 10% of fwt_total) is retained for the accepted case. */
+    if (c->fwt && !(fwt_max > CF_WEIGHT_FLOOR + 1e-3)) {
+        fprintf(stderr, "coreg fast: -weight ROI does not reach the fixed foreground "
+                        "(no pyramid-sampled weight rises above the background floor)\n");
         return 1;
     }
     c->ns = ns; c->K = K;
@@ -842,7 +864,35 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                negative sample would otherwise spread through the Gaussian and depress neighbouring
                positive support (a weight is conceptually non-negative). `!(w > 0)` also maps NaN->0. */
             size_t wnv = (size_t)fnx * fny * fnz;
-            for (size_t i = 0; i < wnv; i++) if (!(wfull[i] > 0.0f)) wfull[i] = 0.0f;
+            float wmax = 0.0f;
+            for (size_t i = 0; i < wnv; i++) {
+                /* Clamp negatives/NaN AND +Inf to 0 (magnitude guard, since this TU is
+                   -ffast-math and a +Inf would poison the remap: wmax=+Inf -> inv=0 ->
+                   Inf*0=NaN for that voxel and every finite ROI value collapses to the floor). */
+                if (!(wfull[i] > 0.0f && wfull[i] <= FLT_MAX)) wfull[i] = 0.0f;
+                else if (wfull[i] > wmax) wmax = wfull[i];
+            }
+            /* AFNI-style whole-head anchor (the wisdom of 3dAllineate's -autobox default): do NOT
+               zero the cost outside the ROI. Restricting the cost to the mask alone leaves GLOBAL
+               (isotropic) extent underdetermined — the outer head boundary that fixes absolute size
+               has been masked away — so the masked cost slides monotonically toward shrinking the
+               source until its bright scalp is dragged into the ROI (the FLIRT Fig-1 degeneracy).
+               The failure is ill-conditioned, hence compiler/FP-sensitive: it surfaced as a large
+               clang-vs-gcc divergence. Instead map the weight to [FLOOR, 1] over the WHOLE fixed
+               grid: out-of-ROI head voxels (scalp/skull) stay in the cost at a reduced level and
+               anchor scale, while the ROI (weight 1) dominates the refinement. Normalizing by the
+               max keeps the fit invariant to a global weight scaling (HEL/CR are scale-invariant),
+               and the whole cost surface is now well-posed at every stage, so no per-stage scale
+               special-casing is needed. Only fixed-FOREGROUND voxels are ever sampled, so the floor
+               on true background (air) is inert. */
+            if (wmax > 0.0f) {
+                /* Divide directly rather than multiply by 1/wmax: a subnormal/tiny wmax makes
+                   1.0f/wmax overflow to +Inf, and then 0*Inf=NaN (background) / tiny*Inf=+Inf
+                   (foreground) would poison the remap (+Inf is not caught downstream). Because
+                   every wfull[i] <= wmax, the ratio is in [0,1] and CANNOT overflow. */
+                for (size_t i = 0; i < wnv; i++)
+                    wfull[i] = CF_WEIGHT_FLOOR + (1.0f - CF_WEIGHT_FLOOR) * (wfull[i] / wmax);
+            }
             if (cf_build_level(wfull, fnx,fny,fnz, &Sf, SEP[2], FWHM[2], &Lwt[2])) build_ok = 0;
             free(wfull);
             if (build_ok) {

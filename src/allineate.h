@@ -97,10 +97,12 @@ typedef struct {
        standalone's flag, provided in niimath by -deface with a brain mask). Splitting the
        estimator options from CLI state is a possible future refactor. --- */
     const char *skullstrip; /* CLI-only: -skullstrip brain mask (NULL = normal registration) */
-    const char *weight;     /* CLI-only: -weight fixed(stationary)-space weight image (dims match
-                               the stationary). Fast engine only: scales each fixed sample's cost
-                               contribution at the FINE levels so the fit optimizes a region (e.g.
-                               the brain) rather than whole-head features. NULL = unweighted. */
+    const char *weight;     /* CLI-only: -weight fixed(stationary)-space SOFT-FOCUS map (dims match
+                               the stationary). Fast engine only: normalized by its max and remapped
+                               to [0.5, 1] over the WHOLE fixed grid, then applied at the FINE levels
+                               so the ROI (weight ~1) dominates the refinement while out-of-ROI head
+                               stays in the cost at the floor (anchors global scale). NOT an exclusion
+                               mask — a zeroed region still contributes at the floor. NULL = unweighted. */
     double robustfov;       /* CLI-only: -robustfov crop mm applied to the moving image (0 = off) */
     const char *savemat;    /* CLI-only: -savemat path; main.c saves the fitted affine as JSON
                                (via nii_last_affine()). NULL = don't save. */

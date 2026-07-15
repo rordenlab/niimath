@@ -6585,6 +6585,9 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		   weight validation (dims + world frame + LS/3D) and its diagnostics. */
 		nifti_image *weight_img = NULL;
 		if (opts.weight) {
+			if (nii_reject_oversize_aux(opts.weight, "weight image")) { // header-only: reject a huge/malformed weight before load
+				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
+			}
 			weight_img = nifti_image_read(opts.weight, 1);
 			if (!weight_img) {
 				printfx("** failed to read -weight image '%s'\n", opts.weight);
@@ -6820,7 +6823,13 @@ static int nii_admit_file_before_load(const char *fin, const char *first_op, int
    payload is read. int-indexed consumers (reslice/mask, registration base, deface template/mask,
    bitmap overlay) require an INT_MAX-safe image; checking the header first avoids allocating or
    decompressing gigabytes only to reject afterwards (finding 2). stdin/.zst skip (their post-load
-   validation remains). Returns 0 to proceed, 1 to reject (message printed). */
+   validation remains). ACCEPTED LIMITATION: a `.nii.zst` aux is NOT header-preflighted here —
+   `nii_is_zst_name` returns early because the zstd reader has no bounded header-only path (it
+   decompresses the whole frame), so a huge/malformed zstd aux is still caught only post-load
+   (after `coreg_fast_estimate`/etc. reject its dims), which can transiently allocate its declared
+   expanded size. This matches the primary-image `.nii.zst` behavior (see the Huge image section)
+   and is bounded once, in the zstd/header reader, if streaming header preflight is added — do NOT
+   add per-op zstd guards. Returns 0 to proceed, 1 to reject (message printed). */
 static int nii_reject_oversize_aux(const char *fin, const char *label) {
 	if (!fin || !strcmp(fin, "-") || nii_is_zst_name(fin))
 		return 0;

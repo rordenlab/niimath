@@ -465,6 +465,16 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     if '"weight"' not in prov.read_text():
         raise AssertionError("-savemat did not record the -weight provenance")
 
+    # An oversized -weight must be rejected from its HEADER (the aux oversize gate), before any
+    # payload allocation — not decompressed/allocated then rejected by the estimator. The
+    # deliberately header-only file declares 32767*32767*3 > INT_MAX voxels.
+    huge_weight = tmp / "al_huge_weight.nii"
+    huge_weight.write_bytes(nifti_header((32767, 32767, 3), datatype=16, bitpix=32))
+    hw = run_niimath(exe, [str(moving), "-allineate", str(base), "-weight", str(huge_weight),
+                           "-gz", "0", str(tmp / "al_hw.nii")])
+    if hw.returncode == 0 or "exceeds the supported INT_MAX" not in (hw.stdout + hw.stderr):
+        raise AssertionError("oversized -weight was not header-rejected before load")
+
     # Out-of-FOV fill: a full-X translation maps every target voxel outside the (all -5)
     # source, so the whole output is the fill value — a clean auto/zero/nan distinction.
     neg = tmp / "al_neg.nii"

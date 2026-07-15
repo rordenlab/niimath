@@ -39,13 +39,18 @@ typedef struct {
                           from initial dependence*overlap (default); 0 = use the
                           supplied frame only (-nocmass, or an already-applied -com) */
     int verbose;       /* nonzero: per-stage logging to stderr */
-    const nifti_image *weight; /* optional (-weight): a fixed(base)-space weight image with dims
-                          identical to `fixed`. When set, each fixed foreground sample's cost
-                          contribution is scaled by the weight at that voxel, applied ONLY at the
-                          fine pyramid levels (4/2 mm) so the coarse 8 mm capture + seed selection
-                          stay whole-head. Honored by the HEL and CR costs; rejected with CF_COST_LS
-                          (which does not read it). NULL (default) leaves the fit byte-for-byte
-                          unchanged. Not owned by the estimator (caller frees). */
+    const nifti_image *weight; /* optional (-weight): a fixed(base)-space SOFT-FOCUS map with dims
+                          identical to `fixed`. It is NOT an exclusion mask: the image is normalized
+                          and remapped to [CF_WEIGHT_FLOOR, 1] over the WHOLE fixed grid (AFNI-style
+                          whole-head anchor), so out-of-ROI head voxels still contribute at the floor
+                          (a zeroed region is down-weighted, never excluded). Each fine-level sample's
+                          cost is scaled by that remapped value; applied ONLY at the fine pyramid
+                          levels (4/2 mm) so the coarse 8 mm capture + seed selection stay whole-head.
+                          The floor keeps global scale anchored (a mask that zeroed outside the ROI
+                          would make extent underdetermined and let a cross-modal fit shrink into the
+                          scalp). Honored by the HEL and CR costs; rejected with CF_COST_LS (which does
+                          not read it). NULL (default) leaves the fit byte-for-byte unchanged. Not
+                          owned by the estimator (caller frees). */
     /* NOTE: the final reslice/interpolation is applied by the CALLER (main.c), not the
        estimator, so there is no interp field here — coreg_fast_estimate() only returns
        the world affine and does not touch image data. */

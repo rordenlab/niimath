@@ -41,6 +41,15 @@ const registered = await niimath.image(selectedFile).allineate(baseFile).run();
 const defaced = await niimath.image(selectedFile).deface(templateFile, maskFile).run();
 ```
 
+`allineate(base, opts?, weight?)` accepts an optional third `File`: a **soft-focus weight** in the base's space (its dims + world frame must match `base`). It focuses the fast-engine fine stage on a region — e.g. a brain mask — rather than whole-head features. It is **experimental** and is *not* an exclusion mask: the map is remapped to `[0.5, 1]` over the whole grid, so a zeroed region is down-weighted, never removed.
+
+```javascript
+// register `selectedFile` onto `baseFile`, focusing the fit on `brainMaskFile`
+const registered = await niimath.image(selectedFile).allineate(baseFile, [], brainMaskFile).run();
+```
+
+**Worker lifecycle.** `await niimath.init()` once before processing; it spawns a single persistent Web Worker. `init()` returns a promise that rejects if the worker fails to load or instantiate (e.g. the WASM cannot be fetched). **Single-flight:** one `.run()` is in flight per instance at a time — a second overlapping `run()` (or a `run()` before `init()` has resolved) rejects immediately rather than interleaving, so serialize calls (await the previous `run()`) or use a separate instance per concurrent stream. Call `niimath.dispose()` to terminate the worker and release its WASM heap; it is idempotent and rejects any in-flight `init()`/`run()`. A worker crash during a `run()` rejects that run and invalidates the worker — a subsequent `image(...).run()` rejects with "Worker not initialized" until you `init()` again.
+
 Two more operations take a `File` operand and are in both builds: `resliceNN(refFile)` reslices the current image onto another image's grid (nearest-neighbour), and `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` only takes a scalar). These let you, e.g., reslice a brain mask onto a native grid and apply it:
 
 ```javascript
