@@ -39,6 +39,16 @@ typedef struct {
                           from initial dependence*overlap (default); 0 = use the
                           supplied frame only (-nocmass, or an already-applied -com) */
     int verbose;       /* nonzero: per-stage logging to stderr */
+    const nifti_image *weight; /* optional (-weight): an AFNI 3dAllineate-style graded weight in
+                          fixed(base) space with dims identical to `fixed`. Normalized to [0,1] over
+                          the whole grid (÷ max) and applied GRADED per fixed sample (a voxel weighted
+                          0 is excluded, ~1 dominates) — NOT the old soft-focus floor. Applied ONLY at
+                          the FINEST pyramid level (2 mm) so the 8 mm rigid coarse and the 4 mm
+                          global-scale bracket stay whole-head (a brain-concentrated weight must not
+                          re-select global scale — the FLIRT Fig-1 shrink basin). Keep the out-of-ROI
+                          head attenuated (nonzero) to anchor scale. Honored by the HEL and CR costs;
+                          rejected with CF_COST_LS (which does not read it). NULL (default) leaves the
+                          fit byte-for-byte unchanged. Not owned by the estimator (caller frees). */
     /* NOTE: the final reslice/interpolation is applied by the CALLER (main.c), not the
        estimator, so there is no interp field here — coreg_fast_estimate() only returns
        the world affine and does not touch image data. */
@@ -62,6 +72,7 @@ static inline coreg_fast_opts coreg_fast_opts_default(void) {
     o.max_dof = 12;
     o.use_cmass = 1;   /* auto-select supplied-affine vs COM initialization */
     o.verbose = 0;
+    o.weight = NULL;   /* no region weighting unless -weight supplies a fixed-space image */
     return o;
 }
 

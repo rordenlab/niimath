@@ -3592,11 +3592,60 @@ static float param_dist(GA_setup *stup, float *p1, float *p2)
    free set (e.g. -sagseed's in-MSP {1,2,4}). When NULL, the common
    contiguous-prefix behavior applies: params[0 .. warp_dof-1] free, the rest
    fixed. */
+/* Load a user-supplied -weight image for the ordinary engine (AFNI 3dAllineate `-weight`): a
+ * base(fixed)-space GRADED weight used in place of the autoweight. AFNI requires it to share the
+ * base grid (dims) and uses it graded, normalized to [0,1] by the caller (never binarized). We
+ * additionally require world-frame agreement (the 8 base-index corners within ~1/20 voxel of the
+ * weight's own frame) so a matching-dims image in a different orientation/origin is rejected
+ * rather than silently misaligned. Extracts float in NATIVE voxel order so it aligns with
+ * bsim = nii_to_float(base). Returns a base-grid float buffer (caller frees), or NULL on error. */
+static float *al_load_user_weight(const char *fname, const nifti_image *base)
+{
+    int bnx = base->nx, bny = base->ny, bnz = base->nz;
+    nifti_image *wim = nifti_image_read(fname, 1);
+    if (!wim) { fprintf(stderr, "allineate: cannot read -weight image '%s'\n", fname); return NULL; }
+    if (wim->nvox != (size_t)wim->nx * wim->ny * wim->nz) {
+        fprintf(stderr, "allineate: -weight must be a single 3D volume (4D not supported)\n");
+        nifti_image_free(wim); return NULL;
+    }
+    if (wim->nx != bnx || wim->ny != bny || wim->nz != bnz) {
+        fprintf(stderr, "allineate: -weight dims %dx%dx%d must match the base %dx%dx%d\n",
+                (int)wim->nx, (int)wim->ny, (int)wim->nz, bnx, bny, bnz);
+        nifti_image_free(wim); return NULL;
+    }
+    mat44 Sb, Sw;
+    al_image_xform_or_pixdim(base, &Sb, NULL);
+    al_image_xform_or_pixdim(wim, &Sw, NULL);
+    double vmin = mat44_colnorm(Sb, 0), t;
+    t = mat44_colnorm(Sb, 1); if (t < vmin) vmin = t;
+    t = mat44_colnorm(Sb, 2); if (t < vmin) vmin = t;
+    double tol = 0.05 * vmin; if (!(tol > 0.0)) tol = 0.05;
+    for (int c = 0; c < 8; c++) {
+        double ix = (c & 1) ? bnx - 1 : 0, iy = (c & 2) ? bny - 1 : 0, iz = (c & 4) ? bnz - 1 : 0;
+        double bx = Sb.m[0][0]*ix + Sb.m[0][1]*iy + Sb.m[0][2]*iz + Sb.m[0][3];
+        double by = Sb.m[1][0]*ix + Sb.m[1][1]*iy + Sb.m[1][2]*iz + Sb.m[1][3];
+        double bz = Sb.m[2][0]*ix + Sb.m[2][1]*iy + Sb.m[2][2]*iz + Sb.m[2][3];
+        double wx = Sw.m[0][0]*ix + Sw.m[0][1]*iy + Sw.m[0][2]*iz + Sw.m[0][3];
+        double wy = Sw.m[1][0]*ix + Sw.m[1][1]*iy + Sw.m[1][2]*iz + Sw.m[1][3];
+        double wz = Sw.m[2][0]*ix + Sw.m[2][1]*iy + Sw.m[2][2]*iz + Sw.m[2][3];
+        double dx = bx - wx, dy = by - wy, dz = bz - wz;
+        if (sqrt(dx*dx + dy*dy + dz*dz) > tol) {
+            fprintf(stderr, "allineate: -weight image is in a different world frame than the base "
+                            "(matching dims but sform/qform disagree)\n");
+            nifti_image_free(wim); return NULL;
+        }
+    }
+    float *w = nii_to_float(wim);
+    nifti_image_free(wim);
+    if (!w) { fprintf(stderr, "allineate: -weight float conversion failed\n"); return NULL; }
+    return w;
+}
+
 static int al_register(nifti_image *source, nifti_image *base,
                        int match_code, int do_cmass, int do_src_automask,
                        int do_dark_automask, int relax_scale,
                        int fine_interp_code, int warp_dof, float wpar_out[12],
-                       const int *free_mask)
+                       const int *free_mask, const char *weight_fname)
 {
     int reg_rc = 0;   /* nonzero -> abort via al_cleanup (setup/optimizer OOM) */
     GA_setup stup;
@@ -3684,12 +3733,19 @@ static int al_register(nifti_image *source, nifti_image *base,
     al_image_xform_or_pixdim(source, &targ_cmat, NULL);
     targ_imat = nifti_mat44_inverse(targ_cmat);
 
-    /* --- 3. Compute autoweight --- */
+    /* --- 3. Weight: user -weight (AFNI 3dAllineate style, graded) or manufactured autoweight --- */
     PROFILE_START(autoweight);
-    fprintf(stderr, " + Computing autoweight from base image\n");
-    wght = al_autoweight(bsim, bnx, bny, bnz, bdx, bdy, bdz);
+    int user_weight = 0;
+    if (weight_fname) {
+        wght = al_load_user_weight(weight_fname, base);   /* NULL on read/dims/frame error */
+        user_weight = 1;
+        if (wght) fprintf(stderr, " + Using -weight '%s' (graded, AFNI 3dAllineate style)\n", weight_fname);
+    } else {
+        fprintf(stderr, " + Computing autoweight from base image\n");
+        wght = al_autoweight(bsim, bnx, bny, bnz, bdx, bdy, bdz);
+    }
     if (wght == NULL) {
-        fprintf(stderr, "allineate: failed to allocate autoweight image\n");
+        fprintf(stderr, "allineate: failed to obtain the base weight image\n");
         free(bsim); free(ajim);
         return 1;
     }
@@ -3746,7 +3802,11 @@ static int al_register(nifti_image *source, nifti_image *base,
            overlap unpenalized (the T2w->T1 shrink: peripheral voxels pushed out of FOV cost
            little); the binary weight anchors the full brain extent, so the fit contracts to
            fill (det 0.94->0.74, matching AFNI's 0.72). See AGENTS.md. */
-        int box_weight = (match_code != GA_MATCH_PEARSON_SCALAR &&
+        /* A USER -weight is used GRADED for every cost (matching AFNI 3dAllineate, which never
+           binarizes -weight). Only the MANUFACTURED autoweight is binarized for the box-mode
+           costs (Hellinger/MI/NMI/CR) — see the note above and AGENTS.md. */
+        int box_weight = (!user_weight) &&
+                         (match_code != GA_MATCH_PEARSON_SCALAR &&
                           match_code != GA_MATCH_PEARSON_LOCALS &&
                           match_code != GA_MATCH_PEARSON_LOCALA);
         float wmx = 0.0f;
@@ -3756,7 +3816,41 @@ static int al_register(nifti_image *source, nifti_image *base,
             for (ii = 0; ii < nvox_base; ii++) {
                 wght[ii] = fabsf(wght[ii]) * inv;
                 stup.bmask[ii] = (wght[ii] > 0.0f) ? 1 : 0;
-                if (stup.bmask[ii]) { stup.nmask++; if (box_weight) wght[ii] = 1.0f; }
+            }
+            if (box_weight) {
+                /* AFNI's default weight for the box-mode costs (Hellinger/MI/NMI/CR) is
+                   `-autobbox` (auto_weight=3): fill the BOUNDING BOX of the mask solidly,
+                   so every voxel across the full head extent is weighted equally. A brain-
+                   SHAPED binary mask (what a plain binarize produces) leaves the S-I
+                   periphery unconstrained, and a box-mode cost squashes it out cheaply
+                   (the FLIRT Fig-1 degeneracy — observed as a head-foot squash on a
+                   full-head base). The solid box anchors the whole extent, matching AFNI.
+                   Only the MANUFACTURED autoweight is boxed; a USER -weight stays graded
+                   (user_weight -> box_weight=0), as AFNI 3dAllineate never binarizes it. */
+                int bx_lo = bnx, bx_hi = -1, by_lo = bny, by_hi = -1, bz_lo = bnz, bz_hi = -1;
+                int bi, bj, bk;
+                for (bk = 0; bk < bnz; bk++)
+                    for (bj = 0; bj < bny; bj++)
+                        for (bi = 0; bi < bnx; bi++)
+                            if (stup.bmask[bi + bj * bnx + bk * bnx * bny]) {
+                                if (bi < bx_lo) bx_lo = bi; if (bi > bx_hi) bx_hi = bi;
+                                if (bj < by_lo) by_lo = bj; if (bj > by_hi) by_hi = bj;
+                                if (bk < bz_lo) bz_lo = bk; if (bk > bz_hi) bz_hi = bk;
+                            }
+                if (bx_hi >= bx_lo) {
+                    memset(stup.bmask, 0, (size_t)nvox_base);
+                    for (ii = 0; ii < nvox_base; ii++) wght[ii] = 0.0f;
+                    for (bk = bz_lo; bk <= bz_hi; bk++)
+                        for (bj = by_lo; bj <= by_hi; bj++)
+                            for (bi = bx_lo; bi <= bx_hi; bi++) {
+                                int idx = bi + bj * bnx + bk * bnx * bny;
+                                wght[idx] = 1.0f;
+                                stup.bmask[idx] = 1;
+                            }
+                    stup.nmask = (bx_hi - bx_lo + 1) * (by_hi - by_lo + 1) * (bz_hi - bz_lo + 1);
+                }
+            } else {
+                for (ii = 0; ii < nvox_base; ii++) if (stup.bmask[ii]) stup.nmask++;
             }
         }
     }
@@ -4454,6 +4548,78 @@ static int al_dims_ok(const nifti_image *n, const char *who)
     return 0;
 }
 
+/* Resolve an AL_FILL_* mode to the concrete out-of-FOV fill value (see allineate.h). */
+float al_resolve_fillv(int fillmode, const float *data, size_t n)
+{
+    if (fillmode == AL_FILL_ZERO) return 0.0f;
+    if (fillmode == AL_FILL_NAN)  return (float)NAN;
+    /* AL_FILL_AUTO: 0 unless the darkest (finite) voxel is negative, then that value.
+     * Magnitude guard (al_finitef) rather than isnan/isfinite because this TU is
+     * built with -ffast-math. An all-nonfinite or empty source yields 0. */
+    if (!data || n == 0) return 0.0f;
+    float mn = 0.0f; int have = 0;
+    for (size_t i = 0; i < n; i++) {
+        float v = data[i];
+        if (al_finitef(v) && (!have || v < mn)) { mn = v; have = 1; }
+    }
+    return (have && mn < 0.0f) ? mn : 0.0f;
+}
+
+/* al_resolve_fillv for a whole image of any datatype. Returns 0 on extraction failure. Used by
+   the CLI dispatch paths that reslice via nii_apply_affine (nii_allineate resolves from its own
+   float source). ZERO/NAN never touch the data. AUTO: an UNSCALED float32 image (the usual
+   niimath calc-chain case) is scanned in place — no allocation, matching nii_reslice_affine's
+   alias fast-path; only a scaled or non-float32 image takes the converting nii_to_float copy so
+   AUTO still sees true intensities (e.g. a raw int16 CT whose HU air is negative). */
+float al_image_fillv(int fillmode, nifti_image *nim)
+{
+    if (fillmode == AL_FILL_ZERO) return 0.0f;
+    if (fillmode == AL_FILL_NAN)  return (float)NAN;
+    if (nim == NULL || nim->data == NULL) return 0.0f;
+    size_t n = (size_t)nim->nx * nim->ny * nim->nz;
+    if (nim->datatype == DT_FLOAT32 &&
+        (nim->scl_slope == 0.0f || (nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)))
+        return al_resolve_fillv(AL_FILL_AUTO, (const float *)nim->data, n);
+    float *f = nii_to_float(nim);
+    if (!f) return 0.0f;
+    float v = al_resolve_fillv(AL_FILL_AUTO, f, n);
+    free(f);
+    return v;
+}
+
+/* Set every out-of-FOV output voxel of a fused-warp result to `fillv`, using the exact
+   FOV predicate the interpolation kernels use (coord < -0.499 || coord > dim-0.501). The
+   fused warp writes AL_FILL's 0 default; this rewrites only the out-of-FOV voxels (a
+   disjoint set from al_clip_fused_cubic_infov's in-FOV clamp, so order is irrelevant).
+   `gam` is the base-index -> source-index affine (== GA_setup_affine(12, wpar)). No-op
+   when fillv == 0 (the value the kernel already wrote). */
+static void al_fill_fused_oob(float * restrict war, mat44 gam,
+                              int anx, int any, int anz,
+                              int bnx, int bny, int bnz, float fillv)
+{
+    if (!war || fillv == 0.0f) return;
+    float nxh = anx - 0.501f, nyh = any - 0.501f, nzh = anz - 0.501f;
+    float mx0=gam.m[0][0], mx1=gam.m[0][1], mx2=gam.m[0][2], mx3=gam.m[0][3];
+    float my0=gam.m[1][0], my1=gam.m[1][1], my2=gam.m[1][2], my3=gam.m[1][3];
+    float mz0=gam.m[2][0], mz1=gam.m[2][1], mz2=gam.m[2][2], mz3=gam.m[2][3];
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if((size_t)bnx*bny*bnz > 100000)
+#endif
+    for (int kk = 0; kk < bnz; kk++) {
+        for (int jj = 0; jj < bny; jj++) {
+            size_t ob = ((size_t)kk * bny + jj) * bnx;
+            float bx = mx1*jj + mx2*kk + mx3;
+            float by = my1*jj + my2*kk + my3;
+            float bz = mz1*jj + mz2*kk + mz3;
+            for (int ii = 0; ii < bnx; ii++) {
+                float xx = mx0*ii + bx, yy = my0*ii + by, zz = mz0*ii + bz;
+                if (xx < -0.499f || xx > nxh || yy < -0.499f || yy > nyh ||
+                    zz < -0.499f || zz > nzh) war[ob+ii] = fillv;   /* out-of-FOV */
+            }
+        }
+    }
+}
+
 /* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index
  * affine `gam` (0-based NIfTI voxel indices). Replaces source->data with the
  * resliced float volume and adopts base dims + sform/qform. interp: AL_INTERP_*
@@ -4607,7 +4773,7 @@ static int al_estimate(nifti_image *source, nifti_image *base, al_opts opts,
 
     int ok = al_register(source, base, match_code, opts.cmass,
                          opts.source_automask, opts.dark_automask, opts.zoom /*relax_scale*/,
-                         opts.interp, opts.warp, wpar_out, NULL);
+                         opts.interp, opts.warp, wpar_out, NULL, opts.weight);
     if (ok) return ok;
     *world_out = al_world_xform_from_params(12, wpar_out);
     return 0;
@@ -4658,6 +4824,11 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
     else
 #endif
         fprintf(stderr, " + Applying final warp with %s interpolation\n", interp_name);
+    /* Resolve the out-of-FOV output fill from the source (before ajim is freed): AUTO
+       keeps 0 for positive-only images (MRI — byte-identical to before) but uses the
+       source minimum for signed data (CT/HU air). al_scalar_warpone writes 0 for
+       out-of-FOV voxels; the post-pass below rewrites them when fillv != 0. */
+    float fillv = al_resolve_fillv(opts.fillmode, ajim, (size_t)anx * any * anz);
     PROFILE_START(warp);
     float *warped = al_scalar_warpone(12, wpar, al_wfunc_affine,
                                       ajim, anx, any, anz,
@@ -4668,6 +4839,8 @@ int nii_allineate(nifti_image *source, nifti_image *base, al_opts opts)
         fprintf(stderr, "allineate: failed to warp image\n");
         return 1;
     }
+    al_fill_fused_oob(warped, GA_setup_affine(12, wpar), anx, any, anz,
+                      bnx, bny, bnz, fillv);
 
     /* Replace source->data with warped result, adopt base dims/transforms */
     free(source->data);
@@ -4809,7 +4982,7 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
         float wpar[12];
         int ok = al_register(input, tmpl, match_code, opts.cmass,
                              opts.source_automask, opts.dark_automask, 0 /*relax_scale*/,
-                             opts.interp, opts.warp, wpar, NULL);
+                             opts.interp, opts.warp, wpar, NULL, NULL);
         if (ok) {
             fprintf(stderr, "%s: registration failed\n", label);
             return 1;
@@ -5079,7 +5252,7 @@ static int al_sym_correction(nifti_image *nim, int dark_automask, mat44 *C_out, 
     float wpar[12];
     int ok = al_register(&src, &mir, GA_MATCH_PEARSON_SCALAR, 1 /*cmass*/,
                          0 /*source_automask*/, dark_automask, 0 /*relax_scale*/,
-                         AL_INTERP_LINEAR, 6 /*warp*/, wpar, NULL);
+                         AL_INTERP_LINEAR, 6 /*warp*/, wpar, NULL, NULL);
     al_shift_max_override = 0.0f;
     if (ok) { fprintf(stderr, "sym: mirror registration failed\n"); return 1; }
 
@@ -5257,7 +5430,7 @@ int nii_sagseed(nifti_image *nim, nifti_image *tmpl, al_opts opts)
     int ok = al_register(nim, tmpl, match_code, opts.cmass,
                          opts.source_automask, opts.dark_automask, 0 /*relax_scale: seed uses the isotropic tie*/,
                          opts.interp, 6 /*warp: ignored w/ mask*/,
-                         wpar, free_mask);
+                         wpar, free_mask, NULL);
     if (ok) { al_zoom_isotropic = prev_zoom; fprintf(stderr, "sagseed: constrained registration failed\n"); return 1; }
 
     /* Pure world transform P (base=tmpl -> source=nim); the seed correction that

@@ -52,22 +52,46 @@ int nii_mul_size(size_t a, size_t b, size_t *out) {
 	return 0;
 }
 
-/* Core operators use int spatial offsets. Validate that invariant once after input,
-   before dispatch, instead of repeating overflow-prone nx*ny*nz expressions in every
-   operator. Pass-through copies intentionally bypass this computation-only limit. */
+/* Validate calculator geometry once and classify its flat-index requirement. Promoted kernels
+   retain int-sized axis lengths, while their 3D and total voxel counts can be wider. Requiring
+   an integral number of 3D volumes prevents either narrow or wide callers from deriving offsets
+   from a malformed in-memory header. */
+nii_nvox_class nii_nvox_classify(const nifti_image *nim, uint64_t *nvox3d) {
+	if (!nim || nim->nx < 1 || nim->ny < 1 || nim->nz < 1 || nim->nvox < 1 ||
+		nim->nx > INT_MAX || nim->ny > INT_MAX || nim->nz > INT_MAX)
+		return NII_NVOX_INVALID;
+	uint64_t nx = (uint64_t)nim->nx;
+	uint64_t ny = (uint64_t)nim->ny;
+	uint64_t nz = (uint64_t)nim->nz;
+	if (nx > UINT64_MAX / ny)
+		return NII_NVOX_INVALID;
+	uint64_t nxy = nx * ny;
+	if (nxy > UINT64_MAX / nz)
+		return NII_NVOX_INVALID;
+	uint64_t nxyz = nxy * nz;
+	uint64_t total = (uint64_t)nim->nvox;
+	if (nxyz < 1 || total % nxyz != 0)
+		return NII_NVOX_INVALID;
+	if (nvox3d)
+		*nvox3d = nxyz;
+	return (nxyz > INT_MAX || total > INT_MAX) ? NII_NVOX_HUGE : NII_NVOX_INT_SAFE;
+}
+
 int nii_nvox3d_int(const nifti_image *nim, int *out) {
-	if (!nim || !out || nim->nx < 1 || nim->ny < 1 || nim->nz < 1)
-		return 1;
-	if (nim->nvox < 1 || (uint64_t)nim->nvox > INT_MAX)
-		return 1;
-	if ((uint64_t)nim->nx > SIZE_MAX || (uint64_t)nim->ny > SIZE_MAX ||
-		(uint64_t)nim->nz > SIZE_MAX)
-		return 1;
-	size_t nxy, nxyz;
-	if (nii_mul_size((size_t)nim->nx, (size_t)nim->ny, &nxy) ||
-		nii_mul_size(nxy, (size_t)nim->nz, &nxyz) || nxyz > INT_MAX)
+	uint64_t nxyz;
+	if (!out || nii_nvox_classify(nim, &nxyz) != NII_NVOX_INT_SAFE)
 		return 1;
 	*out = (int)nxyz;
+	return 0;
+}
+
+int nii_nvox3d(const nifti_image *nim, nvox_t *out) {
+	uint64_t nxyz;
+	nii_nvox_class cls = nii_nvox_classify(nim, &nxyz);
+	if (!out || cls == NII_NVOX_INVALID || nxyz > (uint64_t)NVOX_MAX ||
+		(uint64_t)nim->nvox > (uint64_t)NVOX_MAX)
+		return 1;
+	*out = (nvox_t)nxyz;
 	return 0;
 }
 
@@ -120,8 +144,11 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 		Sum = Sum + H[v];
 	if (Sum <= 0)
 		return 0;
-	double *P = (double*) malloc(nBin * nBin * sizeof(double));
-	double *S = (double*) malloc(nBin * nBin * sizeof(double));
+	/* Fixed-size Otsu workspaces use the project's checked, fail-closed allocator. Returning
+	   threshold 0 on OOM was ambiguous with a valid result and silently modified the image. */
+	size_t nCell = (size_t)nBin * (size_t)nBin; // nBin <= 32767 above
+	double *P = (double *)nii_malloc(nCell, sizeof(double));
+	double *S = (double *)nii_malloc(nCell, sizeof(double));
 	P[0] = H[0];
 	S[0] = H[0];
 	for (int v = 1; v < nBin; v++) {
@@ -362,7 +389,7 @@ nifti_image *nifti_image_read2(const char *hname, int read_data) {
 	// fslmaths in -add 0 out -odt input
 	nifti_image *nim = nifti_image_read(hname, read_data);
 	if (nim == NULL)
-		exit(134);
+		return NULL;
 	nim->cal_min = 0.0;
 	nim->cal_max = 0.0;
 	//nim->descrip = '';
@@ -402,7 +429,7 @@ float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2) {
 	            sqr(pos.v[2] - pos2.v[2]));
 }
 
-static double xyz_units_to_mm(int xyz_units) {
+double xyz_units_to_mm(int xyz_units) {
 	// NIfTI spatial coordinates are expressed in xyz_units; normalize to
 	// millimetres so callers can apply fixed-mm thresholds. Unknown/unspecified
 	// units are assumed to be mm (the overwhelmingly common case).
@@ -491,10 +518,10 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	int idt = nim->datatype; //input datatype
 	if ((idt == DT_RGB24) || (idt == DT_RGBA32)) {
 		// convert single volume RGB into 3 scalar volumes
-		int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-		int nVol = nim->nvox / nvox3D;
+		nvox_t nvox3D = (nvox_t)nim->nx * nim->ny * MAX(nim->nz, 1);
+		nvox_t nVol = nim->nvox / nvox3D;
 		if (nVol != 1) {
-			printfx("multivolume (%d) RGB/RGBA (DT %d) not supported.\n", nVol, idt);
+			printfx("multivolume (%lld) RGB/RGBA (DT %d) not supported.\n", (long long)nVol, idt);
 			return EXIT_FAILURE;
 		}
 		uint8_t *i8 = (uint8_t *)nim->data;
@@ -531,8 +558,8 @@ int nifti_image_change_datatype(nifti_image *nim, int dt, in_hdr *ihdr) {
 	int8_t *i8 = (int8_t *)nim->data;
 	int ok = -1;
 	if ((dt == DT_RGBA32) || (dt == DT_RGB24)) {
-		int nvox3D = nim->nx * nim->ny * MAX(nim->nz, 1);
-		int nVol = nim->nvox / nvox3D;
+		nvox_t nvox3D = (nvox_t)nim->nx * nim->ny * MAX(nim->nz, 1);
+		nvox_t nVol = nim->nvox / nvox3D;
 		if (idt != DT_FLOAT32) {
 			printfx("RGB/RGBA output requires at least float32 input.\n");
 			return EXIT_FAILURE;

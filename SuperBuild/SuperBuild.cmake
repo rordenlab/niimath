@@ -50,6 +50,11 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 # instead of silently reporting an unused variable.
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
+option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
+option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
+if(ENABLE_QWARP AND NOT ENABLE_ALLINEATE)
+  message(FATAL_ERROR "ENABLE_QWARP=ON requires ENABLE_ALLINEATE=ON (qwarp uses the allineate/NEWUOA optimizer).")
+endif()
 # OPENMP_XCODE is the AppleClang-only legacy alias (src/CMakeLists.txt gates OpenMP
 # on `USE_OPENMP AND OPENMP_XCODE`). Its DEFAULT follows USE_OPENMP so a plain
 # top-level build enables OpenMP on Apple (matching the docs), but it stays an
@@ -111,6 +116,8 @@ ExternalProject_Add(src
         -DENABLE_GPL:BOOL=${ENABLE_GPL}
         -DUSE_OPENMP:BOOL=${USE_OPENMP}
         -DENABLE_QC:BOOL=${ENABLE_QC}
+        -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}
+        -DENABLE_QWARP:BOOL=${ENABLE_QWARP}
         -DBUILD_BMP:BOOL=${BUILD_BMP}
         # forward static runtime and static linking
         -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=${CMAKE_MSVC_RUNTIME_LIBRARY}

@@ -185,12 +185,16 @@ export function setupWorker(ModuleFactory: EmscriptenModuleFactory): void {
           if (!out_bin) {
             throw new Error(`niimath completed but output "${outName}" was not found`);
           }
-          // binary output file from niimath wasm: nii or mz3. Copy into an exact-
-          // length buffer so the Blob is precisely the file's bytes — the FS_readFile
-          // view can in principle sit at an offset/short of its backing ArrayBuffer.
-          const exact = new Uint8Array(out_bin.byteLength);
-          exact.set(out_bin);
-          const outputFile = new Blob([exact.buffer], { type: 'application/sla' });
+          // binary output file from niimath wasm: nii or mz3. Pass the Uint8Array VIEW
+          // (not its .buffer) to Blob: the constructor copies exactly [byteOffset,
+          // byteOffset+byteLength), so the Blob is precisely the file's bytes even when
+          // the FS_readFile view sits at an offset/short of its backing ArrayBuffer — with
+          // no separate full-size copy. The cast narrows TS 5.7's `Uint8Array<ArrayBufferLike>`
+          // to the non-shared `ArrayBuffer` the DOM BlobPart type requires; the niimath WASM
+          // heap is a regular (single-threaded, non-shared) ArrayBuffer, so this is accurate.
+          // Neutral binary MIME: the output is a NIfTI (.nii/.nii.gz) or MZ3 mesh, not STL —
+          // the previous 'application/sla' (an STL type) mislabeled it.
+          const outputFile = new Blob([out_bin as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
           // send a message back to the main thread with the output file, exit code and output file name
           const successMsg: WorkerSuccessMessage = {
             blob: outputFile,

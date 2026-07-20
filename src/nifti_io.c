@@ -180,7 +180,12 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
          /* Deferred write: buffer to tmpfile, compress on close */
          f->zst_fname = nifti_strdup(path);
          f->nzfptr = tmpfile();
-         if (!f->nzfptr || !f->zst_fname) { free(f->zst_fname); free(f); return NULL; }
+         if (!f->nzfptr || !f->zst_fname) {
+            if (f->nzfptr) fclose(f->nzfptr); // close the temp file if strdup was what failed (was leaked)
+            free(f->zst_fname);
+            free(f);
+            return NULL;
+         }
       }
       return f;
    }
