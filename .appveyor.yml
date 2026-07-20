@@ -133,15 +133,8 @@ for:
       - git clone https://github.com/rordenlab/niimath_tests.git $basedir
       - cd $basedir; ./canonical_test.sh
 
-deploy:
-  - provider: GitHub
-    tag: $(APPVEYOR_REPO_TAG_NAME)
-    release: version $(RELEASE_VERSION) ($(APPVEYOR_REPO_TAG_NAME))
-    description: ""
-    auth_token:
-      secure: AkRtDExPl2IzRW9oEojYwx593B1S9GERT8H0XgelH7fPwVspj9GAIfMYaFImjJ3M
-    artifact: /niimath_.*\.zip/
-    draft: false
-    prerelease: false
-    on:
-      APPVEYOR_REPO_TAG: true
+# NOTE: GitHub Release ASSETS (the niimath_{win,lnx,macos}.zip binaries) are published by the
+# GitHub Actions workflow `.github/workflows/release-binaries.yml` using the built-in GITHUB_TOKEN.
+# The old AppVeyor `deploy: provider: GitHub` step was removed because its personal-access token
+# silently expired and returned 401 at release time — failing the tag build (red master) and
+# blocking assets. AppVeyor now only builds/tests cross-platform; it no longer deploys.

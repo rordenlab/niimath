@@ -1,0 +1,92 @@
+name: Release binaries
+# Build the standalone niimath CLI for Windows / Linux / macOS (universal) and attach the zips to
+# the GitHub Release using the built-in GITHUB_TOKEN. This REPLACES the AppVeyor `deploy: provider:
+# GitHub` step, whose personal-access token silently EXPIRES (401 at release time -> no assets AND a
+# red build). GITHUB_TOKEN is auto-provisioned per run, scoped to this repo, and never expires.
+# Python wheels are published separately by release.yml (-> PyPI); this handles the CLI binaries.
+#
+# Triggers: a v*.*.* tag push (normal release), or manual dispatch against an existing tag (to
+# (re)attach binaries without re-tagging — avoids re-running release.yml's one-shot PyPI upload).
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build from and attach binaries to (e.g. v1.0.20260720)'
+        required: true
+permissions:
+  contents: write   # GITHUB_TOKEN needs this to upload release assets
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            zip: niimath_win.zip
+          - os: ubuntu-22.04       # older glibc -> the Linux binary runs on more distros
+            zip: niimath_lnx.zip
+          - os: macos-latest
+            zip: niimath_macos.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          # Build the tagged source: the pushed tag, or the manually supplied one.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # ---- Linux: system zstd; the SuperBuild builds zlib-ng from source (self-contained gz). ----
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get update && sudo apt-get install -y libzstd-dev
+          cmake -Wno-dev -B build -DENABLE_ZSTD=ON
+          cmake --build build
+          python3 .github/scripts/release_smoke.py ./build/bin/niimath --expect-zstd
+          7z a "${{ matrix.zip }}" ./build/bin/* >/dev/null
+
+      # ---- Windows: static zstd via vcpkg (as release.yml), passed through ZSTD_ROOT. ----
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install zstd:x64-windows-static
+          cmake -Wno-dev -B build -DENABLE_ZSTD=ON `
+            -DZSTD_ROOT=C:/vcpkg/installed/x64-windows-static `
+            -DCMAKE_PREFIX_PATH=C:/vcpkg/installed/x64-windows-static
+          cmake --build build --config Release
+          python .github\scripts\release_smoke.py .\build\bin\niimath.exe --expect-zstd
+          7z a ${{ matrix.zip }} .\build\bin\* > $null
+
+      # ---- macOS: universal (x86_64 + arm64), static zstd from source (self-contained, no dylib),
+      #      no OpenMP (single-arch libomp can't link into a universal binary). ----
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          curl -sL -o zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+          tar xzf zstd.tar.gz
+          make -C zstd-1.5.6/lib -j libzstd.a CFLAGS="-O3 -fPIC -arch x86_64 -arch arm64"
+          ZSTD="$PWD/zstd-univ"; mkdir -p "$ZSTD/lib" "$ZSTD/include"
+          cp zstd-1.5.6/lib/libzstd.a "$ZSTD/lib/"
+          cp zstd-1.5.6/lib/zstd.h zstd-1.5.6/lib/zdict.h zstd-1.5.6/lib/zstd_errors.h "$ZSTD/include/"
+          for arch in x86_64 arm64; do
+            cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=$arch -DOPENMP_XCODE=OFF -DENABLE_ZSTD=ON \
+              -DZSTD_ROOT="$ZSTD" -DCMAKE_PREFIX_PATH="$ZSTD" -B "build/$arch"
+            cmake --build "build/$arch"
+          done
+          lipo -create -output build/niimath build/x86_64/bin/niimath build/arm64/bin/niimath
+          lipo -info build/niimath   # expect: x86_64 arm64
+          if otool -L build/niimath | grep -qi zstd; then echo "ERROR: zstd not statically linked"; exit 1; fi
+          python3 .github/scripts/release_smoke.py ./build/niimath --expect-zstd
+          zip -j "${{ matrix.zip }}" ./build/niimath
+
+      - name: Attach binary to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ matrix.zip }}
+          fail_on_unmatched_files: true
