@@ -170,6 +170,10 @@ LeakSanitizer is unavailable on Apple Silicon; ASan is libomp-deadlocked (so `ma
 - `make_fixtures.py` / `reg_quality.py` run only on the CI runner's modern `python3` (never inside a wheel), so they are NOT minimum-Python-constrained — only `release_smoke.py` is.
 - To reproduce the exact wheel-test locally before tagging: `pipx run cibuildwheel --only <id>` or run `python3.7 .github/scripts/release_smoke.py <binary>` under the minimum interpreter.
 
+**Two separate release outputs, two mechanisms:**
+- **Python wheels → PyPI:** `release.yml` (cibuildwheel across 5 OS/arch, `deploy-pypi`). PyPI rejects a duplicate version, so do NOT re-push an existing tag expecting a re-upload — cut a new version instead.
+- **Standalone CLI binaries → GitHub Release assets** (`niimath_{win,lnx,macos}.zip`): `release-binaries.yml`, using the built-in **`GITHUB_TOKEN`** (auto-provisioned, repo-scoped, **never expires**). It replaced the AppVeyor `deploy: provider: GitHub` step, whose **personal-access token silently expired → 401 at release time**, which both blocked the assets AND red-failed the tag build (the AppVeyor branch and tag builds share one status context, so the tag build's deploy failure overwrote the branch build's success on the commit — a red master that will not self-clear). AppVeyor now only builds/tests cross-platform; it no longer deploys. The macOS binary is a universal (x86_64+arm64) lipo with static zstd (built from source, self-contained) and no OpenMP (single-arch libomp can't link into a universal binary). **Lesson:** never gate a release on a rotating PAT — prefer `GITHUB_TOKEN`. To (re)attach binaries to an existing release WITHOUT re-tagging (and without re-triggering the one-shot PyPI upload), run `release-binaries.yml` via `workflow_dispatch` with the tag as input.
+
 ## Known Remaining Issues
 
 1. **NULL checks** — ~26 unchecked malloc/calloc calls remain in MarchingCubes.c (6), oldcubes.c (3), and quadric.c (17); meshify.c is largely fixed.
