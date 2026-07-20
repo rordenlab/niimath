@@ -39,6 +39,14 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR BUILD_FLAVOR STREQUAL "tiny")
     ADD_DEFINITIONS(-DFORCE_INT32_MAX)
 endif()
 
+# ENABLE_QWARP is only meaningful for the full "all" flavor (tiny/nano omit the allineate engine
+# qwarp depends on). Reject the explicit unsupported combination rather than silently dropping the
+# feature — the tiny branch never declares the option, so -DENABLE_QWARP=ON would otherwise be an
+# unused-cli variable (and the top-level SuperBuild suppresses that warning).
+if(ENABLE_QWARP AND NOT BUILD_FLAVOR STREQUAL "all")
+    message(FATAL_ERROR "ENABLE_QWARP=ON requires BUILD_FLAVOR=all (tiny/nano omit the allineate engine qwarp depends on).")
+endif()
+
 if(${BUILD_FLAVOR} STREQUAL "all")
     ADD_DEFINITIONS(-DHAVE_64BITS)
     set(ADDITIONAL_SRCS core64.c)
@@ -58,14 +66,26 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
+    # Fail explicitly rather than silently ignoring -DENABLE_QWARP=ON when allineate is off
+    # (ENABLE_QWARP is declared inside the branch below; read the cache value here).
+    if(ENABLE_QWARP AND NOT ENABLE_ALLINEATE)
+        message(FATAL_ERROR "ENABLE_QWARP=ON requires ENABLE_ALLINEATE=ON (qwarp uses the allineate/NEWUOA optimizer).")
+    endif()
     if(ENABLE_ALLINEATE)
         ADD_DEFINITIONS(-DHAVE_ALLINEATE)
-        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c coreg_fast.c)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} allineate.c powell_newuoa.c coreg_fast.c reface.c)
         # fast-math is applied WHOLE-PROGRAM below (non-MSVC), matching the Makefile release
         # build — the registration cost surface must round like the standalone allineate/
         # fslmaths goldens, and scoping it to only these 3 TUs made CMake artifacts diverge
         # numerically from the Make (release) build. See the whole-program block after the
         # compiler branches.
+        # Optional -qwarp nonlinear registration (attributed AFNI 3dQwarp port). OFF by default:
+        # memory/CPU-heavy, benefits from OpenMP, impractically slow in WASM (matches Makefile QWARP=1).
+        option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
+        if(ENABLE_QWARP)
+            ADD_DEFINITIONS(-DHAVE_QWARP)
+            set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} qwarp.c)
+        endif()
     endif()
 
     # Optional GPL spm_coreg module (-spm_coreg/-spm_deface). OFF so default builds stay

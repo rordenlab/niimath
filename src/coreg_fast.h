@@ -39,18 +39,16 @@ typedef struct {
                           from initial dependence*overlap (default); 0 = use the
                           supplied frame only (-nocmass, or an already-applied -com) */
     int verbose;       /* nonzero: per-stage logging to stderr */
-    const nifti_image *weight; /* optional (-weight): a fixed(base)-space SOFT-FOCUS map with dims
-                          identical to `fixed`. It is NOT an exclusion mask: the image is normalized
-                          and remapped to [CF_WEIGHT_FLOOR, 1] over the WHOLE fixed grid (AFNI-style
-                          whole-head anchor), so out-of-ROI head voxels still contribute at the floor
-                          (a zeroed region is down-weighted, never excluded). Each fine-level sample's
-                          cost is scaled by that remapped value; applied ONLY at the fine pyramid
-                          levels (4/2 mm) so the coarse 8 mm capture + seed selection stay whole-head.
-                          The floor keeps global scale anchored (a mask that zeroed outside the ROI
-                          would make extent underdetermined and let a cross-modal fit shrink into the
-                          scalp). Honored by the HEL and CR costs; rejected with CF_COST_LS (which does
-                          not read it). NULL (default) leaves the fit byte-for-byte unchanged. Not
-                          owned by the estimator (caller frees). */
+    const nifti_image *weight; /* optional (-weight): an AFNI 3dAllineate-style graded weight in
+                          fixed(base) space with dims identical to `fixed`. Normalized to [0,1] over
+                          the whole grid (÷ max) and applied GRADED per fixed sample (a voxel weighted
+                          0 is excluded, ~1 dominates) — NOT the old soft-focus floor. Applied ONLY at
+                          the FINEST pyramid level (2 mm) so the 8 mm rigid coarse and the 4 mm
+                          global-scale bracket stay whole-head (a brain-concentrated weight must not
+                          re-select global scale — the FLIRT Fig-1 shrink basin). Keep the out-of-ROI
+                          head attenuated (nonzero) to anchor scale. Honored by the HEL and CR costs;
+                          rejected with CF_COST_LS (which does not read it). NULL (default) leaves the
+                          fit byte-for-byte unchanged. Not owned by the estimator (caller frees). */
     /* NOTE: the final reslice/interpolation is applied by the CALLER (main.c), not the
        estimator, so there is no interp field here — coreg_fast_estimate() only returns
        the world affine and does not touch image data. */

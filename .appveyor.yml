@@ -115,6 +115,17 @@ for:
       - cmake -Wno-dev -B build -DENABLE_ZSTD=ON
       - cmake --build build
       - python3 .github/scripts/release_smoke.py ./build/bin/niimath --expect-zstd
+      # QWARP=1 compile gate: the object-based (ALOBJS) and direct-source (ALSRC) Makefile
+      # inventories must BOTH link the -qwarp dispatch (guards the qwarp source-list drift that
+      # the default builds never exercise). native-noomp is the direct-source (ALSRC) path.
+      - make -C src QWARP=1 CNAME=gcc-9
+      - make -C src QWARP=1 CNAME=gcc-9 native-noomp
+      # QWARP=1 dispatch smoke (not just linkage): a 4D subject reaches nifti_qwarp_wrap and hits its
+      # single-3D-volume guard (before any base read or optimization), emitting the reject and exiting
+      # nonzero — proving -qwarp is dispatched, not reported as an "unknown operation". No warp runs.
+      - python3 -c "import sys; sys.path.insert(0,'.github/scripts'); from release_smoke import write_float32_nifti; from pathlib import Path; write_float32_nifti(Path('/tmp/qw4d.nii'),(4,4,4),[1.0]*128,nt=2); write_float32_nifti(Path('/tmp/qwb.nii'),(4,4,4),[1.0]*64)"
+      - if src/niimath /tmp/qw4d.nii -qwarp /tmp/qwb.nii /tmp/qwout.nii 2>/tmp/qw.err; then echo "ERROR -qwarp 4D subject should fail"; exit 1; fi
+      - grep -q "single 3D volume" /tmp/qw.err || { echo "ERROR -qwarp not dispatched"; cat /tmp/qw.err; exit 1; }
 
     after_build:
       - export builddir=$APPVEYOR_BUILD_FOLDER/build

@@ -21,7 +21,7 @@ endif
 #Affine registration (from AFNI 3dAllineate, public domain)
 AFASTMATH= -ffast-math -fno-finite-math-only
 AFLAGS= -DHAVE_ALLINEATE
-ALOBJS= allineate.o powell_newuoa.o coreg_fast.o
+ALOBJS= allineate.o powell_newuoa.o coreg_fast.o reface.o
 
 #Zlib flags
 ZFLAGS= -DHAVE_ZLIB -lz
@@ -98,7 +98,7 @@ endif
 WASM_AL=
 WASM_AL_PREREQ=
 ifneq "$(AL)" "0"
-    WASM_AL= $(AFLAGS) al_wasm.o pn_wasm.o cf_wasm.o
+    WASM_AL= $(filter-out -DHAVE_QWARP,$(AFLAGS)) al_wasm.o pn_wasm.o cf_wasm.o rf_wasm.o
     WASM_AL_PREREQ= wasm_al_objs
 endif
 
@@ -148,6 +148,22 @@ endif
 ifeq "$(AL)" "0"
 	AFLAGS=
 	ALOBJS=
+endif
+
+# run "QWARP=1 make" to include -qwarp nonlinear (deformable) registration, an attributed
+# public-domain port of AFNI 3dQwarp (qwarp.c/.h). OFF by default: it is memory/CPU-heavy,
+# benefits greatly from OpenMP, and is impractically slow in WASM. Requires allineate
+# (uses powell_newuoa.o), so do not combine with AL=0.
+ifeq "$(QWARP)" "1"
+ifeq "$(AL)" "0"
+$(error QWARP=1 requires allineate (qwarp uses powell_newuoa); do not combine with AL=0)
+endif
+ifneq "$(filter wasm wasm-wasi wasm-emcc-core tiny nano,$(MAKECMDGOALS))" ""
+$(error QWARP=1 is not supported for wasm/tiny/nano targets (these omit the allineate engine qwarp depends on, and qwarp is impractically slow in WASM); build a full native target)
+endif
+	AFLAGS += -DHAVE_QWARP
+	ALOBJS += qwarp.o
+	QWARP_SRC= qwarp.c
 endif
 
 #run "ZSTD=0 make" for compile without zstd support
@@ -214,13 +230,22 @@ powell_newuoa.o: powell_newuoa.c .al_obj_flags
 coreg_fast.o: coreg_fast.c coreg_fast.h core32.h allineate.h .al_obj_flags
 	$(CNAME) $(CFLAGS) -MMD -MP -c coreg_fast.c -o coreg_fast.o
 
+reface.o: reface.c reface.h core32.h nifti_io.h .al_obj_flags
+	$(CNAME) $(CFLAGS) -MMD -MP -c reface.c -o reface.o
+
+# qwarp.o is only linked when QWARP=1 (added to ALOBJS above); the rule is always present.
+qwarp.o: qwarp.c qwarp.h core32.h nifti_io.h .al_obj_flags
+	$(CNAME) $(CFLAGS) -MMD -MP -c qwarp.c -o qwarp.o
+
 # Auto-generated header dependencies for the prebuilt registration objects (from -MMD).
--include allineate.d powell_newuoa.d coreg_fast.d
+-include allineate.d powell_newuoa.d coreg_fast.d reface.d qwarp.d
 
 #allineate source files for non-default targets (compiled directly, not as separate .o)
 ALSRC=
 ifneq "$(AL)" "0"
-ALSRC= allineate.c powell_newuoa.c coreg_fast.c
+# qwarp.c ($(QWARP_SRC)) is appended when QWARP=1, matching ALOBJS's qwarp.o — both the object
+# and direct-source inventories derive from the same QWARP conditional so QWARP=1 links on every target.
+ALSRC= allineate.c powell_newuoa.c coreg_fast.c reface.c $(QWARP_SRC)
 endif
 
 # True single-threaded release build for native performance comparisons. This compiles the same
@@ -293,6 +318,7 @@ wasm_al_objs:
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c allineate.c -o al_wasm.o
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c powell_newuoa.c -o pn_wasm.o
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c coreg_fast.c -o cf_wasm.o
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c reface.c -o rf_wasm.o
 
 # WASM_OUT names the emitted ES6 module (emcc derives the sibling .wasm from it).
 # Default is the BSD ../js/src/niimath.js; the GPL build overrides it to
@@ -326,7 +352,7 @@ WASI_CC= zig cc -target wasm32-wasi
 # has shipped wasm SIMD since 2021. ~+11% wasm size for a large filter speedup.
 WASI_CFLAGS= -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DFORCE_INT32_MAX -DNII_WASI -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH
 # Scoped compute sources. niimath.c is compiled separately (with -Dmain=niimath_entry).
-WASI_SRCS= core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c wasi_shim.c
+WASI_SRCS= core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c reface.c wasi_shim.c
 WASI_EXPORTS= -Wl,--export=nii_run -Wl,--export=malloc -Wl,--export=free -Wl,--export=_initialize -Wl,--export-memory
 WASI_OUT= ../js/src/niimath-wasi.wasm
 
@@ -352,7 +378,7 @@ wasm-wasi: wasi-toolcheck
 EMCC_CORE_OUT= ../js/src/niimath-emcc-core.js
 wasm-emcc-core:
 	emcc -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DEMSCRIPTEN -DFORCE_INT32_MAX -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH \
-	  niimath.c core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c \
+	  niimath.c core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c reface.c \
 	  -s STACK_SIZE=4194304 -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 \
 	  -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","cwrap","FS_createDataFile","FS_readFile","FS_unlink","stringToUTF8","getValue","setValue"]' \
 	  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free"]' -s INVOKE_RUN=0 -o $(EMCC_CORE_OUT)

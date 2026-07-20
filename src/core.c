@@ -429,7 +429,7 @@ float vertexDisplacement(float x, float y, float z, mat44 m, mat44 m2) {
 	            sqr(pos.v[2] - pos2.v[2]));
 }
 
-static double xyz_units_to_mm(int xyz_units) {
+double xyz_units_to_mm(int xyz_units) {
 	// NIfTI spatial coordinates are expressed in xyz_units; normalize to
 	// millimetres so callers can apply fixed-mm thresholds. Unknown/unspecified
 	// units are assumed to be mm (the overwhelmingly common case).

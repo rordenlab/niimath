@@ -79,7 +79,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260713"
+#define kMTHdate "v1.0.20260720"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -353,7 +353,7 @@ int show_help( void ) {
 	printf("                                  -nosagseed  disable the in-MSP rigid seed that -sym runs by default\n");
 	printf("                                    (-com/-sym seeds work with every cost, incl. -cost fast)\n");
 	printf("                                  -zoom  relax the scale range (abnormal size, e.g. infant vs adult template; needs a normal -cost, not fast)\n");
-	printf("                                  -weight <img>  base-space fine-stage region soft-focus, remapped to [0.5,1] (dims/frame match base); not an exclusion mask; fast engine only (experimental)\n");
+	printf("                                  -weight <img>  AFNI 3dAllineate-style graded base-space weight, normalized [0,1] (dims/frame match base); both engines (fast applies it at the finest 2mm stage only)\n");
 	printf("                            default cost: fast (no -cost == -cost fast); use -source_automask with lpc/lpa\n");
 	printf("                            (skull-stripping: use -deface with a brain mask; robustfov crop: chain -robustfov before -allineate)\n");
 	printf("                            4D input: registers the FIRST volume only (== -crop 0 1), with a warning; use -Tmean or -crop first to choose\n");
@@ -362,6 +362,12 @@ int show_help( void ) {
 	printf("                              opts: -cost XX (fast [default], fastcr, hel, lpc, lpa, ls) -cmass -nocmass tuning + -final/-nearest/-linear/-cubic [default final: linear]\n");
 	printf("                                    (fast is SPM/FLIRT-inspired; -cost hel is AFNI-style. -warp/-interp/-source_automask/-dark_automask need -cost hel)\n");
 	printf("                                    (the -savemat/-applymat/-com/-sym*/-nosagseed/-zoom/-master workflow options are for -allineate only and are rejected here)\n");
+	printf(" -reface <tmpl> <shell> <weight> [opts] : ANONYMIZE — register subject to tmpl, back-project the template-space face shell onto the ORIGINAL subject grid, composite an artificial face (AFNI afni_refacer2 -mode_reface)\n");
+	printf("                              shell voxels: >0 replace (brightness-matched), ==0 keep subject, <0 zero. weight is REQUIRED (base-space registration weight). opts: -cost XX (as -deface); the shell back-projection is nearest-neighbour so -final does not apply. QC the output.\n");
+#ifdef HAVE_QWARP
+	printf(" -qwarp <base>            : NONLINEAR (deformable) registration to 'base' (attributed AFNI 3dQwarp -blur 0 3 port; QWARP=1 build)\n");
+	printf("                              input must ALREADY be unifized + skull-stripped + affine-aligned + share the base grid. Memory/CPU-heavy; benefits from OpenMP; QW_VERB=1 for a per-level trace\n");
+#endif
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
@@ -426,7 +432,7 @@ int show_help( void ) {
 	printf(" -tensor_2upper           : convert NIfTI standard lower triangle image to FSL style upper triangle order\n");
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
-	printf(" -unifize                 : bias field correction (adapted from AFNI 3dUnifize)\n");
+	printf(" -unifize [-GM]           : bias field correction (adapted from AFNI 3dUnifize); optional -GM also scales gray matter\n");
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels [1 is typical]; scl is amount [0.5 medium, 1.0 heavy])\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");

@@ -161,6 +161,7 @@ int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);
 mat44 xform(nifti_image * nim);
 int nifti_image_change_datatype ( nifti_image * nim, int dt , in_hdr * ihdr);
 float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
+double xyz_units_to_mm(int xyz_units); // NIfTI spatial-unit -> mm scale (m=1000, micron=0.001, else 1)
 vec4 setVec4(float x, float y, float z);
 vec4 nifti_vect44mat44_mul(vec4 v, mat44 m );
 int neg_determ(nifti_image * nim);

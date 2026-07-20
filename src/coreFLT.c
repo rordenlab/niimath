@@ -85,6 +85,10 @@
 #ifdef HAVE_ALLINEATE
 #include "allineate.h"
 #include "coreg_fast.h"
+#include "reface.h"
+#ifdef HAVE_QWARP
+#include "qwarp.h"
+#endif
 #endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
@@ -6264,18 +6268,18 @@ staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
 } // nifti_compare()
 
 // unifize wrapper: always processes in float internally
-staticx int nifti_unifize(nifti_image *nim) {
+staticx int nifti_unifize(nifti_image *nim, int do_gm) {
 	if (nim->datatype != DT_CALC) return 1;
 	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
 #ifdef DT32
-	return unifize_image((float *)nim->data, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+	return unifize_image((float *)nim->data, nx, ny, nz, nim->dx, nim->dy, nim->dz, do_gm);
 #else
 	size_t nvox3D = (size_t)nx * ny * nz;
 	float *tmp = (float *)malloc(nvox3D * sizeof(float));
 	if (!tmp) return 1;
 	double *dd = (double *)nim->data;
 	for (size_t i = 0; i < nvox3D; i++) tmp[i] = (float)dd[i];
-	int ret = unifize_image(tmp, nx, ny, nz, nim->dx, nim->dy, nim->dz);
+	int ret = unifize_image(tmp, nx, ny, nz, nim->dx, nim->dy, nim->dz, do_gm);
 	if (ret == 0)
 		for (size_t i = 0; i < nvox3D; i++) dd[i] = (double)tmp[i];
 	free(tmp);
@@ -6502,10 +6506,12 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	if (fast_default)
 		opts.fast = AL_ENGINE_FAST_HEL;
 
-	/* -weight (fast-engine fine-stage region focus) is only honored by the fast engine.
-	   Reject it for the ordinary engine rather than silently ignoring the region request. */
-	if (opts.weight && !opts.fast) {
-		printfx("** -weight is only supported with the fast engine (-cost fast / -cost fastcr)\n");
+	/* -weight is an AFNI 3dAllineate-style graded base-space weight honored by BOTH engines: the
+	   ordinary engine (hel/lpc/lpa/ls) loads it internally via al_load_user_weight, replacing its
+	   manufactured autoweight; the fast engine loads it in its branch below. Preflight the header
+	   ONCE here (fail-closed on a huge/malformed weight) because the ordinary engine's internal
+	   load has no oversize gate. */
+	if (opts.weight && nii_reject_oversize_aux(opts.weight, "weight image")) {
 		nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 	}
 	/* Reject stdin for -weight: only the moving image may be piped, and its cached buffer would
@@ -6585,9 +6591,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		   weight validation (dims + world frame + LS/3D) and its diagnostics. */
 		nifti_image *weight_img = NULL;
 		if (opts.weight) {
-			if (nii_reject_oversize_aux(opts.weight, "weight image")) { // header-only: reject a huge/malformed weight before load
-				nifti_image_free(base); if (master) nifti_image_free(master); return 1;
-			}
+			/* header oversize already preflighted once above (both engines) */
 			weight_img = nifti_image_read(opts.weight, 1);
 			if (!weight_img) {
 				printfx("** failed to read -weight image '%s'\n", opts.weight);
@@ -6599,14 +6603,14 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		coreg_fast_result res;
 		ok = coreg_fast_estimate(nim, base, &cfo, &res);
 		nifti_image_free(weight_img); weight_img = NULL;
-		if (ok && fast_default && !opts.weight) {
+		if (ok && fast_default) {
 			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
 			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
 			   regresses. An explicit -cost fast/fastcr still errors rather than silently switching
 			   engines. Any -com/-sym header seed was applied to nim above (not by the failed
 			   estimate, which does not mutate nim), so the ordinary path below starts from the same
-			   seeded pose. NOT when -weight was requested: the ordinary engine ignores it, so
-			   silently dropping to an unweighted fit would defeat the explicit region request. */
+			   seeded pose. A -weight, if given, is honored on the fallback too — the ordinary engine
+			   loads it internally (al_load_user_weight), so the region request is not lost. */
 			fprintf(stderr, " + fast registration failed; falling back to -cost hel\n");
 			opts.fast = 0;
 			opts.cost = AL_COST_HELLINGER;
@@ -6661,7 +6665,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 				    ? nifti_mat44_mul(S_orig, nifti_mat44_mul(nifti_mat44_inverse(S_seed), fitmat))
 				    : fitmat;
 				if (al_write_affine_json(opts.savemat, outmat, "allineate", opts.warp,
-				                         al_cost_name(opts.cost), basefile, moving_name, NULL))
+				                         al_cost_name(opts.cost), basefile, moving_name, opts.weight))
 					ok = 1;
 				else
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
@@ -6709,6 +6713,188 @@ staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, 
 	return 1;
 #endif
 }
+
+/* -reface: anonymize the loaded subject (nim) by registering it to a template, back-projecting
+   a template-space face-replacement SHELL onto the subject grid, and compositing an anonymized
+   image in place. Clean-room emulation of AFNI afni_refacer2 -mode_reface (see reface.c/.h). The
+   shell is a signed template-space image (>0 insert scaled face, ==0 keep subject, <0 zero). A
+   registration weight is REQUIRED (opts.weight, the third positional arg) — AFNI supplies the
+   template's registration weight and reface relies on a good fit. The compositing (reface_isola/
+   reface_apply) is self-contained; the result is copied back into `nim` (subject grid, float32),
+   which the driver then saves. Returns 0 on success, nonzero on error (nim unchanged on error). */
+/* Physical voxel volume (mm^3) from the |det| of a world transform's 3x3 linear block, normalized
+   for xyz_units. Uses the coded transform actually used to place/reslice the shell rather than the
+   pixdim product, so a scaled/sheared sform (or pixdims disagreeing with the coded scale) cannot
+   distort the reface coverage ratio and invert the <10% privacy gate. */
+staticx double reface_voxvol_mm3(mat44 M, int xyz_units) {
+	double det = (double)M.m[0][0] * (M.m[1][1]*M.m[2][2] - M.m[1][2]*M.m[2][1])
+	           - (double)M.m[0][1] * (M.m[1][0]*M.m[2][2] - M.m[1][2]*M.m[2][0])
+	           + (double)M.m[0][2] * (M.m[1][0]*M.m[2][1] - M.m[1][1]*M.m[2][0]);
+	double mm = xyz_units_to_mm(xyz_units);
+	return fabs(det) * (mm * mm * mm);
+}
+
+staticx int nifti_reface_wrap(nifti_image *nim, char *tmplfile, char *shellfile, al_opts opts) {
+#ifdef DT32
+	/* Fail fast on a 4D subject (reface_apply rejects it eventually, but only after an expensive
+	   fit + aux reads): the face shell covers one volume, so 4D anonymization is ill-defined. */
+	if (nim->nvox != (size_t)nim->nx * nim->ny * nim->nz) {
+		printfx("** -reface: subject must be a single 3D volume (4D not supported)\n"); return 1;
+	}
+	if (!opts.weight) { printfx("** -reface requires a weight image: -reface <tmpl> <shell> <weight>\n"); return 1; }
+	/* Reject stdin ('-') for every reface auxiliary: they are explicit template-space assets, and a
+	   piped primary would make a `nifti_image_read("-")` reuse/misread the input stream — a privacy
+	   hazard for an anonymization command (nii_reject_oversize_aux deliberately exempts '-'). */
+	if (!strcmp(tmplfile, "-") || !strcmp(shellfile, "-") || !strcmp(opts.weight, "-")) {
+		printfx("** -reface: template/shell/weight cannot be stdin ('-'); give explicit files\n"); return 1;
+	}
+	if (nii_reject_oversize_aux(tmplfile, "reface template") ||
+	    nii_reject_oversize_aux(shellfile, "reface shell") ||
+	    nii_reject_oversize_aux(opts.weight, "reface weight")) return 1;
+	nifti_image *tmpl = nifti_image_read(tmplfile, 1);
+	if (!tmpl) { printfx("** failed to read template image from '%s'\n", tmplfile); return 1; }
+	nifti_image *shell = nifti_image_read(shellfile, 1);
+	if (!shell) { printfx("** failed to read shell image from '%s'\n", shellfile); nifti_image_free(tmpl); return 1; }
+	/* Single-volume 3D shell with a USABLE coded transform (it defines the template world frame;
+	   a no-form/singular shell cannot be placed relative to the registration). */
+	if (shell->nvox != (size_t)shell->nx * shell->ny * shell->nz) {
+		printfx("** -reface shell '%s' must be a single-volume 3D image\n", shellfile);
+		nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+	}
+	mat44 sxform;
+	if (al_image_xform(shell, &sxform)) {
+		printfx("** -reface shell '%s' has no usable coded sform/qform (needed to place it in template space)\n", shellfile);
+		nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+	}
+	/* Convert the shell to physical float32 so the pre/post face-coverage counts read the same
+	   values and reface_apply (which requires DT_FLOAT32) can consume it. nim is already float32
+	   in the DT32 build. */
+	{ in_hdr shdr = set_input_hdr(shell);
+	  if (nifti_image_change_datatype(shell, DT_FLOAT32, &shdr) != 0) {
+		printfx("** -reface: failed to convert the shell to float32\n");
+		nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+	  }
+	}
+	/* Face-coverage diagnostic (anonymization safety): count the shell's face volume in template
+	   space; after back-projection, how much mapped into the subject FOV. Physical VOLUME (voxel
+	   count x voxel size) so it is independent of the shell-vs-subject resolution difference. */
+	size_t shell_n = (size_t)shell->nx * shell->ny * shell->nz;
+	const float *sd0 = (const float *)shell->data;
+	size_t face_tmpl = 0;
+	for (size_t i = 0; i < shell_n; i++) if (sd0[i] > 0.0f) face_tmpl++;
+	/* Physical voxel volume from the |det| of the SELECTED transform (sxform = the shell's coded
+	   sform/qform used to place/reslice it), NOT the pixdim product: a legal scaled/sheared
+	   transform, or pixdims that disagree with the coded scale, would otherwise give a wrong volume
+	   and could invert the <10% privacy gate. */
+	double vox_tmpl = reface_voxvol_mm3(sxform, shell->xyz_units);
+	/* Register the SUBJECT (moving = nim) to the TEMPLATE (fixed) — the well-posed direction, as
+	   -deface does. Weight is REQUIRED. Both estimates are NON-mutating (nim is untouched, so the
+	   pristine subject is composited). */
+	mat44 fixed_to_moving;
+	if (opts.fast) {
+		coreg_fast_opts cfo = coreg_fast_opts_default();
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+		cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
+		nifti_image *weight_img = nifti_image_read(opts.weight, 1);
+		if (!weight_img) {
+			printfx("** failed to read -reface weight image '%s'\n", opts.weight);
+			nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+		}
+		cfo.weight = weight_img;
+		coreg_fast_result res;
+		int rc = coreg_fast_estimate(nim, tmpl, &cfo, &res);
+		nifti_image_free(weight_img);
+		if (rc) {
+			printfx("** -reface: fast registration failed\n");
+			nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+		}
+		fixed_to_moving = res.fixed_to_moving;
+	} else {
+		/* Ordinary engine: nii_allineate_estimate honors opts.weight (filename) internally. */
+		if (nii_allineate_estimate(nim, tmpl, opts, &fixed_to_moving)) {
+			printfx("** -reface: registration failed\n");
+			nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+		}
+	}
+	/* Back-project the shell (template frame) -> subject grid, NN (preserve the -/0/+ labels),
+	   fill 0. The engine matrix is fixed->moving world; the inverse maps subject world -> template
+	   world, exactly what nii_apply_affine samples for each subject voxel. */
+	if (nii_apply_affine(shell, nim, nifti_mat44_inverse(fixed_to_moving), AL_INTERP_NN, 0.0f)) {
+		printfx("** -reface: shell back-projection onto the subject grid failed\n");
+		nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+	}
+	reface_isola((float *)shell->data, shell->nx, shell->ny, shell->nz);
+	{
+		const float *sd1 = (const float *)shell->data;
+		size_t sub_n = (size_t)shell->nx * shell->ny * shell->nz, face_subj = 0;
+		for (size_t i = 0; i < sub_n; i++) if (sd1[i] > 0.0f) face_subj++;
+		/* Subject-grid voxel volume in mm^3 (the resliced shell now shares nim's grid), from the
+		   |det| of nim's world transform — the same frame nii_apply_affine sampled the shell into —
+		   so template-vs-subject comparison is on one physical scale (see vox_tmpl). */
+		mat44 nxform; al_image_xform_or_pixdim(nim, &nxform, "reface subject");
+		double vox_subj = reface_voxvol_mm3(nxform, nim->xyz_units);
+		double face_vol_tot = (double)face_tmpl * vox_tmpl;
+		double cov = (face_vol_tot > 0.0) ? ((double)face_subj * vox_subj) / face_vol_tot : 0.0;
+		fprintf(stderr, " + reface: %zu face voxels replaced (~%.0f%% of the shell face volume mapped into the subject FOV)\n",
+		        face_subj, 100.0 * cov);
+		/* FAIL CLOSED for privacy: -reface is an anonymization command, so if almost none of the
+		   face shell reached the subject (registration mislocated, or FOV mismatch) refuse to write
+		   a possibly-unanonymized image rather than warn-and-succeed. */
+		if (cov < 0.10) {
+			printfx("** -reface: only ~%.0f%% of the face shell mapped into the subject FOV -- the "
+			        "registration likely failed; refusing to write a possibly-unanonymized image\n", 100.0 * cov);
+			nifti_image_free(shell); nifti_image_free(tmpl); return 1;
+		}
+	}
+	nifti_image *result = NULL;
+	int rc = reface_apply(nim, shell, &result);
+	nifti_image_free(shell); nifti_image_free(tmpl);
+	if (rc || !result) { printfx("** -reface compositing failed\n"); return 1; }
+	/* Write the anonymized result back into `nim` (same subject grid + float32) so the driver
+	   saves it. reface_apply allocated `result` on the subject grid, so dims/dtype match nim. */
+	memcpy(nim->data, result->data, (size_t)nim->nx * nim->ny * nim->nz * sizeof(float));
+	nifti_image_free(result);
+	return 0;
+#else
+	(void)tmplfile; (void)shellfile; (void)opts;
+	printfx("'-dt double' does not support reface\n");
+	return 1;
+#endif
+}
+
+#ifdef HAVE_QWARP
+/* -qwarp <base>: nonlinear (deformable) registration of the loaded subject (nim, = moving/source)
+   to <base> (stationary), an attributed public-domain port of AFNI `3dQwarp -blur 0 3` (qwarp.c/.h).
+   This is ONLY the nonlinear stage: nim must ALREADY be unifized + skull-stripped + affine-aligned
+   and share the base grid (equal dims + equivalent world frame; qwarp_run validates this to a small
+   tolerance and fails hard otherwise). The warped result (on the base grid = nim's grid) is copied
+   back into nim, which the driver saves. Serial-safe; OpenMP inside qwarp.c. Returns 0 on success. */
+staticx int nifti_qwarp_wrap(nifti_image *nim, char *basefile) {
+#ifdef DT32
+	/* Fail fast on a 4D subject (qwarp_run rejects it eventually, but only after reading the base):
+	   the deformable warp is defined on a single 3D volume. */
+	if (nim->nvox != (size_t)nim->nx * nim->ny * nim->nz) {
+		printfx("** -qwarp: subject must be a single 3D volume (4D not supported)\n"); return 1;
+	}
+	if (nii_reject_oversize_aux(basefile, "qwarp base")) return 1;
+	nifti_image *base = nifti_image_read(basefile, 1);
+	if (!base) { printfx("** failed to read qwarp base image from '%s'\n", basefile); return 1; }
+	nifti_image *result = NULL;
+	int rc = qwarp_run(nim, base, &result);   /* atomic: result set only on full success */
+	nifti_image_free(base);
+	if (rc || !result) { printfx("** -qwarp failed\n"); return 1; }
+	/* qwarp requires moving & base to share the grid, so the result (base grid) matches nim's dims
+	   and float32 datatype. Copy back so the driver saves the warped image. */
+	memcpy(nim->data, result->data, (size_t)nim->nx * nim->ny * nim->nz * sizeof(float));
+	nifti_image_free(result);
+	return 0;
+#else
+	(void)basefile;
+	printfx("'-dt double' does not support qwarp\n");
+	return 1;
+#endif
+}
+#endif
 #endif
 
 /* Huge-image (> INT_MAX voxel) support, issue #67. The core calculator ops below are
@@ -7551,8 +7737,11 @@ int main64(int argc, char *argv[]) {
 			ac++;
 			double dx = strtod(argv[ac], &end);
 			ok = nifti_erode(nim, iso, dx);
-		} else if (!strcmp(argv[ac], "-unifize"))
-			ok = nifti_unifize(nim);
+		} else if (!strcmp(argv[ac], "-unifize")) {
+			int do_gm = 0;   /* optional trailing '-GM' (AFNI 3dUnifize): gray-matter global scaling */
+			if ((ac + 1) < argc && !strcmp(argv[ac + 1], "-GM")) { do_gm = 1; ac++; }
+			ok = nifti_unifize(nim, do_gm);
+		}
 #ifdef HAVE_ALLINEATE
 		else if (!strcmp(argv[ac], "-allineate")) {
 			ac++;
@@ -7597,6 +7786,43 @@ int main64(int argc, char *argv[]) {
 			}
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
 		}
+		else if (!strcmp(argv[ac], "-reface")) {
+			/* -reface <tmpl> <shell> <weight>: anonymize the loaded subject. Three REQUIRED
+			   positional files (weight is mandatory, as in AFNI). fast is DEFAULT; an explicit
+			   -cost hel/lpc/lpa/ls selects the ordinary engine. */
+			const char *cmd = argv[ac];
+			al_opts rf_opts = al_opts_default();
+			ac++;
+			if (ac + 2 >= argc) {
+				printfx("%s requires template, shell, and weight arguments (%s <tmpl> <shell> <weight>)\n", cmd, cmd);
+				goto fail;
+			}
+			char *rf_tmpl = argv[ac]; ac++;
+			char *rf_shell = argv[ac]; ac++;
+			rf_opts.weight = argv[ac];   /* weight is positional + REQUIRED (drives the fit) */
+			/* No AL_CAP_FINAL: the shell is always back-projected nearest-neighbour (to preserve its
+			   -/0/+ labels), so -final would be silently ignored — reject it at parse time instead. */
+			if (al_parse_subopts(&ac, argc, argv, &rf_opts, cmd, AL_CAP_TUNING | AL_CAP_FAST))
+				goto fail;
+			int rf_fast_incompat = rf_opts.source_automask || rf_opts.dark_automask ||
+			                       (rf_opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
+			if (!rf_opts.fast && !(rf_opts.cli_set & AL_CLI_COST) && !rf_fast_incompat)
+				rf_opts.fast = AL_ENGINE_FAST_HEL;
+			if (rf_opts.fast && rf_fast_incompat) {
+				printfx("** -reface -cost fast/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
+				goto fail;
+			}
+			ok = nifti_reface_wrap(nim, rf_tmpl, rf_shell, rf_opts);
+		}
+#ifdef HAVE_QWARP
+		else if (!strcmp(argv[ac], "-qwarp")) {
+			/* -qwarp <base>: nonlinear registration to <base>. nim must already be
+			   unifized + skull-stripped + affine-aligned + share the base grid. */
+			ac++;
+			if (ac >= argc) { printfx("-qwarp requires a base image argument (-qwarp <base>)\n"); goto fail; }
+			ok = nifti_qwarp_wrap(nim, argv[ac]);
+		}
+#endif
 #endif
 #ifdef HAVE_GPL
 		/* "-spmcoreg" kept as a silent backward-compat alias for "-spm_coreg" */

@@ -25,7 +25,7 @@ type MethodDefinitions = Record<string, OperatorDefinition | KernelOperatorDefin
 // in the native CLI and via raw `callMain`; exclude them from the generated browser API
 // until multi-file staging exists.
 const fileOperandOps = new Set<string>([
-  'allineate', 'deface', 'skullstrip',
+  'allineate', 'deface', 'reface', 'skullstrip',
   'reslice', 'reslice_nn', 'reslice_mask',
   'mas', 'restart'
 ]);

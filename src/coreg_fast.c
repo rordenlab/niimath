@@ -44,6 +44,22 @@ extern void powell_newuoa_free_threadlocal(void);
 #define CF_CR_NCHUNK 64
 #define CF_HEL_NBIN  32   /* bins per axis for the CF_COST_HEL 2D joint histogram */
 
+/* HEL joint-foreground policy: a fixed sample whose corresponding MOVING intensity is at
+ * background/air (<= this fraction of the moving level's dynamic range above its minimum)
+ * carries no cross-modal information and is dropped from the joint histogram. The fixed side
+ * is already foreground-thresholded (cf_make_samples); this is its moving-side partner, so the
+ * statistics use only the INTERSECTION of both foregrounds. It deepens the otherwise-shallow
+ * HEL well produced by a full-head moving whose air/sinuses are hard-zeroed (masked scans) or
+ * by a skull-stripped/hard-zeroed base (e.g. an @SSwarper SSW template) — those zero-mapped
+ * pairs pile into moving-bin-0 as an ~independence floor that flattens the landscape and lets
+ * the sparse coarse search lock a wrong pitch. Validated across the full benchmark modality
+ * sweep (T1/T2/FLAIR/EPI x plain + SSW bases): large gains on hard-zeroed bases, pose unchanged
+ * (<1 deg) elsewhere. The threshold must stay SMALL (only true background) — >=2% re-eats real
+ * low-signal cortex and can flip a fit. The overlap floor still counts every in-FOV sample, so a
+ * pose cannot cheat by mapping the foreground onto background. Deterministic per-sample test ->
+ * -p1==-pN stays bit-identical. HEL only (the CR/LS reductions are not wired for it). */
+#define CF_HEL_MDARK_FRAC 0.01
+
 /* Per-stage profiling, enabled by -DAL_PROFILE (same flag as allineate.c / `make
  * profile`). Output goes to stderr as " [coreg profile] ...". The timing points are
  * per-level (a handful of calls), never per cost evaluation, so the release build is
@@ -79,17 +95,14 @@ static double g_prof_blur = 0.0, g_prof_resample = 0.0;
 #define CF_PS_SCALE 0.01   /* fractional scale per unit (1%) */
 #define CF_PS_SHEAR 0.01   /* shear per unit */
 
-/* -weight background floor (AFNI-style whole-head anchor). A supplied region weight is mapped
- * to [CF_WEIGHT_FLOOR, 1] over the whole fixed grid rather than zeroed outside the ROI, so
- * out-of-ROI head voxels still anchor global scale. The ROI:background emphasis ratio is
- * 1/CF_WEIGHT_FLOOR (2:1 here). 0.5 is the smallest floor that stays degeneracy-free across
- * every benchmark pair AND both compilers (clang/gcc): lower floors (0.35, 0.2) still let a
- * cross-modal fit collapse into the scalp-shrink basin, and the collapse is ill-conditioned so
- * it surfaces compiler-dependently. Higher floors wash the ROI emphasis back toward unweighted.
- * NB: because the floor lifts every foreground voxel to >=0.5, a weight CANNOT exclude a region
- * (a user-zeroed lesion still contributes at the floor) — that is a deliberate soft-focus scope;
- * region exclusion would need an SPM-style scale/shear prior instead. See the weight build. */
-#define CF_WEIGHT_FLOOR 0.5f
+/* -weight uses AFNI 3dAllineate's scheme: a base(fixed)-space GRADED weight, normalized to
+ * [0,1] over the whole fixed grid (divide by its max), applied per fixed sample. It is NOT a
+ * soft-focus floor — a voxel weighted 0 is excluded and one weighted near 1 dominates, exactly
+ * as AFNI weights each base voxel. A whole-head weight that keeps the scalp attenuated (nonzero)
+ * still anchors global scale; a weight that fully zeroes everything outside the brain removes the
+ * scale anchor (the FLIRT Fig-1 shrink risk), so — like AFNI — supply an attenuated (not zeroed)
+ * out-of-ROI weight. HEL/CR are scale-invariant, so the fit is invariant to a global weight
+ * scaling. See the weight build below. */
 
 /* Guardrails (normalized units), wider than the supported capture envelope so a
  * valid fit is never clipped; a fit landing on a guardrail is reported as failure.
@@ -450,6 +463,9 @@ static double cf_cost_eval(const double p[12]) {
         memset(acc, 0, (size_t)NC * hstride * sizeof(double));
         double mspan = c->m_top - c->m_bg; if (!(mspan > 0.0)) mspan = 1.0;
         double minv = (NB - 1) / mspan;
+        /* Joint-foreground cutoff: drop pairs whose moving value is background/air (m_bg + 1% of
+           range). Local like mspan/minv above — a HEL-only derived constant, not a shared ctx field. */
+        double m_dark_thr = c->m_bg + CF_HEL_MDARK_FRAC * (c->m_top - c->m_bg);
         int Kf = c->K;
         const float *fwt = c->fwt;   /* NULL -> weight 1.0 (default, bit-identical) */
 #ifdef _OPENMP
@@ -467,6 +483,7 @@ static double cf_cost_eval(const double p[12]) {
                 if (!ok) continue;
                 double mv = v;
                 lnin++;   /* raw in-FOV count for the overlap floor (weight-independent) */
+                if (mv <= m_dark_thr) continue;  /* joint-foreground: drop moving-background pairs (see CF_HEL_MDARK_FRAC) */
                 int fb = (int)((long)c->fbin[s] * NB / Kf); if (fb < 0) fb = 0; if (fb >= NB) fb = NB-1;
                 int mb = (int)((mv - c->m_bg) * minv + 0.5); if (mb < 0) mb = 0; if (mb >= NB) mb = NB-1;
                 H[fb*NB + mb] += fwt ? fwt[s] : 1.0;
@@ -645,19 +662,15 @@ static int cf_make_samples(cf_ctx *c, int K) {
     double fwt_max = 0.0;
     if (c->fwt) for (int s = 0; s < ns; s++) { c->fwt_total += c->fwt[s];
                                                if (c->fwt[s] > fwt_max) fwt_max = c->fwt[s]; }
-    /* Reject a weight with no meaningful support over the fixed foreground ONCE here, rather than
-       letting the fit silently degrade. Under the AFNI-style floor EVERY foreground sample is
-       lifted to >=CF_WEIGHT_FLOOR, so a nonzero `fwt_total` no longer proves the ROI touches the
-       foreground: a mask whose positive voxels lie only in the fixed BACKGROUND leaves the
-       foreground reading a uniform floor and would pass on that alone. Require instead that at
-       least one foreground sample exceeds the floor — i.e. the ROI, after the pyramid blur,
-       actually reaches the foreground (a real ROI reads ~1.0, well clear of the 1e-3 margin,
-       so legitimate weighted fits are bit-identical). This subsumes the all-zero-weight case
-       (`wmax==0` in the driver skips the remap, so `fwt_max==0`). The per-pose weighted-coverage
-       floor (N >= 10% of fwt_total) is retained for the accepted case. */
-    if (c->fwt && !(fwt_max > CF_WEIGHT_FLOOR + 1e-3)) {
-        fprintf(stderr, "coreg fast: -weight ROI does not reach the fixed foreground "
-                        "(no pyramid-sampled weight rises above the background floor)\n");
+    /* Reject a weight with no positive support over the fixed foreground ONCE here (AFNI errors
+       if -weight is never positive; we scope it to the sampled foreground since only foreground
+       voxels enter the cost). With the [0,1]-normalized graded weight a real ROI reads up to ~1.0
+       over the foreground, so require at least one foreground sample above a small margin — this
+       rejects a mask whose positive voxels lie only in the fixed BACKGROUND (foreground reads ~0)
+       and subsumes the all-zero-weight case (`wmax==0` skips the remap, so `fwt_max==0`). The
+       per-pose weighted-coverage floor (N >= 10% of fwt_total) is retained for the accepted case. */
+    if (c->fwt && !(fwt_max > 1e-3)) {
+        fprintf(stderr, "coreg fast: -weight is never positive over the fixed foreground\n");
         return 1;
     }
     c->ns = ns; c->K = K;
@@ -726,6 +739,41 @@ static int cf_com_world(const float *d, int nx, int ny, int nz, const mat44 *S,
     }
     if (sw <= 0) return 1;
     cf_apply(S, cx/sw, cy/sw, cz/sw, wx, wy, wz);
+    return 0;
+}
+
+/* Point the cost context at a moving-pyramid level and cache that level's intensity
+ * range (m_bg/m_top drive the HEL moving-axis binning and the LS background fill).
+ * Used at each pyramid level. */
+static void cf_use_moving_level(cf_ctx *c, const cf_level *Lmlv) {
+    c->Lm = Lmlv;
+    double mn = DBL_MAX, mx = -DBL_MAX;
+    size_t n = (size_t)Lmlv->nx * Lmlv->ny * Lmlv->nz;
+    for (size_t i = 0; i < n; i++) { double v = Lmlv->data[i]; if (v<mn) mn=v; if (v>mx) mx=v; }
+    c->m_bg = (mn < DBL_MAX) ? mn : 0.0;
+    c->m_top = (mx > mn) ? mx : (c->m_bg + 1.0);
+}
+
+/* Build a whole moving pyramid (levels 2->1->0) from a source image plus its brightness-centroid
+ * seed, holding only ONE full-resolution copy at a time (extract -> build finest -> free full-res
+ * -> quadrature-add coarser levels). Returns 0 on success; on failure frees any partially-built
+ * levels (leaving them NULL-safe for the caller's cleanup) and returns 1. This is deterministic
+ * construction OFF the numerical cost path, so it does not affect -p1==-pN. */
+static int cf_build_moving_pyramid(const nifti_image *src, int nx, int ny, int nz,
+                                   const mat44 *Sm, int use_cmass,
+                                   const double SEP[3], const double FWHM[3],
+                                   double com[3], int *have_com, cf_level L[3]) {
+    float *full = cf_extract_float(src, NULL);
+    if (!full) return 1;
+    *have_com = use_cmass && !cf_com_world(full, nx, ny, nz, Sm, &com[0], &com[1], &com[2]);
+    int ok = (cf_build_level(full, nx, ny, nz, Sm, SEP[2], FWHM[2], &L[2]) == 0);
+    free(full);
+    for (int lv = 1; lv >= 0 && ok; lv--) {
+        double add = sqrt(FWHM[lv]*FWHM[lv] - FWHM[lv+1]*FWHM[lv+1]);
+        if (cf_build_level(L[lv+1].data, L[lv+1].nx, L[lv+1].ny, L[lv+1].nz, &L[lv+1].v2w,
+                           SEP[lv], add, &L[lv])) ok = 0;
+    }
+    if (!ok) { for (int i = 0; i < 3; i++) cf_free_level(&L[i]); return 1; }
     return 0;
 }
 
@@ -820,8 +868,8 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
        other image, so only ONE full-resolution volume is ever held at a time (plus the
        small pyramids and one blur scratch). The moving COM is taken from its full-res
        buffer just before that buffer is freed. */
-    cf_level Lf[3] = {{0}}, Lm[3] = {{0}}, Lwt[3] = {{0}};   /* Lwt: fine-level weight (if -weight) */
-    double comm[3];
+    cf_level Lf[3] = {{0}}, Lm[3] = {{0}}, Lwt[3] = {{0}};  /* Lwt: fine-stage weight pyramid */
+    double comm[3] = {0};            /* moving brightness centroid (world mm), for the -com seed */
     int build_ok = 1, have_com_m = 0;
 #ifdef AL_PROFILE
     double _tb0 = cf_wtime();
@@ -836,26 +884,17 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
         if (cf_build_level(Lf[lv+1].data, Lf[lv+1].nx,Lf[lv+1].ny,Lf[lv+1].nz, &Lf[lv+1].v2w, SEP[lv], add, &Lf[lv])) build_ok = 0;
     }
     /* moving pyramid — extracted only after the fixed full-res copy is freed */
-    if (build_ok) {
-        float *mfull = cf_extract_float(moving, NULL);
-        if (!mfull) build_ok = 0;
-        else {
-            have_com_m = O.use_cmass && !cf_com_world(mfull, mnx,mny,mnz, &Sm, &comm[0],&comm[1],&comm[2]);
-            if (cf_build_level(mfull, mnx,mny,mnz, &Sm, SEP[2], FWHM[2], &Lm[2])) build_ok = 0;
-            free(mfull); mfull = NULL;
-            for (int lv = 1; lv >= 0 && build_ok; lv--) {
-                double add = sqrt(FWHM[lv]*FWHM[lv] - FWHM[lv+1]*FWHM[lv+1]);
-                if (cf_build_level(Lm[lv+1].data, Lm[lv+1].nx,Lm[lv+1].ny,Lm[lv+1].nz, &Lm[lv+1].v2w, SEP[lv], add, &Lm[lv])) build_ok = 0;
-            }
-        }
-    }
+    if (build_ok && cf_build_moving_pyramid(moving, mnx,mny,mnz, &Sm, O.use_cmass, SEP, FWHM,
+                                            comm, &have_com_m, Lm))
+        build_ok = 0;
     /* -nocmass (O.use_cmass==0) already zeroed have_com_m above by short-circuiting
        cf_com_world(), so the supplied-affine start is all that remains. */
-    /* Weight pyramid: only the FINE levels (4/2 mm) — the 8 mm coarse capture + seed
-       selection stay whole-head. The weight shares `fixed`'s dims and frame, so building it
-       with the same (Sf, SEP, FWHM) chain yields grids identical to Lf[2]/Lf[1] voxel-for-voxel
-       (blurring softens a binary mask, which is desirable). Level 2 is built from the full-res
-       weight, level 1 from level 2 (matching the fixed pyramid's hierarchical add-in-quadrature). */
+    /* Weight pyramid: only the FINEST level (2 mm, Lwt[2]) is ever consumed — the cost applies the
+       weight solely at lv==2 (see the `ctx.Lw = have_weight && lv>=2` gate below), so the 8 mm
+       coarse capture, the 4 mm global-scale bracket, and seed selection stay whole-head. The weight
+       shares `fixed`'s dims and frame, so building Lwt[2] from the full-res weight with the same
+       (Sf, SEP[2], FWHM[2]) chain yields a grid identical to Lf[2] voxel-for-voxel (blurring softens
+       a binary mask, which is desirable). Lwt[0]/Lwt[1] are never built (NULL-safe frees below). */
     if (build_ok && have_weight) {
         float *wfull = cf_extract_float(O.weight, NULL);
         if (!wfull) { build_ok = 0; fprintf(stderr, "coreg fast: weight unsupported datatype / OOM\n"); }
@@ -878,28 +917,21 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
                has been masked away — so the masked cost slides monotonically toward shrinking the
                source until its bright scalp is dragged into the ROI (the FLIRT Fig-1 degeneracy).
                The failure is ill-conditioned, hence compiler/FP-sensitive: it surfaced as a large
-               clang-vs-gcc divergence. Instead map the weight to [FLOOR, 1] over the WHOLE fixed
-               grid: out-of-ROI head voxels (scalp/skull) stay in the cost at a reduced level and
-               anchor scale, while the ROI (weight 1) dominates the refinement. Normalizing by the
-               max keeps the fit invariant to a global weight scaling (HEL/CR are scale-invariant),
-               and the whole cost surface is now well-posed at every stage, so no per-stage scale
-               special-casing is needed. Only fixed-FOREGROUND voxels are ever sampled, so the floor
-               on true background (air) is inert. */
+               clang-vs-gcc divergence. AFNI's -weight avoids it not with a floor but by supplying
+               a whole-head weight that keeps the scalp ATTENUATED (nonzero), so scale stays
+               anchored; we mirror AFNI exactly here — normalize the supplied weight to [0,1] over
+               the whole fixed grid (divide by its max) and use it graded. Normalizing by the max
+               keeps the fit invariant to a global weight scaling (HEL/CR are scale-invariant). */
             if (wmax > 0.0f) {
                 /* Divide directly rather than multiply by 1/wmax: a subnormal/tiny wmax makes
                    1.0f/wmax overflow to +Inf, and then 0*Inf=NaN (background) / tiny*Inf=+Inf
                    (foreground) would poison the remap (+Inf is not caught downstream). Because
                    every wfull[i] <= wmax, the ratio is in [0,1] and CANNOT overflow. */
                 for (size_t i = 0; i < wnv; i++)
-                    wfull[i] = CF_WEIGHT_FLOOR + (1.0f - CF_WEIGHT_FLOOR) * (wfull[i] / wmax);
+                    wfull[i] = wfull[i] / wmax;
             }
             if (cf_build_level(wfull, fnx,fny,fnz, &Sf, SEP[2], FWHM[2], &Lwt[2])) build_ok = 0;
             free(wfull);
-            if (build_ok) {
-                double add = sqrt(FWHM[1]*FWHM[1] - FWHM[2]*FWHM[2]);
-                if (cf_build_level(Lwt[2].data, Lwt[2].nx,Lwt[2].ny,Lwt[2].nz, &Lwt[2].v2w,
-                                   SEP[1], add, &Lwt[1])) build_ok = 0;
-            }
         }
     }
     if (!build_ok) {
@@ -915,14 +947,23 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 
     /* ---- optimize coarse -> fine over the prebuilt pyramid ---- */
     for (int lv = 0; lv < nlv; lv++) {
-        ctx.Lf=&Lf[lv]; ctx.Lm=&Lm[lv]; ctx.Sf_lvl=Lf[lv].v2w;
-        /* Weight only the fine levels (lv>=1); the coarse level and the unweighted default
-           both leave ctx.Lw NULL so cf_make_samples produces no per-sample weight. */
-        ctx.Lw = (have_weight && lv >= 1) ? &Lwt[lv] : NULL;
-        { double mn = DBL_MAX, mx = -DBL_MAX; size_t mnv2 = (size_t)Lm[lv].nx*Lm[lv].ny*Lm[lv].nz;
-          for (size_t i=0;i<mnv2;i++) { double v=Lm[lv].data[i]; if (v<mn) mn=v; if (v>mx) mx=v; }
-          ctx.m_bg = (mn < DBL_MAX) ? mn : 0.0;
-          ctx.m_top = (mx > mn) ? mx : (ctx.m_bg + 1.0); }
+        ctx.Lf=&Lf[lv]; ctx.Sf_lvl=Lf[lv].v2w;
+        /* Weight ONLY the finest level (lv==2, 2 mm); the 8 mm rigid coarse (lv==0) AND the
+           4 mm global-scale bracket + its refine (lv==1) stay UNWEIGHTED so the graded ROI weight
+           cannot hijack global-scale SELECTION. This extends "rigid coarse, scale later": the
+           scale-later stage must also see the full head, or a brain-concentrated weight (e.g. an
+           @SSwarper T1w weight applied cross-modal) picks the scale that shrinks the moving into
+           the ROI (the FLIRT Fig-1 basin) — the 4 mm bracket scored a spurious ~1.13x isotropic
+           shrink on T2w/T1w_MICCAI -> SSW, det 1.45, collapsing the fit. Scoring the bracket on the
+           full head recovers the correct expand scale (AFNI-parity: T2w masked HEL 0.153 vs 0.095,
+           det 0.69 vs 1.45), and the weighted 2 mm descent then refines WITHIN that basin without
+           collapsing. Neutral (<0.001) on the non-collapsing weighted cases; unweighted fits are
+           unaffected (have_weight==0 leaves ctx.Lw NULL). The weight's role is fine-stage steering,
+           matching its doc: it must not re-select DOF the coarse pyramid already resolved. */
+        ctx.Lw = (have_weight && lv >= 2) ? &Lwt[lv] : NULL;
+        /* The moving level (ctx.Lm + m_bg/m_top) is set here for the fine levels; the coarse
+           level (lv==0) sets it itself below. cf_make_samples reads only ctx.Lf. */
+        if (lv != 0) cf_use_moving_level(&ctx, &Lm[lv]);
 #ifdef AL_PROFILE
         int _ev0 = ctx.evals; double _tsamp0 = cf_wtime();
 #endif
@@ -934,94 +975,95 @@ int coreg_fast_estimate(const nifti_image *moving, const nifti_image *fixed,
 #endif
 
         if (lv == 0) {
-            /* Choose the supplied-affine frame or the exact `-com` recentered frame
-               before the expensive orientation search. In the original world frame,
-               applying `-com` is exactly a translation by the moving brightness
-               centroid, so both starts can be scored against the SAME pyramid.
+          cf_use_moving_level(&ctx, &Lm[0]);
+          /* Choose the supplied-affine frame or the exact `-com` recentered frame
+             before the expensive orientation search. In the original world frame,
+             applying `-com` is exactly a translation by the moving brightness
+             centroid, so both starts can be scored against the SAME pyramid.
 
-               HEL and CR are minimized unexplained-dependence coefficients
-               (1 == independent), hence the joint selection score is:
+             HEL and CR are minimized unexplained-dependence coefficients
+             (1 == independent), hence the joint selection score is:
 
-                   (1 - cost) * fraction_of_fixed_foreground_inside_moving_FOV
+                 (1 - cost) * fraction_of_fixed_foreground_inside_moving_FOV
 
-               Maximizing this rewards both statistical alignment and useful overlap.
-               Multiplying the minimized cost itself by coverage would perversely favor
-               low overlap. Once selected, only ONE seed receives the coarse grid and
-               local descent. Forced `-com` arrives with a recentered header and
-               O.use_cmass==0; `-nocmass` likewise keeps only its supplied frame. */
-            double seeds[1][12]; int nseed = 1;
-            memset(seeds[0], 0, sizeof seeds[0]);
-            /* NB: the seed CHOICE below must be deterministic across thread counts (the byte-
-               parity contract). It is, because HEL/CR use fixed-order chunked reductions — but
-               cf_cost_eval's LS branch uses reduction(+:) and is NOT thread-stable, so do not
-               wire a future LS caller to use_cmass expecting -p1==-pN seed selection. */
-            if (O.use_cmass && have_com_m) {
-                double hp[12] = {0}, cp[12] = {0};
-                cp[0] = comm[0] / CF_PS_TRANS;
-                cp[1] = comm[1] / CF_PS_TRANS;
-                cp[2] = comm[2] / CF_PS_TRANS;
-                double hc = cf_cost_eval(hp), cc = cf_cost_eval(cp);
-                double hov = cf_sample_coverage(hp), cov = cf_sample_coverage(cp);
-                double hd = 1.0 - hc, cd = 1.0 - cc;
-                if (!cf_finite(hd) || hd < 0.0 || hc >= CF_PENALTY) hd = 0.0;
-                if (!cf_finite(cd) || cd < 0.0 || cc >= CF_PENALTY) cd = 0.0;
-                if (hd > 1.0) hd = 1.0;
-                if (cd > 1.0) cd = 1.0;
-                double hs = hd * hov, cs = cd * cov;
-                if (cs > hs) memcpy(seeds[0], cp, sizeof cp);
-                if (O.verbose)
-                    fprintf(stderr, "[coreg fast] initial affine cost=%.5f overlap=%.5f score=%.5f; "
-                                    "COM cost=%.5f overlap=%.5f score=%.5f -> %s\n",
-                            hc, hov, hs, cc, cov, cs, (cs > hs) ? "COM" : "affine");
-            }
+             Maximizing this rewards both statistical alignment and useful overlap.
+             Multiplying the minimized cost itself by coverage would perversely favor
+             low overlap. Once selected, only ONE seed receives the coarse grid and
+             local descent. Forced `-com` arrives with a recentered header and
+             O.use_cmass==0; `-nocmass` likewise keeps only its supplied frame. */
+          double seeds[1][12]; int nseed = 1;
+          memset(seeds[0], 0, sizeof seeds[0]);
+          /* NB: the seed CHOICE below must be deterministic across thread counts (the byte-
+             parity contract). It is, because HEL/CR use fixed-order chunked reductions — but
+             cf_cost_eval's LS branch uses reduction(+:) and is NOT thread-stable, so do not
+             wire a future LS caller to use_cmass expecting -p1==-pN seed selection. */
+          if (O.use_cmass && have_com_m) {
+              double hp[12] = {0}, cp[12] = {0};
+              cp[0] = comm[0] / CF_PS_TRANS;
+              cp[1] = comm[1] / CF_PS_TRANS;
+              cp[2] = comm[2] / CF_PS_TRANS;
+              double hc = cf_cost_eval(hp), cc = cf_cost_eval(cp);
+              double hov = cf_sample_coverage(hp), cov = cf_sample_coverage(cp);
+              double hd = 1.0 - hc, cd = 1.0 - cc;
+              if (!cf_finite(hd) || hd < 0.0 || hc >= CF_PENALTY) hd = 0.0;
+              if (!cf_finite(cd) || cd < 0.0 || cc >= CF_PENALTY) cd = 0.0;
+              if (hd > 1.0) hd = 1.0;
+              if (cd > 1.0) cd = 1.0;
+              double hs = hd * hov, cs = cd * cov;
+              if (cs > hs) memcpy(seeds[0], cp, sizeof cp);
+              if (O.verbose)
+                  fprintf(stderr, "[coreg fast] initial affine cost=%.5f overlap=%.5f score=%.5f; "
+                                  "COM cost=%.5f overlap=%.5f score=%.5f -> %s\n",
+                          hc, hov, hs, cc, cov, cs, (cs > hs) ? "COM" : "affine");
+          }
 
-            /* Search and refine the selected start. */
-            typedef struct { double p[12]; double c; } cand;
-            const double ANG[5] = {-30,-15,0,15,30};
-            const int NTOP = 3;
-            /* RIGID coarse (8 mm): lock global scale at identity and search only
-               orientation+translation. Freeing scale this coarse lets the correlation-ratio
-               cost commit to a spurious isotropic-shrink basin on wide-FOV / short-axis
-               cross-modal inputs (observed: T2w->avg152T1 collapsed to ~1.2x). Global scale
-               is introduced at 4 mm from this good rigid start; aniso/shear at 2 mm. This
-               mirrors FLIRT (coarse rotation/translation search before scaling). Honors a
-               lower max_dof request. See AGENTS.md "rigid coarse". */
-            int cdof = (O.max_dof < 6) ? O.max_dof : 6;
-            double bestc = CF_PENALTY;
-            for (int sd=0; sd<nseed; sd++) {
-                double bp[12]; memcpy(bp,seeds[sd],sizeof bp);
-                cand top[3]; for (int i=0;i<NTOP;i++) top[i].c=CF_PENALTY;
-                if (O.coarse_search) {
-                    for (int a=0;a<5;a++) for (int b=0;b<5;b++) for (int cc=0;cc<5;cc++) {
-                        double p[12]; memcpy(p,bp,sizeof p);
-                        p[3]=bp[3]+ANG[a]*CF_DEG2RAD/CF_PS_ROT;
-                        p[4]=bp[4]+ANG[b]*CF_DEG2RAD/CF_PS_ROT;
-                        p[5]=bp[5]+ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
-                        p[6]=p[7]=p[8]=0.0;   /* identity scale — rigid coarse */
-                        double cv = cf_cost_eval(p);
-                        for (int t=0;t<NTOP;t++) if (cv < top[t].c) {
-                            for (int u=NTOP-1;u>t;u--) top[u]=top[u-1];
-                            memcpy(top[t].p,p,sizeof p); top[t].c=cv; break;
-                        }
-                    }
-                } else {
-                    memcpy(top[0].p,bp,sizeof bp); top[0].c=cf_cost_eval(bp);
-                }
-                double seedbest = CF_PENALTY; double seedp[12]; memcpy(seedp,bp,sizeof seedp);
-                for (int t=0;t<NTOP;t++) {
-                    if (top[t].c >= CF_PENALTY) continue;
-                    double p[12]; memcpy(p,top[t].p,sizeof p);
-                    double cv = cf_refine(&ctx, cdof, p, rstart, rend, 150);
-                    if (cv < seedbest) { seedbest=cv; memcpy(seedp,p,sizeof seedp); }
-                }
-                if (O.verbose) fprintf(stderr, "[coreg fast]  seed %d refined best %.4f rot(%.1f,%.1f,%.1f)deg\n",
-                    sd, seedbest, seedp[3]*CF_PS_ROT/CF_DEG2RAD, seedp[4]*CF_PS_ROT/CF_DEG2RAD, seedp[5]*CF_PS_ROT/CF_DEG2RAD);
-                if (seedbest < bestc) { bestc=seedbest; memcpy(best,seedp,sizeof best); }
-            }
-            if (bestc >= CF_PENALTY) memcpy(best,seeds[0],sizeof best);
-            if (O.verbose) fprintf(stderr, "[coreg fast] seeds=%d -> best %.4f rot(%.1f,%.1f,%.1f)deg\n",
-                nseed, bestc,
-                best[3]*CF_PS_ROT/CF_DEG2RAD, best[4]*CF_PS_ROT/CF_DEG2RAD, best[5]*CF_PS_ROT/CF_DEG2RAD);
+          /* Search and refine the selected start. */
+          typedef struct { double p[12]; double c; } cand;
+          const double ANG[5] = {-30,-15,0,15,30};
+          const int NTOP = 3;
+          /* RIGID coarse (8 mm): lock global scale at identity and search only
+             orientation+translation. Freeing scale this coarse lets the correlation-ratio
+             cost commit to a spurious isotropic-shrink basin on wide-FOV / short-axis
+             cross-modal inputs (observed: T2w->avg152T1 collapsed to ~1.2x). Global scale
+             is introduced at 4 mm from this good rigid start; aniso/shear at 2 mm. This
+             mirrors FLIRT (coarse rotation/translation search before scaling). Honors a
+             lower max_dof request. See AGENTS.md "rigid coarse". */
+          int cdof = (O.max_dof < 6) ? O.max_dof : 6;
+          double bestc = CF_PENALTY;
+          for (int sd=0; sd<nseed; sd++) {
+              double bp[12]; memcpy(bp,seeds[sd],sizeof bp);
+              cand top[3]; for (int i=0;i<NTOP;i++) top[i].c=CF_PENALTY;
+              if (O.coarse_search) {
+                  for (int a=0;a<5;a++) for (int b=0;b<5;b++) for (int cc=0;cc<5;cc++) {
+                      double p[12]; memcpy(p,bp,sizeof p);
+                      p[3]=bp[3]+ANG[a]*CF_DEG2RAD/CF_PS_ROT;
+                      p[4]=bp[4]+ANG[b]*CF_DEG2RAD/CF_PS_ROT;
+                      p[5]=bp[5]+ANG[cc]*CF_DEG2RAD/CF_PS_ROT;
+                      p[6]=p[7]=p[8]=0.0;   /* identity scale — rigid coarse */
+                      double cv = cf_cost_eval(p);
+                      for (int t=0;t<NTOP;t++) if (cv < top[t].c) {
+                          for (int u=NTOP-1;u>t;u--) top[u]=top[u-1];
+                          memcpy(top[t].p,p,sizeof p); top[t].c=cv; break;
+                      }
+                  }
+              } else {
+                  memcpy(top[0].p,bp,sizeof bp); top[0].c=cf_cost_eval(bp);
+              }
+              double seedbest = CF_PENALTY; double seedp[12]; memcpy(seedp,bp,sizeof seedp);
+              for (int t=0;t<NTOP;t++) {
+                  if (top[t].c >= CF_PENALTY) continue;
+                  double p[12]; memcpy(p,top[t].p,sizeof p);
+                  double cv = cf_refine(&ctx, cdof, p, rstart, rend, 150);
+                  if (cv < seedbest) { seedbest=cv; memcpy(seedp,p,sizeof seedp); }
+              }
+              if (O.verbose) fprintf(stderr, "[coreg fast]  seed %d refined best %.4f rot(%.1f,%.1f,%.1f)deg\n",
+                  sd, seedbest, seedp[3]*CF_PS_ROT/CF_DEG2RAD, seedp[4]*CF_PS_ROT/CF_DEG2RAD, seedp[5]*CF_PS_ROT/CF_DEG2RAD);
+              if (seedbest < bestc) { bestc=seedbest; memcpy(best,seedp,sizeof best); }
+          }
+          if (bestc >= CF_PENALTY) memcpy(best,seeds[0],sizeof best);
+          if (O.verbose) fprintf(stderr, "[coreg fast]  coarse seeds=%d -> best %.4f rot(%.1f,%.1f,%.1f)deg\n",
+              nseed, bestc,
+              best[3]*CF_PS_ROT/CF_DEG2RAD, best[4]*CF_PS_ROT/CF_DEG2RAD, best[5]*CF_PS_ROT/CF_DEG2RAD);
         } else if (lv == 1) {
             /* Global scale is introduced HERE (the 8 mm coarse level was rigid). A
                continuous refine from identity cannot reach a large TRUE scale at the

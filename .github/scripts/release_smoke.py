@@ -500,6 +500,110 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     if not all(v != v for v in fill_out("nan")):
         raise AssertionError("-fill nan did not write NaN out-of-FOV")
 
+    # --- Back-ported allineate integration surfaces (glue not covered by the standalone suite).
+    #     These assert the REPAIRED BEHAVIOR, not merely that an output file was created. ---
+
+    # The ordinary engine consumes the graded -weight (old "-weight is fast-only" gate removed).
+    # Prove it took the weight (not silently ignored it): the ordinary weighted -savemat must
+    # record the "weight" provenance key (which the ordinary/master path previously dropped).
+    hel_prov = tmp / "al_hel_prov.json"
+    require_success(
+        run_niimath(exe, [str(moving), "-allineate", str(base), "-cost", "hel", "-weight", str(weight),
+                          "-savemat", str(hel_prov), "-gz", "0", str(tmp / "al_hel_w.nii")]),
+        "-allineate -cost hel -weight (ordinary engine)",
+    )
+    if '"weight"' not in hel_prov.read_text():
+        raise AssertionError("ordinary weighted -savemat dropped the -weight provenance")
+    # Prove the ordinary engine actually CONSUMES/validates the weight (not just records the name):
+    # a dims-mismatched weight must FAIL the fit with no output (if it ignored the image it would pass).
+    bad_w = tmp / "al_badw.nii"
+    write_float32_nifti(bad_w, (8, 8, 8), [1.0] * 512)
+    bad = run_niimath(exe, [str(moving), "-allineate", str(base), "-cost", "hel", "-weight", str(bad_w),
+                            "-gz", "0", str(tmp / "al_badw_out.nii")])
+    if bad.returncode == 0 or (tmp / "al_badw_out.nii").exists():
+        raise AssertionError("ordinary -cost hel -weight accepted a dims-mismatched weight (weight not consumed)")
+    # A same-spatial-dims 4D weight must hit the single-volume guard (nvox != nx*ny*nz) in
+    # al_load_user_weight — distinct from the dims-mismatch path above (spatial dims agree here).
+    w4d = tmp / "al_w4d.nii"
+    write_float32_nifti(w4d, (n, n, n), [1.0] * (n * n * n * 2), nt=2)
+    r4 = run_niimath(exe, [str(moving), "-allineate", str(base), "-cost", "hel", "-weight", str(w4d),
+                           "-gz", "0", str(tmp / "al_w4d_out.nii")])
+    if r4.returncode == 0 or (tmp / "al_w4d_out.nii").exists():
+        raise AssertionError("ordinary -weight accepted a same-dims 4D weight (single-volume guard missing)")
+
+    # -reface: identity registration (subject==template) -> full coverage. Assert it actually
+    # REPLACES the shell>0 face voxels (not an unchanged anonymization-failed passthrough).
+    shell_vals = [1.0 if (12 <= x < 20 and 12 <= y < 20 and 12 <= z < 20) else 0.0
+                  for z in range(n) for y in range(n) for x in range(n)]
+    shell = tmp / "al_shell.nii"
+    write_float32_nifti(shell, (n, n, n), shell_vals)
+    reface_out = tmp / "al_reface.nii"
+    require_success(
+        run_niimath(exe, [str(moving), "-reface", str(base), str(shell), str(weight), "-gz", "0", str(reface_out)]),
+        "-reface positional triplet + output",
+    )
+    before = read_float32_nifti(moving)
+    after = read_float32_nifti(reface_out)
+    n_face = sum(1 for s in shell_vals if s > 0.0)
+    n_changed = sum(1 for i, s in enumerate(shell_vals) if s > 0.0 and abs(after[i] - before[i]) > 1e-4)
+    if n_changed < 0.9 * n_face:
+        raise AssertionError(f"-reface replaced only {n_changed}/{n_face} face voxels (expected most anonymized)")
+    # Privacy fail-closed: a shell with no positive support -> <10% coverage -> refuse to write.
+    empty_shell = tmp / "al_shell_empty.nii"
+    write_float32_nifti(empty_shell, (n, n, n), [0.0] * (n * n * n))
+    fc = run_niimath(exe, [str(moving), "-reface", str(base), str(empty_shell), str(weight),
+                           "-gz", "0", str(tmp / "al_reface_fc.nii")])
+    if fc.returncode == 0 or (tmp / "al_reface_fc.nii").exists():
+        raise AssertionError("-reface did not fail closed on <10% face coverage (wrote output)")
+    # Privacy fail-closed via the coverage RATIO (not just the empty-shell ternary): a NONEMPTY face
+    # shell whose sform origin places it far outside the subject FOV maps ~0 voxels into the subject
+    # -> cov ~ 0 -> refuse. Exercises the mm^3-normalized face_subj/face_tmpl arithmetic.
+    far_shell = tmp / "al_shell_far.nii"
+    write_float32_nifti(far_shell, (n, n, n), shell_vals, offset=(1000.0, 1000.0, 1000.0))
+    fc2 = run_niimath(exe, [str(moving), "-reface", str(base), str(far_shell), str(weight),
+                            "-gz", "0", str(tmp / "al_reface_far.nii")])
+    if fc2.returncode == 0 or (tmp / "al_reface_far.nii").exists():
+        raise AssertionError("-reface did not fail closed on an out-of-FOV nonempty shell (wrote output)")
+    # Discriminating regression for the |det(sform)| coverage fix: a shell whose PIXDIM disagrees
+    # with its sform scale. Reslicing uses the sform (identity here -> the face maps ~1:1 onto the
+    # subject), so the physical coverage is ~100% using |det(sform)|=1 and the run must PASS. The old
+    # pixdim-based volume (pixdim=5 -> voxel 125x too large) would compute ~0.8% and WRONGLY refuse —
+    # so the verdict flips, locking the repaired metric. (sform bytes untouched; only pixdim patched.)
+    skew_shell = tmp / "al_shell_skew.nii"
+    write_float32_nifti(skew_shell, (n, n, n), shell_vals)
+    sbuf = bytearray(skew_shell.read_bytes())
+    struct.pack_into("<3f", sbuf, 80, 5.0, 5.0, 5.0)  # pixdim[1..3] = 5 (header sform diagonal stays 1.0)
+    skew_shell.write_bytes(bytes(sbuf))
+    skew_out = tmp / "al_reface_skew.nii"
+    skew = run_niimath(exe, [str(moving), "-reface", str(base), str(skew_shell), str(weight),
+                             "-gz", "0", str(skew_out)])
+    if skew.returncode != 0 or not skew_out.exists():
+        raise AssertionError("-reface wrongly refused a pixdim!=sform shell (coverage used pixdim, not |det(sform)|)")
+    # The three reface aux operands each reject stdin '-' (a piped primary could otherwise make the
+    # aux read reuse/misread the input stream — a privacy hazard).
+    for label, triplet in (("template", ["-", str(shell), str(weight)]),
+                           ("shell", [str(base), "-", str(weight)]),
+                           ("weight", [str(base), str(shell), "-"])):
+        rs = run_niimath(exe, [str(moving), "-reface", *triplet, "-gz", "0", str(tmp / "al_rf_stdin.nii")])
+        if rs.returncode == 0 or (tmp / "al_rf_stdin.nii").exists():
+            raise AssertionError(f"-reface accepted stdin '-' for the {label} operand")
+    # -reface rejects -final (back-projection is always nearest-neighbour, so -final is meaningless).
+    rf_final = run_niimath(exe, [str(moving), "-reface", str(base), str(shell), str(weight),
+                                 "-final", "linear", "-gz", "0", str(tmp / "al_rf_final.nii")])
+    if rf_final.returncode == 0 or "does not support -final" not in (rf_final.stdout + rf_final.stderr):
+        raise AssertionError("-reface did not reject -final")
+
+    # -unifize -GM must CONSUME the trailing -GM token AND actually apply GM scaling: its output
+    # must DIFFER from a plain -unifize (token consumption alone would leave them identical).
+    uni = tmp / "al_uni.nii"
+    unigm = tmp / "al_unigm.nii"
+    require_success(run_niimath(exe, [str(moving), "-unifize", "-gz", "0", str(uni)]), "-unifize")
+    res = run_niimath(exe, [str(moving), "-unifize", "-GM", "-gz", "0", str(unigm)])
+    if res.returncode != 0 or "unsupported operation" in (res.stdout + res.stderr) or not unigm.exists():
+        raise AssertionError(f"-unifize -GM did not consume -GM / produce output: {res.stdout + res.stderr}")
+    if all(abs(a - b) < 1e-4 for a, b in zip(read_float32_nifti(uni), read_float32_nifti(unigm))):
+        raise AssertionError("-unifize -GM output identical to plain -unifize (GM scaling not applied)")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

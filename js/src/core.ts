@@ -283,15 +283,29 @@ class ImageProcessor {
   }
 
   // Affine registration (BSD allineate): -allineate <base> [opts] [-weight <img>]
-  // The optional `weight` is a base(fixed)-space SOFT-FOCUS map (fast engine only, EXPERIMENTAL;
-  // its dims + world frame must match `base`): it is remapped to [0.5, 1] over the whole grid so
-  // the ROI (e.g. a brain mask) dominates the fine-stage fit while out-of-ROI head stays in the
-  // cost — it is NOT an exclusion mask (a zeroed region still contributes at the floor). Emitted
-  // as `-weight <img>` after the base + opts and staged into MEMFS like the other file operands.
+  // The optional `weight` is a base(fixed)-space GRADED weight image, AFNI 3dAllineate style (its
+  // dims + world frame must match `base`): normalized to [0, 1] (divide by max) and used per base
+  // voxel — a voxel weighted 0 is excluded, one near 1 dominates. It is NOT an exclusion mask; keep
+  // the out-of-ROI head attenuated (nonzero) to anchor global scale (a fully-zeroed exterior lets a
+  // cross-modal fit collapse into the scalp). It steers BOTH engines — the ordinary engine
+  // (`-cost hel`/`lpc`/`lpa`/`ls`) uses it in place of its manufactured autoweight, the fast engine
+  // applies it at the finest 2 mm stage only. It is rejected only with stdin and `-applymat`; when
+  // the default fast engine falls back to the ordinary engine, the weight is still honored.
+  // Emitted as `-weight <img>` after the base + opts and staged
+  // into MEMFS like the other file operands.
   allineate(base: File, opts: (string | number)[] = [], weight?: File): this {
     this._addFileCommand('-allineate', [base], opts);
     if (weight) this._addFileCommand('-weight', [weight]);
     return this;
+  }
+
+  // Anonymization by face replacement (BSD allineate/reface): -reface <tmpl> <shell> <weight> [opts].
+  // Registers the subject to `tmpl`, back-projects the signed template-space `shell` onto the
+  // subject grid, and composites an anonymized image. All three file operands are REQUIRED (the
+  // `weight` is reused as the registration weight); opts are the `-cost` tuning as for `deface`.
+  // For privacy the coverage diagnostic fails closed (<10% mapped → the run errors, no output).
+  reface(tmpl: File, shell: File, weight: File, opts: (string | number)[] = []): this {
+    return this._addFileCommand('-reface', [tmpl, shell, weight], opts);
   }
 
   // Nearest-neighbour reslice of the current image onto another image's grid:
@@ -485,6 +499,7 @@ interface FileOperandMethods {
   spmDeface(tmpl: File, mask: File, opts?: (string | number)[]): this;
   spmcoreg(ref: File, opts?: (string | number)[]): this;
   allineate(base: File, opts?: (string | number)[], weight?: File): this;
+  reface(tmpl: File, shell: File, weight: File, opts?: (string | number)[]): this;
   resliceNN(ref: File): this;
   mulImage(img: File): this;
 }
