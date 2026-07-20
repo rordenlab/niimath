@@ -24,6 +24,15 @@ from pathlib import Path
 SHORT_READ = "++ WARNING: read "
 
 
+def _prod(values):
+    # math.prod is Python 3.8+, but this script is the cibuildwheel test-command and
+    # must run on the package minimum (requires-python >=3.7). Keep it stdlib-portable.
+    result = 1
+    for value in values:
+        result *= value
+    return result
+
+
 def run_niimath(exe: str, args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [exe, *args],
@@ -104,7 +113,7 @@ def write_float32_nifti(
 def read_float32_nifti(path: Path) -> list[float]:
     blob = path.read_bytes()
     dim = struct.unpack_from("<8h", blob, 40)
-    nvox = math.prod(dim[1 : dim[0] + 1])
+    nvox = _prod(dim[1 : dim[0] + 1])
     offset = int(struct.unpack_from("<f", blob, 108)[0])
     return list(struct.unpack_from(f"<{nvox}f", blob, offset))
 
@@ -793,7 +802,7 @@ def main() -> int:
         # Positive-threshold ROC: noise rank `i` must never index the observed array `k`. Use only
         # two included truth voxels but ten noise volumes, so nvol > nTest deterministically.
         ndims = (12, 12, 12)
-        nn3 = math.prod(ndims)
+        nn3 = _prod(ndims)
         noise_obs = tmp / "roc_noise_obs.nii"
         noise_truth = tmp / "roc_noise_truth.nii"
         noise_stack = tmp / "roc_noise_stack.nii"
