@@ -1,0 +1,33 @@
+name: Release checks
+# Fast, pre-deploy guards for failures that cibuildwheel would otherwise only surface at
+# RELEASE time. The release smoke test (.github/scripts/release_smoke.py) is cibuildwheel's
+# per-wheel test-command, so it runs inside EVERY target Python down to the package minimum
+# (pyproject `requires-python`). A stdlib symbol newer than that minimum (e.g. math.prod is
+# 3.8+) passes on the CI runner's modern python3 but fails only on the oldest wheel — after a
+# multi-platform wheel build, on a tag. This job catches it statically in seconds, on every PR
+# (before merge to master, which triggers Release) and on the release push/tag itself.
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*.*.*']
+jobs:
+  release-smoke-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {submodules: false}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.x'}
+      - name: release_smoke.py must run on the package minimum Python
+        run: |
+          set -e
+          python -m pip install --quiet vermin
+          # Minimum Python from pyproject requires-python (kept in one place).
+          min=$(grep -oE 'requires-python[^"]*">=[[:space:]]*[0-9.]+' pyproject.toml | grep -oE '[0-9]+\.[0-9]+')
+          echo "package minimum Python (requires-python): $min"
+          # Statically assert the wheel test-command uses no stdlib feature newer than $min.
+          # No --eval-annotations: the script's `from __future__ import annotations` defers all
+          # annotations to strings, so PEP 585/604 hints (list[str], X | None) are never evaluated
+          # at runtime and must NOT be flagged; vermin honours the future import automatically.
+          vermin --target=$min --violations .github/scripts/release_smoke.py
