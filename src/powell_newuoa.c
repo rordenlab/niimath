@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include <limits.h>
+#include <stdint.h>
 #include <time.h>
 
 /* MSVC lacks POSIX srand48/drand48 */
@@ -67,11 +69,9 @@ static void xreduce(int n, double *x);
 /* Static variables replacing AO_* macros (thread-local for OpenMP safety)   */
 /*---------------------------------------------------------------------------*/
 
-#ifdef _OPENMP
-#define PNL_TLOCAL __thread
-#else
-#define PNL_TLOCAL
-#endif
+#include "al_thread_local.h"
+
+#define PNL_TLOCAL AL_THREAD_LOCAL
 
 static PNL_TLOCAL int scalx = 0;
 
@@ -2325,6 +2325,54 @@ void powell_get_mfac( float *mm , float *aa )
    and the dominant per-thread retained buffer (~64 KB at 12 DOF). */
 static PNL_TLOCAL double *pn_w = NULL ; static PNL_TLOCAL int pn_w_len = 0 ;
 
+static int pn_size_mul(size_t a, size_t b, size_t *out)
+{
+   if( a != 0 && b > SIZE_MAX / a ) return 1 ;
+   *out = a * b ; return 0 ;
+}
+
+static int pn_size_add(size_t a, size_t b, size_t *out)
+{
+   if( b > SIZE_MAX - a ) return 1 ;
+   *out = a + b ; return 0 ;
+}
+
+/* Validate NEWUOA's quadratic workspace arithmetic before it reaches the
+   f2c integer expressions. Direct callers are not restricted to the small
+   in-tree dimensions, and an overflowing workspace length would otherwise
+   under-allocate before newuoa_ writes through it. */
+static int pn_workspace_shape(int ndim, int extra, integer *nout,
+                              integer *nptout, integer *workout)
+{
+   size_t n, npt, nptmax, t1, t2, work ;
+   double raw ;
+   long long iraw ;
+   if( ndim < 1 || ndim > (INT_MAX-10)/5 || extra < 0 ) return 1 ;
+   n = (size_t)ndim ;
+   raw = (double)mfac * (double)ndim + (double)afac ;
+   if( !(raw >= -(double)INT_MAX && raw <= (double)INT_MAX) ) return 1 ;
+   iraw = (long long)raw ;             /* in-range: truncates as the old int cast did */
+   npt = (iraw > 0) ? (size_t)iraw : 0 ;
+   if( npt < n+2 ) npt = n+2 ;
+   if( pn_size_mul(n+1,n+2,&nptmax) ) return 1 ;
+   nptmax /= 2 ;
+   if( npt > nptmax ) npt = nptmax ;
+
+   if( pn_size_add(npt,14,&t1) || pn_size_add(npt,n,&t2) ||
+       pn_size_mul(t1,t2,&t1) ) return 1 ;
+   if( pn_size_add(n,3,&t2) || pn_size_mul(n,t2,&t2) ||
+       pn_size_mul(t2,3,&t2) ) return 1 ;
+   t2 /= 2 ;
+   if( pn_size_add(t1,t2,&work) || pn_size_add(work,(size_t)extra,&work) )
+      return 1 ;
+   if( npt > (size_t)INT_MAX || work > (size_t)INT_MAX ||
+       work > SIZE_MAX/sizeof(double) ) return 1 ;
+   *nout = (integer)n ;
+   *nptout = (integer)npt ;
+   *workout = (integer)work ;
+   return 0 ;
+}
+
 int powell_newuoa( int ndim , double *x ,
                    double rstart , double rend ,
                    int maxcall , double (*ufunc)(int,double *) )
@@ -2339,18 +2387,14 @@ int powell_newuoa( int ndim , double *x ,
    if( rstart < rend || rstart <= 1.e-4 ) return -4 ;
    if( ufunc == NULL                    ) return -5 ;
 
-   if( rend    <= 0.0       ) rend    = 1.e-4 * rstart ;
-   if( maxcall <  10+5*ndim ) maxcall = 10+5*ndim ;
-
-   n      = ndim ;
-   npt    = (int)(mfac*n+afac) ; if( npt < n+2   ) npt = n+2 ;
-   icode  = (n+1)*(n+2)/2      ; if( npt > icode ) npt = icode ;
+   if( rend <= 0.0 ) rend = 1.e-4 * rstart ;
+   if( pn_workspace_shape(ndim,6666,&n,&npt,&icode) ) return -8 ;
+   if( maxcall < 10+5*ndim ) maxcall = 10+5*ndim ;
    maxfun = maxcall ;
 
    rhobeg = (doublereal)rstart ;
    rhoend = (doublereal)rend   ;
 
-   icode   = (npt+14)*(npt+n) + 3*n*(n+3)/2 + 6666 ;
    if( pn_w_len < icode ){
      free(pn_w);
      pn_w = (double*)calloc((size_t)icode,sizeof(double)) ;
@@ -2414,18 +2458,14 @@ int powell_newuoa_con( int ndim , double *x , double *xbot , double *xtop ,
    if( ufunc == NULL                    ) return -5 ;
    if( xbot == NULL || xtop == NULL     ) return -6 ;
 
-   if( rend    <= 0.0       ) rend    = 1.e-4 * rstart ;
-   if( maxcall <  10+5*ndim ) maxcall = 10+5*ndim ;
-
-   n      = ndim ;
-   npt    = (int)(mfac*n+afac) ; if( npt < n+2   ) npt = n+2 ;
-   icode  = (n+1)*(n+2)/2      ; if( npt > icode ) npt = icode ;
+   if( rend <= 0.0 ) rend = 1.e-4 * rstart ;
+   if( pn_workspace_shape(ndim,666,&n,&npt,&icode) ) return -8 ;
+   if( maxcall < 10+5*ndim ) maxcall = 10+5*ndim ;
    maxfun = maxcall ;
 
    rhobeg = (doublereal)rstart ;
    rhoend = (doublereal)rend   ;
 
-   icode   = (npt+14)*(npt+n) + 3*n*(n+3)/2 + 666 ;
    if( pn_resize_1d(&pn_con_w,&pn_con_w_len,(int)icode) ) return -7 ;
 
    icode   = 0 ;

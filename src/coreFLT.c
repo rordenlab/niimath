@@ -6488,7 +6488,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		}
 	}
 	/* Default cost is the fast SPM/FLIRT-inspired engine: a bare -allineate with no explicit
-	   -cost selects `-cost fast` (Hellinger). An explicit -cost (fast/fastcr or hel/lpc/lpa/ls)
+	   -cost selects mixed `-cost fast`/`fastx`. An explicit fast selector or ordinary cost
 	   is honored as given. -cmass/-nocmass/-com apply to the fast engine too. When fast is the
 	   DEFAULT (not an explicit -cost fast), a fast failure falls back to the robust Hellinger
 	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
@@ -6504,7 +6504,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	                        (opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 	int fast_default = !opts.fast && !(opts.cli_set & AL_CLI_COST) && !fast_incompatible;
 	if (fast_default)
-		opts.fast = AL_ENGINE_FAST_HEL;
+		opts.fast = AL_ENGINE_FAST_X;
 
 	/* -weight is an AFNI 3dAllineate-style graded base-space weight honored by BOTH engines: the
 	   ordinary engine (hel/lpc/lpa/ls) loads it internally via al_load_user_weight, replacing its
@@ -6558,31 +6558,32 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	   (al_image_fillv would otherwise waste a full-image float copy + scan for AUTO). */
 	int ok;
 	if (opts.fast) {
-		/* Fast SPM/FLIRT-inspired engine (-cost fast = Hellinger, -cost fastcr = CR):
+		/* Fast SPM/FLIRT-inspired engine (fast/fastx = mixed, fasthel = HEL, fastcr = CR):
 		   estimate the world-mm FIXED->MOVING affine WITHOUT mutating inputs, then reslice
 		   `nim` in place onto the base (or -master) grid. The fast engine runs a fixed
 		   12-DOF schedule with its own internal sampling/masking, so reject (rather than
 		   silently ignore) options it cannot honor — the header contract promises this. */
 		if (opts.cli_set & AL_CLI_WARP) {
-			printfx("** -cost fast/fastcr does not support -warp (fixed 12-DOF schedule); omit -warp or use a normal cost\n");
+			printfx("** fast/fastx/fasthel/fastcr does not support -warp (fixed 12-DOF schedule); omit -warp or use a normal cost\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
 		if (opts.cli_set & AL_CLI_INTERP) {
-			printfx("** -cost fast/fastcr does not support -interp (internal sampling); use -final for the output interpolation\n");
+			printfx("** fast/fastx/fasthel/fastcr does not support -interp (internal sampling); use -final for the output interpolation\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
 		if (opts.source_automask || opts.dark_automask) {
-			printfx("** -cost fast/fastcr does not support -source_automask/-dark_automask (internal masking)\n");
+			printfx("** fast/fastx/fasthel/fastcr does not support -source_automask/-dark_automask (internal masking)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
 		if (opts.zoom) {
-			printfx("** -cost fast/fastcr does not support -zoom (it relaxes the affine scale range, which the fast engine's fixed scale capture cannot do; use -cost hel)\n");
+			printfx("** fast/fastx/fasthel/fastcr does not support -zoom (it relaxes the affine scale range, which the fast engine's fixed scale capture cannot do; use -cost hel)\n");
 			nifti_image_free(base); if (master) nifti_image_free(master); return 1;
 		}
 		/* -com/-sym header seeds were already applied to nim above (shared with the ordinary
 		   engine); the fast estimate simply starts from the seeded pose. */
 		coreg_fast_opts cfo = coreg_fast_opts_default();
-		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL :
+		           (opts.fast == AL_ENGINE_FAST_CR)  ? CF_COST_CR : CF_COST_HEL_CR;
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
 		cfo.use_cmass = !opts.com &&
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
@@ -6606,7 +6607,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		if (ok && fast_default) {
 			/* The DEFAULT fast engine could not register this image (too small/degenerate for its
 			   pyramid). Fall back to the robust Hellinger engine so a bare -allineate never
-			   regresses. An explicit -cost fast/fastcr still errors rather than silently switching
+			   regresses. An explicit fast-engine selector still errors rather than silently switching
 			   engines. Any -com/-sym header seed was applied to nim above (not by the failed
 			   estimate, which does not mutate nim), so the ordinary path below starts from the same
 			   seeded pose. A -weight, if given, is honored on the fallback too — the ordinary engine
@@ -6626,7 +6627,8 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 					save_mat = nifti_mat44_mul(seeded_to_original, save_mat);
 				}
 				const char *fc = (res.resolved_cost == CF_COST_LS) ? "ls" :
-				                 (res.resolved_cost == CF_COST_HEL) ? "hel" : "cr";
+				                 (res.resolved_cost == CF_COST_HEL) ? "hel" :
+				                 (res.resolved_cost == CF_COST_CR) ? "cr" : "hel+cr";
 				if (al_write_affine_json(opts.savemat, save_mat, "coreg_fast",
 				                         res.resolved_dof, fc, basefile, moving_name, opts.weight))
 					ok = 1;
@@ -6793,7 +6795,8 @@ staticx int nifti_reface_wrap(nifti_image *nim, char *tmplfile, char *shellfile,
 	mat44 fixed_to_moving;
 	if (opts.fast) {
 		coreg_fast_opts cfo = coreg_fast_opts_default();
-		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL :
+		           (opts.fast == AL_ENGINE_FAST_CR)  ? CF_COST_CR : CF_COST_HEL_CR;
 		cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		nifti_image *weight_img = nifti_image_read(opts.weight, 1);
 		if (!weight_img) {
@@ -7779,9 +7782,9 @@ int main64(int argc, char *argv[]) {
 			int df_fast_incompat = df_opts.source_automask || df_opts.dark_automask ||
 			                       (df_opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 			if (!df_opts.fast && !(df_opts.cli_set & AL_CLI_COST) && !df_fast_incompat)
-				df_opts.fast = AL_ENGINE_FAST_HEL;
+				df_opts.fast = AL_ENGINE_FAST_X;
 			if (df_opts.fast && df_fast_incompat) {
-				printfx("** -deface -cost fast/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
+				printfx("** -deface fast/fastx/fasthel/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
 				goto fail;
 			}
 			ok = nifti_deface_wrap(nim, tmpl_file, mask_file, df_opts);
@@ -7807,9 +7810,9 @@ int main64(int argc, char *argv[]) {
 			int rf_fast_incompat = rf_opts.source_automask || rf_opts.dark_automask ||
 			                       (rf_opts.cli_set & (AL_CLI_WARP | AL_CLI_INTERP));
 			if (!rf_opts.fast && !(rf_opts.cli_set & AL_CLI_COST) && !rf_fast_incompat)
-				rf_opts.fast = AL_ENGINE_FAST_HEL;
+				rf_opts.fast = AL_ENGINE_FAST_X;
 			if (rf_opts.fast && rf_fast_incompat) {
-				printfx("** -reface -cost fast/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
+				printfx("** -reface fast/fastx/fasthel/fastcr does not support -warp/-interp/-source_automask/-dark_automask; use -cost hel\n");
 				goto fail;
 			}
 			ok = nifti_reface_wrap(nim, rf_tmpl, rf_shell, rf_opts);

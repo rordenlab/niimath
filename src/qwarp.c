@@ -34,6 +34,7 @@
 #include <limits.h>
 #include "qwarp.h"
 #include "core32.h"   /* nifti_smooth_gauss_f32 — niimath's BSD/public-domain Gaussian */
+#include "al_size_guard.h"
 
 /* FWHM (voxels) -> Gaussian sigma (voxels): AFNI FWHM_TO_SIGMA (editvol.h). */
 #define QW_FWHM_TO_SIGMA(f) (0.42466090 * (f))
@@ -122,8 +123,10 @@ static int qw_grid_compat(const nifti_image *mov, const nifti_image *sta) {
     }
     if (!qw_is_single_vol_3d(mov) || !qw_is_single_vol_3d(sta)) {   /* product now overflow-safe */
         fprintf(stderr, "qwarp: inputs must be single-volume 3D (no 4D/multi-volume)\n"); return 1; }
-    /* unpadded product must fit INT_MAX (padding only grows it; the padded product is re-checked) */
-    if ((int64_t)mov->nx * mov->ny * mov->nz > (int64_t)INT_MAX) {
+    /* The unpadded product must fit both the int-based engine and an addressable
+       float buffer (padding only grows it; the padded product is re-checked). */
+    int64_t unv = (int64_t)mov->nx * mov->ny * mov->nz;
+    if (unv > (int64_t)INT_MAX || !al_float_nvox_fits((uint64_t)unv)) {
         fprintf(stderr, "qwarp: voxel count exceeds the supported maximum\n"); return 1; }
     if (mov->nx != sta->nx || mov->ny != sta->ny || mov->nz != sta->nz) {
         fprintf(stderr, "qwarp: moving %ldx%ldx%ld and stationary %ldx%ldx%ld dims differ "
@@ -1623,7 +1626,8 @@ int qwarp_run(const nifti_image *moving, const nifti_image *stationary,
      * BEFORE the padding allocations (mirrors the fast engine's nvox guard). ~2.1 Gvoxel is far
      * beyond any real brain grid. */
     int64_t pnv = (int64_t)pnx * pny * pnz;
-    if (pnv > (int64_t)INT_MAX) { fprintf(stderr, "qwarp: padded volume %dx%dx%d exceeds the "
+    if (pnv > (int64_t)INT_MAX || !al_float_nvox_fits((uint64_t)pnv)) {
+        fprintf(stderr, "qwarp: padded volume %dx%dx%d exceeds the "
         "supported voxel count\n", pnx, pny, pnz); goto pipe_done; }
     int cpnx, cpny, cpnz;
     basep = qw_zeropad(base, onx, ony, onz, xm, xp, ym, yp, zm, zp, &cpnx, &cpny, &cpnz);
