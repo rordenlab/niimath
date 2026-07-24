@@ -167,14 +167,14 @@ elseif(MSVC)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4244")   # 'initializing': conversion from 'double' to 'int', possible loss of data
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4267")   # 'initializing': conversion from 'size_t' to 'int', possible loss of data
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /wd4305")   # 'argument': truncation from 'double' to 'float'
-    # MSVC is built single-threaded regardless of USE_OPENMP. Its bundled OpenMP is the
-    # ancient 2.0 runtime whose loop-form parser rejects our canonical `#pragma omp for`
-    # loops (C3015), and cl.exe never accepts the GCC/Clang `__thread` qualifier that the
-    # shared allineate.c/powell_newuoa.c expand AL_TLOCAL/PNL_TLOCAL to when _OPENMP is
-    # defined (C2054/C2085). Leaving _OPENMP undefined compiles those out cleanly (every
-    # omp.h include, omp_* call, and `#pragma omp` is _OPENMP-guarded), matching the
-    # long-proven single-threaded Windows release. Re-enabling would require `/openmp:llvm`
-    # AND teaching the shared TLS macros to emit `__declspec(thread)` on MSVC.
+    # MSVC remains single-threaded regardless of USE_OPENMP. Its bundled OpenMP 2.0
+    # loop-form parser rejects our canonical `#pragma omp for` loops (C3015). Shared
+    # registration TLS is now compiler-portable (`al_thread_local.h` emits
+    # `__declspec(thread)` on MSVC, including optional GPL `SC_TLOCAL`), removing
+    # the former C2054/C2085 blocker, but
+    # re-enabling OpenMP still requires `/openmp:llvm` plus a deliberate plan to ship
+    # its libomp runtime DLL with every Windows artifact. Leaving _OPENMP undefined
+    # preserves the long-proven, self-contained single-threaded Windows release.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")  # set "Stack Reserve Size" to 8MB (default value is 1MB)
 endif()
 

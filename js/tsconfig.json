@@ -21,5 +21,6 @@
     "noEmit": false
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/**/*.js"]
+  "//": "Ship declarations for the library only. GPL wrappers (index-gpl/worker-gpl) are historical (BSD-only package); tests and build-only scripts must not emit .d.ts into dist/.",
+  "exclude": ["node_modules", "dist", "src/**/*.js", "src/**/*.mjs", "src/index-gpl.ts", "src/worker-gpl.ts", "src/**/*.test.ts", "src/**/*.test.mts"]
 }

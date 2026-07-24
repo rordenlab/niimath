@@ -41,16 +41,16 @@ const registered = await niimath.image(selectedFile).allineate(baseFile).run();
 const defaced = await niimath.image(selectedFile).deface(templateFile, maskFile).run();
 ```
 
-`allineate(base, opts?, weight?)` accepts an optional third `File`: a **soft-focus weight** in the base's space (its dims + world frame must match `base`). It focuses the fast-engine fine stage on a region — e.g. a brain mask — rather than whole-head features. It is **experimental** and is *not* an exclusion mask: the map is remapped to `[0.5, 1]` over the whole grid, so a zeroed region is down-weighted, never removed.
+`allineate(base, opts?, weight?)` accepts an optional third `File`: a graded weight in the base's space (dims and world frame must match `base`). Values are normalized to `[0, 1]`; zero excludes a voxel and larger values contribute more. Both registration engines honor it (the fast engine at its finest stage). Keep the outer head attenuated but nonzero so the whole-head boundary still anchors scale.
 
 ```javascript
-// register `selectedFile` onto `baseFile`, focusing the fit on `brainMaskFile`
-const registered = await niimath.image(selectedFile).allineate(baseFile, [], brainMaskFile).run();
+// register `selectedFile` onto `baseFile`, focusing the fit with a graded whole-head weight
+const registered = await niimath.image(selectedFile).allineate(baseFile, [], weightFile).run();
 ```
 
 **Worker lifecycle.** `await niimath.init()` once before processing; it spawns a single persistent Web Worker. `init()` returns a promise that rejects if the worker fails to load or instantiate (e.g. the WASM cannot be fetched). **Single-flight:** one `.run()` is in flight per instance at a time — a second overlapping `run()` (or a `run()` before `init()` has resolved) rejects immediately rather than interleaving, so serialize calls (await the previous `run()`) or use a separate instance per concurrent stream. Call `niimath.dispose()` to terminate the worker and release its WASM heap; it is idempotent and rejects any in-flight `init()`/`run()`. A worker crash during a `run()` rejects that run and invalidates the worker — a subsequent `image(...).run()` rejects with "Worker not initialized" until you `init()` again.
 
-Two more operations take a `File` operand and are in both builds: `resliceNN(refFile)` reslices the current image onto another image's grid (nearest-neighbour), and `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` only takes a scalar). These let you, e.g., reslice a brain mask onto a native grid and apply it:
+Two more operations take a `File` operand: `resliceNN(refFile)` reslices the current image onto another image's grid (nearest-neighbour), and `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` only takes a scalar). These let you, e.g., reslice a brain mask onto a native grid and apply it:
 
 ```javascript
 // reslice `maskFile` (conformed space) onto `nativeFile`'s grid, binarize, save
@@ -61,25 +61,9 @@ const nativeMask = new File([maskBlob], 'nativeMask.nii.gz');
 const brain = await niimath.image(nativeFile).mulImage(nativeMask).run();
 ```
 
-### GPL build (`-spm_coreg`, `-spm_deface`)
+### SPM coregistration (`-spm_coreg`, `-spm_deface`)
 
-A second, larger WASM module adds the optional **GPL-2** SPM coregistration operations (`-spm_coreg`, `-spm_deface`) on top of everything in the BSD build. It is exposed under a separate subpath export so you explicitly opt into the GPL licensing:
-
-```javascript
-// GPL-2 build — same API as the default import, plus SPM coregistration
-import { Niimath } from '@niivue/niimath/gpl';
-
-const niimath = new Niimath();
-await niimath.init();
-
-// rigid-body coregister `selectedFile` onto a reference volume
-const coregistered = await niimath.image(selectedFile).spmcoreg(referenceFile).run();
-
-// SPM rigid-body defacing with a template + mask pair
-const defaced = await niimath.image(selectedFile).spmDeface(templateFile, maskFile).run();
-```
-
-> **Licensing:** importing from `@niivue/niimath/gpl` pulls in GPL-2 code, so a bundle that includes it becomes a GPL-2 combined work. Use the default `@niivue/niimath` import if your project must remain BSD-2-Clause — it still provides `-allineate`/`-deface`, just not the SPM operations. The GPL WASM binary is built from the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule; a plain clone without that submodule still builds the BSD package (the GPL entry point is simply omitted). The package ships the GPL-2 license text (`LICENSE.GPL-2.0.txt`) and a written offer for the complete corresponding source (`GPL-NOTICE.md`); see `LICENSE` for the dual-license summary (`BSD-2-Clause AND GPL-2.0-only`).
+The published `@niivue/niimath` package is **BSD-2-Clause only** and no longer ships the optional GPL-2 SPM coregistration WASM module — the permissively licensed `-allineate`/`-deface` engine supersedes it. The `-spm_coreg`/`-spm_deface` C sources remain in the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule and can still be built from source for local/historical use (`GPL=1 make`, or `bun run makeWasmGpl` to produce a GPL WASM), but they are not part of the npm package or its exports.
 
 ### Example: meshes
 
@@ -182,11 +166,10 @@ To run the tests, run the following command:
 bun run test
 ```
 
-The tests in `tests/` load the built WASM modules from `dist/` directly (via the
-in-memory filesystem, no browser Worker), so run `bun run build` first. The GPL
-tests (`tests/gpl.test.ts`) automatically **skip** when `dist/niimath-gpl.js` was
-not produced (e.g. a clone without the `niimath_gpl` submodule), so the suite still
-passes on a BSD-only build.
+The tests in `tests/` load the built WASM module from `dist/` directly (via the
+in-memory filesystem, no browser Worker), so run `bun run build` first. The package
+is BSD-only; the historical GPL binding/test is kept under `gpl-historical/` and is
+not part of the default suite.
 
 ### Development server with Hot Module Reloading
 
@@ -197,6 +180,5 @@ bun run dev
 ```
 
 This will start a development server at `http://localhost:3000` with automatic page reloading when source files change.
-
 
 

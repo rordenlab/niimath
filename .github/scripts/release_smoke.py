@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import math
 import os
 import shutil
@@ -441,6 +442,44 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
          for z in range(n) for y in range(n) for x in range(n)],
     )
 
+    # Every advertised fast selector must reach the niimath host dispatch and
+    # serialize its resolved engine/cost. The bare default, fast, and fastx are
+    # aliases for the same adaptive strategy and must remain byte-identical.
+    fast_outputs: dict[str, list[float]] = {}
+    expected_cost = {
+        "default": "hel+cr", "fast": "hel+cr", "fastx": "hel+cr",
+        "fasthel": "hel", "fastcr": "cr",
+    }
+    for selector in ("default", "fast", "fastx", "fasthel", "fastcr"):
+        out = tmp / f"al_{selector}.nii"
+        mat = tmp / f"al_{selector}.json"
+        args = [str(moving), "-allineate", str(base)]
+        if selector != "default":
+            args.extend(["-cost", selector])
+        args.extend(["-savemat", str(mat), "-gz", "0", str(out)])
+        require_success(run_niimath(exe, args), f"-allineate -cost {selector}")
+        meta = json.loads(mat.read_text())
+        if meta.get("engine") != "coreg_fast" or meta.get("cost") != expected_cost[selector]:
+            raise AssertionError(
+                f"{selector} resolved to engine/cost {meta.get('engine')}/{meta.get('cost')}, "
+                f"expected coreg_fast/{expected_cost[selector]}"
+            )
+        fast_outputs[selector] = read_float32_nifti(out)
+    if fast_outputs["default"] != fast_outputs["fast"] or fast_outputs["fast"] != fast_outputs["fastx"]:
+        raise AssertionError("bare default, -cost fast, and -cost fastx are not identical aliases")
+
+    # -deface shares the parser but owns a separate shared-engine dispatch.
+    # Regression-guard that fastx/default maps to adaptive HEL/CR rather than
+    # accidentally collapsing every non-fasthel selector to correlation ratio.
+    df_out = tmp / "al_deface_fastx.nii"
+    df = run_niimath(
+        exe, [str(moving), "-deface", str(base), str(weight), "-cost", "fastx",
+              "-gz", "0", str(df_out)]
+    )
+    require_success(df, "-deface -cost fastx")
+    if "adaptive HEL/CR" not in (df.stdout + df.stderr):
+        raise AssertionError("-deface -cost fastx did not dispatch the adaptive HEL/CR strategy")
+
     # -dilate with a threshold > 1: grown voxels must reach at least `iso`. The prior
     # fmax(1.0, ..) left a `-dilate 10 dx` grow at value 1 — below the requested threshold.
     seed = [0.0] * (12 * 12 * 12)
@@ -557,6 +596,18 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     n_changed = sum(1 for i, s in enumerate(shell_vals) if s > 0.0 and abs(after[i] - before[i]) > 1e-4)
     if n_changed < 0.9 * n_face:
         raise AssertionError(f"-reface replaced only {n_changed}/{n_face} face voxels (expected most anonymized)")
+    # -reface routes its fast-selector through the shared cf_cost_from_fast_engine() mapping (same
+    # as -allineate/-deface). Smoke that every adaptive/explicit selector is accepted and produces
+    # output on the reface host path (guards the third mapping site the -allineate/-deface tests miss).
+    for sel in ("fastx", "fasthel", "fastcr"):
+        rf_sel = tmp / f"al_reface_{sel}.nii"
+        require_success(
+            run_niimath(exe, [str(moving), "-reface", str(base), str(shell), str(weight),
+                              "-cost", sel, "-gz", "0", str(rf_sel)]),
+            f"-reface -cost {sel}",
+        )
+        if not rf_sel.exists():
+            raise AssertionError(f"-reface -cost {sel} produced no output")
     # Privacy fail-closed: a shell with no positive support -> <10% coverage -> refuse to write.
     empty_shell = tmp / "al_shell_empty.nii"
     write_float32_nifti(empty_shell, (n, n, n), [0.0] * (n * n * n))

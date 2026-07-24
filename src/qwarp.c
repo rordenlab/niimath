@@ -34,6 +34,7 @@
 #include <limits.h>
 #include "qwarp.h"
 #include "core32.h"   /* nifti_smooth_gauss_f32 — niimath's BSD/public-domain Gaussian */
+#include "al_size_guard.h"
 
 /* FWHM (voxels) -> Gaussian sigma (voxels): AFNI FWHM_TO_SIGMA (editvol.h). */
 #define QW_FWHM_TO_SIGMA(f) (0.42466090 * (f))
@@ -122,8 +123,10 @@ static int qw_grid_compat(const nifti_image *mov, const nifti_image *sta) {
     }
     if (!qw_is_single_vol_3d(mov) || !qw_is_single_vol_3d(sta)) {   /* product now overflow-safe */
         fprintf(stderr, "qwarp: inputs must be single-volume 3D (no 4D/multi-volume)\n"); return 1; }
-    /* unpadded product must fit INT_MAX (padding only grows it; the padded product is re-checked) */
-    if ((int64_t)mov->nx * mov->ny * mov->nz > (int64_t)INT_MAX) {
+    /* The unpadded product must fit both the int-based engine and an addressable
+       float buffer (padding only grows it; the padded product is re-checked). */
+    int64_t unv = (int64_t)mov->nx * mov->ny * mov->nz;
+    if (unv > (int64_t)INT_MAX || !al_float_nvox_fits((uint64_t)unv)) {
         fprintf(stderr, "qwarp: voxel count exceeds the supported maximum\n"); return 1; }
     if (mov->nx != sta->nx || mov->ny != sta->ny || mov->nz != sta->nz) {
         fprintf(stderr, "qwarp: moving %ldx%ldx%ld and stationary %ldx%ldx%ld dims differ "
@@ -247,13 +250,30 @@ static int qw_gauss_blur_vox(float *f, int nx, int ny, int nz, double sigma_vox)
 
 /* THD_mask_clust: keep only the largest 6-connected (NN1) cluster of set voxels.
  * Faithful to AFNI's largest-component semantics via an index flood fill. */
-static void qw_mask_clust(int nx, int ny, int nz, unsigned char *mmm) {
+static int qw_next_queue_capacity(size_t cap, size_t limit, size_t *next)
+{
+    size_t alloc_limit = SIZE_MAX / sizeof(int);
+    if (limit > alloc_limit) limit = alloc_limit;
+    if (next == NULL || cap >= limit) return 1;
+    *next = (cap > limit / 2) ? limit : cap * 2;
+    return *next > cap ? 0 : 1;
+}
+
+#ifdef QWARP_TEST_CAPACITY
+int qwarp_test_next_queue_capacity(size_t cap, size_t limit, size_t *next)
+{
+    return qw_next_queue_capacity(cap, limit, next);
+}
+#endif
+
+static int qw_mask_clust(int nx, int ny, int nz, unsigned char *mmm) {
     int nxy = nx * ny; int64_t nv = (int64_t)nxy * nz;
-    int *best = NULL, nbest = 0, cap = 4096, *cur = (int *)malloc(sizeof(int) * cap);
-    if (!cur) return;
+    size_t nbest = 0, cap = (nv < 4096) ? (size_t)nv : 4096;
+    int *best = NULL, *cur = (int *)malloc(sizeof(int) * cap);
+    if (!cur) return EXIT_FAILURE;
     for (int64_t s = 0; s < nv; s++) {
+        size_t ncur = 0, head = 0;
         if (!mmm[s]) continue;
-        int ncur = 0, head = 0;
         cur[ncur++] = (int)s; mmm[s] = 0;
         while (head < ncur) {
             int ijk = cur[head++];
@@ -269,28 +289,36 @@ static void qw_mask_clust(int nx, int ny, int nz, unsigned char *mmm) {
                 int q = nb[t];
                 if (mmm[q]) {
                     mmm[q] = 0;
-                    if (ncur >= cap) { cap *= 2; int *nc = (int *)realloc(cur, sizeof(int) * cap);
-                        if (!nc) { free(cur); free(best); return; } cur = nc; }
+                    if (ncur >= cap) {
+                        size_t next;
+                        if (qw_next_queue_capacity(cap, (size_t)nv, &next)) {
+                            free(cur); free(best); return EXIT_FAILURE;
+                        }
+                        int *nc = (int *)realloc(cur, sizeof(int) * next);
+                        if (!nc) { free(cur); free(best); return EXIT_FAILURE; }
+                        cur = nc; cap = next;
+                    }
                     cur[ncur++] = q;
                 }
             }
         }
         if (ncur > nbest) {
             int *nb2 = (int *)malloc(sizeof(int) * ncur);
-            if (!nb2) { free(cur); free(best); return; }
+            if (!nb2) { free(cur); free(best); return EXIT_FAILURE; }
             memcpy(nb2, cur, sizeof(int) * ncur); free(best); best = nb2; nbest = ncur;
         }
     }
-    for (int t = 0; t < nbest; t++) mmm[best[t]] = 1;
+    for (size_t t = 0; t < nbest; t++) mmm[best[t]] = 1;
     free(best); free(cur);
+    return EXIT_SUCCESS;
 }
 
 /* THD_mask_erode(...,redilate=1,NN=2): erode any in-mask voxel lacking all 18 of its
  * NN1+NN2 neighbors (edges always erode), then redilate eroded voxels adjacent to a
  * survivor. Faithful port of the thd_automask.c body (public domain). */
-static void qw_mask_erode(int nx, int ny, int nz, unsigned char *mmm) {
+static int qw_mask_erode(int nx, int ny, int nz, unsigned char *mmm) {
     int nxy = nx * ny; int64_t nxyz = (int64_t)nxy * nz;
-    unsigned char *nnn = (unsigned char *)calloc((size_t)nxyz, 1); if (!nnn) return;
+    unsigned char *nnn = (unsigned char *)calloc((size_t)nxyz, 1); if (!nnn) return EXIT_FAILURE;
     for (int kk = 0; kk < nz; kk++) {
         int kz = kk * nxy, km = (kk == 0) ? kz : kz - nxy, kp = (kk == nz - 1) ? kz : kz + nxy;
         for (int jj = 0; jj < ny; jj++) {
@@ -335,16 +363,18 @@ static void qw_mask_erode(int nx, int ny, int nz, unsigned char *mmm) {
     }
     for (int64_t i = 0; i < nxyz; i++) if (nnn[i]) mmm[i] = 1;
     free(nnn);
+    return EXIT_SUCCESS;
 }
 
 /* THD_mask_erodemany(...,npeel=1): peel layers where an in-mask voxel has < peelthr(17) of
- * 18 NN2 neighbors, then unpeel next to survivors. Faithful port (public domain). */
-static void qw_mask_erodemany(int nx, int ny, int nz, unsigned char *mmm, int npeel) {
+ * 18 NN2 neighbors, then unpeel next to survivors. Faithful port (public domain).
+ * Returns 0 on success (including the legitimate too-small/no-op case), 1 on alloc failure. */
+static int qw_mask_erodemany(int nx, int ny, int nz, unsigned char *mmm, int npeel) {
     int nxy = nx * ny; int64_t nxyz = (int64_t)nxy * nz;
-    if (npeel < 1 || nxyz < 27) return;
+    if (npeel < 1 || nxyz < 27) return EXIT_SUCCESS;
     const int realpeelthr = 17;
-    unsigned char *nnn = (unsigned char *)calloc((size_t)nxyz, 1); if (!nnn) return;
-    unsigned char *qqq = (unsigned char *)malloc((size_t)nxyz); if (!qqq) { free(nnn); return; }
+    unsigned char *nnn = (unsigned char *)calloc((size_t)nxyz, 1); if (!nnn) return EXIT_FAILURE;
+    unsigned char *qqq = (unsigned char *)malloc((size_t)nxyz); if (!qqq) { free(nnn); return EXIT_FAILURE; }
     for (int pp = 1; pp <= npeel; pp++) {
         for (int kk = 0; kk < nz; kk++) {
             int kz = kk * nxy, km = (kk == 0) ? kz : kz - nxy, kp = (kk == nz - 1) ? kz : kz + nxy;
@@ -389,29 +419,31 @@ static void qw_mask_erodemany(int nx, int ny, int nz, unsigned char *mmm, int np
         for (int64_t i = 0; i < nxyz; i++) if (qqq[i] > bth) mmm[i] = 1;
     }
     free(qqq); free(nnn);
+    return EXIT_SUCCESS;
 }
 
 /* MRI_autobbox (thd_automask.c, PD): inclusive first/last set-voxel index per axis, after
  * the default clust -> erodemany(peelcount=1) -> clust despeckle of the nonzero mask. */
-static void qw_autobbox(const float *far, int nx, int ny, int nz,
-                        int *xm, int *xp, int *ym, int *yp, int *zm, int *zp) {
+static int qw_autobbox(const float *far, int nx, int ny, int nz,
+                       int *xm, int *xp, int *ym, int *yp, int *zm, int *zp) {
     int nxy = nx * ny; int64_t nv = (int64_t)nxy * nz;
     *xm = *xp = *ym = *yp = *zm = *zp = 0;
-    unsigned char *mmm = (unsigned char *)calloc((size_t)nv, 1); if (!mmm) return;
+    unsigned char *mmm = (unsigned char *)calloc((size_t)nv, 1); if (!mmm) return EXIT_FAILURE;
     int64_t nmm = 0;
     for (int64_t i = 0; i < nv; i++) if (far[i] != 0.0f) { mmm[i] = 1; nmm++; }
-    if (nmm == 0) { free(mmm); return; }
-    qw_mask_clust(nx, ny, nz, mmm);
-    qw_mask_erodemany(nx, ny, nz, mmm, 1);
-    qw_mask_clust(nx, ny, nz, mmm);
+    if (nmm == 0) { free(mmm); return EXIT_FAILURE; }   /* empty input mask */
+    if (qw_mask_clust(nx, ny, nz, mmm) ||
+        qw_mask_erodemany(nx, ny, nz, mmm, 1) ||
+        qw_mask_clust(nx, ny, nz, mmm)) { free(mmm); return EXIT_FAILURE; }   /* mask-pipeline alloc failure */
     int ii, jj, kk;
-    for (ii = 0; ii < nx; ii++) { for (kk = 0; kk < nz; kk++) for (jj = 0; jj < ny; jj++) if (mmm[ii + jj*nx + kk*nxy]) goto X0; } X0: *xm = (ii < nx) ? ii : 0;
+    for (ii = 0; ii < nx; ii++) { for (kk = 0; kk < nz; kk++) for (jj = 0; jj < ny; jj++) if (mmm[ii + jj*nx + kk*nxy]) goto X0; } X0: if (ii >= nx) { free(mmm); return EXIT_FAILURE; } *xm = ii;  /* mask emptied by despeckle */
     for (ii = nx-1; ii >= 0; ii--) { for (kk = 0; kk < nz; kk++) for (jj = 0; jj < ny; jj++) if (mmm[ii + jj*nx + kk*nxy]) goto X1; } X1: *xp = (ii >= 0) ? ii : 0;
     for (jj = 0; jj < ny; jj++) { for (kk = 0; kk < nz; kk++) for (ii = 0; ii < nx; ii++) if (mmm[ii + jj*nx + kk*nxy]) goto Y0; } Y0: *ym = (jj < ny) ? jj : 0;
     for (jj = ny-1; jj >= 0; jj--) { for (kk = 0; kk < nz; kk++) for (ii = 0; ii < nx; ii++) if (mmm[ii + jj*nx + kk*nxy]) goto Y1; } Y1: *yp = (jj >= 0) ? jj : 0;
     for (kk = 0; kk < nz; kk++) { for (jj = 0; jj < ny; jj++) for (ii = 0; ii < nx; ii++) if (mmm[ii + jj*nx + kk*nxy]) goto Z0; } Z0: *zm = (kk < nz) ? kk : 0;
     for (kk = nz-1; kk >= 0; kk--) { for (jj = 0; jj < ny; jj++) for (ii = 0; ii < nx; ii++) if (mmm[ii + jj*nx + kk*nxy]) goto Z1; } Z1: *zp = (kk >= 0) ? kk : 0;
     free(mmm);
+    return EXIT_SUCCESS;
 }
 
 /* EDIT_volpad (edt_volpad.c, PD), float only: grow (bot/top >=0) or crop (negative) each
@@ -448,7 +480,13 @@ static void qw_compute_pad(const float *base, int nx, int ny, int nz,
     if (!q) { *xm=*xp=*ym=*yp=*zm=*zp=3; return; }
     for (int64_t i = 0; i < nv; i++) q[i] = (base[i] < cv) ? 0.0f : base[i];
     int bxm, bxp, bym, byp, bzm, bzp;
-    qw_autobbox(q, nx, ny, nz, &bxm, &bxp, &bym, &byp, &bzm, &bzp);
+    /* Non-fatal here: the bbox only tunes padding. On failure use the minimum safe pad. */
+    if (qw_autobbox(q, nx, ny, nz, &bxm, &bxp, &bym, &byp, &bzm, &bzp) != EXIT_SUCCESS) {
+        free(q);
+        *xm = *xp = *ym = *yp = *zm = *zp = 3;
+        if (nz == 1) *zm = *zp = 0;
+        return;
+    }
     free(q);
     int mpx = (int)rintf(0.1234f * nx) + 1; if (mpx < 9) mpx = 9;
     int mpy = (int)rintf(0.1234f * ny) + 1; if (mpy < 9) mpy = 9;
@@ -554,9 +592,11 @@ static float *qw_weightize(const float *base, int nx, int ny, int nz) {
     if (clip2 > clip) clip = clip2;
     if (nz > 2) {
         for (int64_t i = 0; i < nv; i++) mmm[i] = (wf[i] >= clip);
-        qw_mask_clust(nx, ny, nz, mmm);
-        qw_mask_erode(nx, ny, nz, mmm);
-        qw_mask_clust(nx, ny, nz, mmm);
+        if (qw_mask_clust(nx, ny, nz, mmm) ||
+            qw_mask_erode(nx, ny, nz, mmm) ||
+            qw_mask_clust(nx, ny, nz, mmm)) {
+            free(wf); free(mmm); return NULL;
+        }
         for (int64_t i = 0; i < nv; i++) if (!mmm[i]) wf[i] = 0.0f;
     }
     free(mmm);
@@ -1232,6 +1272,7 @@ extern int powell_newuoa_con(int ndim, double *x, double *xbot, double *xtop,
                              int nrand, double rstart, double rend, int maxcall,
                              double (*cost)(int, double *));
 extern void powell_set_mfac(float mm, float aa);
+extern void powell_newuoa_free_threadlocal(void);
 extern void powell_get_mfac(float *mm, float *aa);
 
 /* IW3D_improve_warp: optimize one patch with the given basis, compositing the result into
@@ -1340,9 +1381,10 @@ static int qw_improve_warp(qw_ctx *H, int code, int ibot, int itop, int jbot, in
     if (iter == -1)   /* the one recoverable code: retry once with a larger end radius */
         iter = powell_newuoa_con(H->nparmap, parvec, xbot, xtop, 0, prad, 0.09 * prad, itmax, qw_scalar_costfun);
     powell_set_mfac(saved_mfac, saved_afac);
-    /* After the retry, a NEGATIVE result is a NEWUOA hard failure (workspace alloc -7, bad args
-     * -2..-6) — treat as fatal so an optimizer OOM cannot yield a silently-degraded warp. Zero is
-     * a benign non-convergence / no-improvement result and stays a patch skip. */
+    /* After the retry, a NEGATIVE result is a NEWUOA hard failure (workspace allocation -7,
+     * unsupported/overflowing shape -8, bad args -2..-6) — treat as fatal so an optimizer
+     * failure cannot yield a silently-degraded warp. Zero is a benign non-convergence /
+     * no-improvement result and stays a patch skip. */
     if (iter < 0)  { g_qw = saved_qw; free(parvec); free(xbot); free(xtop); H->fatal = 1; return -4; }
     if (iter == 0) { g_qw = saved_qw; free(parvec); free(xbot); free(xtop); H->nskipped++; return 0; }
 
@@ -1623,7 +1665,8 @@ int qwarp_run(const nifti_image *moving, const nifti_image *stationary,
      * BEFORE the padding allocations (mirrors the fast engine's nvox guard). ~2.1 Gvoxel is far
      * beyond any real brain grid. */
     int64_t pnv = (int64_t)pnx * pny * pnz;
-    if (pnv > (int64_t)INT_MAX) { fprintf(stderr, "qwarp: padded volume %dx%dx%d exceeds the "
+    if (pnv > (int64_t)INT_MAX || !al_float_nvox_fits((uint64_t)pnv)) {
+        fprintf(stderr, "qwarp: padded volume %dx%dx%d exceeds the "
         "supported voxel count\n", pnx, pny, pnz); goto pipe_done; }
     int cpnx, cpny, cpnz;
     basep = qw_zeropad(base, onx, ony, onz, xm, xp, ym, yp, zm, zp, &cpnx, &cpny, &cpnz);
@@ -1642,8 +1685,12 @@ int qwarp_run(const nifti_image *moving, const nifti_image *stationary,
 
     if (qw_setup_for_improvement(&H, basep, srcbp, wtp, pnx, pny, pnz) != 0) { qw_ctx_free(&H); goto pipe_done; }
     have_H = 1;
-    qw_autobbox(wtp, pnx, pny, pnz, &H.imin, &H.imax, &H.jmin, &H.jmax, &H.kmin, &H.kmax);
-    if (H.imax < H.imin || H.jmax < H.jmin || H.kmax < H.kmin) goto pipe_done;  /* empty weight */
+    if (qw_autobbox(wtp, pnx, pny, pnz, &H.imin, &H.imax, &H.jmin, &H.jmax, &H.kmin, &H.kmax) != EXIT_SUCCESS) {
+        /* Alloc failure in the mask/bbox pipeline or an empty weight — fail rather than warp a
+           degraded/identity region (the bbox defines the warp extent). */
+        fprintf(stderr, "qwarp: base weight mask/bbox failed (allocation failure or empty weight)\n");
+        goto pipe_done;
+    }
 
 #ifdef QWARP_CHECKPOINT
     { qw_incor c0 = H.mpar; qw_incor_addto(&c0, (int)pnv, basep, H.aasrcim, wtp);
@@ -1686,6 +1733,9 @@ int qwarp_run(const nifti_image *moving, const nifti_image *stationary,
 
 pipe_done:
     if (have_H) qw_ctx_free(&H);
+    /* Release this thread's grow-only NEWUOA workspace at the operation boundary (as
+       allineate/coreg_fast do), including the optimizer-failure paths above. */
+    powell_newuoa_free_threadlocal();
     free(base); free(src); free(basep); free(srcp); free(srcbp); free(wtp); free(warpedp); free(cropped);
     return rc;
 }

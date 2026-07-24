@@ -56,13 +56,10 @@ static int al_mul_size(size_t a, size_t b, size_t *out)
 #include "nifti_io.h"
 #include "allineate.h"
 #include "coreg_fast.h"   /* fast SPM/FLIRT-inspired engine, shared by -allineate and -deface */
+#include "al_thread_local.h"
+#include "al_size_guard.h"
 
-/* Thread-local storage qualifier for OpenMP safety */
-#ifdef _OPENMP
-#define AL_TLOCAL __thread
-#else
-#define AL_TLOCAL
-#endif
+#define AL_TLOCAL AL_THREAD_LOCAL
 
 /* Convert nifti_dmat44 (double) to mat44 (float) */
 static mat44 dmat44_to_mat44(nifti_dmat44 d) {
@@ -101,6 +98,7 @@ static nifti_dmat44 mat44_to_dmat44(mat44 f) {
 
 /* Cost function method codes (subset of AFNI's full list) */
 #define GA_MATCH_PEARSON_SCALAR        1
+#define GA_MATCH_NORMUTIN_SCALAR       5  /* Normalized Mutual Info (AFNI numbering) */
 #define GA_MATCH_HELLINGER_SCALAR      7
 #define GA_MATCH_PEARSON_LOCALS       11  /* pure lpc (signed local Pearson) */
 #define GA_MATCH_PEARSON_LOCALA       12  /* pure lpa (absolute local Pearson) */
@@ -450,27 +448,36 @@ static mat44 mat44_diag(float a, float b, float c)
     return m;
 }
 
+/* Finite (non-NaN, non-Inf) test via a magnitude guard: this TU is built with
+ * -ffast-math, under which isfinite()/isnan() are unreliable, but the ordered
+ * comparison `-FLT_MAX <= v <= FLT_MAX` still excludes NaN (compares false) and
+ * ±Inf. Single source of truth for the several places that filter non-finite. */
+static inline int al_finitef(float v) { return v >= -FLT_MAX && v <= FLT_MAX; }
+
+/* Normalize a NIfTI spacing for algorithms that require a finite positive value.
+ * The file reader normally sanitizes pixdims, but public C callers can construct
+ * nifti_image objects directly. */
+static inline float al_spacing(float v)
+{
+    v = fabsf(v);
+    return (al_finitef(v) && v > 0.0f) ? v : 1.0f;
+}
+
 /* Index->world (mm) matrix for a pixdim-centered frame (no sform/qform): a
  * diagonal scale by |pixdim| with the volume centered on the origin. Shared by
  * al_register's sform-absent fallback and nii_symmetry (single source of truth
- * for the centered-frame convention). Non-positive pixdims clamp to 1.0. */
+ * for the centered-frame convention). Non-finite/non-positive pixdims clamp to 1.0. */
 static mat44 al_pixdim_frame(int nx, int ny, int nz, float dx, float dy, float dz)
 {
-    if (dx <= 0.0f) dx = 1.0f;
-    if (dy <= 0.0f) dy = 1.0f;
-    if (dz <= 0.0f) dz = 1.0f;
+    dx = al_spacing(dx);
+    dy = al_spacing(dy);
+    dz = al_spacing(dz);
     mat44 m = mat44_diag(dx, dy, dz);
     m.m[0][3] = -(nx - 1) * 0.5f * dx;
     m.m[1][3] = -(ny - 1) * 0.5f * dy;
     m.m[2][3] = -(nz - 1) * 0.5f * dz;
     return m;
 }
-
-/* Finite (non-NaN, non-Inf) test via a magnitude guard: this TU is built with
- * -ffast-math, under which isfinite()/isnan() are unreliable, but the ordered
- * comparison `-FLT_MAX <= v <= FLT_MAX` still excludes NaN (compares false) and
- * ±Inf. Single source of truth for the several places that filter non-finite. */
-static inline int al_finitef(float v) { return v >= -FLT_MAX && v <= FLT_MAX; }
 
 /* Return nonzero if m is usable as an index->world transform: every entry is
  * finite (see al_finitef — isfinite() is unreliable under -ffast-math) and the
@@ -2374,6 +2381,21 @@ static double GA_scalar_costfun(int meth, int npt,
             val = -(double)hmc.a; /* aligned → hmc.a > 0 → val negative → good for min */
         } break;
 
+        case GA_MATCH_NORMUTIN_SCALAR: { /* Normalized mutual information (cross-modal) */
+            float_quad hmc;
+            hmc = al_helmicra(npt, gstup->hxc_bot, gstup->hxc_top, avm,
+                                   gstup->hyc_bot, gstup->hyc_top, bvm, wvm,
+                                   gstup->aj_topclip, gstup->bs_topclip);
+            if (al_hist_oom) return (double)AL_BIGVAL; /* histogram OOM: reject, not a cost-0 "win" */
+            /* hmc.c = H(x,y)/(H(x)+H(y)): already a MINIMIZED cost (1 == independent,
+               -> ~0.5 as the images become perfectly dependent). Unlike Hellinger's
+               sqrt(joint*marginal*marginal) sum, entropy weights a bin by p*log(p), so a
+               single huge shared-background cell contributes a bounded amount instead of
+               dominating -- the reason this is the better choice on masked/skull-stripped
+               pairs. Same sign convention AFNI uses for its `-cost nmi`. */
+            val = (double)hmc.c;
+        } break;
+
         case GA_MATCH_PEARSON_LOCALS:  /* pure lpc (signed local Pearson) */
             val = (double)GA_pearson_local(npt, avm, bvm, wvm);
         break;
@@ -2618,7 +2640,8 @@ static void al_scalar_setup(GA_setup *stup)
        pure wasted work — a full-image quantile per axis, a per-stage sample clipate, and a
        discarded sequential warm-up eval. Gate it on the cost so those paths skip it. The default
        (Hellinger) is byte-for-byte unchanged (hist_cost == 1). */
-    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR);
+    int hist_cost = (stup->match_code == GA_MATCH_HELLINGER_SCALAR ||
+                     stup->match_code == GA_MATCH_NORMUTIN_SCALAR);
 #ifdef AL_LPC_MICHO
     hist_cost = hist_cost || stup->match_code == GA_MATCH_LPC_MICHO_SCALAR
                           || stup->match_code == GA_MATCH_LPA_MICHO_SCALAR;
@@ -3009,9 +3032,12 @@ static int al_scalar_ransetup(GA_setup *stup, int nrand)
 #endif
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] >= AL_BIGVAL) continue;
+        float old_mfac, old_afac;
+        powell_get_mfac(&old_mfac, &old_afac);
         powell_set_mfac(rs_mfac, rs_afac);
         int prc = powell_newuoa(nfr, kpar[kk], 0.05, 0.001, maxstep, GA_scalar_fitter);
         kval[kk] = (prc < 0) ? AL_BIGVAL : GA_scalar_fitter(nfr, kpar[kk]);  /* OOM -> not selectable */
+        powell_set_mfac(old_mfac, old_afac);
     }
     for (kk = 0; kk < ngood; kk++) {
         if (kval[kk] < vbest) { vbest = kval[kk]; jj = kk; }
@@ -3422,6 +3448,7 @@ static void al_resolve_cost(int cost, int *match_out, const char **name_out)
         case AL_COST_LPA:       *match_out = GA_MATCH_PEARSON_LOCALA;   *name_out = "lpa"; return;
 #endif
         case AL_COST_PEARSON:   *match_out = GA_MATCH_PEARSON_SCALAR;   *name_out = "Pearson"; return;
+        case AL_COST_NMI:       *match_out = GA_MATCH_NORMUTIN_SCALAR;  *name_out = "NMI"; return;
         default:
         case AL_COST_HELLINGER: *match_out = GA_MATCH_HELLINGER_SCALAR; *name_out = "Hellinger"; return;
     }
@@ -3451,9 +3478,10 @@ static void al_center_of_mass(const float *data, int nx, int ny, int nz,
 
 
 /* Overflow-safe 3D voxel count (nx*ny*nz), kept within int range so the int loop
- * counters/indices used throughout allineate stay valid. NIfTI dims are int64; this
- * uses division-based checked multiplication so the product is never formed unless it
- * is provably <= INT_MAX. Returns 0 and sets *out on success, 1 (message) on failure. */
+ * counters/indices used throughout allineate stay valid and within the portable
+ * byte limit for float buffers. NIfTI dims are int64; this uses division-based
+ * checked multiplication so the product is never formed unless it is safe.
+ * Returns 0 and sets *out on success, 1 (message) on failure. */
 static int al_safe_nvox(const nifti_image *n, const char *who, size_t *out)
 {
     long long nx = n->nx, ny = n->ny, nz = n->nz;
@@ -3461,7 +3489,12 @@ static int al_safe_nvox(const nifti_image *n, const char *who, size_t *out)
         fprintf(stderr, "%s: non-positive dimensions\n", who); return 1; }
     if (nx > (long long)INT_MAX / ny || nx * ny > (long long)INT_MAX / nz) {
         fprintf(stderr, "%s: voxel count out of range\n", who); return 1; }
-    *out = (size_t)(nx * ny * nz);   /* proven <= INT_MAX */
+    uint64_t nv = (uint64_t)(nx * ny * nz);   /* proven positive and <= INT_MAX */
+    if (!al_float_nvox_fits(nv)) {
+        fprintf(stderr, "%s: voxel count exceeds addressable float-buffer range\n", who);
+        return 1;
+    }
+    *out = (size_t)nv;
     return 0;
 }
 
@@ -3658,6 +3691,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     mat44 base_cmat, base_imat, targ_cmat, targ_imat;
     int jj, ii, nvox_base, nvox_src;
     int nfunc;
+    float caller_mfac = 0.0f, caller_afac = 0.0f;
+    /* NEWUOA sampling factors are caller-owned thread-local configuration.
+       Capture them before this registration installs its coarse/fine policies. */
+    powell_get_mfac(&caller_mfac, &caller_afac);
 
     if (source == NULL || base == NULL) {
         fprintf(stderr, "allineate: NULL input image\n");
@@ -3684,12 +3721,12 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     bnx = base->nx;   bny = base->ny;   bnz = base->nz;
     anx = source->nx;  any = source->ny;  anz = source->nz;
-    bdx = (float)fabs(base->dx);   if (bdx <= 0.0f) bdx = 1.0f;
-    bdy = (float)fabs(base->dy);   if (bdy <= 0.0f) bdy = 1.0f;
-    bdz = (float)fabs(base->dz);   if (bdz <= 0.0f) bdz = 1.0f;
-    adx = (float)fabs(source->dx); if (adx <= 0.0f) adx = 1.0f;
-    ady = (float)fabs(source->dy); if (ady <= 0.0f) ady = 1.0f;
-    adz = (float)fabs(source->dz); if (adz <= 0.0f) adz = 1.0f;
+    bdx = al_spacing(base->dx);
+    bdy = al_spacing(base->dy);
+    bdz = al_spacing(base->dz);
+    adx = al_spacing(source->dx);
+    ady = al_spacing(source->dy);
+    adz = al_spacing(source->dz);
 
     size_t nvox_base_size, nvox_src_size, tmp_size;
     if (al_mul_size((size_t)bnx, (size_t)bny, &tmp_size) ||
@@ -3907,6 +3944,7 @@ static int al_register(nifti_image *source, nifti_image *base,
 #ifdef AL_LPC_MICHO
     if (match_code == GA_MATCH_PEARSON_SCALAR  ||
         match_code == GA_MATCH_HELLINGER_SCALAR ||
+        match_code == GA_MATCH_NORMUTIN_SCALAR  ||
         match_code == GA_MATCH_PEARSON_LOCALS   ||
         match_code == GA_MATCH_PEARSON_LOCALA) {
         stup.micho_mi = stup.micho_nmi = stup.micho_crA = stup.micho_hel = stup.micho_ov = 0.0;
@@ -4247,10 +4285,13 @@ static int al_register(nifti_image *source, nifti_image *base,
         #pragma omp parallel for schedule(dynamic)
 #endif
         for (int ib = 0; ib < tfdone; ib++) {
+            float old_mfac, old_afac;
+            powell_get_mfac(&old_mfac, &old_afac);
             powell_set_mfac(mfac_m, mfac_a);
             int prc = powell_newuoa(nfr_ref, cand_wpar[ib], rstart_ref, rend_ref,
                          maxstep_ref, GA_scalar_fitter);
             tfcost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr_ref, cand_wpar[ib]);
+            powell_set_mfac(old_mfac, old_afac);
         }
 
         /* Unpack results back to tfparm */
@@ -4369,9 +4410,12 @@ static int al_register(nifti_image *source, nifti_image *base,
         for (int ib = 0; ib < tfdone; ib++) {
             int maxstep = cand_rtb[ib];
             if (maxstep <= 4 * nfr + 5) maxstep = 6666;
+            float old_mfac, old_afac;
+            powell_get_mfac(&old_mfac, &old_afac);
             powell_set_mfac(fc_mfac, fc_afac);
             int prc = powell_newuoa(nfr, cand_wpar[ib], rad, 0.01 * rad, maxstep, GA_scalar_fitter);
             cand_cost[ib] = (prc < 0) ? AL_BIGVAL : (float)GA_scalar_fitter(nfr, cand_wpar[ib]);
+            powell_set_mfac(old_mfac, old_afac);
         }
 
         /* Unpack results back to ffparm */
@@ -4486,6 +4530,8 @@ al_cleanup:
         free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
         powell_newuoa_free_threadlocal();  /* free this thread's NEWUOA workspace */
     }
+    powell_set_mfac(caller_mfac, caller_afac);
+    gstup = NULL;  /* never retain a pointer to this function's stack frame */
 
     if (reg_rc == 0)
         fprintf(stderr, " + Registration complete\n");
@@ -4576,7 +4622,12 @@ float al_image_fillv(int fillmode, nifti_image *nim)
     if (fillmode == AL_FILL_ZERO) return 0.0f;
     if (fillmode == AL_FILL_NAN)  return (float)NAN;
     if (nim == NULL || nim->data == NULL) return 0.0f;
-    size_t n = (size_t)nim->nx * nim->ny * nim->nz;
+    size_t n;
+    if (al_safe_nvox(nim, "fill source", &n)) return 0.0f;
+    if (nim->nvox < 0 || (uint64_t)nim->nvox != (uint64_t)n) {
+        fprintf(stderr, "fill source: nvox does not match 3D dimensions\n");
+        return 0.0f;
+    }
     if (nim->datatype == DT_FLOAT32 &&
         (nim->scl_slope == 0.0f || (nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)))
         return al_resolve_fillv(AL_FILL_AUTO, (const float *)nim->data, n);
@@ -4959,13 +5010,14 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
          * first arg — here the mask, treated as the FIXED-space image — onto the second
          * arg's grid, so the inverse is the moving->fixed direction it needs). */
         coreg_fast_opts cfo = coreg_fast_opts_default();
-        cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+        cfo.cost = cf_cost_from_fast_engine(opts.fast);
         /* -nocmass forces the supplied affine; otherwise auto-select (the fast engine
          * scores the supplied-affine and COM starts and keeps the better one). -deface
          * exposes no -com seed, so there is no recentered-header case here. */
         cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
-        const char *fname = (opts.fast == AL_ENGINE_FAST_HEL) ? "fast (Hellinger)"
-                                                              : "fast (correlation-ratio)";
+        const char *fname = (opts.fast == AL_ENGINE_FAST_HEL) ? "fast (Hellinger)" :
+                            (opts.fast == AL_ENGINE_FAST_CR)  ? "fast (correlation-ratio)"
+                                                             : "fast (adaptive HEL/CR)";
         fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, fname);
         coreg_fast_result res;
         if (coreg_fast_estimate(input, tmpl, &cfo, &res)) {

@@ -18,6 +18,7 @@
 #include <float.h>
 #include "reface.h"
 #include "core32.h"   /* nifti_smooth_gauss_f32 */
+#include "al_size_guard.h"
 
 /* FWHM -> Gaussian sigma: FWHM = 2*sqrt(2*ln2)*sigma. */
 #define REFACE_FWHM_MM        2.666f
@@ -44,7 +45,8 @@ static int reface_nvox(int nx, int ny, int nz, size_t *out) {
     size_t ab = a * b;
     if (c > SIZE_MAX / ab) return 1;
     size_t n = ab * c;
-    if (n > (size_t)INT_MAX) return 1;   /* backend uses int counts; fail cheap, pre-alloc */
+    if (n > (size_t)INT_MAX || !al_float_nvox_fits((uint64_t)n))
+        return 1;   /* int backend + float-buffer byte limit; fail cheap, pre-alloc */
     *out = n;
     return 0;
 }

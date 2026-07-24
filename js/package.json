@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "1.3.2",
+  "version": "2.0.0",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -10,17 +10,12 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
-    "./gpl": {
-      "import": "./dist/index-gpl.js",
-      "types": "./dist/index-gpl.d.ts"
-    },
-    "./niimath.js": "./dist/niimath.js",
-    "./niimath-gpl.js": "./dist/niimath-gpl.js"
+    "./niimath.js": "./dist/niimath.js"
   },
   "scripts": {
     "test": "bun test ./tests",
     "test:wasi:fixtures": "bun run scripts/wasi-fixtures.ts",
-    "test:wasi": "make -C ../src && bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
+    "test:wasi": "make -C ../src && bun run makeWasi && bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
     "build": "bun run esbuild.config.ts",
     "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
@@ -31,7 +26,7 @@
     "makeWasmGpl": "git submodule update --init ../src/GPL && make wasm GPL=1 WASM_OUT=../js/src/niimath-gpl.js -C ../src && bun run scripts/pre-build.ts -i src/niimath-gpl.js -o src/niimath-gpl.js",
     "parseHelpText": "bun run scripts/parseNiimathHelp.ts",
     "generateTypes": "bun run scripts/generateTypeDefinitions.ts",
-    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js && (bun run makeWasmGpl || echo 'GPL build skipped (submodule/emcc unavailable) — shipping BSD only')",
+    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js",
     "dev": "bun run build && bun run server.ts",
     "pub": "bun run build && npm publish --access public"
   },
@@ -44,14 +39,11 @@
     "brain"
   ],
   "author": "NiiVue developers",
-  "license": "BSD-2-Clause AND GPL-2.0-only",
+  "license": "BSD-2-Clause",
   "description": "A javascript library to easily use the WASM build of Chris Rorden's niimath command line program written in C",
   "files": [
     "dist/",
-    "corresponding-source/",
-    "LICENSE",
-    "LICENSE.GPL-2.0.txt",
-    "GPL-NOTICE.md"
+    "LICENSE"
   ],
   "devDependencies": {
     "@types/bun": "^1.3.0",
