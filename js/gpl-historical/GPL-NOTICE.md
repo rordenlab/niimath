@@ -39,7 +39,7 @@ The same source is also maintained publicly at:
 - **niimath (BSD sources + build scripts):** https://github.com/rordenlab/niimath
 - **niimath_gpl (GPL `spm_coreg` sources), pinned submodule commit:**
   https://github.com/rordenlab/niimath_gpl — commit
-  `d589203cb9a0b0bf8899aa365740c85ba00c825e`
+  `d4cf589c71a22686bbd3ffdf3e9921694d6641d2`
   (the exact `src/GPL` submodule revision used to build the published
   `niimath-gpl.wasm`).
 

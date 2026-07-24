@@ -159,7 +159,7 @@ ifeq "$(AL)" "0"
 $(error QWARP=1 requires allineate (qwarp uses powell_newuoa); do not combine with AL=0)
 endif
 ifneq "$(filter wasm wasm-wasi wasm-emcc-core tiny nano,$(MAKECMDGOALS))" ""
-$(error QWARP=1 is not supported for wasm/tiny/nano targets (these omit the allineate engine qwarp depends on, and qwarp is impractically slow in WASM); build a full native target)
+$(error QWARP=1 is native-only (qwarp benefits greatly from OpenMP and is impractically slow in serial/WASM builds); build a full native OpenMP target)
 endif
 	AFLAGS += -DHAVE_QWARP
 	ALOBJS += qwarp.o

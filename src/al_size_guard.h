@@ -8,6 +8,8 @@
  *
  * INT_MAX is not a sufficient allocation bound on 32-bit targets:
  * counts above SIZE_MAX/sizeof(float) wrap a `count * sizeof(float)` malloc.
+ * This proves ONE separate float[nvox] buffer fits. A future fused/AoS allocation
+ * containing k floats per voxel must instead guard k*nvox*sizeof(float).
  * AL_SIZE_MAX is overrideable only so the native C-API harness can exercise
  * the wasm32/native-32 boundary without allocating a giant image.
  */

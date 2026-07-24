@@ -37,6 +37,20 @@
                             strategies through the 2 mm 7-DOF arbiter, then polish only the winner.
                             This is a mode selector, never passed to cf_cost_eval directly. */
 
+/* Single source of truth mapping an allineate fast-engine selector (allineate.h
+ * AL_ENGINE_FAST_*) to a CF_COST_* for coreg_fast_opts.cost. Every host that dispatches the
+ * fast engine (-allineate, -deface, -reface) MUST use this instead of an inline ternary, so the
+ * selector semantics cannot drift between commands. FAST_HEL->HEL, FAST_CR->CR, FAST_X/default->
+ * adaptive HEL_CR. The AL_ENGINE_FAST_* numeric values are given inline (this header does not
+ * include allineate.h); keep in sync if those change. */
+static inline int cf_cost_from_fast_engine(int al_fast_engine) {
+    switch (al_fast_engine) {
+        case 2:  return CF_COST_HEL;    /* AL_ENGINE_FAST_HEL  (-cost fasthel) */
+        case 1:  return CF_COST_CR;     /* AL_ENGINE_FAST_CR   (-cost fastcr)  */
+        default: return CF_COST_HEL_CR; /* AL_ENGINE_FAST_X / default (-cost fast/fastx) */
+    }
+}
+
 typedef struct {
     int cost;          /* CF_COST_* (default CF_COST_HEL_CR) */
     int coarse_search; /* 1 = bounded deterministic orientation/scale search after

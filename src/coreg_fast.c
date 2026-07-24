@@ -817,9 +817,10 @@ static void cf_set_dof(cf_ctx *c, int dof, const double base[12]) {
 
 /* Run one NEWUOA refinement from base params, writing the result back into base.
  * powell_newuoa() returns the number of function calls, or a NEGATIVE code on a bad
- * argument or a workspace allocation failure (-7). Any negative return is propagated
- * via c->opt_err so the driver can fail the whole estimate rather than silently
- * returning an unrefined (or partially optimized) fit as success. */
+ * argument or workspace setup failure (-7 allocation, -8 unsupported/overflowing
+ * shape). Any negative return is propagated via c->opt_err so the driver can fail
+ * the whole estimate rather than silently returning an unrefined (or partially
+ * optimized) fit as success. */
 static double cf_refine(cf_ctx *c, int dof, double base[12], double rstart, double rend, int maxcall) {
     cf_set_dof(c, dof, base);
     double x[12];

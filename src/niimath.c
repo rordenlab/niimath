@@ -79,7 +79,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260720"
+#define kMTHdate "v1.0.20260724"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -339,7 +339,8 @@ int show_help( void ) {
 #ifdef HAVE_ALLINEATE
 	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");
 	printf("                            opts: -cost XX (fast/fastx [default],fasthel,fastcr,hel,nmi,lpc,lpa,ls) -cmass -nocmass -source_automask\n");
-	printf("                                    fast/fastx compete HEL and CR coarse fits; fasthel/fastcr force one cost\n");
+	printf("                                    fast/fastx adapt HEL/CR capture to whole-head or hard-zeroed bases\n");
+	printf("                                    fasthel forces HEL only; fastcr forces correlation-ratio only\n");
 	printf("                                  -warp XX (sho,shr,srs,aff) transform type [default: aff]\n");
 	printf("                                  -interp XX (NN,linear,cubic) matching interpolation [default: linear]\n");
 	printf("                                  -final XX  (NN,linear,cubic) output interpolation [default: cubic]\n");
@@ -580,6 +581,10 @@ int main(int argc, char * argv[]) {
 	//fslmaths robust range not fully described, this emulation is close
 	//fslmaths ing/inm are listed as "unary" but should be listed as binary
 	//"niimath in.nii" for fslhd style output
+	if (argc > 1 && !strcmp(argv[1], "--version")) {  // argc guard: no-arg niimath must fall through to show_help(), not deref argv[1]
+		printf("%s (%llu-bit %s)\n",kMTHvers, (unsigned long long) sizeof(size_t)*8, kOS);
+		return(EXIT_SUCCESS);
+	}
 	#ifdef _WIN32
 		_setmode(_fileno(stdin), _O_BINARY);
 	#endif

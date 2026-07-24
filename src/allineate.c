@@ -448,27 +448,36 @@ static mat44 mat44_diag(float a, float b, float c)
     return m;
 }
 
+/* Finite (non-NaN, non-Inf) test via a magnitude guard: this TU is built with
+ * -ffast-math, under which isfinite()/isnan() are unreliable, but the ordered
+ * comparison `-FLT_MAX <= v <= FLT_MAX` still excludes NaN (compares false) and
+ * ±Inf. Single source of truth for the several places that filter non-finite. */
+static inline int al_finitef(float v) { return v >= -FLT_MAX && v <= FLT_MAX; }
+
+/* Normalize a NIfTI spacing for algorithms that require a finite positive value.
+ * The file reader normally sanitizes pixdims, but public C callers can construct
+ * nifti_image objects directly. */
+static inline float al_spacing(float v)
+{
+    v = fabsf(v);
+    return (al_finitef(v) && v > 0.0f) ? v : 1.0f;
+}
+
 /* Index->world (mm) matrix for a pixdim-centered frame (no sform/qform): a
  * diagonal scale by |pixdim| with the volume centered on the origin. Shared by
  * al_register's sform-absent fallback and nii_symmetry (single source of truth
- * for the centered-frame convention). Non-positive pixdims clamp to 1.0. */
+ * for the centered-frame convention). Non-finite/non-positive pixdims clamp to 1.0. */
 static mat44 al_pixdim_frame(int nx, int ny, int nz, float dx, float dy, float dz)
 {
-    if (dx <= 0.0f) dx = 1.0f;
-    if (dy <= 0.0f) dy = 1.0f;
-    if (dz <= 0.0f) dz = 1.0f;
+    dx = al_spacing(dx);
+    dy = al_spacing(dy);
+    dz = al_spacing(dz);
     mat44 m = mat44_diag(dx, dy, dz);
     m.m[0][3] = -(nx - 1) * 0.5f * dx;
     m.m[1][3] = -(ny - 1) * 0.5f * dy;
     m.m[2][3] = -(nz - 1) * 0.5f * dz;
     return m;
 }
-
-/* Finite (non-NaN, non-Inf) test via a magnitude guard: this TU is built with
- * -ffast-math, under which isfinite()/isnan() are unreliable, but the ordered
- * comparison `-FLT_MAX <= v <= FLT_MAX` still excludes NaN (compares false) and
- * ±Inf. Single source of truth for the several places that filter non-finite. */
-static inline int al_finitef(float v) { return v >= -FLT_MAX && v <= FLT_MAX; }
 
 /* Return nonzero if m is usable as an index->world transform: every entry is
  * finite (see al_finitef — isfinite() is unreliable under -ffast-math) and the
@@ -3682,6 +3691,10 @@ static int al_register(nifti_image *source, nifti_image *base,
     mat44 base_cmat, base_imat, targ_cmat, targ_imat;
     int jj, ii, nvox_base, nvox_src;
     int nfunc;
+    float caller_mfac = 0.0f, caller_afac = 0.0f;
+    /* NEWUOA sampling factors are caller-owned thread-local configuration.
+       Capture them before this registration installs its coarse/fine policies. */
+    powell_get_mfac(&caller_mfac, &caller_afac);
 
     if (source == NULL || base == NULL) {
         fprintf(stderr, "allineate: NULL input image\n");
@@ -3708,12 +3721,12 @@ static int al_register(nifti_image *source, nifti_image *base,
 
     bnx = base->nx;   bny = base->ny;   bnz = base->nz;
     anx = source->nx;  any = source->ny;  anz = source->nz;
-    bdx = (float)fabs(base->dx);   if (bdx <= 0.0f) bdx = 1.0f;
-    bdy = (float)fabs(base->dy);   if (bdy <= 0.0f) bdy = 1.0f;
-    bdz = (float)fabs(base->dz);   if (bdz <= 0.0f) bdz = 1.0f;
-    adx = (float)fabs(source->dx); if (adx <= 0.0f) adx = 1.0f;
-    ady = (float)fabs(source->dy); if (ady <= 0.0f) ady = 1.0f;
-    adz = (float)fabs(source->dz); if (adz <= 0.0f) adz = 1.0f;
+    bdx = al_spacing(base->dx);
+    bdy = al_spacing(base->dy);
+    bdz = al_spacing(base->dz);
+    adx = al_spacing(source->dx);
+    ady = al_spacing(source->dy);
+    adz = al_spacing(source->dz);
 
     size_t nvox_base_size, nvox_src_size, tmp_size;
     if (al_mul_size((size_t)bnx, (size_t)bny, &tmp_size) ||
@@ -4517,6 +4530,8 @@ al_cleanup:
         free(tl_wbuf); tl_wbuf = NULL; tl_wbuf_len = 0;
         powell_newuoa_free_threadlocal();  /* free this thread's NEWUOA workspace */
     }
+    powell_set_mfac(caller_mfac, caller_afac);
+    gstup = NULL;  /* never retain a pointer to this function's stack frame */
 
     if (reg_rc == 0)
         fprintf(stderr, " + Registration complete\n");
@@ -4607,7 +4622,12 @@ float al_image_fillv(int fillmode, nifti_image *nim)
     if (fillmode == AL_FILL_ZERO) return 0.0f;
     if (fillmode == AL_FILL_NAN)  return (float)NAN;
     if (nim == NULL || nim->data == NULL) return 0.0f;
-    size_t n = (size_t)nim->nx * nim->ny * nim->nz;
+    size_t n;
+    if (al_safe_nvox(nim, "fill source", &n)) return 0.0f;
+    if (nim->nvox < 0 || (uint64_t)nim->nvox != (uint64_t)n) {
+        fprintf(stderr, "fill source: nvox does not match 3D dimensions\n");
+        return 0.0f;
+    }
     if (nim->datatype == DT_FLOAT32 &&
         (nim->scl_slope == 0.0f || (nim->scl_slope == 1.0f && nim->scl_inter == 0.0f)))
         return al_resolve_fillv(AL_FILL_AUTO, (const float *)nim->data, n);
@@ -4990,13 +5010,14 @@ int nii_deface(nifti_image *input, nifti_image *tmpl, nifti_image *mask, al_opts
          * first arg — here the mask, treated as the FIXED-space image — onto the second
          * arg's grid, so the inverse is the moving->fixed direction it needs). */
         coreg_fast_opts cfo = coreg_fast_opts_default();
-        cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL : CF_COST_CR;
+        cfo.cost = cf_cost_from_fast_engine(opts.fast);
         /* -nocmass forces the supplied affine; otherwise auto-select (the fast engine
          * scores the supplied-affine and COM starts and keeps the better one). -deface
          * exposes no -com seed, so there is no recentered-header case here. */
         cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
-        const char *fname = (opts.fast == AL_ENGINE_FAST_HEL) ? "fast (Hellinger)"
-                                                              : "fast (correlation-ratio)";
+        const char *fname = (opts.fast == AL_ENGINE_FAST_HEL) ? "fast (Hellinger)" :
+                            (opts.fast == AL_ENGINE_FAST_CR)  ? "fast (correlation-ratio)"
+                                                             : "fast (adaptive HEL/CR)";
         fprintf(stderr, " + %s: registering input to template using %s (mask warped back to native space)\n", label, fname);
         coreg_fast_result res;
         if (coreg_fast_estimate(input, tmpl, &cfo, &res)) {

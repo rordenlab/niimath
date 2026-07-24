@@ -377,7 +377,8 @@ static inline int al_parse_subopts(int *ac, int argc, char **argv, al_opts *opts
                 return 1;
             }
             /* Four names select the FAST engine rather than an allineate cost:
-               `fast`/`fastx` = HEL/CR coarse competition followed by HEL fine stages,
+               `fast`/`fastx` = adaptive HEL/CR strategy (whole-head coarse competition;
+                                full-depth multi-start for hard-zeroed bases),
                `fasthel` = Hellinger only, `fastcr` = correlation-ratio only.
                `-cost` is last-one-wins: a normal cost after `-cost fast` clears the fast
                engine selection (and vice-versa) so the final `-cost` always decides. */
@@ -467,7 +468,8 @@ int nii_last_affine(mat44 *out);
 float al_resolve_fillv(int fillmode, const float *data, size_t n);
 
 /* al_resolve_fillv for a whole image of ANY datatype (extracts float internally so AUTO
- * detects negative Hounsfield air in a raw int16 CT). Returns 0 on extraction failure. */
+ * detects negative Hounsfield air in a raw int16 CT). Returns 0 on extraction failure or
+ * invalid/inconsistent 3D voxel metadata; malformed public C-API images are never scanned. */
 float al_image_fillv(int fillmode, nifti_image *nim);
 
 /* Reslice `source` onto `base`'s grid using an explicit base-index -> source-index

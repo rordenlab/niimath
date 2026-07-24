@@ -6488,7 +6488,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		}
 	}
 	/* Default cost is the fast SPM/FLIRT-inspired engine: a bare -allineate with no explicit
-	   -cost selects mixed `-cost fast`/`fastx`. An explicit fast selector or ordinary cost
+	   -cost selects adaptive `-cost fast`/`fastx`. An explicit fast selector or ordinary cost
 	   is honored as given. -cmass/-nocmass/-com apply to the fast engine too. When fast is the
 	   DEFAULT (not an explicit -cost fast), a fast failure falls back to the robust Hellinger
 	   engine below, so a bare -allineate never regresses on inputs too small/degenerate for the
@@ -6558,7 +6558,8 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	   (al_image_fillv would otherwise waste a full-image float copy + scan for AUTO). */
 	int ok;
 	if (opts.fast) {
-		/* Fast SPM/FLIRT-inspired engine (fast/fastx = mixed, fasthel = HEL, fastcr = CR):
+		/* Fast SPM/FLIRT-inspired engine (fast/fastx = adaptive HEL/CR,
+		   fasthel = HEL only, fastcr = CR only):
 		   estimate the world-mm FIXED->MOVING affine WITHOUT mutating inputs, then reslice
 		   `nim` in place onto the base (or -master) grid. The fast engine runs a fixed
 		   12-DOF schedule with its own internal sampling/masking, so reject (rather than
@@ -6582,8 +6583,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		/* -com/-sym header seeds were already applied to nim above (shared with the ordinary
 		   engine); the fast estimate simply starts from the seeded pose. */
 		coreg_fast_opts cfo = coreg_fast_opts_default();
-		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL :
-		           (opts.fast == AL_ENGINE_FAST_CR)  ? CF_COST_CR : CF_COST_HEL_CR;
+		cfo.cost = cf_cost_from_fast_engine(opts.fast);
 		/* -com and -nocmass are strict overrides; otherwise auto-select initialization. */
 		cfo.use_cmass = !opts.com &&
 		                 !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
@@ -6795,8 +6795,7 @@ staticx int nifti_reface_wrap(nifti_image *nim, char *tmplfile, char *shellfile,
 	mat44 fixed_to_moving;
 	if (opts.fast) {
 		coreg_fast_opts cfo = coreg_fast_opts_default();
-		cfo.cost = (opts.fast == AL_ENGINE_FAST_HEL) ? CF_COST_HEL :
-		           (opts.fast == AL_ENGINE_FAST_CR)  ? CF_COST_CR : CF_COST_HEL_CR;
+		cfo.cost = cf_cost_from_fast_engine(opts.fast);
 		cfo.use_cmass = !((opts.cli_set & AL_CLI_CMASS) && opts.cmass == AL_CMASS_NONE);
 		nifti_image *weight_img = nifti_image_read(opts.weight, 1);
 		if (!weight_img) {

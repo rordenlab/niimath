@@ -272,15 +272,8 @@ class ImageProcessor {
     return this._addFileCommand('-deface', [tmpl, mask], opts);
   }
 
-  // SPM rigid-body defacing (GPL spm_coreg): -spm_deface <tmpl> <mask> [opts]
-  spmDeface(tmpl: File, mask: File, opts: (string | number)[] = []): this {
-    return this._addFileCommand('-spm_deface', [tmpl, mask], opts);
-  }
-
-  // SPM rigid-body coregistration (GPL): -spm_coreg <ref> [opts]
-  spmcoreg(ref: File, opts: (string | number)[] = []): this {
-    return this._addFileCommand('-spm_coreg', [ref], opts);
-  }
+  // NOTE: -spm_coreg/-spm_deface (GPL) are intentionally absent — the published package is
+  // BSD-only. The GPL C sources remain for a local `GPL=1` build but ship no JS binding here.
 
   // Affine registration (BSD allineate): -allineate <base> [opts] [-weight <img>]
   // The optional `weight` is a base(fixed)-space GRADED weight image, AFNI 3dAllineate style (its
@@ -496,8 +489,6 @@ class ImageProcessor {
 // (NOT in the regenerated types.ts) so consumers get a complete typed API.
 interface FileOperandMethods {
   deface(tmpl: File, mask: File, opts?: (string | number)[]): this;
-  spmDeface(tmpl: File, mask: File, opts?: (string | number)[]): this;
-  spmcoreg(ref: File, opts?: (string | number)[]): this;
   allineate(base: File, opts?: (string | number)[], weight?: File): this;
   reface(tmpl: File, shell: File, weight: File, opts?: (string | number)[]): this;
   resliceNN(ref: File): this;

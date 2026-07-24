@@ -12,10 +12,10 @@ export type {
 } from './core';
 
 /**
- * BSD-2-Clause build of niimath. Loads the minimal WASM module that ships with
- * the published `@niivue/niimath` package. For the GPL-2 build that additionally
- * provides `-spm_coreg`/`-spm_deface`/`-allineate`/`-deface`, import from
- * `@niivue/niimath/gpl` instead.
+ * niimath (BSD-2-Clause). Loads the WASM module shipped with the `@niivue/niimath`
+ * package, providing the full BSD feature set including `-allineate`/`-deface`.
+ * (The optional GPL `-spm_coreg`/`-spm_deface` are no longer published; the
+ * permissive allineate engine supersedes them.)
  */
 export class Niimath extends NiimathBase {
   constructor() {
