@@ -4,6 +4,8 @@ Everything below was obtained by treating Warpkit as a **black box**: running th
 
 The reference NIfTIs are large and gitignored (`/test/medic_ref/`). This file plus the scripts in `test/medic_experiments/` are the committed record; every conclusion here is reproducible by re-running the named script.
 
+**No equivalence is claimed with the reference tool, and none should be inferred from any table below.** `-unwarp` reproduces the reference's corrected magnitudes to nrmse 3.5e-5 (§5.1) — that stage does match. `--medic` does **not** match end to end: given a shared mask its native field map agrees to p99 0.0027 Hz (§5), but the mask construction is deliberately not reproduced (§3.7, §4.3), the inverter is deliberately different (§3.4), a broadband low-rank residual is unexplained (§5.2), and the current end-to-end displacement p95 misses the plan's M5 gate for `j` (§5, §5.4). Bit identity with the reference is an explicit non-goal (`medic_plan.md` §11).
+
 ## 1. Environment
 
 | item | value |
@@ -23,9 +25,12 @@ Experiment scripts (`test/medic_experiments/`, analysis-only, not shipped, not i
 | `exp07_axis_orientation.py` | §7.7 letter → voxel axis vs world axis |
 | `exp07b_axis_sweep.py` | §7.7 full 10-grid × 3-letter physical-displacement sweep |
 | `exp01_08_known_field.py` | §7.1 phase scaling, §7.8 inversion, analytic field |
+| `exp08_inversion.py` | §3.3 Hz→mm identity, §3.4 fixed-point inversion (linear vs cubic vs nearest) |
 | `exp04_05_12_multiframe.py` | §7.4 temporal, §7.5 low-rank, §7.12 noise frames |
 | `bench170.py` | M12 wall time / CPU time / peak RAM head-to-head (gzipped output, plus the apply stage) |
 | `bench_threads.py` | M12 like-for-like head-to-head at 1 and 8 threads, both tools writing uncompressed `.nii` |
+
+**Two measurements below have no committed script** and are therefore not reproducible from this directory: the §3.5b polarity sweep (`j` vs `j-`, including its 0.045/0.024 mm figures — this is why its support is unrecorded) and the end-to-end agreement tables of §5, which were run by hand against `test/medic_ref/`. Both are flagged where they appear.
 
 ## 2. Reference run inventory
 
@@ -116,12 +121,12 @@ The three outputs are mutually consistent with a single scalar fixed point along
 f_undistorted(y) = f_native( y + f_undistorted(y) * TotalReadoutTime )
 ```
 
-i.e. the undistorted-grid field is the native field sampled at the **distorted** location. Solving this by direct iteration from a zero start with **linear** interpolation along the PE axis reproduces `_fieldmaps` on the demo data to p50 = 1e-4 Hz, p95 = 0.041 Hz. Cubic/nearest sampling are strictly worse (p95 2.05 / 4.07), so the field resampling is **linear**, unlike `wk-apply-warp` (§3.6).
+i.e. the undistorted-grid field is the native field sampled at the **distorted** location. Solving this by direct iteration from a zero start with **linear** interpolation along the PE axis reproduces `_fieldmaps` on the **sbref demo (1 frame, `j`)** to p50 = 1e-4 Hz, p95 = 0.041 Hz. Cubic/nearest sampling are strictly worse (p95 2.05 / 4.07), so the field resampling is **linear**, unlike `wk-apply-warp` (§3.6).
 
 Two honest caveats:
 
 - **We do not reproduce Warpkit's inverter exactly, by design.** It is iteration-limited (ITK-style), not converged: on a synthetic linear ramp with analytic answer `1/(1 − b·TRT) = 1.14490`, Warpkit returns a ratio of `1.14911` (+0.37 %), which is *above* the converged fixed point and so cannot be reached by running our iteration longer or shorter. On real data 1.8 % of voxels differ by >1 Hz, concentrated where `|f_native|` is large (p50 53 Hz there vs 0 Hz overall) — i.e. near folds where the inverse is genuinely multi-valued.
-- **It passes the plan's M5 gate with 8× margin anyway.** Converged fixed point vs Warpkit's `_displacementmaps`, inside a crude magnitude-based brain mask (106 268 voxels): p50 = 0.0002 mm, **p95 = 0.006 mm** (gate: < 0.05 mm), p99 = 1.4 mm, max 9.0 mm — the tail being exactly the folded voxels. Displacement range is −10.0…8.5 mm.
+- **As a CONVENTION check the inversion clears the plan's 0.05 mm M5 threshold with 8× margin.** This row is *not* a `--medic` end-to-end result — see §5.4, which attributes every displacement figure in this file. Measured: the converged fixed point plus the §3.3 scaling, applied to the **reference's own `_fieldmaps_native`**, compared against the reference's `_displacementmaps`; **sbref, 1 frame, polarity `j`, no polarity term**, inside a crude magnitude-based brain mask built for this experiment (106 268 voxels): p50 = 0.0002 mm, **p95 = 0.006 mm** (threshold < 0.05 mm), p99 = 1.4 mm, max 9.0 mm — the tail being exactly the folded voxels. Displacement range is −10.0…8.5 mm.
 
 **niimath decision:** implement the converged fixed point (iterate to tolerance with a cap). It is the mathematically correct inverse, deterministic, and ~15 lines. Gate on displacement p95 inside the common mask, per plan §9.
 
@@ -161,7 +166,7 @@ f_undistorted(y) = f_native( y + s * f_undistorted(y) * TRT )
 displacement_mm  = -s * f_undistorted * TRT * pixdim[PE axis]
 ```
 
-Verified against the reference at displacement p95 **0.045 mm** for `j` and **0.024 mm** for `j-`, both inside the 0.05 mm gate.
+Verified as a **convention check, on the same footing as §3.4 and again NOT end-to-end**: this model, fed the reference's own `_fieldmaps_native`, reproduces the reference's `_displacementmaps` on the **sbref demo (1 frame)** at displacement p95 **0.045 mm** for `j` and **0.024 mm** for `j-`, both inside the 0.05 mm threshold. **Attribution caveat, flagged rather than reconciled:** the support (mask) over which those two percentiles were taken was not recorded at the time, so this row and §3.4's 0.006 mm — nominally the same model on the same data at `j` — differ by 7× for a reason this file cannot document. Both are quoted as measured; neither has been adjusted to agree with the other. See §5.4.
 
 This matters in practice: the supplied three-echo dataset is acquired `j-`. Discarding the sign would apply the correction backwards and roughly double the distortion instead of removing it. Found by external review after the first implementation dropped the suffix — every M0 experiment had used `j` only, so the black-box coverage had a genuine hole.
 
@@ -184,6 +189,8 @@ Because the displacement has components on all three voxel axes for oblique data
 `--debug` writes `masks.nii` with three levels: 0 (165 738 voxels), 1 (35 081), 2 (64 877). Magnitude increases monotonically with level (p50 = 291 / 1530 / 11 667), but the levels are not a pure intensity threshold — the ranges overlap, so a spatial step (component labelling or hole filling) is involved.
 
 What the mask **does**: the per-echo unwrapped phase is nonzero exactly on `mask >= 1` (99 925 of 99 958 voxels; the 33 exceptions are voxels whose phase is genuinely ≈0, and `nz \ (mask>=1)` is empty). So the mask gates **where phase is unwrapped**, and hence where the field map is nonzero. It does not appear as a weight in the regression (§3.2 is exact without one).
+
+**The measured in-mask test is `>= 1`, not "nonzero", and `--mask` implements exactly that** (`medic.c`, the `--mask` load): a supplied mask voxel is in-mask iff its scaled value is `>= 1.0`. Consequences, all deliberate: a fractional probability map is **not** a mask here (0.9 is *out*; threshold it first, e.g. `niimath p.nii -thr 0.5 -bin m.nii`); NaN fails the comparison and is therefore excluded, which is the safe direction; and a mask with no voxel `>= 1` is a hard error naming the remedy rather than a silently all-zero output set. The reference's `masks.nii` is a 3-level integer image, so `>= 1` is what "in mask" means for it too — passing it verbatim to `--mask` selects levels 1 and 2, which is the region §4.3 shows makes the MCPC offset match exactly.
 
 Hypotheses tested and **rejected**:
 
@@ -305,21 +312,27 @@ Level 2 is very nearly `robustmask(|hip|)` (dice 0.975) and level >= 1 is a *loo
 
 ## 5. Measured agreement of this implementation
 
-sbref demo (1 frame), errors inside the reference's own mask:
+Everything in this section is **`niimath --medic` end to end** versus the reference's outputs — a different measurement from the convention checks of §3.4/§3.5b, which feed the reference's own native field through one formula. §5.4 attributes every displacement figure in this file to its dataset, stage, mask, polarity and code revision; read it before quoting any number from here.
+
+**sbref demo (1 frame), polarity `j`, errors inside the reference's own mask. Measured BEFORE the mask-gating change** (the unwrapped phase is now zeroed outside the mask before anything reads it), so the two `_displacementmaps` p95 entries are superseded — see the note under the table:
 
 | configuration | output | p50 | p95 | p99 | corr |
 | --- | --- | --- | --- | --- | --- |
-| shipping default (robustmask + romeo4) | `_fieldmaps_native` | 0.0016 Hz | 45.96 Hz | 91.91 Hz | 0.726 |
+| shipping default (built-in `robustmask` + romeo4) | `_fieldmaps_native` | 0.0016 Hz | 45.96 Hz | 91.91 Hz | 0.726 |
 | | `_displacementmaps` | 0.0004 mm | 2.40 mm | 4.46 mm | 0.771 |
-| **`--mask` = reference mask** | `_fieldmaps_native` | **0.0013 Hz** | **0.0025 Hz** | **0.0027 Hz** | **0.988** |
+| **`--mask` = reference mask (`masks.nii >= 1`)** | `_fieldmaps_native` | **0.0013 Hz** | **0.0025 Hz** | **0.0027 Hz** | **0.988** |
 | | `_fieldmaps` | 0.0056 Hz | 3.47 Hz | 40.30 Hz | 0.958 |
 | | `_displacementmaps` | 0.0003 mm | 0.197 mm | 2.29 mm | 0.958 |
 
-Read that table carefully: **given the reference's mask, the native field map is exact to 0.0027 Hz at p99** -- the regression, MCPC, unwrapping, rescaling and echo handling are all right. What remains is (a) the mask, and (b) 0.24 % of voxels on a different 2*pi branch, which the inversion then smears along the phase-encoding line (hence `_fieldmaps` p99 40 Hz from `_fieldmaps_native` p99 0.0027 Hz).
+**Current values for the `--mask` = reference-mask row after mask gating** (`audit_response.md`, re-audit item 1): `_displacementmaps` p95 **0.059 mm** for `j` (from 0.197 mm) and **0.029 mm** for `j-` (from 0.096 mm) — a 3.3× improvement, and the reason peak RSS rose ~50 MB (§5.3). Only these two percentiles were re-measured; the p50/p99/corr columns and every `_fieldmaps*` row above have **not** been re-run since the change and are therefore pre-gating figures. They are left as measured rather than adjusted.
 
-`-unwarp` is unaffected by any of this and passes its own gate outright (§6).
+> **M5 gate status, stated plainly.** The plan's M5 gate (§8) is "reference displacement error below 0.05 mm at the 95th percentile inside the valid mask". End to end, with the reference's own mask supplied, `--medic` is at **p95 0.059 mm for `j` — the gate is NOT met**, by 18 %. `j-` is at 0.029 mm and **does** meet it. The gate *is* met by the isolated inversion/scaling convention checks (§3.4 0.006 mm, §3.5b 0.045/0.024 mm), which is a statement about the formulas, not about the pipeline. With the shipping `robustmask` default the end-to-end figure is 2.40 mm and the gate is missed by ~48×; that difference is the mask, per §3.7/§4.3, and is not being chased.
 
-170-frame run, shipping default, sampled every 17th frame: `_fieldmaps_native` p50 0.37 Hz, p95 26.6 Hz, corr 0.893; `_displacementmaps` p50 0.022 mm, p95 1.37 mm, corr 0.900. Peak RSS 2.74 GB, 106.5 G cycles.
+Read the table carefully: **given the reference's mask, the native field map is exact to 0.0027 Hz at p99** -- the regression, MCPC, unwrapping, rescaling and echo handling are all right. What remains is (a) the mask, and (b) 0.24 % of voxels on a different 2*pi branch, which the inversion then smears along the phase-encoding line (hence `_fieldmaps` p99 40 Hz from `_fieldmaps_native` p99 0.0027 Hz).
+
+`-unwarp` is unaffected by any of this and passes its own gate outright (§5.1).
+
+**170-frame run, shipping default (built-in `robustmask`), polarity `j`, sampled every 17th frame, also PRE-mask-gating:** `_fieldmaps_native` p50 0.37 Hz, p95 26.6 Hz, corr 0.893; `_displacementmaps` p50 0.022 mm, p95 1.37 mm, corr 0.900. The 2.74 GB peak RSS quoted with that run is from an older revision still (before the `uw` buffer was deleted); **§5.3 carries the current memory and timing figures and is authoritative for both.**
 
 ### 5.1 M3 gate -- PASSED
 
@@ -344,9 +357,9 @@ There is a clean factor-2 drop at index 10 (770.6 -> 383.3), so a rank-10 trunca
 
 Hypotheses not yet discriminated: truncation applied per temporal-correlation group rather than globally; a residual add-back (Eq. 9 read as a correction rather than a replacement); or truncation applied before a later full-rank stage. **Deliberately not guessed.** `--rank 0` disables the filter for anyone who wants the raw regression.
 
-## 5.3 Performance vs the reference (M12)
+### 5.3 Performance vs the reference (M12)
 
-Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench_threads.py` (the like-for-like table, 1 and 8 threads, both tools uncompressed) and `test/medic_experiments/bench170.py` (the gzipped-output and apply-stage tables, 8 threads).
+Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), shipping default mask, Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench_threads.py` (the like-for-like table, 1 and 8 threads, both tools uncompressed) and `test/medic_experiments/bench170.py` (the gzipped-output and apply-stage tables, 8 threads). **These four tables are the authoritative timing and memory figures for MEDIC; `AGENTS.md`, `README.md` and `medic_plan.md` quote them and must not contradict them.**
 
 **Estimate stage, like for like** — both writing UNCOMPRESSED `.nii`, so this compares compute rather than gzip (`test/medic_experiments/bench_threads.py`):
 
@@ -359,7 +372,7 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 
 **3.09x faster single-threaded, 3.67x faster at 8 threads**, using ~4x less CPU and ~1.5x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.47x for niimath and 2.91x for the reference. Note the reference spends 53 s of CPU to do single-threaded what niimath does in 14.0 s, so its higher parallel efficiency is recovering overhead rather than winning work.
 
-These are post-audit figures. Peak rose ~50 MB from an earlier revision because the per-frame masks are now retained long enough to zero the unwrapped phase outside them — which bought a 3.3x improvement in displacement agreement (p95 0.197 → 0.059 mm for `j`), so it is a deliberate trade.
+These are post-audit, post-mask-gating figures — the current revision. Peak rose ~50 MB from the previous revision because the per-frame masks are now retained long enough to zero the unwrapped phase outside them, which bought a 3.3x improvement in end-to-end displacement agreement on the sbref demo with the reference mask supplied (p95 0.197 → 0.059 mm for `j`, 0.096 → 0.029 mm for `j-`; §5, §5.4), so it is a deliberate trade.
 
 **Estimate stage, gzipped output** (`wk-medic` vs `niimath --medic`):
 
@@ -369,7 +382,7 @@ These are post-audit figures. Peak rose ~50 MB from an earlier revision because 
 | `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.35 GB** |
 | `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.19 GB |
 
-(Those two rows are separate runs from the like-for-like table above and predate the mask-retention change; the uncompressed row is the same configuration as the 8-thread row there, so read 2.24 GB as current.)
+(Those three rows are separate runs from the like-for-like table above, and the two `niimath` rows were measured before the mask-retention change. Their **2.19 GB `--gz 0` peak is superseded by the 2.24 GB** of the 8-thread like-for-like row — same configuration, current revision. **2.35 GB remains the quoted peak for the gzipped run** and is what the other documents cite; it was not re-run after the change, so treat it as good to a few tens of MB rather than as a fresh measurement. Wall and CPU times here were likewise not re-run.)
 
 **Apply stage** (one echo, 170 frames):
 
@@ -389,11 +402,28 @@ Two build gotchas that invalidate this table if ignored:
 
 **niimath: yes, by design, and that is a decided position rather than an omission.** A 4D `.nii.gz` cannot be seeked, so every tool — including the reference — reads and writes whole volumes in RAM anyway; a streaming layer would buy nothing for the dominant gzip case. The requirement is instead to be fast and honest about the cost.
 
-The resident working set is `n3 * T * (2*echoes + 3) * 4` bytes, printed at startup (1.18 GiB here); peak RSS of 2.35 GB adds the input images held until repacking plus the output buffers. It grows linearly with frames x echoes, so a 5-echo/600-frame run at this resolution needs roughly 10 GiB — fine natively, and **impossible in wasm32**, whose 4 GiB address space (and `-DFORCE_INT32_MAX` on every wasm target) is why `--medic` is documented as native-scale-only while `-unwarp` is browser-friendly.
+The **work arrays** are `phase + mag + fields + fu + disp` = `n3 * T * (2*echoes + 3) * 4` bytes — 1.18 GiB on this run, and that is the figure `--medic` prints at startup. It grows linearly with frames x echoes, so a 5-echo/600-frame run at this resolution needs roughly 10 GiB of work arrays — fine natively, and **impossible in wasm32**, whose 4 GiB address space (and `-DFORCE_INT32_MAX` on every wasm target) is why `--medic` is documented as native-scale-only while `-unwarp` is browser-friendly.
 
-An earlier revision carried a separate unwrapped-phase series; it was removed during the audit (phase is unwrapped in place), taking peak from 2.53 GB to 2.35 GB.
+**The banner is the work-array budget, not the peak, and the gap is real.** In the current `medic.c` all five work arrays are `malloc`ed *before* the repack loop, at which point all `2*echoes` input images are still resident — so the allocation-time footprint is `(4*echoes + 3)` series, 1.85 GiB here, not `(2*echoes + 3)`. What keeps the measured peak near that rather than well above it is that the repack loop frees each echo's magnitude and phase **as soon as that echo has been copied**, so the pages of the work arrays are dirtied roughly as fast as the input pages are released. The measured 2.04 GB single-threaded is consistent with `(4*echoes + 3)` plus the output buffer, and **not** with the 1.18 GiB banner: do not read the banner as a peak-RSS prediction, and do not describe the per-echo free as reducing the *allocation* peak — it bounds the overshoot during repacking, which is a different claim.
+
+An earlier revision carried a separate unwrapped-phase series; it was removed during the audit (phase is unwrapped in place), taking the gzipped peak from 2.53 GB to 2.35 GB.
 
 **The reference: also yes, and more.** Peak footprint is 3.40 GB against inputs that are 0.67 GiB as float32 and 1.35 GiB as float64, so it is holding every series resident (float64, on the evidence of the ratio) plus unwrapped phase, intermediates and Python overhead. Neither tool streams; niimath simply keeps a smaller resident set by working in float32 throughout.
+
+### 5.4 Where every displacement figure in this file comes from
+
+Six different displacement percentiles appear above and they are **not** measurements of the same thing. Quote a figure only with its row.
+
+| p95 | § | what was compared | dataset | mask / support | polarity | revision |
+| --- | --- | --- | --- | --- | --- | --- |
+| **0.006 mm** | §3.4 | *Convention check.* Converged fixed-point inversion + §3.3 Hz→mm applied to the **reference's own** `_fieldmaps_native`, vs the reference's `_displacementmaps`. No `--medic` pipeline involved. | sbref, 1 frame | crude magnitude-based brain mask, 106 268 voxels | `j` (no polarity term) | M0, pre-implementation |
+| **0.045 mm** (`j`), **0.024 mm** (`j-`) | §3.5b | *Convention check*, same as above with the polarity term `s = ±1` added and run once per polarity. | sbref, 1 frame | **not recorded** — see the caveat in §3.5b | `j` and `j-` | audit round 1 |
+| **0.197 mm** | §5 | *End to end.* `niimath --medic` `_displacementmaps` vs the reference's. | sbref, 1 frame | `--mask` = reference `masks.nii >= 1` | `j` | before mask gating |
+| **0.059 mm** (`j`), **0.029 mm** (`j-`) | §5, §5.3 | *End to end*, same configuration, after the unwrapped phase is zeroed outside the mask. **This is the current end-to-end number, and 0.059 mm misses the 0.05 mm M5 gate.** | sbref, 1 frame | `--mask` = reference mask | `j` and `j-` | current |
+| **2.40 mm** | §5 | *End to end*, shipping default mask. | sbref, 1 frame | built-in `robustmask` of echo 1 | `j` | before mask gating |
+| **1.37 mm** | §5 | *End to end*, shipping default mask, every 17th frame. | 170 frames | built-in `robustmask` per frame | `j` | before mask gating |
+
+Two things this table deliberately does **not** do. It does not reconcile §3.4's 0.006 mm with §3.5b's 0.045 mm — same model, same data, same polarity, 7× apart, and the missing support makes the difference undiagnosable from the record; re-running §3.5b with a stated mask is the only honest fix. And it does not back-fill the pre-gating rows with post-gating values: only the two `--mask` `_displacementmaps` p95 entries were re-measured after that change.
 
 ## 6. What still needs porting
 
@@ -412,7 +442,7 @@ Every implementation-sensitive convention is now measured and recorded, or expli
 | phase scaling | measured, already implemented (§3.1) |
 | weighted regression | measured exact (§3.2) |
 | Hz→mm sign and units | measured exact (§3.3) |
-| inversion | measured; converged fixed point adopted, residual quantified, gate passes 8× (§3.4) |
+| inversion | measured; converged fixed point adopted, residual quantified, convention check clears the 0.05 mm threshold 8× (§3.4 — not the end-to-end figure, see §5.4) |
 | PE-axis semantics, displacement sign | measured over 30 configurations (§3.5) |
 | interpolation kernel, fill, Jacobian | measured exact (§3.6) |
 | masking | measured *behaviour*; construction not reproduced — deliberate, gate on common mask (§3.7) |

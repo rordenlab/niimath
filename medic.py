@@ -105,16 +105,34 @@ def read_meta(phase_files: dict[int, Path]) -> dict:
 
 
 OUTPUT_SUFFIXES = ("_fieldmaps_native", "_fieldmaps", "_displacementmaps")
+EXTS = (".nii.gz", ".nii", ".nii.zst")
+STALE = "\n  delete the stale file(s) or point --out-dir at a clean directory"
 
 
-def emitted(prefix: Path, suffix: str) -> Path | None:
-    """Which file did --medic actually write?  It honours FSLOUTPUTTYPE, so the extension is not
-    knowable in advance -- assuming .nii.gz silently broke NIFTI and NIFTI_ZST runs."""
-    for ext in (".nii.gz", ".nii", ".nii.zst"):
-        cand = Path(str(prefix) + suffix + ext)
-        if cand.is_file():
-            return cand
-    return None
+def candidates(base: Path) -> list[Path]:
+    """Every existing file `base` could have been written as: niimath re-derives the extension
+    from FSLOUTPUTTYPE, so it is not knowable in advance."""
+    return [p for p in (Path(str(base) + e) for e in EXTS) if p.is_file()]
+
+
+def resolve_outputs(prefix: Path) -> tuple[dict, str | None]:
+    """Map each --medic output suffix to the one file that IS it, or return an error.
+
+    Never picks among extensions by priority: a leftover `.nii.gz` beside a fresh `.nii` is two
+    different runs, and choosing one silently hands -unwarp a stale displacement map.
+    """
+    got = {}
+    for sfx in OUTPUT_SUFFIXES:
+        c = candidates(Path(str(prefix) + sfx))
+        if len(c) > 1:
+            return got, "more than one file is %s%s:\n  %s%s" % (
+                prefix.name, sfx, "\n  ".join(str(p) for p in c), STALE)
+        if c:
+            got[sfx] = c[0]
+    if len(set(str(p)[len(str(prefix)) + len(s):] for s, p in got.items())) > 1:
+        return got, "outputs left over from different runs (mixed formats):\n  %s%s" % (
+            "\n  ".join(str(p) for p in got.values()), STALE)
+    return got, None
 
 
 def run_cmd(cmd: list[str], dry: bool) -> None:
@@ -176,56 +194,83 @@ def main(argv: list[str] | None = None) -> int:
             continue
         meta = read_meta(run["phase"])
         prefix = args.out_dir / stem
-        # Check the COMPLETE output set, not just one file: a partial set from an interrupted run
-        # would otherwise read as "already done".
-        if not args.overwrite and all(emitted(prefix, sfx) for sfx in OUTPUT_SUFFIXES):
-            print(f"skipping {stem}: all outputs exist (use --overwrite)", file=sys.stderr)
-            skipped += 1
-            continue
-
-        cmd = [exe, "--medic",
-               "--magnitude", *[str(run["mag"][e]) for e in mag_e],
-               "--phase", *[str(run["phase"][e]) for e in pha_e],
-               "--te-ms", ",".join(f"{t:g}" for t in meta["tes"]),
-               "--total-readout-time", f"{meta['trt']:g}",
-               "--phase-encoding-direction", meta["ped"],
-               "--out-prefix", str(prefix)]
-        if args.n_cpus:
-            cmd += ["--n-cpus", str(args.n_cpus)]
-        if args.noise_frames is not None:
-            cmd += ["--noise-frames", str(args.noise_frames)]
-        if args.rank is not None:
-            cmd += ["--rank", str(args.rank)]
-        run_cmd(cmd, args.dry_run)
-
-        processed += 1
-        if args.no_apply:
-            continue
-        # One displacement map series corrects every echo: all echoes share one EPI readout.
-        found = emitted(prefix, "_displacementmaps")
-        if found is None and not args.dry_run:
-            print(f"error: {stem}: --medic wrote no displacement map", file=sys.stderr)
+        outs, err = resolve_outputs(prefix)
+        if err:
+            print(f"error: {stem}: {err}", file=sys.stderr)
             failed += 1
             continue
-        dmap = found if found is not None else Path(str(prefix) + "_displacementmaps.nii.gz")
-        if args.noise_frames:
-            # --medic drops N trailing frames, so the map is shorter than the magnitude and
-            # -unwarp correctly refuses the pairing. Say so rather than emit a failing command.
+        if args.noise_frames and not args.no_apply:
+            # --medic drops N trailing frames, so the map is shorter than the magnitude series and
+            # -unwarp correctly refuses the pairing. Say so BEFORE spending an estimate on it.
             print(f"error: {stem}: --noise-frames {args.noise_frames} makes the displacement map "
                   f"shorter than the magnitude series, which -unwarp will reject. Trim the "
-                  f"magnitudes first (niimath <mag> -crop 0 N ...) or drop --noise-frames.",
-                  file=sys.stderr)
+                  f"magnitudes first (niimath <mag> -crop 0 N ...), pass --no-apply, or drop "
+                  f"--noise-frames.", file=sys.stderr)
             failed += 1
             continue
-        axis = meta["ped"][0]  # the sign already lives in the map; -unwarp ignores a '-' suffix
-        for e in mag_e:
-            src = run["mag"][e]
-            out = args.out_dir / (src.name.split(".nii")[0] + "_undistorted.nii.gz")
-            cmd = [exe, str(src)]
+
+        # Estimate and apply are independent, separately resumable stages: a complete estimate is
+        # reused rather than recomputed, and reusing it does NOT skip the apply.
+        worked = False
+        if args.overwrite or len(outs) != len(OUTPUT_SUFFIXES):
+            cmd = [exe, "--medic",
+                   "--magnitude", *[str(run["mag"][e]) for e in mag_e],
+                   "--phase", *[str(run["phase"][e]) for e in pha_e],
+                   "--te-ms", ",".join(f"{t:g}" for t in meta["tes"]),
+                   "--total-readout-time", f"{meta['trt']:g}",
+                   "--phase-encoding-direction", meta["ped"],
+                   "--out-prefix", str(prefix)]
             if args.n_cpus:
-                cmd += ["-p", str(args.n_cpus)]   # was not propagated to the apply step
-            cmd += ["-unwarp", str(dmap), axis, str(out)]
+                cmd += ["--n-cpus", str(args.n_cpus)]
+            if args.noise_frames is not None:
+                cmd += ["--noise-frames", str(args.noise_frames)]
+            if args.rank is not None:
+                cmd += ["--rank", str(args.rank)]
+            before = {p: p.stat().st_mtime_ns
+                      for sfx in OUTPUT_SUFFIXES for p in candidates(Path(str(prefix) + sfx))}
             run_cmd(cmd, args.dry_run)
+            worked = True
+            outs = {}  # --dry-run: nothing was written, so nothing can be observed
+            if not args.dry_run:
+                outs, err = resolve_outputs(prefix)
+                # Keep only what THIS estimate wrote: a file left over from an earlier output
+                # format is not an output of this run, whatever its name says.
+                if not err:
+                    outs = {s: p for s, p in outs.items() if before.get(p) != p.stat().st_mtime_ns}
+                    if len(outs) != len(OUTPUT_SUFFIXES):
+                        err = "--medic did not write " + ", ".join(
+                            s for s in OUTPUT_SUFFIXES if s not in outs)
+                if err:
+                    print(f"error: {stem}: {err}", file=sys.stderr)
+                    failed += 1
+                    continue
+        if not args.no_apply:
+            base = {e: args.out_dir / (run["mag"][e].name.split(".nii")[0] + "_undistorted")
+                    for e in mag_e}
+            todo = [e for e in mag_e if args.overwrite or not candidates(base[e])]
+            if todo and not worked:
+                print(f"{stem}: reusing the existing estimate (use --overwrite to redo it)",
+                      file=sys.stderr)
+            # One displacement map series corrects every echo: all echoes share one EPI readout.
+            dmap = outs.get("_displacementmaps")
+            if dmap is None:  # --dry-run only: nothing was written, so nothing can be observed
+                dmap = Path(str(prefix) + "_displacementmaps.nii.gz")
+                if todo:
+                    print(f"# dry-run: PREDICTED map path (the real extension follows "
+                          f"FSLOUTPUTTYPE): {dmap}", file=sys.stderr)
+            axis = meta["ped"][0]  # the sign already lives in the map; -unwarp ignores a '-' suffix
+            for e in todo:
+                cmd = [exe, str(run["mag"][e])]
+                if args.n_cpus:
+                    cmd += ["-p", str(args.n_cpus)]   # was not propagated to the apply step
+                cmd += ["-unwarp", str(dmap), axis, str(base[e]) + ".nii.gz"]
+                run_cmd(cmd, args.dry_run)
+                worked = True
+        if worked:
+            processed += 1
+        else:
+            print(f"skipping {stem}: all outputs exist (use --overwrite)", file=sys.stderr)
+            skipped += 1
     if failed:
         print(f"{processed} run(s) processed, {skipped} skipped, {failed} FAILED", file=sys.stderr)
         return 1

@@ -29,11 +29,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifndef _MSC_VER
 	#include <unistd.h>   /* getpid() for the temporary output prefix */
 #else
 	#include <process.h>
 	#define getpid _getpid
+	#ifndef S_ISREG
+		#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+	#endif
 #endif
 #ifdef _OPENMP
 	#include <omp.h>
@@ -53,8 +57,20 @@
 #define MD_MAX_ECHO 64
 #define MD_RANK_DEFAULT 10
 #define MD_INVERT_ITERS 64      /* fixed point; converged well before this (manifest §3.4) */
-#define MD_INVERT_TOL 1e-6f     /* Hz; early exit */
+/* Convergence tolerance for the inversion fixed point, in Hz.
+ *
+ * NOT 1e-6: the iterate is float32 and field values run to ~200 Hz, where one ULP is ~1.5e-5 Hz,
+ * so a 1e-6 threshold can never be met and the "did not converge" diagnostic fired on every frame
+ * of every run -- a warning that is always on is worse than none.  1e-3 Hz is comfortably above
+ * float32 resolution and corresponds to ~6e-8 mm of displacement, i.e. six orders of magnitude
+ * below the 0.05 mm gate. */
+#define MD_INVERT_TOL 1e-3f
 #define MD_CORR_THRESH 0.98     /* paper §2.1.3 magnitude-correlation grouping */
+/* Ceiling for the DENSE low-rank solver: it forms a T x T Gram matrix and runs cyclic Jacobi on
+   it, so cost is O(T^3) and memory O(T^2).  Generous for real fMRI (the target workload is ~600
+   frames); it exists so a pathological frame count fails with an explanation rather than wrapping
+   an allocation on a 32-bit build. */
+#define MD_MAX_FRAMES_DENSE 8192
 /* Guards against undefined float->int conversion.  Any displacement or sample position outside
    these bounds (including NaN and +-Inf, which fail the comparisons) is treated as out of FOV. */
 #define MD_DISP_LIMIT 1.0e9
@@ -250,6 +266,26 @@ static void md_pull(const float *in, float *out, int nx, int ny, int nz,
 
 /* ============================== I/O helpers ============================== */
 
+/* Header-only read, for validating geometry before any payload is loaded or any work array is
+   allocated.  Keeps the true allocation peak at (2*echoes + 3) work series plus ONE echo pair,
+   instead of holding all 2*echoes payloads alive while the work set is allocated. */
+static nifti_image *md_read_hdr(const char *fn, const char *what) {
+	nifti_image *h = nifti_image_read(fn, 0);
+	if (!h) { MD_ERR("failed to read the header of %s '%s'\n", what, fn); return NULL; }
+	if (h->nvox < 1 || h->nx < 1 || h->ny < 1 || h->nz < 1) {
+		MD_ERR("%s '%s' has invalid dimensions\n", what, fn); nifti_image_free(h); return NULL;
+	}
+	if (h->nu > 1 || h->nv > 1 || h->nw > 1) {
+		MD_ERR("%s '%s' has more than 4 dimensions (5D input is out of scope)\n", what, fn);
+		nifti_image_free(h); return NULL;
+	}
+	if ((int64_t)h->nvox > INT_MAX) {
+		MD_ERR("%s '%s' exceeds INT_MAX voxels; --medic is not a huge-image-safe operation\n", what, fn);
+		nifti_image_free(h); return NULL;
+	}
+	return h;
+}
+
 /* Read a NIfTI as float32.  Returns the image (caller frees with nifti_image_free) with
    ->data already converted, or NULL. */
 static nifti_image *md_read_f32(const char *fn, const char *what) {
@@ -423,6 +459,22 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 	int i, j, k, r, rc = 1;
 	int64_t v;
 	if (rank <= 0 || T <= 1 || rank >= T) return 0;   /* nothing to truncate */
+	{	/* T*T is formed HERE, and neither the working-set check (which bounds n3*T) nor the
+		   temporal check (which does not run under --temporal-correction 0) covers it.  On a
+		   32-bit / FORCE_INT32_MAX build a large T wraps the element count to zero and the Gram
+		   writes then run off the end. */
+		size_t bytes;
+		if (T > MD_MAX_FRAMES_DENSE) {
+			MD_ERR("the low-rank filter needs a dense %dx%d matrix; %d frames exceeds this "
+				"solver's %d-frame ceiling (use --rank 0 to skip it)\n",
+				T, T, T, MD_MAX_FRAMES_DENSE);
+			return 1;
+		}
+		if (nii_mul_size((size_t)T, (size_t)T, &bytes) || nii_mul_size(bytes, sizeof(double), &bytes)) {
+			MD_ERR("the %dx%d low-rank matrices exceed this build's address space\n", T, T);
+			return 1;
+		}
+	}
 	G = (double *)calloc((size_t)T * T, sizeof(double));
 	V = (double *)malloc((size_t)T * T * sizeof(double));
 	w = (double *)malloc((size_t)T * sizeof(double));
@@ -657,11 +709,12 @@ static void md_regress(const md_ctx *c, const float *phase, const float *mag, fl
  *
  * `uw` is neco * nframe volumes, echo-major within frame.  `mag1` is the first echo's magnitude
  * series (n3 * nframe). */
-static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
+static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint8_t *masks) {
 	const int64_t n3 = c->n3;
 	const int T = c->nframe;
 	double *mu = NULL, *sd = NULL, *corr = NULL;
 	float *acc = NULL, *snap = NULL;
+	int32_t *cnt = NULL;   /* per-voxel count of frames valid at that voxel */
 	int t, u, e, rc = 1;
 	int64_t i;
 	size_t bytes;
@@ -677,9 +730,10 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 	sd = (double *)malloc((size_t)T * sizeof(double));
 	corr = (double *)malloc((size_t)T * T * sizeof(double));
 	acc = (float *)malloc((size_t)n3 * sizeof(float));
+	cnt = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
 	/* snapshot of every frame's FIRST-echo unwrapped phase, so group means are order-independent */
 	snap = (float *)malloc((size_t)n3 * T * sizeof(float));
-	if (!mu || !sd || !corr || !acc || !snap) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
+	if (!mu || !sd || !corr || !acc || !snap || !cnt) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 	for (t = 0; t < T; t++)
 		memcpy(snap + (int64_t)t * n3, uw + ((int64_t)t * c->neco) * n3, (size_t)n3 * sizeof(float));
 
@@ -711,18 +765,29 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 		int ng = 0;
 		for (u = 0; u < T; u++) if (corr[(size_t)t * T + u] >= MD_CORR_THRESH) ng++;
 		if (ng < 2) continue;   /* a frame alone in its group has no reference to move toward */
-		for (i = 0; i < n3; i++) acc[i] = 0.0f;
+		/* Accumulate the group mean PER VOXEL over the frames that are valid AT THAT VOXEL.
+		 *
+		 * Masks are per frame and generally differ between frames, so a fixed group size would
+		 * average structural zeros from frames where the voxel is outside the mask into the mean
+		 * of frames where it is inside -- biasing the reference and, worse, letting an EXCLUDED
+		 * voxel be pushed off zero by a 2*pi correction, silently undoing the mask gating. */
+		for (i = 0; i < n3; i++) { acc[i] = 0.0f; cnt[i] = 0; }
 		for (u = 0; u < T; u++) {
 			const float *p;
+			const uint8_t *mu_ = masks ? masks + (int64_t)u * n3 : NULL;
 			if (corr[(size_t)t * T + u] < MD_CORR_THRESH) continue;
 			p = snap + (int64_t)u * n3;   /* snapshot, not the live (partly corrected) series */
-			for (i = 0; i < n3; i++) acc[i] += p[i];
+			for (i = 0; i < n3; i++) if (!mu_ || mu_[i]) { acc[i] += p[i]; cnt[i]++; }
 		}
 		{
 			float *p1 = uw + ((int64_t)t * c->neco) * n3;
+			const uint8_t *mt = masks ? masks + (int64_t)t * n3 : NULL;
 			for (i = 0; i < n3; i++) {
-				double ref = (double)acc[i] / (double)ng;
-				double n = nearbyint((ref - (double)p1[i]) / MD_2PI);
+				double ref, n;
+				if (mt && !mt[i]) continue;          /* excluded here: leave the gated zero alone */
+				if (cnt[i] < 2) continue;            /* no other valid frame to move toward */
+				ref = (double)acc[i] / (double)cnt[i];
+				n = nearbyint((ref - (double)p1[i]) / MD_2PI);
 				p1[i] = (float)((double)p1[i] + MD_2PI * n);
 			}
 			for (e = 1; e < c->neco; e++) {
@@ -735,6 +800,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 				if (!(denom > 0.0)) continue;
 				for (i = 0; i < n3; i++) {
 					double num = 0.0, pred, n;
+					if (mt && !mt[i]) continue;      /* keep excluded voxels at their gated zero */
 					for (k = 0; k < e; k++)
 						num += (double)uw[((int64_t)t * c->neco + k) * n3 + i] * c->TEs[k];
 					pred = tn * num / denom;
@@ -746,7 +812,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 	}
 	rc = 0;
 done:
-	free(mu); free(sd); free(corr); free(acc); free(snap);
+	free(mu); free(sd); free(corr); free(acc); free(snap); free(cnt);
 	return rc;
 }
 
@@ -764,20 +830,24 @@ done:
  * and a displacement map that is very nearly negated (corr -0.918, median ratio -0.973).  Getting
  * it wrong on a `j-` acquisition doubles the distortion instead of correcting it.  Verified for
  * both polarities against the reference at displacement p95 0.045 mm (j) and 0.024 mm (j-). */
-static void md_invert(const md_ctx *c, const float *fn, float *fu) {
+static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold, int64_t *nunconv) {
 	const int nx = c->nx, ny = c->ny, nz = c->nz;
 	const int m = c->pe_axis;
 	const int64_t n3 = c->n3;
 	const int64_t stride = (m == 0) ? 1 : ((m == 1) ? nx : (int64_t)nx * ny);
 	const int len = (m == 0) ? nx : ((m == 1) ? ny : nz);
-	int it;
-	int64_t i;
+	int it, converged = 0;
+	int64_t i, folds = 0, slow = 0;
 	for (i = 0; i < n3; i++) fu[i] = 0.0f;
 	for (it = 0; it < MD_INVERT_ITERS; it++) {
 		double worst = 0.0;
 		int z;
+		/* On the LAST iteration, count the voxels still moving: a global max is dominated by a
+		   handful of oscillating folded voxels, which made every frame look unconverged. */
+		const int last = (it == MD_INVERT_ITERS - 1);
+		slow = 0;
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(static) reduction(max:worst)
+		#pragma omp parallel for schedule(static) reduction(max:worst) reduction(+:slow)
 #endif
 		for (z = 0; z < nz; z++) {
 			int x, y;
@@ -788,7 +858,7 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 				double cur = (double)fu[o];
 				double pos;
 				int lo;
-				double frac, a, b, nv;
+				double frac, a, b, nv, delta;
 				if (!(cur >= -MD_DISP_LIMIT && cur <= MD_DISP_LIMIT)) cur = 0.0; /* NaN/Inf -> no shift */
 				pos = (double)idx + (double)c->pe_sign * cur * c->trt;
 				if (!(pos >= -MD_POS_LIMIT && pos <= MD_POS_LIMIT)) pos = (double)idx;
@@ -801,12 +871,36 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 				a = (double)fn[base + (int64_t)lo * stride];
 				b = (double)fn[base + (int64_t)((lo + 1 < len) ? lo + 1 : lo) * stride];
 				nv = a * (1.0 - frac) + b * frac;
-				if (fabs(nv - (double)fu[o]) > worst) worst = fabs(nv - (double)fu[o]);
+				delta = fabs(nv - (double)fu[o]);
+				if (delta > worst) worst = delta;
+				if (last && delta > (double)MD_INVERT_TOL) slow++;
 				fu[o] = (float)nv;
 			}
 		}
-		if (worst < MD_INVERT_TOL) break;
+		if (worst < MD_INVERT_TOL) { converged = 1; break; }
 	}
+	/* Folding detector: where d(displacement)/d(PE index) <= -1 the forward map is not monotone,
+	   so the inverse is genuinely multi-valued and the fixed point picks one branch arbitrarily.
+	   That is where the reference and this implementation disagree most (manifest 3.4 records
+	   p99 1.4 mm, max 9.0 mm there), so it is worth reporting rather than hiding. */
+	{
+		const int64_t stride2 = stride;
+		int z;
+		for (z = 0; z < nz; z++) {
+			int x, y;
+			for (y = 0; y < ny; y++) for (x = 0; x < nx; x++) {
+				int64_t o = (int64_t)x + (int64_t)y * nx + (int64_t)z * nx * ny;
+				int idx = (m == 0) ? x : ((m == 1) ? y : z);
+				double dd;
+				if (idx + 1 >= len) continue;
+				dd = ((double)fu[o + stride2] - (double)fu[o]) * c->trt;
+				if (dd <= -1.0) folds++;
+			}
+		}
+	}
+	if (nfold) *nfold = folds;
+	if (nunconv) *nunconv = converged ? 0 : slow;
+	return converged ? 0 : 1;
 }
 
 /* ============================== output ============================== */
@@ -872,12 +966,20 @@ static int md_write_temp(md_ctx *c, const char *tmppfx, const char *suffix,
 		snprintf(out, outsz, "%s%s%s", tmppfx, suffix, MD_EXT[i]);
 		remove(out);
 	}
-	if (md_write(c, suffix, buf, T, gz)) return 1;
+	if (md_write(c, suffix, buf, T, gz)) goto fail;
 	for (i = 0; i < 3; i++) {
 		FILE *f;
 		snprintf(out, outsz, "%s%s%s", tmppfx, suffix, MD_EXT[i]);
 		f = fopen(out, "rb");
 		if (f) { fclose(f); return 0; }
+	}
+	/* Wrote something we cannot name -- e.g. a .hdr/.img pair.  Fall through and clean up. */
+fail:
+	/* A short write, a compressor-close error or a disk-full partial leaves a file the caller
+	   cannot know about, because it only tracks paths we successfully returned.  Remove ours. */
+	for (i = 0; i < 3; i++) {
+		snprintf(out, outsz, "%s%s%s", tmppfx, suffix, MD_EXT[i]);
+		remove(out);
 	}
 	out[0] = '\0';
 	return 1;
@@ -965,6 +1067,7 @@ int nii_medic(int argc, char *argv[]) {
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
 	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
 	int *frc = NULL;
+	uint8_t *maskbuf = NULL;   /* per-frame masks, retained through the temporal correction */
 	romeo_opts ro = romeo_opts_default();
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
@@ -1071,6 +1174,16 @@ int nii_medic(int argc, char *argv[]) {
 		if (e && !(c.TEs[e] > c.TEs[e - 1])) { MD_ERR("echo times must be strictly increasing\n"); goto done; }
 	}
 	if (!(c.trt > 0.0) || !isfinite(c.trt)) { MD_ERR("--total-readout-time must be finite and positive\n"); goto done; }
+	{	/* One-file NIfTI is the stated scope.  A PAIR setting makes nifti_save write .hdr/.img,
+		   which the output transaction cannot discover or publish -- it used to leave orphaned
+		   temporaries and exit 1 AFTER doing all the work.  Refuse before computing anything. */
+		const char *fot = getenv("FSLOUTPUTTYPE");
+		if (fot && strstr(fot, "PAIR")) {
+			MD_ERR("FSLOUTPUTTYPE=%s selects a .hdr/.img pair; --medic writes one-file NIfTI only "
+				"(use NIFTI, NIFTI_GZ or NIFTI_ZST)\n", fot);
+			goto done;
+		}
+	}
 	if (c.noiseframes < 0) { MD_ERR("--noise-frames must be >= 0\n"); goto done; }
 	c.neco = npha;
 
@@ -1078,9 +1191,9 @@ int nii_medic(int argc, char *argv[]) {
 		if (!strcmp(phaf[e], "-") || !strcmp(magf[e], "-")) {
 			MD_ERR("stdin is not supported: --medic reads several synchronized inputs\n"); goto done;
 		}
-		ph[e] = md_read_f32(phaf[e], "phase");
+		ph[e] = md_read_hdr(phaf[e], "phase");
 		if (!ph[e]) goto done;
-		mg[e] = md_read_f32(magf[e], "magnitude");
+		mg[e] = md_read_hdr(magf[e], "magnitude");
 		if (!mg[e]) goto done;
 		if (!md_same_grid(ph[0], ph[e]) || !md_same_grid(ph[0], mg[e])) {
 			MD_ERR("echo %d does not share echo 1's grid (dimensions and world transform must match across all echoes and parts)\n", e + 1);
@@ -1130,23 +1243,32 @@ int nii_medic(int argc, char *argv[]) {
 	disp = (float *)malloc((size_t)n3 * T * sizeof(float));
 	if (!phase || !mag || !fields || !fu || !disp) { MD_ERR("out of memory allocating the working set\n"); goto done; }
 
-	/* Repack to frame-major, echo-minor and rescale each echo's phase series as readphase does.
+	/* Load, rescale and repack ONE ECHO PAIR AT A TIME.
 	 *
-	 * Each echo's inputs are released AS SOON AS they have been repacked, rather than all of them
-	 * afterwards.  Holding all 2*neco input payloads alive across the whole repack put the true
-	 * peak at roughly (4*neco + 3) series while the banner reported (2*neco + 3); freeing per
-	 * echo keeps the overshoot to one echo pair.  Echo 0's phase image is kept: it is the header
-	 * template (c.tmpl) for every output. */
+	 * Geometry was validated from headers alone above, so no payload is resident when the work
+	 * arrays are allocated.  An earlier version loaded all 2*neco payloads during validation and
+	 * only freed them during the repack -- which is AFTER the work allocation, so the true peak
+	 * was ~(4*neco + 3) series while the banner reported (2*neco + 3).  Now the overshoot is one
+	 * echo pair regardless of echo count.  Echo 0's phase image is retained, payload dropped, as
+	 * the header template (c.tmpl) for every output. */
 	for (e = 0; e < c.neco; e++) {
-		float *pe = (float *)ph[e]->data;
+		nifti_image *pi, *mi;
+		float *pe;
+		if (e > 0) { nifti_image_free(ph[e]); ph[e] = NULL; }   /* header stub no longer needed */
+		nifti_image_free(mg[e]); mg[e] = NULL;
+		pi = md_read_f32(phaf[e], "phase");
+		if (!pi) goto done;
+		mi = md_read_f32(magf[e], "magnitude");
+		if (!mi) { nifti_image_free(pi); goto done; }
+		pe = (float *)pi->data;
 		md_rescale_phase(pe, (int64_t)n3 * Tin);
 		for (t = 0; t < T; t++) {
 			memcpy(phase + ((int64_t)t * c.neco + e) * n3, pe + (int64_t)t * n3, (size_t)n3 * sizeof(float));
-			memcpy(mag + ((int64_t)t * c.neco + e) * n3, ((float *)mg[e]->data) + (int64_t)t * n3, (size_t)n3 * sizeof(float));
+			memcpy(mag + ((int64_t)t * c.neco + e) * n3, ((float *)mi->data) + (int64_t)t * n3, (size_t)n3 * sizeof(float));
 		}
-		nifti_image_free(mg[e]); mg[e] = NULL;
-		if (e > 0) { nifti_image_free(ph[e]); ph[e] = NULL; }
-		else { free(ph[0]->data); ph[0]->data = NULL; }   /* keep the header, drop the payload */
+		nifti_image_free(mi);
+		if (e == 0) { free(pi->data); pi->data = NULL; nifti_image_free(ph[0]); ph[0] = pi; c.tmpl = ph[0]; }
+		else nifti_image_free(pi);
 	}
 
 	/* ---- per-frame: MCPC-3D-S -> ROMEO -> weighted regression ------------------------------- */
@@ -1171,10 +1293,24 @@ int nii_medic(int argc, char *argv[]) {
 				MD_ERR("--mask must be a single 3D volume on the input grid\n");
 				nifti_image_free(mk); free(offs); free(masks); goto done;
 			}
+			/* MEASURED contract (manifest 3.7): in-mask is `>= 1`, not merely nonzero.  A
+			   fractional probability map is therefore NOT a mask -- threshold it first
+			   (`niimath p.nii -thr 0.5 -bin m.nii`).  NaN fails the comparison and is excluded,
+			   which is the safe direction. */
 			for (t = 0; t < T; t++)
 				for (q = 0; q < n3; q++)
-					masks[(int64_t)t * n3 + q] = (((const float *)mk->data)[q] != 0.0f) ? 1 : 0;
+					masks[(int64_t)t * n3 + q] = (((const float *)mk->data)[q] >= 1.0f) ? 1 : 0;
 			nifti_image_free(mk);
+			{	/* An all-fractional or empty mask would silently zero every voxel downstream. */
+				int64_t nz = 0;
+				for (q = 0; q < n3; q++) if (masks[q]) nz++;
+				if (nz == 0) {
+					MD_ERR("--mask '%s' has no voxel >= 1 (MEDIC's in-mask test is `>= 1`; "
+						"threshold a probability map first, e.g. niimath m.nii -thr 0.5 -bin m_bin.nii)\n",
+						c.maskfile);
+					free(offs); free(masks); free(frc); frc = NULL; goto done;
+				}
+			}
 		} else {
 #ifdef _OPENMP
 			#pragma omp parallel for schedule(dynamic)
@@ -1245,7 +1381,8 @@ int nii_medic(int argc, char *argv[]) {
 			/* --save-intermediates is an explicit request; a failure to honour it is an error. */
 			if (wrc) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("failed to write an intermediate\n"); goto done; }
 		}
-		free(offs); free(masks); free(frc); frc = NULL;
+		free(offs); free(frc); frc = NULL;
+		maskbuf = masks;   /* retained: md_temporal must know which samples are valid */
 	}
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
@@ -1254,7 +1391,7 @@ int nii_medic(int argc, char *argv[]) {
 		int trc;
 		if (!mag1) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 		for (t = 0; t < T; t++) memcpy(mag1 + (int64_t)t * n3, mag + (int64_t)t * c.neco * n3, (size_t)n3 * sizeof(float));
-		trc = md_temporal(&c, phase, mag1);
+		trc = md_temporal(&c, phase, mag1, maskbuf);
 		free(mag1);
 		if (trc) goto done;
 	}
@@ -1284,6 +1421,7 @@ int nii_medic(int argc, char *argv[]) {
 	/* ---- inversion and displacement ---------------------------------------------------------- */
 	{
 		double vox;
+		int64_t inv_folds = 0, inv_unconv = 0;
 		{	/* Phase-encoding voxel size in MILLIMETRES (pixdim is in the header's xyz_units). */
 			double A[3][3], s = 0.0, unit = xyz_units_to_mm(c.tmpl->xyz_units);
 			int r;
@@ -1298,34 +1436,49 @@ int nii_medic(int argc, char *argv[]) {
 		#pragma omp parallel for schedule(static)
 #endif
 		for (t = 0; t < T; t++) {
-			int64_t q;
-			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3);
+			int64_t q, nf = 0, nu = 0;
+			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu);
+			inv_folds += nf; inv_unconv += nu;
 			for (q = 0; q < n3; q++)
 				disp[(int64_t)t * n3 + q] =
 					(float)(-(double)c.pe_sign * (double)fu[(int64_t)t * n3 + q] * c.trt * vox);
 		}
+		/* Report, do not hide: an unconverged frame or a folded region is exactly where this
+		   implementation and the reference disagree most. */
+		if (inv_unconv || inv_folds) {
+			double tot = (double)n3 * T;
+			fprintf(stderr, "--medic: displacement inversion: %lld voxel(s) (%.3f%%) still moving "
+				"by >%g Hz after %d iterations; %lld (%.3f%%) lie in FOLDED columns where the "
+				"forward map is not monotone, so the inverse is multi-valued and the branch chosen "
+				"is arbitrary\n",
+				(long long)inv_unconv, 100.0 * (double)inv_unconv / tot, (double)MD_INVERT_TOL,
+				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot);
+		}
 	}
 
-	/* Fail-atomic via SIBLING TEMPORARIES, never by deleting final names.
+	/* Publish the three outputs as a RECOVERABLE transaction.
 	 *
-	 * An earlier revision wrote straight to the final paths and, on failure, removed all three
-	 * output names in every extension -- which destroyed a PREVIOUS run's results that this
-	 * invocation had never touched, and could not restore a final file nifti_save had already
-	 * truncated.  Now every output is written under a temporary prefix; only once all three have
-	 * been written successfully are they renamed into place.  A failure leaves the previous run
-	 * untouched and removes only files this invocation created. */
+	 * History, because two previous attempts were wrong: writing straight to the final paths and
+	 * deleting them on failure destroyed a PREVIOUS run's results; sibling temporaries plus a
+	 * plain rename loop fixed that but still published a MIXED set if the second rename failed
+	 * (new file 1, old files 2 and 3), which is worse than either a clean old set or a clean new
+	 * one because it looks usable.
+	 *
+	 * So: write all three temporaries; move any existing finals aside to `.medicbak`; rename the
+	 * temporaries in; on ANY failure put the backups back and remove our temporaries.  Individual
+	 * renames are atomic and same-directory, so the restore path is itself renames.  This is
+	 * recoverable rather than atomic -- a crash between two renames still leaves a mixed set --
+	 * and it is deliberately NOT labelled atomic. */
 	{
 		static const char *const outs[3] = { "_fieldmaps_native", "_fieldmaps", "_displacementmaps" };
 		const float *bufs[3];
-		char tmppfx[MD_PATH_MAX];
-		char made[3][MD_PATH_MAX];
+		char tmppfx[MD_PATH_MAX], made[3][MD_PATH_MAX];
+		char final[3][MD_PATH_MAX], bak[3][MD_PATH_MAX];
 		const char *saved_prefix = c.prefix;
-		int k, wrc = 0, nmade = 0;
+		int k, q, wrc = 0, nmade = 0, nbak = 0, npub = 0;
 		bufs[0] = fields; bufs[1] = fu; bufs[2] = disp;
-		if ((int)strlen(saved_prefix) + 32 >= MD_PATH_MAX) {
-			MD_ERR("--out-prefix is too long\n");
-			goto done;
-		}
+		/* Reserve room for the longest suffix we ever append: "<out>.medictmp<pid>.nii.gz". */
+		if ((int)strlen(saved_prefix) + 64 >= MD_PATH_MAX) { MD_ERR("--out-prefix is too long\n"); goto done; }
 		snprintf(tmppfx, sizeof tmppfx, "%s.medictmp%ld", saved_prefix, (long)getpid());
 		c.prefix = tmppfx;
 		for (k = 0; k < 3 && !wrc; k++) {
@@ -1334,43 +1487,53 @@ int nii_medic(int argc, char *argv[]) {
 		}
 		c.prefix = saved_prefix;
 		if (wrc) {
-			/* Nothing has been renamed yet, so no final output exists or has been disturbed. */
-			int q;
-			MD_ERR("failed to write %s%s; previous outputs left untouched\n",
+			MD_ERR("failed to write %s%s; existing outputs left untouched\n",
 				saved_prefix, outs[k > 0 ? k - 1 : 0]);
 			for (q = 0; q < nmade; q++) remove(made[q]);
 			goto done;
 		}
-		/* All three temporaries exist; publish them.
-		 *
-		 * Per-file rename() is atomic, but three of them are not atomic AS A SET: if the second
-		 * fails, the first is already published and cannot be put back.  That window is tiny (same
-		 * directory, same filesystem, no I/O) but it is real, so on failure we report EXACTLY
-		 * which outputs are in place rather than claiming a clean rollback we cannot perform. */
 		for (k = 0; k < 3; k++) {
-			char final[MD_PATH_MAX];
-			/* The extension sits immediately after "<tmppfx><suffix>" -- computed by offset, not
-			   by searching for ".nii", which finds the FIRST occurrence and mangles a legitimate
+			/* The extension sits immediately after "<tmppfx><suffix>" -- by offset, never by
+			   searching for ".nii", which finds the FIRST occurrence and mangles a legitimate
 			   --out-prefix such as "out.nii". */
 			const char *ext = made[k] + strlen(tmppfx) + strlen(outs[k]);
-			snprintf(final, sizeof final, "%s%s%s", saved_prefix, outs[k], ext);
-			if (rename(made[k], final) != 0) {
-				int q;
-				MD_ERR("failed to move %s into place\n", final);
-				if (k > 0) {
-					MD_ERR("  %d of 3 outputs were already published and CANNOT be rolled back:\n", k);
-					for (q = 0; q < k; q++) MD_ERR("    %s%s%s\n", saved_prefix, outs[q],
-						made[q] + strlen(tmppfx) + strlen(outs[q]));
-					MD_ERR("  the output set is INCOMPLETE; delete it before reusing this prefix\n");
-				}
-				for (q = k; q < 3; q++) remove(made[q]);
+			snprintf(final[k], MD_PATH_MAX, "%s%s%s", saved_prefix, outs[k], ext);
+			snprintf(bak[k], MD_PATH_MAX, "%s.medicbak%ld", final[k], (long)getpid());
+		}
+		/* PREFLIGHT the destinations before touching anything.  A path occupied by a directory
+		   (or anything that is not a regular file) must be refused, not renamed out of the way --
+		   moving a user's directory aside would be a surprising side effect, and a non-empty one
+		   cannot then be cleaned up. */
+		for (k = 0; k < 3; k++) {
+			struct stat st;
+			if (stat(final[k], &st) == 0 && !S_ISREG(st.st_mode)) {
+				MD_ERR("%s exists and is not a regular file; refusing to replace it\n", final[k]);
+				for (q = 0; q < 3; q++) remove(made[q]);
 				goto done;
 			}
 		}
+		for (k = 0; k < 3; k++) {   /* move existing finals aside (absent is fine) */
+			remove(bak[k]);
+			if (rename(final[k], bak[k]) == 0) nbak++;
+			else bak[k][0] = '\0';
+		}
+		for (k = 0; k < 3; k++) {
+			remove(final[k]);   /* MSVC rename() will not replace an existing destination */
+			if (rename(made[k], final[k]) != 0) {
+				MD_ERR("failed to publish %s; rolling back\n", final[k]);
+				for (q = 0; q < npub; q++) remove(final[q]);              /* undo our publishes */
+				for (q = 0; q < 3; q++) if (bak[q][0]) rename(bak[q], final[q]);  /* restore */
+				for (q = k; q < 3; q++) remove(made[q]);
+				goto done;
+			}
+			npub++;
+		}
+		for (k = 0; k < 3; k++) if (bak[k][0]) remove(bak[k]);
+		(void)nbak;
 	}
 	rc = EXIT_SUCCESS;
 done:
-	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc);
+	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc); free(maskbuf);
 	for (e = 0; e < MD_MAX_ECHO; e++) { if (ph[e]) nifti_image_free(ph[e]); if (mg[e]) nifti_image_free(mg[e]); }
 	return rc;
 }
