@@ -81,6 +81,17 @@ if(${BUILD_FLAVOR} STREQUAL "all")
                 COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
         endif()
     endif()
+    # MEDIC multi-echo distortion correction (--medic, -unwarp). Requires ROMEO: medic.c calls
+    # romeo_unwrap_frame()/romeo_robustmask(). Ordinary FP -- unlike romeo.c nothing here is
+    # reassociation-sensitive, so no per-source flags.
+    option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -unwarp)" ON)
+    if(ENABLE_MEDIC AND NOT ENABLE_ROMEO)
+        message(FATAL_ERROR "ENABLE_MEDIC=ON requires ENABLE_ROMEO=ON (medic.c calls the ROMEO frame API).")
+    endif()
+    if(ENABLE_MEDIC)
+        ADD_DEFINITIONS(-DHAVE_MEDIC)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} medic.c)
+    endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)

@@ -101,6 +101,8 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 //             caller's business -- this entry point performs neither.
 //   mag       caller-owned, n3 * magvol floats, or NULL.  magvol must be >= neco when non-NULL.
 //   TEs       neco echo times, milliseconds, same units romeo_run uses.
+//   mask_in   optional caller-owned n3 bytes used VERBATIM instead of selecting a mask from `o`;
+//             pass NULL for the ordinary -k behaviour.
 //   mask_out  optional caller-owned n3 bytes; receives the mask, or all zeros when the options
 //             select no mask or the call fails.
 //
@@ -108,7 +110,11 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 // `o` are ignored.  Returns 0 on success.
 int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	int nx, int ny, int nz, int neco, const double *TEs,
-	const romeo_opts *o, uint8_t *mask_out);
+	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out);
+
+// ROMEO's robustmask on its own, for callers that need the mask before unwrapping.
+// `mask` is caller-owned, nx*ny*nz bytes. Returns 0 on success.
+int romeo_robustmask(const float *mag, int nx, int ny, int nz, uint8_t *mask);
 
 #ifdef __cplusplus
 }

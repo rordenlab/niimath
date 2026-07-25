@@ -81,12 +81,18 @@ TFILES= -DHAVE_TENSOR tensor.c
 DTFLAGS= -DHAVE_DTIFIT dtifit.c
 #Anatomical QC metrics (MRIQC-style IQMs from a T1 + segmentation; self-contained)
 QCFLAGS= -DHAVE_QC qc.c
+
+#MEDIC multi-echo distortion correction (--medic, -unwarp). Clean-room emulation of the workflow
+#in Van et al. 2026 (doi:10.1162/IMAG.a.1262); see test/medic_reference_manifest.md. REQUIRES
+#ROMEO (it calls romeo_unwrap_frame), so "ROMEO=0" implies "MEDIC=0". Ordinary FP: unlike
+#romeo.c, nothing here is reassociation-sensitive, so medic.c rides the normal source line.
+MEDICFLAGS= -DHAVE_MEDIC medic.c
 #dtifit's dependencies for the WASM target (which otherwise ships no tensor support);
 #grouped so "DTIFIT=0 make wasm" restores the original tensor-free WASM build
 DT_WASM= $(TFILES) $(DTFLAGS)
 #QC metrics for the WASM target; grouped so "QC=0 make wasm" drops it (qc.c is
 #self-contained and wasm-safe: only core.h helpers, comparator-free quickselect, no OpenMP)
-QC_WASM= $(QCFLAGS)
+QC_WASM= $(QCFLAGS) $(MEDICFLAGS)
 #Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spm_coreg. OFF by
 #default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
 #provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).
@@ -165,8 +171,15 @@ ifeq "$(ROMEO)" "0"
 	ROMEOFLAGS=
 	ROMEOOBJS=
 	ROMEO_SRC=
+	# MEDIC calls romeo_unwrap_frame(); without ROMEO there is nothing to call.
+	MEDICFLAGS=
 else
 	ROMEO_SRC= romeo.c
+endif
+
+#run "MEDIC=0 make" for compile without MEDIC distortion correction (--medic, -unwarp)
+ifeq "$(MEDIC)" "0"
+	MEDICFLAGS=
 endif
 
 # run "QWARP=1 make" to include -qwarp nonlinear (deformable) registration, an attributed
@@ -208,7 +221,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 all: $(ALOBJS) $(ROMEOOBJS)
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(ROMEOFLAGS) $(ROMEOOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(ROMEOFLAGS) $(ROMEOOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
 # Canonical local regression: build, then run the stdlib-only release smoke test
 # (`.github/scripts/release_smoke.py`) against the freshly built binary. It synthesizes small
@@ -291,12 +304,12 @@ endif
 .PHONY: native-noomp
 native-noomp:
 	$(if $(ROMEOOBJS),$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_noomp.o)
-	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_noomp.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
+	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_noomp.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
 
 #issue30: static build
 static:
 	$(if $(ROMEOOBJS),gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEO_STRICT_FP) $(OMPFLAGS) -c romeo.c -o romeo_static.o)
-	gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_static.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_static.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
@@ -309,17 +322,17 @@ nano:
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
 	$(if $(ROMEOOBJS),$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_dbg.o)
-	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_dbg.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_dbg.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
 	$(if $(ROMEOOBJS),$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_verb.o)
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_verb.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_verb.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # Lightweight undefined-behavior diagnostics. Unlike the Apple-Clang ASan target below,
 # UBSan is safe with Homebrew libomp on Apple Silicon and retains the normal OpenMP paths.
 ubsan:
 	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_ubsan.o)
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_ubsan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_ubsan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
@@ -337,7 +350,7 @@ ubsan:
 # Run with: MallocNanoZone=0 make sanitize
 sanitize:
 	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_asan.o)
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_asan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_asan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,

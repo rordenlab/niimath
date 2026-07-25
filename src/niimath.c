@@ -32,6 +32,9 @@
 #ifdef HAVE_DTIFIT
 	#include "dtifit.h"
 #endif
+#ifdef HAVE_MEDIC
+	#include "medic.h"
+#endif
 #ifdef NII2MESH
 	#include <stdbool.h>
 	#include "meshtypes.h"
@@ -390,6 +393,12 @@ int show_help( void ) {
 #else
 	printf(" -romeo <mag|none> [opts] : ROMEO phase unwrapping — NOT in this build (rebuild without ROMEO=0 / with -DENABLE_ROMEO=ON)\n");
 #endif
+#ifdef HAVE_MEDIC
+	printf(" -unwarp <map> <axis>     : resample through a scalar EPI displacement map (mm) along one phase-encoding axis\n");
+	printf("                            <map> is 3D (broadcast over frames) or 4D matching the input frame count, on the input grid\n");
+	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
+	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
+#endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
 	printf("                            opts: -cost XX (nmi,mi,ecc,ncc,ls) -sep 4 2 -fwhm 7 7 -dither 0|1\n");
@@ -465,6 +474,9 @@ int show_help( void ) {
 #endif
 #ifdef HAVE_QC
 	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv] : MRIQC-style hard-mask QC (CJV, CNR-noair, SNR, WM2MAX, EFC-brain, ICV) to TSV\n");
+#endif
+#ifdef HAVE_MEDIC
+	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");
 #endif
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");
@@ -631,6 +643,10 @@ int main(int argc, char * argv[]) {
 #ifdef HAVE_QC
 	if (!strcmp(argv[1], "--qc"))
 		return nii_qc(argc, argv);
+#endif
+#ifdef HAVE_MEDIC
+	if (!strcmp(argv[1], "--medic"))
+		return nii_medic(argc, argv);
 #endif
 
 	int dtCalc = DT_FLOAT32; //data type for calculation

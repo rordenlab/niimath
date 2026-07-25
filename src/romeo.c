@@ -1868,6 +1868,7 @@ static int rm_build_ctx(rm_wctx *c, const float *phase, const float *mag, int ma
 typedef struct {
 	/* caller-supplied */
 	float *phase;         /* in/out, n3 * neco, radians */
+	const uint8_t *mask_in; /* optional: use this mask verbatim instead of selecting one */
 	const float *mag;     /* borrowed, n3 * magvol, or NULL */
 	int magvol;
 	int nx, ny, nz, neco;
@@ -1923,7 +1924,13 @@ static int rm_core_run(rm_core *c) {
 	}
 
 	/* ---- mask ------------------------------------------------------------------------------ */
-	if (o->mask_sel == RM_MASK_ROBUST && !c->have_mag) {
+	if (c->mask_in) {
+		/* Caller supplied the mask (used by --medic, which shares ONE mask across the MCPC-3D-S
+		   phase-difference unwrap and the multi-echo unwrap, as the reference does). */
+		c->mask = (uint8_t *)malloc((size_t)n3);
+		if (!c->mask) return 1;
+		memcpy(c->mask, c->mask_in, (size_t)n3);
+	} else if (o->mask_sel == RM_MASK_ROBUST && !c->have_mag) {
 		/* load_data_and_resolve_args!: robustmask without a magnitude degrades to nomask */
 		fprintf(stderr, " + -romeo: robustmask was chosen but no magnitude is available. No mask is used!\n");
 	} else if (o->mask_sel == RM_MASK_ROBUST) {
@@ -2186,7 +2193,7 @@ static int rm_core_run(rm_core *c) {
  */
 int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	int nx, int ny, int nz, int neco, const double *TEs,
-	const romeo_opts *o, uint8_t *mask_out) {
+	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out) {
 	rm_core c;
 	int rc;
 	if (!phase || !o || nx < 1 || ny < 1 || nz < 1 || neco < 1 || !TEs) return 1;
@@ -2196,6 +2203,7 @@ int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	c.nx = nx; c.ny = ny; c.nz = nz; c.neco = neco;
 	c.n3 = (int64_t)nx * ny * nz;
 	c.TEs = TEs; c.o = o;
+	c.mask_in = mask_in;
 	c.have_mag = (mag != NULL);
 	if (o->template_echo < 1 || o->template_echo > neco) return 1;
 	if (c.have_mag && magvol < neco) return 1;
@@ -2206,6 +2214,21 @@ int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	}
 	rm_core_free(&c);
 	return rc;
+}
+
+/* Compute ROMEO's robustmask from a magnitude volume, for callers that need the mask on its own
+   (--medic shares ONE mask across its two unwrapping calls).  `mask` is caller-owned, nx*ny*nz
+   bytes.  Returns 0 on success. */
+int romeo_robustmask(const float *mag, int nx, int ny, int nz, uint8_t *mask) {
+	rm_mask_stages st;
+	int64_t n3 = (int64_t)nx * ny * nz;
+	memset(&st, 0, sizeof st);
+	if (!mag || !mask || nx < 1 || ny < 1 || nz < 1) return 1;
+	if (rm_robustmask(mag, nx, ny, nz, 0, 0.0, 0, &st)) { rm_mask_stages_free(&st); return 1; }
+	if (!st.s4) { rm_mask_stages_free(&st); return 1; }
+	memcpy(mask, st.s4, (size_t)n3);
+	rm_mask_stages_free(&st);
+	return 0;
 }
 
 /* ---- the runner ---------------------------------------------------------------------------- */

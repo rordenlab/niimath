@@ -681,6 +681,156 @@ def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
     print("  -romeo: unwrap/mask/quality/multi-echo OK")
 
 
+def exercise_medic(exe: str, tmp: Path, help_text: str) -> None:
+    """--medic / -unwarp: analytic property checks, no external data.
+
+    Both properties pin the answer exactly rather than asserting a zero exit status:
+
+      -unwarp  a ramp whose value equals its j index, pulled by a CONSTANT displacement map of
+               exactly N voxels, must come back shifted by exactly -N in the interior.  This
+               catches a sign flip, a wrong axis, a wrong length unit, and a broken kernel.
+               (The convention is measured; see test/medic_reference_manifest.md section 3.5.)
+
+      --medic  phase synthesised as wrap(2*pi*f*TE) for a known linear field f must be recovered
+               by the magnitude-weighted regression.  The field is checked by least-squares slope
+               and intercept, which are immune to the small wrap-boundary ripple the synthesis
+               itself introduces.
+    """
+    if "--medic" not in help_text:
+        print("  --medic: not built (MEDIC=0) - skipping")
+        return
+
+    nx, ny, nz = 16, 24, 8
+    vox = 1.0  # write_float32_nifti's default header is 1 mm isotropic, axis-aligned RAS
+    nvox = nx * ny * nz
+
+    def idx(x: int, y: int, z: int) -> int:
+        return x + y * nx + z * nx * ny
+
+    # ---- -unwarp: constant map, ramp along j -------------------------------------------------
+    ramp = [0.0] * nvox
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                ramp[idx(x, y, z)] = float(y)
+    shift_vox = 3.0
+    dmap = [shift_vox * vox] * nvox
+    ramp_path = tmp / "medic_ramp.nii"
+    dmap_path = tmp / "medic_dmap.nii"
+    write_float32_nifti(ramp_path, (nx, ny, nz), ramp)
+    write_float32_nifti(dmap_path, (nx, ny, nz), dmap)
+    out_path = tmp / "medic_unwarped.nii"
+    require_success(
+        run_niimath(exe, [str(ramp_path), "-unwarp", str(dmap_path), "j", str(out_path)]),
+        "-unwarp constant map",
+    )
+    # niimath may append .gz depending on FSLOUTPUTTYPE, so accept either spelling
+    written = out_path if out_path.exists() else Path(str(out_path) + ".gz")
+    if not written.exists():
+        raise AssertionError("-unwarp did not write an output image")
+    if written.suffix == ".gz":
+        plain = tmp / "medic_unwarped_plain.nii"
+        plain.write_bytes(gzip.decompress(written.read_bytes()))
+        written = plain
+    got = read_float32_nifti(written)
+    # interior only: the kernel has radius 5, so edges legitimately see the zero fill
+    for z in range(2, nz - 2):
+        for y in range(8, ny - 8):
+            for x in range(2, nx - 2):
+                expect = float(y) - shift_vox
+                actual = got[idx(x, y, z)]
+                if abs(actual - expect) > 1e-3:
+                    raise AssertionError(
+                        f"-unwarp: at ({x},{y},{z}) expected {expect} got {actual} "
+                        f"(a constant {shift_vox}-voxel map must pull by exactly that)"
+                    )
+    # out-of-FOV must be zero-filled, not clamped
+    if abs(got[idx(nx // 2, 0, nz // 2)]) > 1e-6:
+        raise AssertionError("-unwarp: out-of-FOV voxels must be zero-filled")
+
+    # ---- --medic: known linear field ---------------------------------------------------------
+    tes = (10.0, 30.0)
+    slope_hz_per_vox = 4.0
+    two_pi = 6.283185307179586
+    mags, phases = [], []
+    for e, te in enumerate(tes):
+        m = [0.0] * nvox
+        p = [0.0] * nvox
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    f = slope_hz_per_vox * (y - ny / 2.0)
+                    ang = two_pi * f * (te / 1000.0)
+                    # principal value in (-pi, pi]
+                    ang = ang - two_pi * math.floor(ang / two_pi + 0.5)
+                    p[idx(x, y, z)] = ang
+                    m[idx(x, y, z)] = 1000.0 if (2 < x < nx - 3 and 3 < y < ny - 4 and 1 < z < nz - 2) else 30.0
+        mp = tmp / f"medic_mag{e}.nii"
+        pp = tmp / f"medic_pha{e}.nii"
+        write_float32_nifti(mp, (nx, ny, nz), m)
+        write_float32_nifti(pp, (nx, ny, nz), p)
+        mags.append(str(mp))
+        phases.append(str(pp))
+
+    prefix = tmp / "medic_out"
+    result = run_niimath(exe, [
+        "--medic",
+        "--magnitude", *mags,
+        "--phase", *phases,
+        "--te-ms", f"{tes[0]:g},{tes[1]:g}",
+        "--total-readout-time", "0.02",
+        "--phase-encoding-direction", "j",
+        "--out-prefix", str(prefix),
+        "--rank", "0",
+    ])
+    require_success(result, "--medic synthetic run")
+
+    native = None
+    for suffix in (".nii", ".nii.gz"):
+        cand = Path(str(prefix) + "_fieldmaps_native" + suffix)
+        if cand.exists():
+            native = cand
+            break
+    if native is None:
+        raise AssertionError("--medic did not write <prefix>_fieldmaps_native")
+    for extra in ("_fieldmaps", "_displacementmaps"):
+        if not any(Path(str(prefix) + extra + sfx).exists() for sfx in (".nii", ".nii.gz")):
+            raise AssertionError(f"--medic did not write <prefix>{extra}")
+
+    if native.suffix == ".gz":
+        plain = tmp / "medic_native_plain.nii"
+        plain.write_bytes(gzip.decompress(native.read_bytes()))
+        native = plain
+    field = read_float32_nifti(native)
+    # least-squares fit of field against j over the high-signal interior
+    xs, ys = [], []
+    for z in range(3, nz - 3):
+        for y in range(6, ny - 6):
+            for x in range(4, nx - 4):
+                xs.append(float(y))
+                ys.append(field[idx(x, y, z)])
+    n = float(len(xs))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+    sxx = sum((a - mx) ** 2 for a in xs)
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    if abs(slope - slope_hz_per_vox) > 0.05 * slope_hz_per_vox:
+        raise AssertionError(
+            f"--medic: recovered field slope {slope:.4f} Hz/voxel, expected {slope_hz_per_vox}"
+        )
+    expect_intercept = -slope_hz_per_vox * ny / 2.0
+    if abs(intercept - expect_intercept) > 0.05 * abs(expect_intercept):
+        raise AssertionError(
+            f"--medic: recovered field intercept {intercept:.4f} Hz, expected {expect_intercept}"
+        )
+    for value in field:
+        if value != value or abs(value) > 1e6:
+            raise AssertionError("--medic: field map contains non-finite or absurd values")
+    print("  --medic/-unwarp: displacement sign, fill and field regression OK")
+
+
 def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     """Regression for the -allineate -fill / -weight options and the -dilate fix — the
     niimath-only dispatch, chain integration, and CLI parsing that the shared allineate
@@ -1164,6 +1314,7 @@ def main() -> int:
 
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
+        exercise_medic(exe, tmp, help_text)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])

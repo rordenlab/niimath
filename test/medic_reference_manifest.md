@@ -219,13 +219,113 @@ across frames: temporal 2*pi correction -> rank-10 truncation
             -> * -TRT * pixdim_PE            -> _displacementmaps
 ```
 
-## 4. What still needs porting
+## 4. MCPC-3D-S, ROMEO weights, and the mask -- measured during M4
+
+`--debug` also writes `phase_offset0.nii` (range +-pi, the MCPC-3D-S zero-echo offset) and `phase{0,1}.nii` (per-echo unwrapped phase). These turn out to pin three more conventions exactly.
+
+### 4.1 The MCPC-3D-S formula -- B, exact
+
+```text
+hip       = m1*m2 * exp(i*(phi2 - phi1))          (Hermitian inner product of echoes 1,2)
+d_uw      = ROMEO_unwrap(angle(hip), mag=|hip|)
+offset    = wrap( phi1 - TE1/(TE2-TE1) * d_uw )
+```
+
+with **no spatial smoothing**. Against `phase_offset0.nii`, after removing whole-2*pi branch differences in `d_uw`, the residual is p50 2.4e-5 / p95 4.6e-5 rad against a stored quantum of 9.6e-5 rad -- i.e. exact. A smoothed offset could not match at p50 = 0.
+
+Patent position for this stage: see [prior_art.md](../prior_art.md). Summary: US10605885B2 claim 1 requires multi-channel coil data, `TE1:TE2 = n:(n+1)`, and an integer `n`-fold subtraction with no unwrapping; this implementation has none of those (coil-combined input, 16.8:38.56 = 1:2.295, a 0.7721-fold subtraction, and it *does* unwrap). MCPC-3D-S itself is prior art to the 2016 priority date.
+
+### 4.2 ROMEO weight preset -- B
+
+The reference uses **romeo4** weights, at BOTH unwrapping stages -- not ROMEO's own `romeo` default (which resolves to romeo3 when a magnitude is present). Measured as the fraction of in-mask voxels landing on the same 2*pi branch as `phase{0,1}.nii`, with the mask held fixed:
+
+| `-w` | same-branch fraction |
+| --- | --- |
+| romeo2 | 0.8791 |
+| romeo3 / romeo (default) | 0.9301 |
+| romeo6 | 0.9817 |
+| **romeo4** | **0.9976** |
+
+`--medic` therefore defaults to romeo4; `--weights` overrides it.
+
+### 4.3 One shared mask, and what it costs us -- B
+
+The reference uses a **single mask for both stages** (the MCPC phase-difference unwrap and the multi-echo unwrap), at level >= 1. Supplying that exact mask via `--mask` makes the MCPC offset match **perfectly**:
+
+| HIP-unwrap configuration | offset frac exact (in mask) | p95 |
+| --- | --- | --- |
+| robustmask(\|hip\|), romeo3 | 0.8236 | 1.4322 rad |
+| nomask, romeo4 | 0.8889 | 1.4322 rad |
+| dilate(robustmask(\|hip\|), 5), romeo4 | 0.9337 | 1.4322 rad |
+| dilate(robustmask(mag1), 4), romeo4 | 0.9318 | 1.4322 rad |
+| **reference mask (level >= 1), romeo4** | **1.0000** | **0.0000** |
+
+The 1.4322 rad quantum is exactly `|wrap((TE1/dTE)*2*pi)|` -- these are whole-2*pi branch differences in the phase-difference unwrap, not formula error.
+
+So the mask is the **only** thing separating this implementation from the reference at the MCPC stage, and §3.7's deferral is what now binds. Additional hypotheses tested and rejected since §3.7 (all against `masks.nii`):
+
+| hypothesis | best result |
+| --- | --- |
+| robustmask(\|hip\| = m1*m2) vs level 2 | dice 0.9754, exact 0.9880 -- **close, but not it** |
+| robustmask of sum / mean / geometric-mean / max / RMS magnitude vs level >= 1 | dice <= 0.868 |
+| union of per-echo robustmasks vs level >= 1 | dice 0.868 |
+| robustmask internal stages (threshold / smooth / fill / final) on \|hip\| vs level >= 1 | dice <= 0.810 |
+| binary dilation of level 2 (6- and 26-connected, k = 1..5) vs level >= 1 | dice <= 0.971 |
+
+Level 2 is very nearly `robustmask(|hip|)` (dice 0.975) and level >= 1 is a *looser* 99 958-voxel region that no dilation of level 2 reproduces exactly. `--medic` therefore ships ROMEO's `robustmask` of the first echo's magnitude as the default and exposes `--mask` so exact parity is reachable, and demonstrable, on demand.
+
+### 4.4 `--wrap-limit` -- B, no effect
+
+`wk-medic --wrap-limit` ("turns off some heuristics for phase unwrapping") produces **byte-identical** field maps to the default on the sbref demo (max difference 0.000 Hz). It is not the source of any remaining divergence.
+
+## 5. Measured agreement of this implementation
+
+sbref demo (1 frame), errors inside the reference's own mask:
+
+| configuration | output | p50 | p95 | p99 | corr |
+| --- | --- | --- | --- | --- | --- |
+| shipping default (robustmask + romeo4) | `_fieldmaps_native` | 0.0016 Hz | 45.96 Hz | 91.91 Hz | 0.726 |
+| | `_displacementmaps` | 0.0004 mm | 2.40 mm | 4.46 mm | 0.771 |
+| **`--mask` = reference mask** | `_fieldmaps_native` | **0.0013 Hz** | **0.0025 Hz** | **0.0027 Hz** | **0.988** |
+| | `_fieldmaps` | 0.0056 Hz | 3.47 Hz | 40.30 Hz | 0.958 |
+| | `_displacementmaps` | 0.0003 mm | 0.197 mm | 2.29 mm | 0.958 |
+
+Read that table carefully: **given the reference's mask, the native field map is exact to 0.0027 Hz at p99** -- the regression, MCPC, unwrapping, rescaling and echo handling are all right. What remains is (a) the mask, and (b) 0.24 % of voxels on a different 2*pi branch, which the inversion then smears along the phase-encoding line (hence `_fieldmaps` p99 40 Hz from `_fieldmaps_native` p99 0.0027 Hz).
+
+`-unwarp` is unaffected by any of this and passes its own gate outright (§6).
+
+170-frame run, shipping default, sampled every 17th frame: `_fieldmaps_native` p50 0.37 Hz, p95 26.6 Hz, corr 0.893; `_displacementmaps` p50 0.022 mm, p95 1.37 mm, corr 0.900. Peak RSS 2.74 GB, 106.5 G cycles.
+
+### 5.1 M3 gate -- PASSED
+
+Feeding the reference's own `_displacementmaps` to `niimath -unwarp` and comparing against its `echo-{1,2}_part-mag_undistorted.nii.gz`:
+
+| echo | nrmse | p50 | p95 | max | corr | non-finite |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 3.456e-05 | 0.168 | 0.312 | 0.330 | 0.999999999 | 0 |
+| 2 | 4.733e-05 | 0.153 | 0.295 | 0.312 | 0.999999999 | 0 |
+
+on data ranging to 41 482, i.e. 8e-6 relative. The residual is the reference map's own uint16 quantization. Ranges match to the last digit (`[-1654.4, 41482.4]` both).
+
+### 5.2 Open item: the low-rank residual
+
+§3.8 established rank-10 truncation from a synthetic series, where the reference's output came back at numerical rank exactly 10. On the **real** 170-frame run it does not. Full-volume singular values of the reference's `_fieldmaps_native`:
+
+```text
+95793.2  2830.7  2321.5  2113.6  1526.5  1093.4  954.8  851.1  806.1  770.6 | 383.3  347.2  279.4  243.3 ...
+```
+
+There is a clean factor-2 drop at index 10 (770.6 -> 383.3), so a rank-10 truncation *was* applied -- but a broadband residual survives it, three orders of magnitude above the uint16 quantization floor (0.55). This implementation's output is strictly rank 10 (sv[10..] = 2.4e-3).
+
+Hypotheses not yet discriminated: truncation applied per temporal-correlation group rather than globally; a residual add-back (Eq. 9 read as a correction rather than a replacement); or truncation applied before a later full-rank stage. **Deliberately not guessed.** `--rank 0` disables the filter for anyone who wants the raw regression.
+
+## 6. What still needs porting
 
 `--debug` also writes `phase_offset0.nii` (range ±π, the MCPC-3D-S zero-echo offset) and `phase{0,1}.nii` (per-echo unwrapped phase). Comparing niimath's current `-romeo` against `phase{0,1}.nii` shows the expected large disagreement — median 4.40 rad at echo 1, with 49 441 of 64 877 in-mask voxels off by a whole 2π — because niimath does **not** yet remove the phase offset before unwrapping. Once offsets are removed the unwrapped phases are near-perfectly linear in TE: `median(phi_2/phi_1) = 2.295230` versus `TE_2/TE_1 = 2.295238`.
 
 **MCPC-3D-S is the one genuinely new numeric kernel** and is the M4 deliverable. Port the monopolar path only, from the pinned MIT MriResearchTools source, beside the strict-FP ROMEO code (plan §4.2).
 
-## 5. M0 gate
+## 7. M0 gate
 
 Every implementation-sensitive convention is now measured and recorded, or explicitly deferred behind a documented decision:
 

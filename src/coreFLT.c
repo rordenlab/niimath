@@ -93,6 +93,9 @@
 #ifdef HAVE_ROMEO
 #include "romeo.h" // MIT port of ROMEO.jl phase unwrapping (compiled strict-FP as romeo.o)
 #endif
+#ifdef HAVE_MEDIC
+#include "medic.h" // MEDIC multi-echo distortion correction (--medic, -unwarp)
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -6965,6 +6968,35 @@ staticx int nifti_romeo_wrap(nifti_image *nim, char *fin, int *pac, int argc, ch
 }
 #endif // HAVE_ROMEO
 
+#ifdef HAVE_MEDIC
+/* -unwarp <displacement-map> <axis>: resample the working image through a scalar EPI displacement
+   map (millimetres) along one phase-encoding axis.  An ordinary chain operation, DT32 only.
+
+   The map's sign is used as stored -- the axis letter's optional '-' suffix is accepted and
+   IGNORED, matching the reference, which applies no sign from the letter (manifest section 3.5).
+   Applying it a second time here would double-correct. */
+staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *mapfile, *axis;
+	if (ac + 1 >= argc) {
+		printfx("-unwarp requires a displacement map and an axis (-unwarp <map> <i|j|k>)\n");
+		return 1;
+	}
+	mapfile = argv[ac];
+	axis = argv[ac + 1];
+	*pac = ac + 2;
+	if (nii_reject_oversize_aux(mapfile, "unwarp displacement map")) return 1;
+	return medic_unwarp(nim, mapfile, axis);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 1 < argc) *pac += 2;
+	printfx("'-dt double' does not support -unwarp (displacement resampling is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_MEDIC
+
 /* Huge-image (> INT_MAX voxel) support, issue #67. The core calculator ops below are
    nvox_t-clean (see core.h). Any op NOT in this EXACT list keeps int-sized indexing, so a
    huge image is rejected before that op runs rather than silently corrupted (fail-closed,
@@ -7903,6 +7935,15 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_qwarp_wrap(nim, argv[ac]);
 		}
 #endif
+#endif
+#ifdef HAVE_MEDIC
+		else if (!strcmp(argv[ac], "-unwarp")) {
+			ac++;
+			ok = nifti_unwarp_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the map and axis
+		}
 #endif
 #ifdef HAVE_ROMEO
 		else if (!strcmp(argv[ac], "-romeo")) {
