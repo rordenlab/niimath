@@ -62,6 +62,8 @@ def nifti_header(
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     xyz_units: int = 2,  # NIFTI_UNITS_MM
     scale: float = 1.0,  # voxel size in xyz_units (pixdim + sform diagonal)
+    scl_slope: float = 1.0,  # intensity scaling: stored -> scaled value is slope*v + inter
+    scl_inter: float = 0.0,
 ) -> bytes:
     # Defaults (xyz_units=2 mm, scale=1.0) reproduce the historic mm/unit-voxel
     # header exactly; scale/xyz_units let a fixture describe the SAME physical grid
@@ -73,7 +75,8 @@ def nifti_header(
     struct.pack_into("<h", hdr, 72, bitpix)
     struct.pack_into("<8f", hdr, 76, 1.0, scale, scale, scale, 0.0, 0.0, 0.0, 0.0)
     struct.pack_into("<f", hdr, 108, 352.0)
-    struct.pack_into("<f", hdr, 112, 1.0)
+    struct.pack_into("<f", hdr, 112, scl_slope)
+    struct.pack_into("<f", hdr, 116, scl_inter)
     hdr[123] = xyz_units
     struct.pack_into("<h", hdr, 252, 3)
     struct.pack_into("<h", hdr, 254, 3)
@@ -101,12 +104,16 @@ def write_float32_nifti(
     data: list[float],
     offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     nt: int = 1,
+    scl_slope: float = 1.0,
+    scl_inter: float = 0.0,
 ) -> None:
     nvox = dims[0] * dims[1] * dims[2] * nt
     if len(data) != nvox:
         raise AssertionError(f"{path}: expected {nvox} values, got {len(data)}")
     payload = struct.pack(f"<{nvox}f", *data)
-    header = bytearray(nifti_header(dims, datatype=16, bitpix=32, offset=offset))
+    header = bytearray(
+        nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope, scl_inter=scl_inter)
+    )
     if nt > 1:
         struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
     path.write_bytes(bytes(header) + payload)

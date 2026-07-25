@@ -352,12 +352,14 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 
 | threads | tool | wall | CPU | parallelism | peak RAM |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `wk-medic` | 45.30 s | 55.02 s | 1.2x | 3.39 GB |
-| 1 | **`niimath --medic`** | **14.82 s** | **14.31 s** | 1.0x | **1.99 GB** |
-| 8 | `wk-medic` | 14.81 s | 64.32 s | 4.3x | 3.53 GB |
-| 8 | **`niimath --medic`** | **4.05 s** | **15.15 s** | 3.7x | **2.19 GB** |
+| 1 | `wk-medic` | 44.37 s | 53.29 s | 1.2x | 3.40 GB |
+| 1 | **`niimath --medic`** | **14.38 s** | **13.96 s** | 1.0x | **2.04 GB** |
+| 8 | `wk-medic` | 15.23 s | 65.51 s | 4.3x | 3.40 GB |
+| 8 | **`niimath --medic`** | **4.15 s** | **14.91 s** | 3.6x | **2.24 GB** |
 
-**3.06x faster single-threaded, 3.66x faster at 8 threads**, using ~4x less CPU and ~1.6x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.66x for niimath and 3.06x for the reference. Note the reference spends 55 s of CPU to do single-threaded what niimath does in 14.3 s, so its higher parallel efficiency is recovering overhead rather than winning work.
+**3.09x faster single-threaded, 3.67x faster at 8 threads**, using ~4x less CPU and ~1.5x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.47x for niimath and 2.91x for the reference. Note the reference spends 53 s of CPU to do single-threaded what niimath does in 14.0 s, so its higher parallel efficiency is recovering overhead rather than winning work.
+
+These are post-audit figures. Peak rose ~50 MB from an earlier revision because the per-frame masks are now retained long enough to zero the unwrapped phase outside them — which bought a 3.3x improvement in displacement agreement (p95 0.197 → 0.059 mm for `j`), so it is a deliberate trade.
 
 **Estimate stage, gzipped output** (`wk-medic` vs `niimath --medic`):
 
@@ -365,7 +367,9 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 | --- | --- | --- | --- | --- |
 | `wk-medic` | 15.63 s | 65.07 s | 4.2x | 3.40 GB |
 | `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.35 GB** |
-| `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.35 GB |
+| `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.19 GB |
+
+(Those two rows are separate runs from the like-for-like table above and predate the mask-retention change; the uncompressed row is the same configuration as the 8-thread row there, so read 2.24 GB as current.)
 
 **Apply stage** (one echo, 170 frames):
 
