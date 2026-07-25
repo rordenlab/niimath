@@ -1,0 +1,109 @@
+Third-party notices for src/romeo.c / src/romeo.h (niimath `-romeo`)
+====================================================================
+
+src/romeo.c is a C port of the Julia sources listed below.  Each is MIT-licensed; the
+original copyright and permission notices are reproduced verbatim, as the MIT licence
+requires.  The pinned reference versions are recorded at the top of src/romeo.c.
+
+Algorithm citation (please cite when using `-romeo`):
+  Dymerska, B., Eckstein, K., Bachrata, B., Siow, B., Trattnig, S., Shmueli, K.,
+  Robinson, S.D., 2020. "Phase Unwrapping with a Rapid Opensource Minimum Spanning TreE
+  AlgOrithm (ROMEO)." Magnetic Resonance in Medicine.  https://doi.org/10.1002/mrm.28563
+
+
+--------------------------------------------------------------------------------------
+1. ROMEO.jl  (https://github.com/korbinian90/ROMEO.jl), v1.4.0
+   Ported: utility.jl, priorityqueue.jl, weights.jl, seed.jl, algorithm.jl,
+           region_handling.jl, unwrapping.jl, voxelquality.jl, ext/RomeoApp/
+--------------------------------------------------------------------------------------
+
+Copyright (c) 2019 Korbinian Eckstein, Barbara Dymerska
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+--------------------------------------------------------------------------------------
+2. MriResearchTools.jl  (https://github.com/korbinian90/MriResearchTools.jl), v3.5.0
+   Ported: masking.jl (robustmask, fill_holes), smoothing.jl (gaussiansmooth3d box
+           filter), utility.jl (sample, approxextrema), niftihandling.jl (readphase
+           rescaling), romeofunctions.jl
+--------------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2019 Korbinian Eckstein
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+--------------------------------------------------------------------------------------
+3. The Julia programming language standard library  (https://github.com/JuliaLang/julia)
+   Ported: base/math.jl (rem2pi, add22condh) and base/special/rem_pio2.jl
+           (rem_pio2_kernel, cody_waite_*, paynehanek, fromfraction), needed because
+           Julia's rem2pi uses an infinitely precise 2*pi and libc remainder() does not.
+   The rem_pio2_kernel and cody_waite_* routines are themselves derived from FDLIBM's
+   __ieee754_rem_pio2; the Sun Microsystems notice follows the Julia licence.
+--------------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2009-2024: Jeff Bezanson, Stefan Karpinski, Viral B. Shah, and other
+contributors: https://github.com/JuliaLang/julia/contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+Developed at SunPro, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this
+software is freely granted, provided that this notice
+is preserved.

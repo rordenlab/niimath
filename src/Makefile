@@ -23,6 +23,16 @@ AFASTMATH= -ffast-math -fno-finite-math-only
 AFLAGS= -DHAVE_ALLINEATE
 ALOBJS= allineate.o powell_newuoa.o coreg_fast.o reface.o
 
+#ROMEO phase unwrapping (-romeo). Faithful MIT-licensed port of ROMEO.jl + the
+#MriResearchTools.jl helpers its CLI app uses; see src/romeo.LICENSE. Enabled by default;
+#run "ROMEO=0 make" to omit it. romeo.o is a PREBUILT OBJECT compiled STRICT-FP: the rest of
+#niimath is whole-program -ffast-math, and a single reassociated/contracted expression can move
+#an 8-bit edge weight across a rescale() bin boundary, change the spanning tree, and shift a
+#whole connected region by 2*pi. These flags must come AFTER $(CFLAGS) so they win.
+ROMEOFLAGS= -DHAVE_ROMEO
+ROMEOOBJS= romeo.o
+ROMEO_STRICT_FP= -fno-fast-math -ffp-contract=off
+
 #Zlib flags
 ZFLAGS= -DHAVE_ZLIB -lz
 # Optional zlib-ng for native builds WITHOUT CMake. Point ZLIBNG_ROOT at a ZLIB_COMPAT build
@@ -150,6 +160,15 @@ ifeq "$(AL)" "0"
 	ALOBJS=
 endif
 
+#run "ROMEO=0 make" for compile without ROMEO phase unwrapping (-romeo)
+ifeq "$(ROMEO)" "0"
+	ROMEOFLAGS=
+	ROMEOOBJS=
+	ROMEO_SRC=
+else
+	ROMEO_SRC= romeo.c
+endif
+
 # run "QWARP=1 make" to include -qwarp nonlinear (deformable) registration, an attributed
 # public-domain port of AFNI 3dQwarp (qwarp.c/.h). OFF by default: it is memory/CPU-heavy,
 # benefits greatly from OpenMP, and is impractically slow in WASM. Requires allineate
@@ -188,8 +207,8 @@ ifeq ($(UNAME_S),Darwin)
 	LDFLAGS =
 endif
 
-all: $(ALOBJS)
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+all: $(ALOBJS) $(ROMEOOBJS)
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(ROMEOFLAGS) $(ROMEOOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
 # Canonical local regression: build, then run the stdlib-only release smoke test
 # (`.github/scripts/release_smoke.py`) against the freshly built binary. It synthesizes small
@@ -237,8 +256,21 @@ reface.o: reface.c reface.h core32.h nifti_io.h .al_obj_flags
 qwarp.o: qwarp.c qwarp.h core32.h nifti_io.h .al_obj_flags
 	$(CNAME) $(CFLAGS) -MMD -MP -c qwarp.c -o qwarp.o
 
+# romeo.o has its OWN flag signature: it must rebuild when CNAME, the optimisation/debug/
+# sanitizer flags, OMP or ROMEO change even in an AL=0 build (where .al_obj_flags is unused).
+# ROMEO_STRICT_FP is appended AFTER $(CFLAGS) so -fno-fast-math wins over the repository-wide
+# -ffast-math; that is the whole point of the separate object.
+ROMEO_OBJ_SIG := $(CNAME)|$(CFLAGS)|$(ROMEOFLAGS)|$(ROMEO_STRICT_FP)
+.PHONY: force_romeo_flags
+force_romeo_flags: ;
+.romeo_obj_flags: force_romeo_flags
+	@printf '%s' '$(ROMEO_OBJ_SIG)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(ROMEO_OBJ_SIG)' > $@
+
+romeo.o: romeo.c romeo.h core.h nifti_io.h .romeo_obj_flags
+	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -MMD -MP -c romeo.c -o romeo.o
+
 # Auto-generated header dependencies for the prebuilt registration objects (from -MMD).
--include allineate.d powell_newuoa.d coreg_fast.d reface.d qwarp.d
+-include allineate.d powell_newuoa.d coreg_fast.d reface.d qwarp.d romeo.d
 
 #allineate source files for non-default targets (compiled directly, not as separate .o)
 ALSRC=
@@ -253,11 +285,13 @@ endif
 # emits a separate artifact so benchmarking it never overwrites the normal OpenMP binary.
 .PHONY: native-noomp
 native-noomp:
-	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
+	$(if $(ROMEOOBJS),$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo.o)
+	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
 
 #issue30: static build
 static:
-	gcc -O3 -static -std=gnu99 $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	$(if $(ROMEOOBJS),gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEO_STRICT_FP) $(OMPFLAGS) -c romeo.c -o romeo.o)
+	gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
@@ -269,15 +303,18 @@ nano:
 
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(if $(ROMEOOBJS),$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo.o)
+	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(if $(ROMEOOBJS),$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo.o)
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # Lightweight undefined-behavior diagnostics. Unlike the Apple-Clang ASan target below,
 # UBSan is safe with Homebrew libomp on Apple Silicon and retains the normal OpenMP paths.
 ubsan:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo.o)
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
@@ -294,7 +331,8 @@ ubsan:
 # build a separate target with Homebrew LLVM clang (/opt/homebrew/opt/llvm/bin/clang).
 # Run with: MallocNanoZone=0 make sanitize
 sanitize:
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo.o)
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,
@@ -314,6 +352,19 @@ sanitize:
 # Pre-build allineate + powell with -ffast-math (matches the native allineate.o/
 # powell_newuoa.o). Load-bearing: the cost-reduction reassociation it enables is what
 # makes the WASM registration converge to the same optimum as native.
+# The ROMEO object is compiled STRICT-FP even in WASM: unlike allineate (whose cost reduction
+# NEEDS the fast-math reassociation to converge), ROMEO's fidelity depends on the exact bit
+# pattern of every weight. Per-object FP policies coexist in one link.
+WASM_ROMEO=
+WASM_ROMEO_PREREQ=
+ifneq "$(ROMEO)" "0"
+    WASM_ROMEO= $(ROMEOFLAGS) rm_wasm.o
+    WASM_ROMEO_PREREQ= wasm_romeo_obj
+endif
+
+wasm_romeo_obj:
+	emcc -O3 $(ROMEO_STRICT_FP) -DEMSCRIPTEN -DFORCE_INT32_MAX $(ROMEOFLAGS) -c romeo.c -o rm_wasm.o
+
 wasm_al_objs:
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN $(AFLAGS) -c allineate.c -o al_wasm.o
 	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -c powell_newuoa.c -o pn_wasm.o
@@ -326,8 +377,8 @@ wasm_al_objs:
 # by side under separate package.json exports.
 WASM_OUT= ../js/src/niimath.js
 
-wasm: $(WASM_AL_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+wasm: $(WASM_AL_PREREQ) $(WASM_ROMEO_PREREQ)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 
@@ -353,6 +404,13 @@ WASI_CC= zig cc -target wasm32-wasi
 WASI_CFLAGS= -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DFORCE_INT32_MAX -DNII_WASI -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH
 # Scoped compute sources. niimath.c is compiled separately (with -Dmain=niimath_entry).
 WASI_SRCS= core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c reface.c wasi_shim.c
+# ROMEO is compiled separately (strict FP) and linked as an object; see wasm_romeo_obj.
+WASI_ROMEO=
+WASI_ROMEO_OBJ=
+ifneq "$(ROMEO)" "0"
+    WASI_ROMEO= $(ROMEOFLAGS)
+    WASI_ROMEO_OBJ= romeo_wasi.o
+endif
 WASI_EXPORTS= -Wl,--export=nii_run -Wl,--export=malloc -Wl,--export=free -Wl,--export=_initialize -Wl,--export-memory
 WASI_OUT= ../js/src/niimath-wasi.wasm
 
@@ -362,9 +420,10 @@ wasi-toolcheck:
 	@echo "WASI toolchain OK: zig $$(zig version)"
 
 wasm-wasi: wasi-toolcheck
-	$(WASI_CC) $(WASI_CFLAGS) -Dmain=niimath_entry -c niimath.c -o niimath_wasi.o
-	$(WASI_CC) $(WASI_CFLAGS) -mexec-model=reactor $(WASI_EXPORTS) -Wl,--gc-sections -Wl,--strip-all niimath_wasi.o $(WASI_SRCS) -lm -o $(WASI_OUT)
-	@rm -f niimath_wasi.o
+	$(if $(WASI_ROMEO_OBJ),$(WASI_CC) $(WASI_CFLAGS) $(ROMEO_STRICT_FP) $(ROMEOFLAGS) -c romeo.c -o $(WASI_ROMEO_OBJ))
+	$(WASI_CC) $(WASI_CFLAGS) $(WASI_ROMEO) -Dmain=niimath_entry -c niimath.c -o niimath_wasi.o
+	$(WASI_CC) $(WASI_CFLAGS) $(WASI_ROMEO) -mexec-model=reactor $(WASI_EXPORTS) -Wl,--gc-sections -Wl,--strip-all niimath_wasi.o $(WASI_SRCS) $(WASI_ROMEO_OBJ) -lm -o $(WASI_OUT)
+	@rm -f niimath_wasi.o $(WASI_ROMEO_OBJ)
 	@# Optional post-parity size pass (Binaryen). Skipped with a hint if wasm-opt is absent, so a
 	@# plain checkout still builds. -all enables the wasm features the reactor uses (bulk-memory,
 	@# sign-ext, etc.); re-run conformance after a toolchain bump to re-confirm parity.
@@ -377,8 +436,9 @@ wasm-wasi: wasi-toolcheck
 # host-side gzip path. Same scoped sources/defines as wasm-wasi; NO -sUSE_ZLIB (raw bytes only).
 EMCC_CORE_OUT= ../js/src/niimath-emcc-core.js
 wasm-emcc-core:
-	emcc -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DEMSCRIPTEN -DFORCE_INT32_MAX -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH \
-	  niimath.c core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c reface.c \
+	$(if $(ROMEOOBJS),emcc -O3 $(ROMEO_STRICT_FP) -DEMSCRIPTEN -DFORCE_INT32_MAX $(ROMEOFLAGS) -c romeo.c -o romeo_emcc.o)
+	emcc -O3 -flto -ffast-math -fno-finite-math-only -msimd128 -DEMSCRIPTEN -DFORCE_INT32_MAX -DFSLSTYLE -DREJECT_COMPLEX -DHAVE_CONFORM -DHAVE_64BITS -DHAVE_ALLINEATE -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_BUTTERWORTH $(ROMEOFLAGS) \
+	  niimath.c core.c core32.c core64.c nifti_io.c conform.c unifize.c tensor.c dtifit.c qc.c bw.c allineate.c powell_newuoa.c coreg_fast.c reface.c $(if $(ROMEOOBJS),romeo_emcc.o) \
 	  -s STACK_SIZE=4194304 -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 \
 	  -s EXPORTED_RUNTIME_METHODS='["callMain","ccall","cwrap","FS_createDataFile","FS_readFile","FS_unlink","stringToUTF8","getValue","setValue"]' \
 	  -s EXPORTED_FUNCTIONS='["_main","_malloc","_free"]' -s INVOKE_RUN=0 -o $(EMCC_CORE_OUT)
