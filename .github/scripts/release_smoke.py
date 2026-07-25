@@ -410,6 +410,125 @@ def assert_payload_size(path: Path, datatype: int, bitpix: int, dims: tuple[int,
         raise AssertionError(f"{path}: expected {expected_size} bytes from header, saw {len(blob)}")
 
 
+def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
+    """-romeo phase unwrapping.
+
+    Checks the RESULT, not merely a zero exit status, with a property that pins the answer
+    exactly and stays portable across the five wheel runners: unwrap a synthetic phase whose
+    ground truth is known, and require `unwrapped - ground_truth` to be ONE constant multiple
+    of 2*pi over the whole volume.  Any mis-assigned wrap shows up as a second constant.
+    """
+    if "NOT in this build" in help_text and "-romeo <mag|none>" in help_text:
+        print("  -romeo: not built (ROMEO=0) - skipping")
+        return
+
+    dims = (12, 10, 8)
+    nvox = dims[0] * dims[1] * dims[2]
+    two_pi = 6.283185307179586
+
+    truth = []
+    mag = []
+    for k in range(dims[2]):
+        for j in range(dims[1]):
+            for i in range(dims[0]):
+                truth.append(0.9 * i + 0.4 * j + 0.25 * k)
+                # bright core, dark rim: gives robustmask something to find
+                core = (2 <= i < dims[0] - 2) and (2 <= j < dims[1] - 2) and (1 <= k < dims[2] - 1)
+                mag.append(900.0 + (i + j + k) % 7 if core else 10.0)
+    wrapped = [t - two_pi * round(t / two_pi) for t in truth]
+    if max(wrapped) - min(wrapped) < 5.0:
+        raise AssertionError("romeo fixture is not actually wrapped")
+
+    phase_path = tmp / "romeo_phase.nii"
+    mag_path = tmp / "romeo_mag.nii"
+    write_float32_nifti(phase_path, dims, wrapped)
+    write_float32_nifti(mag_path, dims, mag)
+
+    # 1. nomask: every voxel is unwrapped, so the property covers the whole volume.
+    out = tmp / "romeo_out.nii"
+    require_success(
+        run_niimath(exe, [str(phase_path), "-gz", "0", "-romeo", str(mag_path), "-t", "5.0",
+                          "-k", "nomask", "-no-phase-rescale", str(out)]),
+        "romeo unwrap (nomask)",
+    )
+    got = read_float32_nifti(out)
+    if len(got) != nvox:
+        raise AssertionError("romeo output has %d voxels, expected %d" % (len(got), nvox))
+    offsets = set()
+    for value, expected in zip(got, truth):
+        delta = value - expected
+        wraps = round(delta / two_pi)
+        if abs(delta - wraps * two_pi) > 1e-3:
+            raise AssertionError(
+                "romeo left a residual of %g rad (not a multiple of 2*pi)" % (delta - wraps * two_pi)
+            )
+        offsets.add(wraps)
+    if len(offsets) != 1:
+        raise AssertionError("romeo assigned %d different 2*pi offsets: %s" % (len(offsets), sorted(offsets)))
+    if (tmp / "romeo_out_mask.nii").exists():
+        raise AssertionError("-k nomask must not write a mask side output")
+
+    # 2. default robustmask: writes a 0/1 mask, and the unwrapped phase still rewraps to the input
+    out2 = tmp / "romeo_masked.nii"
+    require_success(
+        run_niimath(exe, [str(phase_path), "-gz", "0", "-romeo", str(mag_path), "-t", "5.0",
+                          "-no-phase-rescale", "-q", str(out2)]),
+        "romeo unwrap (robustmask)",
+    )
+    mask_path = tmp / "romeo_masked_mask.nii"
+    if not mask_path.exists():
+        raise AssertionError("robustmask must write a <out>_mask side output")
+    mask = read_float32_nifti(mask_path)
+    if set(mask) - {0.0, 1.0}:
+        raise AssertionError("romeo mask is not binary")
+    if not 0 < sum(mask) < nvox:
+        raise AssertionError("romeo mask is empty or covers everything (%g of %d)" % (sum(mask), nvox))
+    quality = read_float32_nifti(tmp / "romeo_masked_quality.nii")
+    if min(quality) < -1e-6 or max(quality) > 1.0 + 1e-6:
+        raise AssertionError("romeo quality map outside [0,1]: %g..%g" % (min(quality), max(quality)))
+    unwrapped2 = read_float32_nifti(out2)
+    for value, original in zip(unwrapped2, wrapped):
+        delta = value - original
+        if abs(delta - round(delta / two_pi) * two_pi) > 1e-3:
+            raise AssertionError("romeo output does not rewrap to its input")
+
+    # 3. options that must FAIL with a specific message rather than being silently ignored
+    for opts, needle in (
+        (["-w", "romeo9"], "unknown -w"),
+        (["-w", "bestpath"], "not implemented"),
+        (["-t", "notanumber"], "cannot parse -t"),
+        (["-max-seeds", "2"], "not implemented"),
+        (["-k", "0.25"], "undefined"),
+    ):
+        bad = run_niimath(exe, [str(phase_path), "-romeo", str(mag_path), "-t", "5.0"] + opts + [str(tmp / "romeo_bad.nii")])
+        if bad.returncode == 0:
+            raise AssertionError("romeo %s should have failed" % " ".join(opts))
+        if needle not in (bad.stdout + bad.stderr):
+            raise AssertionError("romeo %s error message lacks %r" % (" ".join(opts), needle))
+
+    # 4. multi-echo: temporal unwrapping keeps every echo consistent with its own wrapped input
+    truth2 = [t * (11.0 / 5.0) for t in truth]
+    wrapped2 = [t - two_pi * round(t / two_pi) for t in truth2]
+    phase4d = tmp / "romeo_phase4d.nii"
+    mag4d = tmp / "romeo_mag4d.nii"
+    write_float32_nifti(phase4d, dims, wrapped + wrapped2, nt=2)
+    write_float32_nifti(mag4d, dims, mag + mag, nt=2)
+    out3 = tmp / "romeo_me.nii"
+    require_success(
+        run_niimath(exe, [str(phase4d), "-gz", "0", "-romeo", str(mag4d), "-t", "[5.0,11.0]",
+                          "-k", "nomask", "-no-phase-rescale", str(out3)]),
+        "romeo multi-echo unwrap",
+    )
+    me = read_float32_nifti(out3)
+    if len(me) != 2 * nvox:
+        raise AssertionError("romeo multi-echo output has %d voxels, expected %d" % (len(me), 2 * nvox))
+    for value, original in zip(me, wrapped + wrapped2):
+        delta = value - original
+        if abs(delta - round(delta / two_pi) * two_pi) > 1e-3:
+            raise AssertionError("romeo multi-echo output does not rewrap to its input")
+    print("  -romeo: unwrap/mask/quality/multi-echo OK")
+
+
 def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     """Regression for the -allineate -fill / -weight options and the -dilate fix — the
     niimath-only dispatch, chain integration, and CLI parsing that the shared allineate
@@ -678,7 +797,7 @@ def main() -> int:
         info = run_niimath(exe, [])
         require_success(info, "help/version")
         help_text = info.stdout + info.stderr
-        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-bandpass", "-mesh"):
+        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-bandpass", "-mesh", "-romeo"):
             if token not in help_text:
                 raise AssertionError(f"packaged binary help is missing {token}")
         if args.expect_bsd and " BSD " not in help_text:
@@ -892,6 +1011,7 @@ def main() -> int:
         exercise_qc(exe, tmp)
 
         exercise_allineate(exe, tmp, help_text)
+        exercise_romeo(exe, tmp, help_text)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])

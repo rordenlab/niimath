@@ -63,6 +63,24 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         ADD_DEFINITIONS(-DHAVE_QC)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} qc.c)
     endif()
+    # ROMEO phase unwrapping (-romeo). romeo.c MUST be compiled strict-FP: the whole program is
+    # built -ffast-math below, and reassociation moves ROMEO's 8-bit edge weights across a
+    # rescale() bin boundary, which changes the spanning tree and shifts whole regions by 2*pi
+    # (measured: 360/797088 weight bytes, 66 voxels off by a full wrap). Per-source FP options
+    # survive IPO/LTO because the flag is applied at compile time, before any link-time pass.
+    option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
+    if(ENABLE_ROMEO)
+        ADD_DEFINITIONS(-DHAVE_ROMEO)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} romeo.c)
+        if(MSVC)
+            # MSVC never gets the whole-program fast-math above, but be explicit: /fp:precise
+            # forbids the reassociation that would break the weight bins.
+            set_source_files_properties(romeo.c PROPERTIES COMPILE_OPTIONS "/fp:precise")
+        else()
+            set_source_files_properties(romeo.c PROPERTIES
+                COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+        endif()
+    endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)

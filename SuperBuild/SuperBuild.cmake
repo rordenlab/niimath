@@ -50,6 +50,7 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 # instead of silently reporting an unused variable.
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
+option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
 if(ENABLE_QWARP AND NOT ENABLE_ALLINEATE)
@@ -116,6 +117,7 @@ ExternalProject_Add(src
         -DENABLE_GPL:BOOL=${ENABLE_GPL}
         -DUSE_OPENMP:BOOL=${USE_OPENMP}
         -DENABLE_QC:BOOL=${ENABLE_QC}
+        -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}
         -DENABLE_QWARP:BOOL=${ENABLE_QWARP}
         -DBUILD_BMP:BOOL=${BUILD_BMP}

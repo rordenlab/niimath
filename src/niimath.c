@@ -370,6 +370,22 @@ int show_help( void ) {
 	printf("                              input must ALREADY be unifized + skull-stripped + affine-aligned + share the base grid. Memory/CPU-heavy; benefits from OpenMP; QW_VERB=1 for a per-level trace\n");
 #endif
 #endif
+#ifdef HAVE_ROMEO
+	printf(" -romeo <mag|none> [opts] : ROMEO phase unwrapping (MIT port of ROMEO.jl). Input is wrapped phase, 3D or 4D (echoes on dim 4)\n");
+	printf("                            magnitude is a REQUIRED positional argument; pass 'none' to unwrap without one\n");
+	printf("                            opts: -t <TEs>       echo times in ms: 16.8 | 16.8,38.56 | '[16.8,38.56]' | epi [te] (quote the bracket form)\n");
+	printf("                                  -k <spec>      nomask | robustmask (default) | qualitymask [thr] | <mask file>\n");
+	printf("                                  -w <spec>      romeo (default) | romeo2 | romeo3 | romeo4 | romeo6 | <up to 6 bits, e.g. 1010>\n");
+	printf("                                  -template <n>  echo unwrapped spatially (default 1);  -i individual (not temporal) unwrapping\n");
+	printf("                                  -temporal-uncertain-unwrapping [x]  respatial-unwrap low-quality voxels (default 0.5 when given)\n");
+	printf("                                  -g correct global n2pi offset;  -q write <out>_quality;  -Q write <out>_quality_1..6\n");
+	printf("                                  -no-phase-rescale;  -no-mask-out (suppress <out>_mask);  -v verbose\n");
+	printf("                            side outputs use nifti_save postfixes on <out>: <out>_mask, <out>_quality[_1..6]\n");
+	printf("                            phase is rescaled to [-pi,pi] unless -no-phase-rescale, which requires -romeo to be the FIRST operation\n");
+	printf("                            cite: Dymerska et al. 2020, Magn Reson Med, doi:10.1002/mrm.28563\n");
+#else
+	printf(" -romeo <mag|none> [opts] : ROMEO phase unwrapping — NOT in this build (rebuild without ROMEO=0 / with -DENABLE_ROMEO=ON)\n");
+#endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
 	printf("                            opts: -cost XX (nmi,mi,ecc,ncc,ls) -sep 4 2 -fwhm 7 7 -dither 0|1\n");

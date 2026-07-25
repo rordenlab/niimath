@@ -1404,7 +1404,22 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 					double v;
 					if (!rm_parse_double(argv[ac], &v)) { o->qmask_thresh = v; o->qmask_thresh_set = 1; ac++; }
 				}
-			} else { o->mask_sel = RM_MASK_FILE; o->mask_file = spec; }
+			} else {
+				/* set_mask! treats any token that names an existing file as a mask and errors
+				   otherwise, with a hint when the token looks like a bare qualitymask threshold. */
+				FILE *probe = fopen(spec, "rb");
+				if (!probe) {
+					double v;
+					if (!rm_parse_double(spec, &v))
+						RM_ERR("masking option '%s' is undefined (Maybe '-k qualitymask %s' was meant?)\n", spec, spec);
+					else
+						RM_ERR("masking option '%s' is undefined (nomask | robustmask | qualitymask [thr] | <mask file>)\n", spec);
+					return 1;
+				}
+				fclose(probe);
+				o->mask_sel = RM_MASK_FILE;
+				o->mask_file = spec;
+			}
 			continue;
 		}
 		if (!strcmp(a, "-w")) {

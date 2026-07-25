@@ -8,7 +8,7 @@
  * `src/niimath` reference binary and `make -C src wasm-wasi` reactor.
  */
 import { test, expect, beforeAll, describe } from "bun:test";
-import { readFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -316,6 +316,96 @@ describe("QC (TSV schema + numeric parity)", () => {
         expect(rel, `col ${hv[i]}: wasi=${wv[i]} native=${nv[i]}`).toBeLessThan(1e-3);
       }
     }
+  });
+});
+
+/* Minimal NIfTI-1 (n+1) float32 writer, so the ROMEO fixtures below are synthesized in-test
+   rather than committed: -romeo needs a WRAPPED phase, which none of the existing fixtures are. */
+function writeF32Nifti(nx: number, ny: number, nz: number, nt: number, data: Float32Array): Uint8Array {
+  const buf = new Uint8Array(352 + data.length * 4);
+  const dv = new DataView(buf.buffer);
+  dv.setInt32(0, 348, true);
+  const dims = [nt > 1 ? 4 : 3, nx, ny, nz, nt, 1, 1, 1];
+  for (let i = 0; i < 8; i++) dv.setInt16(40 + i * 2, dims[i], true);
+  dv.setInt16(70, 16, true);  // DT_FLOAT32
+  dv.setInt16(72, 32, true);  // bitpix
+  const pix = [1, 1, 1, 1, 0, 0, 0, 0];
+  for (let i = 0; i < 8; i++) dv.setFloat32(76 + i * 4, pix[i], true);
+  dv.setFloat32(108, 352, true); // vox_offset
+  dv.setFloat32(112, 1, true);   // scl_slope
+  buf[123] = 2;                  // xyz_units = mm
+  dv.setInt16(252, 1, true);     // qform_code
+  dv.setInt16(254, 1, true);     // sform_code
+  dv.setFloat32(280, 1, true); dv.setFloat32(300, 1, true); dv.setFloat32(320, 1, true);
+  buf.set(new Uint8Array([0x6e, 0x2b, 0x31, 0x00]), 344); // "n+1\0"
+  new Float32Array(buf.buffer, 352, data.length).set(data);
+  return buf;
+}
+
+describe("ROMEO phase unwrapping (-romeo)", () => {
+  const NX = 12, NY = 10, NZ = 8, N = NX * NY * NZ, TWO_PI = 2 * Math.PI;
+  const truth = new Float32Array(N);
+  const wrapped = new Float32Array(N);
+  const mag = new Float32Array(N);
+  for (let k = 0, i = 0; k < NZ; k++) for (let j = 0; j < NY; j++) for (let x = 0; x < NX; x++, i++) {
+    const t = 0.9 * x + 0.4 * j + 0.25 * k;
+    truth[i] = t;
+    wrapped[i] = t - TWO_PI * Math.round(t / TWO_PI);
+    const core = x >= 2 && x < NX - 2 && j >= 2 && j < NY - 2 && k >= 1 && k < NZ - 1;
+    mag[i] = core ? 900 + ((x + j + k) % 7) : 10;
+  }
+  const phaseNii = writeF32Nifti(NX, NY, NZ, 1, wrapped);
+  const magNii = writeF32Nifti(NX, NY, NZ, 1, mag);
+
+  test("wasm32 reactor unwraps identically to the native binary (and to ground truth)", async () => {
+    const pPath = tmp("romeo_phase.nii"), mPath = tmp("romeo_mag.nii"), nPath = tmp("romeo_native.nii");
+    writeFileSync(pPath, phaseNii);
+    writeFileSync(mPath, magNii);
+    nativeRaw([pPath, "-romeo", mPath, "-t", "5.0", "-k", "nomask", "-no-phase-rescale", nPath]);
+
+    const r = await runner.runFiles({
+      argv: ["p.nii", "-romeo", "m.nii", "-t", "5.0", "-k", "nomask", "-no-phase-rescale", "out.nii"],
+      inputs: { "p.nii": phaseNii, "m.nii": magNii },
+      outputs: ["out.nii"],
+    });
+    expect(r.exitCode).toBe(0);
+    const wasi = payloadFloat(r.files["out.nii"]);
+    const native = payloadFloat(rd(nPath));
+    // wasm32 vs native arm64/x86: same strict-FP source, so require exact agreement
+    expect(maxAbsDiff(wasi, native)).toBe(0);
+    // and the unwrap itself must be right: ONE constant 2*pi offset from the ground truth
+    const offsets = new Set<number>();
+    for (let i = 0; i < N; i++) {
+      const d = wasi[i] - truth[i];
+      const w = Math.round(d / TWO_PI);
+      expect(Math.abs(d - w * TWO_PI)).toBeLessThan(1e-3);
+      offsets.add(w);
+    }
+    expect(offsets.size).toBe(1);
+  });
+
+  test("robustmask writes a binary <out>_mask side output", async () => {
+    const r = await runner.runFiles({
+      argv: ["p.nii", "-romeo", "m.nii", "-t", "5.0", "-no-phase-rescale", "out.nii"],
+      inputs: { "p.nii": phaseNii, "m.nii": magNii },
+      outputs: ["out.nii", "out_mask.nii"],
+    });
+    expect(r.exitCode).toBe(0);
+    const mask = payloadFloat(r.files["out_mask.nii"]);
+    let inside = 0;
+    for (const v of mask) { expect(v === 0 || v === 1).toBe(true); if (v === 1) inside++; }
+    expect(inside).toBeGreaterThan(0);
+    expect(inside).toBeLessThan(N);
+  });
+
+  test("an unported ROMEO option fails with a specific message, not a silent no-op", async () => {
+    const r = await runner.runFiles({
+      argv: ["p.nii", "-romeo", "m.nii", "-t", "5.0", "-w", "bestpath", "o.nii"],
+      inputs: { "p.nii": phaseNii, "m.nii": magNii },
+      outputs: [],
+    });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("not implemented");
   });
 });
 
