@@ -28,6 +28,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _MSC_VER
+	#include <unistd.h>   /* getpid() for the temporary output prefix */
+#else
+	#include <process.h>
+	#define getpid _getpid
+#endif
 #ifdef _OPENMP
 	#include <omp.h>
 #endif
@@ -342,7 +348,7 @@ done:
  *
  * a[] is T*T row-major and is destroyed; v[] receives the eigenvectors as columns; w[] the
  * eigenvalues.  Returns 0 on success. */
-static int md_jacobi_eigh(double *a, double *v, double *w, int n) {
+static void md_jacobi_eigh(double *a, double *v, double *w, int n) {
 	int i, j, p, q, sweep;
 	for (i = 0; i < n; i++) for (j = 0; j < n; j++) v[(size_t)i * n + j] = (i == j) ? 1.0 : 0.0;
 	for (sweep = 0; sweep < 100; sweep++) {
@@ -388,7 +394,6 @@ static int md_jacobi_eigh(double *a, double *v, double *w, int n) {
 			}
 		}
 	}
-	return 0;
 }
 
 /* Rank-`rank` truncation of the Nvox x T matrix F, in place, UNCENTERED (manifest §3.8).
@@ -416,30 +421,16 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 			G[(size_t)i * T + j] = G[(size_t)j * T + i] = s;
 		}
 	}
-	/* FAIL CLOSED on a non-finite spectrum.  One NaN voxel anywhere in the series poisons the
-	   whole Gram matrix, which makes every eigenvalue NaN, which makes every `w[k] > ...` test
-	   below false at k == 0 -- and r == 0 builds the ZERO projector and silently multiplies the
-	   entire field-map series by it, exiting 0.  That is the worst possible failure mode: all
-	   three outputs come back identically zero and nothing says so.  (Magnitude guards, not
-	   isfinite(): this TU is -ffast-math.) */
-	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
-		double g = G[(size_t)i * T + j];
-		if (!(g >= -DBL_MAX && g <= DBL_MAX)) {
-			MD_ERR("field maps contain non-finite values; the low-rank filter cannot run "
-				"(use --rank 0 to skip it)\n");
-			goto done;
-		}
-	}
-	if (md_jacobi_eigh(G, V, w, T)) goto done;
+	md_jacobi_eigh(G, V, w, T);
 
-	/* numerical rank: drop directions that are pure round-off relative to the leading one */
+	/* Numerical rank: drop directions that are pure round-off relative to the leading one.
+	   The series is known finite here (md_all_finite() gates the caller), so r == 0 can only mean
+	   a genuinely zero/degenerate spectrum -- e.g. an all-zero field, whose rank-k truncation is
+	   itself zero.  That is a NO-OP, not an error; only a non-finite series is an error, and that
+	   is caught before this function is reached. */
 	r = rank < T ? rank : T;
 	for (k = 0; k < r; k++) if (!(w[k] > w[0] * 1e-24) || !(w[k] > 0.0)) { r = k; break; }
-	if (r <= 0) {   /* never write a zero projector over real data */
-		MD_ERR("low-rank filter found no positive spectrum in the field-map series\n");
-		goto done;
-	}
-	if (r >= T) { rc = 0; goto done; }
+	if (r <= 0 || r >= T) { rc = 0; goto done; }   /* nothing to project onto, or nothing to drop */
 
 	/* P = V_r V_r^T (T x T projector) */
 	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
@@ -457,7 +448,8 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 			   the reduction reports it -- hence the error text below says so.  Fail-loud, not
 			   atomic. */
 			size_t bytes;
-			if (nii_mul_size((size_t)(CH < nvox ? CH : nvox) * T, sizeof(float), &bytes)) {
+			if (nii_mul_size((size_t)(CH < nvox ? CH : nvox), (size_t)T, &bytes) ||
+				nii_mul_size(bytes, sizeof(float), &bytes)) {
 				MD_ERR("low-rank scratch size overflows this build's address space\n");
 				goto done;
 			}
@@ -498,6 +490,14 @@ done:
 }
 
 /* ============================== MEDIC stages ============================== */
+
+/* Magnitude guards, not isfinite(): this TU is -ffast-math. */
+static int md_all_finite(const float *v, int64_t n) {
+	int64_t i;
+	for (i = 0; i < n; i++) if (!(v[i] >= -FLT_MAX && v[i] <= FLT_MAX)) return 0;
+	return 1;
+}
+
 
 typedef struct {
 	int nx, ny, nz, neco, nframe;
@@ -649,8 +649,10 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 	int64_t i;
 	size_t bytes;
 	if (T < 2) return 0;
-	if (nii_mul_size((size_t)T, (size_t)T * sizeof(double), &bytes) ||
-		nii_mul_size((size_t)n3, (size_t)T * sizeof(float), &bytes)) {
+	if (nii_mul_size((size_t)T, (size_t)T, &bytes) ||
+		nii_mul_size(bytes, sizeof(double), &bytes) ||
+		nii_mul_size((size_t)n3, (size_t)T, &bytes) ||
+		nii_mul_size(bytes, sizeof(float), &bytes)) {
 		MD_ERR("frame count %d is too large for the temporal correction on this build\n", T);
 		return 1;
 	}
@@ -792,6 +794,23 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 
 /* ============================== output ============================== */
 
+#define MD_PATH_MAX 2048
+
+/* Which extension did nifti_save() actually choose?  Returns 1 and fills `out` on success. */
+static int md_find_written(const char *prefix, const char *suffix, char *out, size_t outsz) {
+	static const char *const ext[3] = { ".nii.gz", ".nii.zst", ".nii" };
+	int i;
+	for (i = 0; i < 3; i++) {
+		FILE *f;
+		snprintf(out, outsz, "%s%s%s", prefix, suffix, ext[i]);
+		f = fopen(out, "rb");
+		if (f) { fclose(f); return 1; }
+	}
+	out[0] = '\0';
+	return 0;
+}
+
+
 static int md_write(const md_ctx *c, const char *suffix, const float *vol, int nframe, gzModes gz) {
 	nifti_image *n = c->tmpl;
 	void *savedata = n->data;
@@ -799,6 +818,8 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	int64_t saved_nvox = n->nvox;
 	float saved_slope = n->scl_slope, saved_inter = n->scl_inter;
 	char *saved_fname = n->fname, *saved_iname = n->iname;
+	/* n->data is NULL here by design: the template's payload is freed after repacking and only
+	   its header is retained.  We swap in our own buffer for the write and restore NULL after. */
 	char *fname = NULL;
 	int rc;
 	size_t nb = (size_t)c->n3 * (size_t)nframe;
@@ -887,6 +908,7 @@ int nii_medic(int argc, char *argv[]) {
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
 	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
 	int *frc = NULL;
+	uint8_t *maskbuf = NULL;   /* per-frame masks, owned until teardown */
 	romeo_opts ro = romeo_opts_default();
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
@@ -1018,11 +1040,16 @@ int nii_medic(int argc, char *argv[]) {
 			c.nx, c.ny, c.nz, c.neco, T, gb);
 	}
 
-	{	/* Checked: n3 * neco * T * 4 can wrap size_t on a 32-bit / FORCE_INT32_MAX build. */
-		size_t bytes;
-		if (nii_mul_size((size_t)n3 * c.neco, (size_t)T, &bytes) ||
-			nii_mul_size(bytes, sizeof(float), &bytes) ||
-			nii_mul_size((size_t)n3, (size_t)T * sizeof(float), &bytes)) {
+	{	/* Checked: n3 * neco * T * 4 can wrap size_t on a 32-bit / FORCE_INT32_MAX build, where
+		   medic.c IS compiled.  Chain EVERY factor through the checked multiply -- an earlier
+		   version pre-computed `n3 * neco` unchecked and only then handed it over, so the first
+		   product could already have wrapped. */
+		size_t big, small;
+		if (nii_mul_size((size_t)n3, (size_t)c.neco, &big) ||
+			nii_mul_size(big, (size_t)T, &big) ||
+			nii_mul_size(big, sizeof(float), &big) ||
+			nii_mul_size((size_t)n3, (size_t)T, &small) ||
+			nii_mul_size(small, sizeof(float), &small)) {
 			MD_ERR("%d frame(s) x %d echo(es) exceeds this build's address space\n", T, c.neco);
 			goto done;
 		}
@@ -1034,7 +1061,13 @@ int nii_medic(int argc, char *argv[]) {
 	disp = (float *)malloc((size_t)n3 * T * sizeof(float));
 	if (!phase || !mag || !fields || !fu || !disp) { MD_ERR("out of memory allocating the working set\n"); goto done; }
 
-	/* Repack to frame-major, echo-minor and rescale each echo's phase series as readphase does. */
+	/* Repack to frame-major, echo-minor and rescale each echo's phase series as readphase does.
+	 *
+	 * Each echo's inputs are released AS SOON AS they have been repacked, rather than all of them
+	 * afterwards.  Holding all 2*neco input payloads alive across the whole repack put the true
+	 * peak at roughly (4*neco + 3) series while the banner reported (2*neco + 3); freeing per
+	 * echo keeps the overshoot to one echo pair.  Echo 0's phase image is kept: it is the header
+	 * template (c.tmpl) for every output. */
 	for (e = 0; e < c.neco; e++) {
 		float *pe = (float *)ph[e]->data;
 		md_rescale_phase(pe, (int64_t)n3 * Tin);
@@ -1042,16 +1075,18 @@ int nii_medic(int argc, char *argv[]) {
 			memcpy(phase + ((int64_t)t * c.neco + e) * n3, pe + (int64_t)t * n3, (size_t)n3 * sizeof(float));
 			memcpy(mag + ((int64_t)t * c.neco + e) * n3, ((float *)mg[e]->data) + (int64_t)t * n3, (size_t)n3 * sizeof(float));
 		}
+		nifti_image_free(mg[e]); mg[e] = NULL;
+		if (e > 0) { nifti_image_free(ph[e]); ph[e] = NULL; }
+		else { free(ph[0]->data); ph[0]->data = NULL; }   /* keep the header, drop the payload */
 	}
-	for (e = 0; e < c.neco; e++) { nifti_image_free(mg[e]); mg[e] = NULL; }
-	for (e = 1; e < c.neco; e++) { nifti_image_free(ph[e]); ph[e] = NULL; }
 
 	/* ---- per-frame: MCPC-3D-S -> ROMEO -> weighted regression ------------------------------- */
 	{
 		int failed = 0;
 		/* Only when MCPC RUNS: with --phase-offset none nothing fills this, and writing it would
 		   emit uninitialised heap as if it were an image. */
-		float *offs = (c.save_intermediates && c.mcpc) ? (float *)malloc((size_t)n3 * T * sizeof(float)) : NULL;
+		float *offs = (c.save_intermediates && c.mcpc) ? (float *)calloc((size_t)n3 * T, sizeof(float)) : NULL;
+		if (c.save_intermediates && c.mcpc && !offs) { MD_ERR("out of memory for the phase-offset intermediate\n"); goto done; }
 		uint8_t *masks = (uint8_t *)malloc((size_t)n3 * T);
 		if (!masks) { free(offs); MD_ERR("out of memory allocating the per-frame masks\n"); goto done; }
 		/* ONE mask per frame, shared by the MCPC-3D-S phase-difference unwrap and the multi-echo
@@ -1078,8 +1113,11 @@ int nii_medic(int argc, char *argv[]) {
 			for (t = 0; t < T; t++)
 				frc[t] = romeo_robustmask(mag + (int64_t)t * c.neco * n3, c.nx, c.ny, c.nz,
 						masks + (int64_t)t * n3) ? 1 : 0;
-			for (t = 0; t < T; t++) failed |= frc[t];
-			if (failed) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("robustmask failed for frame %d\n", t); goto done; }
+			for (t = 0; t < T; t++) if (frc[t]) { failed = 1; break; }   /* leaves t = FIRST failure */
+			if (failed) {
+				MD_ERR("robustmask failed for frame %d\n", t);
+				free(offs); free(masks); free(frc); frc = NULL; goto done;
+			}
 		}
 #ifdef _OPENMP
 		#pragma omp parallel for schedule(dynamic)
@@ -1120,7 +1158,24 @@ int nii_medic(int argc, char *argv[]) {
 			/* --save-intermediates is an explicit request; a failure to honour it is an error. */
 			if (wrc) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("failed to write an intermediate\n"); goto done; }
 		}
-		free(offs); free(masks); free(frc); frc = NULL;
+		free(offs); free(frc); frc = NULL;
+		maskbuf = masks;   /* kept: the mask gates the unwrapped phase below */
+	}
+
+	/* ---- restrict the unwrapped phase to the mask --------------------------------------------
+	   MEASURED (manifest 3.7): the reference's per-echo unwrapped phase is nonzero exactly on
+	   mask >= 1.  ROMEO's region growing constrains which voxels it VISITS but leaves unvisited
+	   voxels holding their wrapped values, so without this the excluded background carries
+	   arbitrary phase into the regression, the temporal grouping and the SVD basis. */
+	{
+		int64_t q;
+		for (t = 0; t < T; t++) {
+			const uint8_t *mk = maskbuf + (int64_t)t * n3;
+			for (e = 0; e < c.neco; e++) {
+				float *p = phase + ((int64_t)t * c.neco + e) * n3;
+				for (q = 0; q < n3; q++) if (!mk[q]) p[q] = 0.0f;
+			}
+		}
 	}
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
@@ -1140,6 +1195,17 @@ int nii_medic(int argc, char *argv[]) {
 #endif
 	for (t = 0; t < T; t++) {
 		md_regress(&c, phase + (int64_t)t * c.neco * n3, mag + (int64_t)t * c.neco * n3, fields + (int64_t)t * n3);
+	}
+
+	/* ---- non-finite gate ---------------------------------------------------------------------
+	   Checked HERE, on the field series itself, so it is independent of whether the low-rank
+	   filter runs at all.  Gating it inside md_lowrank() made the check frame-count dependent:
+	   with the default rank 10 and T <= 10 that function returns early, so a NaN sailed straight
+	   through to the outputs.  A non-finite field map is never a usable result. */
+	if (!md_all_finite(fields, (int64_t)n3 * T)) {
+		MD_ERR("the estimated field maps contain non-finite values (check the input phase and "
+			"magnitude for NaN/Inf)\n");
+		goto done;
 	}
 
 	/* ---- rank-10 truncation ------------------------------------------------------------------ */
@@ -1170,32 +1236,55 @@ int nii_medic(int argc, char *argv[]) {
 		}
 	}
 
-	/* Fail-atomic: every stage has already completed, so the only remaining failure is I/O.
-	   If any of the three writes fails, remove whichever already landed rather than leaving an
-	   apparently valid partial result set behind. */
+	/* Fail-atomic via SIBLING TEMPORARIES, never by deleting final names.
+	 *
+	 * An earlier revision wrote straight to the final paths and, on failure, removed all three
+	 * output names in every extension -- which destroyed a PREVIOUS run's results that this
+	 * invocation had never touched, and could not restore a final file nifti_save had already
+	 * truncated.  Now every output is written under a temporary prefix; only once all three have
+	 * been written successfully are they renamed into place.  A failure leaves the previous run
+	 * untouched and removes only files this invocation created. */
 	{
 		static const char *const outs[3] = { "_fieldmaps_native", "_fieldmaps", "_displacementmaps" };
 		const float *bufs[3];
-		int k, wrc = 0;
+		char tmppfx[MD_PATH_MAX];
+		char made[3][MD_PATH_MAX];
+		const char *saved_prefix = c.prefix;
+		int k, wrc = 0, nmade = 0;
 		bufs[0] = fields; bufs[1] = fu; bufs[2] = disp;
-		for (k = 0; k < 3 && !wrc; k++) wrc = md_write(&c, outs[k], bufs[k], T, gz);
-		if (wrc) {
-			MD_ERR("failed to write %s; removing partial outputs\n", outs[k > 0 ? k - 1 : 0]);
-			for (k = 0; k < 3; k++) {
-				char path[2048];
-				const char *ext[3] = { ".nii", ".nii.gz", ".nii.zst" };
-				int x;
-				for (x = 0; x < 3; x++) {
-					snprintf(path, sizeof path, "%s%s%s", c.prefix, outs[k], ext[x]);
-					remove(path);
-				}
-			}
+		if ((int)strlen(saved_prefix) + 32 >= MD_PATH_MAX) {
+			MD_ERR("--out-prefix is too long\n");
 			goto done;
+		}
+		snprintf(tmppfx, sizeof tmppfx, "%s.medictmp%ld", saved_prefix, (long)getpid());
+		c.prefix = tmppfx;
+		for (k = 0; k < 3 && !wrc; k++) {
+			wrc = md_write(&c, outs[k], bufs[k], T, gz);
+			if (!wrc && md_find_written(tmppfx, outs[k], made[nmade], MD_PATH_MAX)) nmade++;
+			else if (!wrc) wrc = 1;   /* wrote something we cannot name: treat as failure */
+		}
+		c.prefix = saved_prefix;
+		if (wrc) {
+			MD_ERR("failed to write %s%s; previous outputs left untouched\n",
+				saved_prefix, outs[k > 0 ? k - 1 : 0]);
+			for (k = 0; k < nmade; k++) remove(made[k]);
+			goto done;
+		}
+		for (k = 0; k < 3; k++) {
+			char final[MD_PATH_MAX];
+			const char *ext = strrchr(made[k], '/');
+			ext = strstr(ext ? ext : made[k], ".nii");
+			snprintf(final, sizeof final, "%s%s%s", saved_prefix, outs[k], ext ? ext : ".nii");
+			if (rename(made[k], final) != 0) {
+				MD_ERR("failed to move %s into place\n", final);
+				for (k = 0; k < 3; k++) remove(made[k]);
+				goto done;
+			}
 		}
 	}
 	rc = EXIT_SUCCESS;
 done:
-	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc);
+	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc); free(maskbuf);
 	for (e = 0; e < MD_MAX_ECHO; e++) { if (ph[e]) nifti_image_free(ph[e]); if (mg[e]) nifti_image_free(mg[e]); }
 	return rc;
 }
