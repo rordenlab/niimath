@@ -443,6 +443,37 @@ Six different displacement percentiles appear above and they are **not** measure
 
 Two things this table deliberately does **not** do. It does not reconcile §3.4's 0.006 mm with §3.5b's 0.045 mm — same model, same data, same polarity, 7× apart, and the missing support makes the difference undiagnosable from the record; re-running §3.5b with a stated mask is the only honest fix. And it does not back-fill the pre-gating rows with post-gating values: only the two `--mask` `_displacementmaps` p95 entries were re-measured after that change.
 
+## 5.5 FP policy for medic.c — MEASURED, no strict FP needed
+
+Three audits flagged that `md_rescale_phase()` and `md_mcpc3ds()` run under `-ffast-math` while feeding ROMEO's bin-quantised 8-bit edge weights — the exact mechanism that forces `romeo.c` strict. Settled the way ROMEO's own policy was settled, with `test/medic_experiments/fp_policy_medic.py`.
+
+Two binaries differing **only** in medic.c's FP flags (65 fused multiply-adds versus 0; the fast object is bit-identical to the shipped LTO build, so this measures what ships).
+
+| measurement | result |
+| --- | --- |
+| configurations | 32 (sbref × 8 option sets, 170-frame BOLD × 4, 12 adversarial synthetics) |
+| voxels compared | 508 051 136 |
+| **whole-2π branch differences in unwrapped phase** | **0** |
+| **mask differences** | **0** |
+| largest unwrapped-phase difference | 3.8e-6 rad (1–4 float32 ULP) |
+| largest `_fieldmaps_native` difference | 3.05e-5 Hz |
+
+Adversarial cases included ±π wrap boundaries, a non-representable 2π/3 rescale slope, a gradient sweep driving weights through all 255 `rescale()` bin edges, 1-ULP-tied and 1e±30 magnitudes, and raw-Siemens-scaled versions so `md_rescale_phase()` actually runs.
+
+**Mechanism isolated:** every `offset=none` configuration is **bit-identical**, including raw-scale synthetics where the rescale slope and intercept are both non-terminating in binary and the FMA is live. `md_rescale_phase()` did not move a single float32 value anywhere in the corpus. All divergence comes from `md_mcpc3ds()`, at 1–4 ULP on ~1e-3 of voxels.
+
+**Saturating probe** (the answer to "how hard did you try"): perturbing the phase handed to ROMEO by ±1 float32 ULP at **100 %** of voxels — one binary run twice, on smooth, residue-laden and fully inconsistent fields — still gave 0 branch flips and 0 mask changes. Measured in `romeo_plan.md`'s own units via `-romeo-dump`:
+
+| case | weight bytes differing | dropped to bin 0 (edge deleted) | 2π branch diffs |
+| --- | --- | --- | --- |
+| smooth | 1 / 221 184 | **0** | 0 |
+| fully inconsistent | 4 / 221 184 | **0** | 0 |
+| *(`romeo.c` built `-ffast-math`, for scale)* | *360 / 797 088* | *yes — edges deleted* | *66 voxels* |
+
+The medic path is 25–90× quieter at the byte level and **never deletes an edge**, which is the specific mechanism that breaks `romeo.c`.
+
+**One separate finding, not an FP defect.** On the 170-frame run the post-inversion `_fieldmaps`/`_displacementmaps` differ by up to 29.2 Hz / 1.66 mm — at **21 voxels of 45 168 320**, 20 of them in folded PE columns, while the pre-inversion native field differs by ≤3.05e-5 Hz. The saturating probe reproduces the same amplification (130 Hz / 7.9 mm) from a pure ±1 ULP perturbation with a single binary. This is `md_invert()` fixed-point conditioning where the inverse is genuinely multi-valued — the run already warns about it — so strict FP would pick a *different* arbitrary branch, not a well-defined one. The lever is `MD_INVERT_ITERS` and fold handling, not compiler flags.
+
 ## 6. What still needs porting
 
 > **M0 snapshot, since delivered.** MCPC-3D-S landed in M4 (`md_mcpc3ds()`, ordinary-FP in `medic.c` rather than beside the strict-FP ROMEO unit) and reproduces the reference's own `phase_offset` exactly under a shared mask — see §4. Retained because the measurements below are the record that motivated it.
