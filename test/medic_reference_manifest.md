@@ -347,7 +347,18 @@ Hypotheses not yet discriminated: truncation applied per temporal-correlation gr
 
 Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), 8 threads, Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench170.py`.
 
-**Estimate stage** (`wk-medic` vs `niimath --medic`):
+**Estimate stage, like for like** — both writing UNCOMPRESSED `.nii`, so this compares compute rather than gzip (`test/medic_experiments/bench_threads.py`):
+
+| threads | tool | wall | CPU | parallelism | peak RAM |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `wk-medic` | 45.30 s | 55.02 s | 1.2x | 3.39 GB |
+| 1 | **`niimath --medic`** | **14.82 s** | **14.31 s** | 1.0x | **1.99 GB** |
+| 8 | `wk-medic` | 14.81 s | 64.32 s | 4.3x | 3.53 GB |
+| 8 | **`niimath --medic`** | **4.05 s** | **15.15 s** | 3.7x | **2.19 GB** |
+
+**3.06x faster single-threaded, 3.66x faster at 8 threads**, using ~4x less CPU and ~1.6x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.66x for niimath and 3.06x for the reference. Note the reference spends 55 s of CPU to do single-threaded what niimath does in 14.3 s, so its higher parallel efficiency is recovering overhead rather than winning work.
+
+**Estimate stage, gzipped output** (`wk-medic` vs `niimath --medic`):
 
 | tool | wall | CPU | parallelism | peak RAM |
 | --- | --- | --- | --- | --- |

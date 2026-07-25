@@ -21,6 +21,7 @@
 // regression, SVD and resampling here are ordinary numerics.  See AGENTS.md.
 
 #include <ctype.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -415,11 +416,29 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 			G[(size_t)i * T + j] = G[(size_t)j * T + i] = s;
 		}
 	}
+	/* FAIL CLOSED on a non-finite spectrum.  One NaN voxel anywhere in the series poisons the
+	   whole Gram matrix, which makes every eigenvalue NaN, which makes every `w[k] > ...` test
+	   below false at k == 0 -- and r == 0 builds the ZERO projector and silently multiplies the
+	   entire field-map series by it, exiting 0.  That is the worst possible failure mode: all
+	   three outputs come back identically zero and nothing says so.  (Magnitude guards, not
+	   isfinite(): this TU is -ffast-math.) */
+	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
+		double g = G[(size_t)i * T + j];
+		if (!(g >= -DBL_MAX && g <= DBL_MAX)) {
+			MD_ERR("field maps contain non-finite values; the low-rank filter cannot run "
+				"(use --rank 0 to skip it)\n");
+			goto done;
+		}
+	}
 	if (md_jacobi_eigh(G, V, w, T)) goto done;
 
 	/* numerical rank: drop directions that are pure round-off relative to the leading one */
 	r = rank < T ? rank : T;
 	for (k = 0; k < r; k++) if (!(w[k] > w[0] * 1e-24) || !(w[k] > 0.0)) { r = k; break; }
+	if (r <= 0) {   /* never write a zero projector over real data */
+		MD_ERR("low-rank filter found no positive spectrum in the field-map series\n");
+		goto done;
+	}
 	if (r >= T) { rc = 0; goto done; }
 
 	/* P = V_r V_r^T (T x T projector) */
@@ -776,7 +795,7 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 static int md_write(const md_ctx *c, const char *suffix, const float *vol, int nframe, gzModes gz) {
 	nifti_image *n = c->tmpl;
 	void *savedata = n->data;
-	int saved_nt = n->nt, saved_ndim = n->ndim, saved_dt = n->datatype;
+	int saved_nt = n->nt, saved_ndim = n->ndim, saved_dt = n->datatype, saved_nbyper = n->nbyper;
 	int64_t saved_nvox = n->nvox;
 	float saved_slope = n->scl_slope, saved_inter = n->scl_inter;
 	char *saved_fname = n->fname, *saved_iname = n->iname;
@@ -808,7 +827,7 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	n->nt = saved_nt; n->dim[4] = saved_nt;
 	n->ndim = saved_ndim; n->dim[0] = saved_ndim;
 	n->nvox = saved_nvox;
-	n->datatype = saved_dt; n->nbyper = (saved_dt == DT_FLOAT32) ? 4 : n->nbyper;
+	n->datatype = saved_dt; n->nbyper = saved_nbyper;
 	n->scl_slope = saved_slope; n->scl_inter = saved_inter;
 	free(buf);
 	return rc;
