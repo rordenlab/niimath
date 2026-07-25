@@ -10,6 +10,7 @@ the reported -conform/-gz 0/-odt char case, feature dispatch, and optional zstd.
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import json
 import math
@@ -410,6 +411,57 @@ def assert_payload_size(path: Path, datatype: int, bitpix: int, dims: tuple[int,
         raise AssertionError(f"{path}: expected {expected_size} bytes from header, saw {len(blob)}")
 
 
+# Golden numeric-primitive tables (638 bytes total), captured from the pinned Julia oracle.
+# Embedded rather than read from test/romeo_ref/ because that directory is gitignored and is not
+# present inside a built wheel — this is what lets release CI verify ROMEO's numeric core on
+# EVERY target (gcc/Linux, MSVC/Windows, AppleClang, wasm) without a Julia install. The tables
+# cover rem2pi in both widths (including the Payne-Hanek branch and subnormal inputs, the FTZ/DAZ
+# canary), gamma, rescale's bin boundaries, and both unwrapvoxel subtraction widths.
+ROMEO_PRIMITIVE_GOLDEN = {
+    "rem2pi64.f64":
+        "AAAAAAAAAAAAAAAAAADwPwAAAAAAAPC/GC1EVPshCUAYLURU+yEJwBgtRFT7Ifk/GC1EVPsh+b8ZLURU+yH5vwdc"
+        "FDMmprG8B1wUMyamsTwAAAAAAAAEQAAAAAAAAATAMVqIqPZDBsAxWoio9kMGQGG0EFHth/S/YbQQUe2H9D8+l95d"
+        "JfDmPz6X3l0l8Oa/I4wWIqr94L8jjBYiqv3gP2HvP001J+8/phdBq8DYCECYs/bQVOLWv3pcxUCqTuK/ZPjUjkVJ"
+        "AcBk+NSORUkBQLL5U6MMqQVAsvlTowypBcAT4iH2nkvgvxPiIfaeS+A/xv0JaKngAEDmuYsUenHmvzHDh+HeDglA"
+        "G+qDVbj92L8AAAAAAADgPwAAAAAAAOC/AAAAAAAA+D8BAAAAAAAEQAEAAAAAAAAAAQAAAAAAAIAr5nCLaBIAAP//"
+        "/////w8A",
+    "rem2pi32_gamma.f32":
+        "AAAAAAAAgD8AAIC/2g9JQNoPScDaD0nA2g9JQOhSRcDoUkVALr07NC69O7S7D0lALr27NGBCog1gQqKNUe0HvwXG"
+        "RkBlSC1A+FwCv/hcAj+LXTc/tR8SwLUfEkABAAAAAQAAgP//fwAAAAAAAACAPwAAgL/aD0lA2w9JwNoPScDbD0lA"
+        "6VJFwOlSRUAAAAAAAAAAALoPSUDbD8lAYEKiDWBCoo0Cb7tC3EzDR3qWGEv5AhVQ+QIV0Ox4rWC2HxLAth8SQAEA"
+        "AAABAACA//9/AA==",
+    "rescale.u8":
+        "/wGA/v78AQEAAAEBv0A=",
+    "unwrapvoxel.f32":
+        "AACAP7UfUsDbD8lA2w/JwNsP6UDbD8dC+QIVUNoPScDthwRB7YcEwQAAgD+1H1LA2w/JQNsPycDbD+lA2w/HQvkC"
+        "FVDaD0nA7YcEQe2HBME=",
+}
+
+
+def check_romeo_primitives(exe: str, tmp: Path, phase: Path, mag: Path) -> None:
+    dump = tmp / "primdump"
+    dump.mkdir(exist_ok=True)
+    require_success(
+        run_niimath(exe, [str(phase), "-gz", "0", "-romeo", str(mag), "-t", "5.0", "-k", "nomask",
+                          "-no-phase-rescale", "-romeo-dump", str(dump), str(tmp / "prim_out.nii")]),
+        "romeo primitive dump",
+    )
+    for name, b64 in ROMEO_PRIMITIVE_GOLDEN.items():
+        want = base64.b64decode(b64)
+        got_path = dump / ("c_prim_" + name)
+        if not got_path.exists():
+            raise AssertionError("romeo did not emit c_prim_%s" % name)
+        got = got_path.read_bytes()
+        if got != want:
+            ndiff = sum(1 for a, b in zip(got, want) if a != b)
+            raise AssertionError(
+                "romeo primitive table %s differs from the Julia golden: %d/%d bytes "
+                "(len %d vs %d) - the numeric core does not match the reference on this target"
+                % (name, ndiff, len(want), len(got), len(want))
+            )
+    print("  -romeo: numeric primitives match the Julia golden")
+
+
 def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
     """-romeo phase unwrapping.
 
@@ -528,6 +580,7 @@ def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
         delta = value - original
         if abs(delta - round(delta / two_pi) * two_pi) > 1e-3:
             raise AssertionError("romeo multi-echo output does not rewrap to its input")
+    check_romeo_primitives(exe, tmp, phase_path, mag_path)
     print("  -romeo: unwrap/mask/quality/multi-echo OK")
 
 

@@ -564,7 +564,8 @@ static int64_t rm_range_round(int64_t i /*0-based*/, int64_t stop, int64_t len) 
 	return q;
 }
 
-/* Gather the sample of v[0..n) into out (caller supplies capacity >= len*len). */
+/* Gather the sample of v[0..n) into out (capacity >= len*len). Returns 0 when every sampled
+   value was non-finite; the caller then runs the whole-array fallback into a larger buffer. */
 static int64_t rm_sample_f32(const float *v, int64_t n, float *out) {
 	int64_t len = rm_sample_len(n), stop = n - len, b, t, m = 0;
 	if (stop < 0) stop = 0;
@@ -578,20 +579,32 @@ static int64_t rm_sample_f32(const float *v, int64_t n, float *out) {
 			}
 		}
 	}
-	if (m == 0) {
-		for (b = 0; b < n; b++) if (isfinite(v[b])) out[m++] = v[b];
-	}
 	return m;
 }
-static int64_t rm_sample_capacity(int64_t n) { int64_t len = rm_sample_len(n); return len * len > n ? len * len : n; }
+
+/* sample(), allocating only what is needed: len*len (~100k) normally, the full array only for
+   the fallback. *buf is malloc'd and owned by the caller. Returns the count, or -1 on failure. */
+static int64_t rm_sample_alloc(const float *v, int64_t n, float **buf) {
+	int64_t len = rm_sample_len(n), cap = len * len, m;
+	float *s = (float *)malloc((size_t)cap * sizeof(float));
+	if (!s) return -1;
+	m = rm_sample_f32(v, n, s);
+	if (m == 0) {   /* filter(isfinite, I) over the WHOLE array */
+		float *g = (float *)realloc(s, (size_t)n * sizeof(float));
+		if (!g) { free(s); return -1; }
+		s = g;
+		for (int64_t i = 0; i < n; i++) if (isfinite(v[i])) s[m++] = v[i];
+	}
+	*buf = s;
+	return m;
+}
 
 /* approxextrema(I) = extrema(sample(I)), falling back to extrema(I) when the sample is flat. */
 static int rm_approxextrema(const float *v, int64_t n, float *mn, float *mx) {
-	int64_t cap = rm_sample_capacity(n), m, i;
-	float *s = (float *)malloc((size_t)cap * sizeof(float));
+	int64_t m, i;
+	float *s = NULL;
 	float lo, hi;
-	if (!s) return 1;
-	m = rm_sample_f32(v, n, s);
+	m = rm_sample_alloc(v, n, &s);
 	if (m < 1) { free(s); return 1; }
 	lo = s[0]; hi = s[0];
 	for (i = 1; i < m; i++) { if (s[i] < lo) lo = s[i]; if (s[i] > hi) hi = s[i]; }
@@ -668,7 +681,12 @@ static double rm_getweight(const rm_wctx *c, int64_t i, int64_t j) {
 	}
 	if (c->M) {
 		float mi = c->M[i - 1], mj = c->M[j - 1], small, big;
-		if (mj < mi) { small = mj; big = mi; } else { small = mi; big = mj; } /* Base.minmax */
+		/* Base.minmax propagates NaN to BOTH endpoints — `minmax(5f0, NaN32) == (NaN32, NaN32)`,
+		   verified in the pinned Julia. A plain `mj < mi` swap leaves one endpoint finite, which
+		   changes magweight/magweight2 (flags 5/6) and can retain an edge Julia drops. */
+		if (isnan(mi) || isnan(mj)) { small = big = mi + mj; }
+		else if (mj < mi) { small = mj; big = mi; }
+		else { small = mi; big = mj; }
 		if (c->flags[3]) {
 			float q = small / big;
 			weight *= (0.1 + 0.9 * (double)(q * q));
@@ -934,22 +952,21 @@ static void rm_mask_stages_free(rm_mask_stages *s) {
 
 /* robustmask(weight; factor=1, threshold=nothing).  Returns 0 and fills stages->s4 (owned by
    the caller) on success.  `have_thr` selects the -k qualitymask path. */
+#define RM_DROP(p) do { if (!keep_stages) { free(p); (p) = NULL; } } while (0)
 static int rm_robustmask(const float *weight, int nx, int ny, int nz,
-	int have_thr, double thr_in, rm_mask_stages *st) {
+	int have_thr, double thr_in, int keep_stages, rm_mask_stages *st) {
 	int64_t n = (int64_t)nx * ny * nz, i, m;
 	float *s = NULL;
 	float threshold;
 	memset(st, 0, sizeof *st);
 	if (!have_thr) {
-		int64_t cap = rm_sample_capacity(n);
 		double q05, q15, q8, q99, acc;
 		int64_t cnt;
 		float *tmp = NULL;
-		s = (float *)malloc((size_t)cap * sizeof(float));
-		tmp = (float *)malloc((size_t)cap * sizeof(float));
-		if (!s || !tmp) { free(s); free(tmp); return 1; }
-		m = rm_sample_f32(weight, n, s);
-		if (m < 1) { free(s); free(tmp); RM_ERR("magnitude has no finite voxels\n"); return 1; }
+		m = rm_sample_alloc(weight, n, &s);
+		if (m < 1) { free(s); RM_ERR("magnitude has no finite voxels\n"); return 1; }
+		tmp = (float *)malloc((size_t)m * sizeof(float));
+		if (!tmp) { free(s); return 1; }
 		st->sample_len = m;
 		memcpy(tmp, s, (size_t)m * sizeof(float)); q05 = rm_quantile7(tmp, m, 0.05);
 		memcpy(tmp, s, (size_t)m * sizeof(float)); q15 = rm_quantile7(tmp, m, 0.15);
@@ -995,16 +1012,22 @@ static int rm_robustmask(const float *weight, int nx, int ny, int nz,
 		if (rm_boxsmooth3d(st->sm1, nx, ny, nz, 1, boxes1)) { rm_mask_stages_free(st); return 1; }
 	}
 	for (i = 0; i < n; i++) st->s2[i] = ((double)st->sm1[i] > 0.4) ? 1 : 0;
+	RM_DROP(st->sm1);
+	RM_DROP(st->s1);
 	memcpy(st->s3, st->s2, (size_t)n);
+	RM_DROP(st->s2);
 	if (rm_fill_holes(st->s3, nx, ny, nz)) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->sm2[i] = (float)st->s3[i];
+	RM_DROP(st->s3);
 	{
 		int boxes2[2] = { 3, 3 };
 		if (rm_boxsmooth3d(st->sm2, nx, ny, nz, 2, boxes2)) { rm_mask_stages_free(st); return 1; }
 	}
 	for (i = 0; i < n; i++) st->s4[i] = ((double)st->sm2[i] > 0.6) ? 1 : 0;
+	RM_DROP(st->sm2);
 	return 0;
 }
+#undef RM_DROP
 
 /* ============================================================================================
  * 7. Priority queues (ROMEO.jl src/priorityqueue.jl)
@@ -1261,7 +1284,13 @@ static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds) {
  * 9. unwrap! (ROMEO.jl src/unwrapping.jl)
  * ==========================================================================================*/
 
-/* correctglobal: wrapped .-= 2pi*median(round.(filter(isfinite, wrapped[mask]) ./ 2pi)) */
+/* correctglobal: wrapped .-= 2pi*median(round.(filter(isfinite, wrapped[mask]) ./ 2pi))
+ *
+ * DELIBERATE DIVERGENCE (safer, and documented rather than reproduced): when nothing inside the
+ * mask is finite, Julia reaches `median([])` and throws. Here the correction is simply skipped
+ * and the phase is returned unchanged. Erroring out on an all-NaN volume adds nothing a caller
+ * can act on, and `-g` is a cosmetic global offset, not part of the unwrap. Identical on any
+ * input with at least one finite in-mask voxel, i.e. every real image. */
 static int rm_correctglobal(float *w, int64_t n, const uint8_t *mask) {
 	int64_t i, m = 0;
 	double med;
@@ -1343,12 +1372,16 @@ static const double RM_PRIM_D[] = {
 	100.0, -100.0, 1000.0, 100000.0, 1000000.0, 1600000.0,
 	/* >= 2^20*pi/2 == the Payne-Hanek branch */
 	1650000.0, -1650000.0, 1.0e7, -1.0e7, 1.0e10, -1.0e10, 1.0e15, 1.0e20, 1.0e30, 1.0e100,
-	0.5, -0.5, 1.5, 2.5000000000000004
+	0.5, -0.5, 1.5, 2.5000000000000004,
+	/* subnormals: the FTZ/DAZ canary. A gcc -ffast-math LINK sets MXCSR flush-to-zero
+	   process-wide, which would turn these into 0 even inside this strict-FP object. */
+	5e-324, -5e-324, 1e-310, 2.2250738585072011e-308
 };
 static const float RM_PRIM_F[] = {
 	0.0f, 1.0f, -1.0f, 3.1415925f, 3.1415927f, -3.1415925f, -3.1415927f,
 	3.2f, -3.2f, 6.2831855f, -6.2831855f, 9.42477f, 12.566371f,
-	1.0e-30f, -1.0e-30f, 100.0f, 1.0e5f, 1.0e7f, 1.0e10f, -1.0e10f, 1.0e20f, 4.0f, -4.0f
+	1.0e-30f, -1.0e-30f, 100.0f, 1.0e5f, 1.0e7f, 1.0e10f, -1.0e10f, 1.0e20f, 4.0f, -4.0f,
+	1.4012984643e-45f, -1.4012984643e-45f, 1.1754942107e-38f   /* subnormal / smallest normal */
 };
 static const double RM_PRIM_W[] = { /* rescale() inputs, incl. exact bin boundaries */
 	0.0, 1.0, 0.5, 0.5 / 255.0, 1.5 / 255.0, 2.5 / 255.0,
@@ -1595,9 +1628,13 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 
 /* ---- auxiliary image loading -------------------------------------------------------------- */
 
-/* Read a NIfTI into float32.  raw!=0 returns the STORED values (Julia's `.raw`, used for masks
-   and for readphase's second branch); otherwise slope/intercept are applied in FLOAT arithmetic,
-   matching NIfTI.jl's getindex (raw*scl_slope + scl_inter, all Float32). */
+/* Read a NIfTI into float32.
+     RM_RD_SCALED   apply slope/intercept in FLOAT arithmetic, matching NIfTI.jl's getindex
+     RM_RD_RAW      the STORED values (Julia's `.raw`, used by readphase's second branch)
+     RM_RD_NONZERO  1.0 where the STORED value is nonzero, else 0.0 -- the mask rule
+                    (`niread(f).raw .!= 0`) evaluated in the ORIGINAL width. Narrowing a float64
+                    mask to float32 first would turn e.g. 1e-300 into a false zero. */
+enum { RM_RD_SCALED = 0, RM_RD_RAW, RM_RD_NONZERO };
 static int rm_read_f32(const char *fn, int raw, float **out, int *nx, int *ny, int *nz, int *nvol) {
 	nifti_image *n = nifti_image_read(fn, 1);
 	int64_t i, nv;
@@ -1605,14 +1642,30 @@ static int rm_read_f32(const char *fn, int raw, float **out, int *nx, int *ny, i
 	float scl, inter;
 	if (!n) { RM_ERR("failed to read '%s'\n", fn); return 1; }
 	if (n->nx < 1 || n->ny < 1 || n->nz < 1 || n->nvox < 1) { nifti_image_free(n); RM_ERR("'%s' has invalid dimensions\n", fn); return 1; }
+	if (n->nu > 1 || n->nv > 1 || n->nw > 1) {   /* 5D multi-channel is out of scope, not "volume 1" */
+		nifti_image_free(n);
+		RM_ERR("'%s' has more than 4 dimensions (5D multi-channel input is not supported)\n", fn);
+		return 1;
+	}
 	nv = (int64_t)n->nvox;
 	if (nv > INT_MAX) { nifti_image_free(n); RM_ERR("'%s' exceeds INT_MAX voxels\n", fn); return 1; }
-	d = (float *)malloc((size_t)nv * sizeof(float));
+	{	/* checked multiply: on a 32-bit/wasm target nv*4 can wrap size_t and under-allocate
+		   while the int64 conversion loop below still writes all nv elements */
+		size_t bytes;
+		if (nii_mul_size((size_t)nv, sizeof(float), &bytes)) {
+			nifti_image_free(n);
+			RM_ERR("'%s' is too large for this build's address space\n", fn);
+			return 1;
+		}
+		d = (float *)malloc(bytes);
+	}
 	if (!d) { nifti_image_free(n); return 1; }
 	scl = (n->scl_slope == 0.0f) ? 1.0f : n->scl_slope;
 	inter = n->scl_inter;
-	if (raw) { scl = 1.0f; inter = 0.0f; }
-#define RM_CVT(T) do { const T *p = (const T *)n->data; for (i = 0; i < nv; i++) d[i] = (float)p[i] * scl + inter; } while (0)
+	if (raw != RM_RD_SCALED) { scl = 1.0f; inter = 0.0f; }
+#define RM_CVT(T) do { const T *p = (const T *)n->data; \
+	if (raw == RM_RD_NONZERO) { for (i = 0; i < nv; i++) d[i] = (p[i] != 0) ? 1.0f : 0.0f; } \
+	else { for (i = 0; i < nv; i++) d[i] = (float)p[i] * scl + inter; } } while (0)
 	switch (n->datatype) {
 	case DT_UINT8: RM_CVT(uint8_t); break;
 	case DT_INT8: RM_CVT(int8_t); break;
@@ -1771,7 +1824,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 				RM_ERR("phase rescaling needs the unscaled stored values, which are unavailable for stdin input; use -no-phase-rescale\n");
 				goto done;
 			}
-			if (rm_read_f32(phasefile, 1, &rawv, &rnx, &rny, &rnz, &rnv)) goto done;
+			if (rm_read_f32(phasefile, RM_RD_RAW, &rawv, &rnx, &rny, &rnz, &rnv)) goto done;
 			if ((int64_t)rnx * rny * rnz * rnv != (int64_t)nim->nvox) {
 				free(rawv); RM_ERR("phase file no longer matches the working image\n"); goto done;
 			}
@@ -1808,7 +1861,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	/* ---- magnitude ------------------------------------------------------------------------ */
 	if (magfile && strcmp(magfile, "none") != 0) {
 		int mnx, mny, mnz;
-		if (rm_read_f32(magfile, 0, &mag, &mnx, &mny, &mnz, &magvol)) goto done;
+		if (rm_read_f32(magfile, RM_RD_SCALED, &mag, &mnx, &mny, &mnz, &magvol)) goto done;
 		if (mnx != nx || mny != ny || mnz != nz) {
 			RM_ERR("magnitude dimensions (%dx%dx%d) do not match the phase (%dx%dx%d)\n", mnx, mny, mnz, nx, ny, nz);
 			goto done;
@@ -1839,7 +1892,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		fprintf(stderr, " + -romeo: robustmask was chosen but no magnitude is available. No mask is used!\n");
 	} else if (o->mask_sel == RM_MASK_ROBUST) {
 		int te = template_echo < magvol ? template_echo : magvol;
-		if (rm_robustmask(mag + (int64_t)(te - 1) * n3, nx, ny, nz, 0, 0.0, &stages)) goto done;
+		if (rm_robustmask(mag + (int64_t)(te - 1) * n3, nx, ny, nz, 0, 0.0, dump != NULL, &stages)) goto done;
 		mask = stages.s4; stages.s4 = NULL;
 	} else if (o->mask_sel == RM_MASK_QUALITY) {
 		/* set_mask!: qmap = voxelquality(phase; get_keyargs(...)) — computed on the still-WRAPPED
@@ -1852,19 +1905,19 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 				template_echo, 2, nx, ny, nz, flags)) { free(qmap); goto done; }
 		if (rm_voxelquality(&qc, qmap)) { free(qmap); goto done; }
 		if (dump) drc |= rm_dump(dump, "c_qmap_wrapped.f32", qmap, sizeof(float), n3);
-		if (rm_robustmask(qmap, nx, ny, nz, 1, o->qmask_thresh, &stages)) { free(qmap); goto done; }
+		if (rm_robustmask(qmap, nx, ny, nz, 1, o->qmask_thresh, dump != NULL, &stages)) { free(qmap); goto done; }
 		free(qmap);
 		mask = stages.s4; stages.s4 = NULL;
 	} else if (o->mask_sel == RM_MASK_FILE) {
 		float *mv = NULL;
 		int mnx, mny, mnz, mnv;
-		if (rm_read_f32(o->mask_file, 1, &mv, &mnx, &mny, &mnz, &mnv)) goto done;
+		if (rm_read_f32(o->mask_file, RM_RD_NONZERO, &mv, &mnx, &mny, &mnz, &mnv)) goto done;
 		if (mnx != nx || mny != ny || mnz != nz || mnv != 1) {
 			free(mv); RM_ERR("mask dimensions do not match the phase\n"); goto done;
 		}
 		mask = (uint8_t *)malloc((size_t)n3);
 		if (!mask) { free(mv); goto done; }
-		for (i = 0; i < n3; i++) mask[i] = (mv[i] != 0.0f) ? 1 : 0; /* raw stored values, per niread(...).raw .!= 0 */
+		for (i = 0; i < n3; i++) mask[i] = (mv[i] != 0.0f) ? 1 : 0; /* RM_RD_NONZERO already applied the raw test */
 		free(mv);
 	}
 
@@ -1938,8 +1991,10 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			template_echo);
 
 	/* ---- unwrap ----------------------------------------------------------------------------- */
-	visited = (uint8_t *)calloc((size_t)n3, 1);
-	if (!visited) goto done;
+	if (dump) {   /* the outer copy feeds the parity dump only; rm_unwrap3d owns its working set */
+		visited = (uint8_t *)calloc((size_t)n3, 1);
+		if (!visited) goto done;
+	}
 	if (neco == 1) {
 		if (rm_unwrap3d(phase, weights, nx, ny, nz, NULL, TE1, TE2, 0,
 				o->wrap_addition, o->maxseeds, visited)) goto done;
@@ -1972,7 +2027,14 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			free(p2copy); free(w2);
 		}
 		if (o->correctglobal) {
-			/* correct_multi_echo_wraps! */
+			/* correct_multi_echo_wraps!
+			 *
+			 * DELIBERATE DIVERGENCE (safer): upstream filters the reference and current echoes
+			 * INDEPENDENTLY before subtracting them, so a NaN present in only one echo either
+			 * throws on a length mismatch or silently pairs mismatched voxels. Here a voxel
+			 * contributes only when BOTH echoes are finite at that voxel, which is what the
+			 * expression means. Identical whenever the two echoes share a finite mask, i.e.
+			 * every real image. */
 			int ie2;
 			double *v = (double *)malloc((size_t)n3 * sizeof(double));
 			if (!v) goto done;

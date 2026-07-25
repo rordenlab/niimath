@@ -6932,6 +6932,14 @@ staticx int nifti_romeo_wrap(nifti_image *nim, char *fin, int *pac, int argc, ch
 		if (nii_reject_oversize_aux(magfile, "romeo magnitude")) return 1;
 	} else magfile = NULL;
 	if (o.mask_sel == RM_MASK_FILE && nii_reject_oversize_aux(o.mask_file, "romeo mask")) return 1;
+	if (o.mask_sel == RM_MASK_FILE) { // same non-fatal check as the magnitude: equal dims can still be a shifted mask
+		nifti_image *kh = nifti_image_read(o.mask_file, 0);
+		if (kh) {
+			if (max_displacement_mm(nim, kh) > 0.5f)
+				printfx("Warning: phase and mask have different spatial transforms (>0.5mm)\n");
+			nifti_image_free(kh);
+		}
+	}
 	if (magfile) { // header-only read: warn on a world-frame mismatch, as ROMEO does not check it
 		nifti_image *mh = nifti_image_read(magfile, 0);
 		if (mh) {
@@ -7251,6 +7259,11 @@ int main64(int argc, char *argv[]) {
 #endif
 
 	// read operations
+	/* -romeo's phase rescale re-reads the UNSCALED input file, so it is only well defined before
+	   any image-MUTATING operation. Pointer-comparing against `first_op` was wrong: -p/-gz/-odt
+	   are execution/output modifiers that leave the voxels untouched, yet they became first_op
+	   and wrongly disqualified the rescale (reproduced with `-gz 0` before -romeo). */
+	int nmutating = 0;
 	int nkernel = 0; // number of voxels in kernel
 	int *kernel = NULL; // default 3x3x3 kernel is created lazily by the first kernel op
 	char *end = NULL;
@@ -7267,6 +7280,9 @@ int main64(int argc, char *argv[]) {
 				free(kernel);
 			return 2;
 		}
+		int op_is_first = (nmutating == 0);
+		if (strcmp(argv[ac], "-p") && strcmp(argv[ac], "-gz") && strcmp(argv[ac], "-odt"))
+			nmutating++;
 		enum eOp op = unknown;
 		if (!strcmp(argv[ac], "-add"))
 			op = add;
@@ -7889,9 +7905,8 @@ int main64(int argc, char *argv[]) {
 			/* -romeo <mag|none> [options]: ROMEO phase unwrapping. Phase rescaling inspects the
 			   unscaled stored values, so it is only well defined when -romeo is the first
 			   computational operation (romeo_run enforces that, unless -no-phase-rescale). */
-			int romeo_first = (argv[ac] == first_op);
 			ac++;
-			ok = nifti_romeo_wrap(nim, fin, &ac, argc, argv, romeo_first, &ihdr, gzMode);
+			ok = nifti_romeo_wrap(nim, fin, &ac, argc, argv, op_is_first, &ihdr, gzMode);
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past every consumed sub-option
