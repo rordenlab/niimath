@@ -838,6 +838,507 @@ def exercise_medic(exe: str, tmp: Path, help_text: str) -> None:
     print("  --medic/-unwarp: displacement sign, fill and field regression OK")
 
 
+# ---------------------------------------------------------------------------------------------
+# MEDIC regression fixtures.
+#
+# Every check below pins a bug that was shipped and fixed; each is annotated with the value the
+# assertion would see under the OLD behaviour, since the fix cannot be reverted to prove it.
+#
+# The synthetic field is shaped so that niimath's readphase rescaling (medic.c md_rescale_phase)
+# is a NO-OP.  That rescale maps the observed [min, max] of a phase series onto [-pi, pi] unless
+# the span is already within 0.1 rad of 2*pi; when it fires it applies a per-echo affine that no
+# analytic expectation survives.  Coverage of the full circle is bought with three ramps of very
+# different rates -- coarse along j, fine along i, finer along k -- so the wrapped samples tile
+# the circle to ~0.002 rad at EVERY echo, while the steepest per-voxel phase step stays well
+# under pi so the unwrap is unambiguous.  With that, --medic recovers the field exactly: the
+# least-squares slope along j comes back 5.0000 Hz/voxel and the intercept to five digits.
+MEDIC_DIMS = (16, 24, 8)
+MEDIC_FIELD_J = 5.0          # Hz per j voxel   (0.05 cycle/voxel at TE 10 ms)
+MEDIC_FIELD_I = 0.3125       # Hz per i voxel   (fills the j gaps)
+MEDIC_FIELD_K = 0.0390625    # Hz per k voxel   (fills the i gaps)
+MEDIC_TWO_PI = 6.283185307179586
+
+
+def medic_field(x: int, y: int, z: int) -> float:
+    return MEDIC_FIELD_J * (y - MEDIC_DIMS[1] / 2.0) + MEDIC_FIELD_I * x + MEDIC_FIELD_K * z
+
+
+def medic_magnitude(x: int, y: int, z: int) -> float:
+    nx, ny, nz = MEDIC_DIMS
+    inside = (2 < x < nx - 3) and (3 < y < ny - 4) and (1 < z < nz - 2)
+    return 1000.0 if inside else 30.0
+
+
+def medic_wrap(angle: float) -> float:
+    """principal value in (-pi, pi], matching medic.c md_wrapf"""
+    return angle - MEDIC_TWO_PI * math.floor(angle / MEDIC_TWO_PI + 0.5)
+
+
+def medic_write_series(
+    tmp: Path,
+    tag: str,
+    tes: tuple[float, ...],
+    frames: int,
+    amplitude,
+    nan_index: int | None = None,
+    offset_rad: float = 0.0,
+) -> tuple[list[str], list[str]]:
+    """Write one magnitude and one phase image per echo for a field amplitude(t)*medic_field(v).
+
+    `nan_index` poisons a single voxel of the FIRST echo's phase (flat index into the whole
+    series), which is how the silent all-zero-output bug is provoked.  `offset_rad` adds a
+    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove."""
+    nx, ny, nz = MEDIC_DIMS
+    mags: list[str] = []
+    phases: list[str] = []
+    for e, te in enumerate(tes):
+        mag_values: list[float] = []
+        phase_values: list[float] = []
+        for t in range(frames):
+            scale = amplitude(t)
+            for z in range(nz):
+                for y in range(ny):
+                    for x in range(nx):
+                        phase_values.append(
+                            medic_wrap(MEDIC_TWO_PI * scale * medic_field(x, y, z) * te / 1000.0 + offset_rad)
+                        )
+                        mag_values.append(medic_magnitude(x, y, z))
+        if nan_index is not None and e == 0:
+            phase_values[nan_index] = float("nan")
+        mag_path = tmp / f"{tag}_mag{e}.nii"
+        phase_path = tmp / f"{tag}_pha{e}.nii"
+        write_float32_nifti(mag_path, MEDIC_DIMS, mag_values, nt=frames)
+        write_float32_nifti(phase_path, MEDIC_DIMS, phase_values, nt=frames)
+        mags.append(str(mag_path))
+        phases.append(str(phase_path))
+    return mags, phases
+
+
+def medic_run(exe: str, mags: list[str], phases: list[str], tes: tuple[float, ...], prefix: Path, extra: list[str]):
+    return run_niimath(exe, [
+        "--medic",
+        "--magnitude", *mags,
+        "--phase", *phases,
+        "--te-ms", ",".join(f"{te:g}" for te in tes),
+        "--total-readout-time", "0.02",
+        "--phase-encoding-direction", "j",
+        "--out-prefix", str(prefix),
+        *extra,
+    ])
+
+
+def medic_read_output(prefix: Path, suffix: str, tmp: Path, tag: str) -> list[float] | None:
+    """Read <prefix><suffix>.nii[.gz]; niimath appends .gz depending on FSLOUTPUTTYPE/-gz."""
+    for ext in (".nii", ".nii.gz"):
+        candidate = Path(str(prefix) + suffix + ext)
+        if candidate.exists():
+            if ext == ".nii.gz":
+                plain = tmp / f"{tag}{suffix}_plain.nii"
+                plain.write_bytes(gzip.decompress(candidate.read_bytes()))
+                candidate = plain
+            return read_float32_nifti(candidate)
+    return None
+
+
+def medic_output_exists(prefix: Path, suffix: str) -> bool:
+    return any(Path(str(prefix) + suffix + ext).exists() for ext in (".nii", ".nii.gz", ".nii.zst"))
+
+
+def medic_fit_along_j(field: list[float], frame: int) -> tuple[float, float]:
+    """Least-squares slope/intercept of the field against the j index over a complete interior
+    block.  The block spans every i and k for each j, so the i/k ramps contribute exactly zero to
+    the slope and a computable constant to the intercept."""
+    nx, ny, nz = MEDIC_DIMS
+    n3 = nx * ny * nz
+    xs: list[float] = []
+    ys: list[float] = []
+    for z in range(3, nz - 3):
+        for y in range(6, ny - 6):
+            for x in range(4, nx - 4):
+                xs.append(float(y))
+                ys.append(field[frame * n3 + x + y * nx + z * nx * ny])
+    n = float(len(xs))
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+    sxx = sum((a - mx) ** 2 for a in xs)
+    slope = sxy / sxx
+    return slope, my - slope * mx
+
+
+def medic_expected_intercept() -> float:
+    nx, ny, nz = MEDIC_DIMS
+    ix = list(range(4, nx - 4))
+    kz = list(range(3, nz - 3))
+    return (
+        -MEDIC_FIELD_J * ny / 2.0
+        + MEDIC_FIELD_I * (sum(ix) / float(len(ix)))
+        + MEDIC_FIELD_K * (sum(kz) / float(len(kz)))
+    )
+
+
+def exercise_medic_unwarp_io(exe: str, tmp: Path) -> None:
+    """-unwarp input handling: scaled float32 maps, grid mismatch, non-finite map values."""
+    nx, ny, nz = MEDIC_DIMS
+    nvox = nx * ny * nz
+
+    def index(x: int, y: int, z: int) -> int:
+        return x + y * nx + z * nx * ny
+
+    ramp = [0.0] * nvox
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                ramp[index(x, y, z)] = float(y)
+    ramp_path = tmp / "unwarp_ramp.nii"
+    write_float32_nifti(ramp_path, MEDIC_DIMS, ramp)
+
+    def unwarp(map_path: Path, out_path: Path):
+        return run_niimath(exe, [str(ramp_path), "-unwarp", str(map_path), "j", str(out_path)])
+
+    def read_written(out_path: Path, tag: str) -> list[float]:
+        written = out_path if out_path.exists() else Path(str(out_path) + ".gz")
+        if not written.exists():
+            raise AssertionError(f"-unwarp did not write {out_path}")
+        if written.suffix == ".gz":
+            plain = tmp / f"{tag}_plain.nii"
+            plain.write_bytes(gzip.decompress(written.read_bytes()))
+            written = plain
+        return read_float32_nifti(written)
+
+    # (3) float32 map carrying scl_slope: the SCALED value is the displacement in mm.  Stored 1.0
+    # with slope 2.0 means a 2 mm (= 2 voxel) pull.  The bug skipped the scale conversion for
+    # float32 input specifically, which would leave a 1-voxel shift here (interior sample 11.0).
+    scaled_map = tmp / "unwarp_scaled.nii"
+    write_float32_nifti(scaled_map, MEDIC_DIMS, [1.0] * nvox, scl_slope=2.0)
+    scaled_out = tmp / "unwarp_scaled_out.nii"
+    require_success(unwarp(scaled_map, scaled_out), "-unwarp scaled float32 map")
+    got = read_written(scaled_out, "unwarp_scaled")
+    for z in range(2, nz - 2):
+        for y in range(8, ny - 8):
+            for x in range(2, nx - 2):
+                expect = float(y) - 2.0
+                actual = got[index(x, y, z)]
+                if abs(actual - expect) > 1e-3:
+                    raise AssertionError(
+                        f"-unwarp: scl_slope=2 on a float32 map must pull by the SCALED 2 mm; "
+                        f"at ({x},{y},{z}) expected {expect} got {actual} "
+                        f"(the raw, unscaled value would give {float(y) - 1.0})"
+                    )
+
+    # (4) same dims and same 3x3, but the sform ORIGIN differs: the map describes a different
+    # patch of the world and must be rejected.  The bug accepted it and applied it misaligned.
+    shifted_map = tmp / "unwarp_shifted.nii"
+    write_float32_nifti(shifted_map, MEDIC_DIMS, [3.0] * nvox, offset=(5.0, 0.0, 0.0))
+    shifted_out = tmp / "unwarp_shifted_out.nii"
+    result = unwarp(shifted_map, shifted_out)
+    message = result.stdout + result.stderr
+    if result.returncode == 0:
+        raise AssertionError("-unwarp accepted a displacement map whose sform origin differs from the input")
+    if "grid" not in message:
+        raise AssertionError(f"-unwarp rejected a mismatched grid without saying so:\n{message}")
+    if shifted_out.exists() or Path(str(shifted_out) + ".gz").exists():
+        raise AssertionError("-unwarp wrote an output after rejecting a mismatched displacement map")
+
+    # (5) NaN / +-Inf map values must not reach floor() and the int cast (undefined behaviour).
+    # The convention is that such a voxel is fully out of FOV, i.e. the documented zero fill.
+    bad_values = [3.0] * nvox
+    bad_values[index(8, 12, 4)] = float("nan")
+    bad_values[index(9, 12, 4)] = float("inf")
+    bad_values[index(10, 12, 4)] = float("-inf")
+    bad_map = tmp / "unwarp_nonfinite.nii"
+    write_float32_nifti(bad_map, MEDIC_DIMS, bad_values)
+    bad_out = tmp / "unwarp_nonfinite_out.nii"
+    require_success(unwarp(bad_map, bad_out), "-unwarp non-finite map")
+    got = read_written(bad_out, "unwarp_nonfinite")
+    for i, value in enumerate(got):
+        if value != value or abs(value) > 1e30:
+            raise AssertionError(f"-unwarp: a non-finite displacement leaked into output voxel {i} ({value})")
+    for x in (8, 9, 10):
+        if got[index(x, 12, 4)] != 0.0:
+            raise AssertionError(
+                f"-unwarp: a non-finite map voxel must take the zero fill, saw {got[index(x, 12, 4)]}"
+            )
+    # a neighbour with a finite 3 mm displacement is still pulled correctly
+    if abs(got[index(7, 12, 4)] - 9.0) > 1e-3:
+        raise AssertionError("-unwarp: a non-finite voxel must not disturb its finite neighbours")
+
+
+def exercise_medic_polarity(exe: str, tmp: Path) -> None:
+    """(1) --phase-encoding-direction j vs j-: the native field must be IDENTICAL and the
+    displacement map must be negated.  Measured convention, manifest section 3.5b: the polarity
+    enters the inversion and the Hz->mm sign but not the weighted regression.
+
+    Under the bug (the '-' suffix dropped) the two runs were byte-identical, so every displacement
+    ratio below would be exactly +1 and max|d_j + d_j-| would be 2*max|d_j| instead of ~0.05 of it
+    -- i.e. a j- acquisition was corrected backwards, roughly doubling the distortion."""
+    tes = (10.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_pol", tes, 1, lambda t: 1.0)
+    fields: dict[str, list[float]] = {}
+    disps: dict[str, list[float]] = {}
+    for direction in ("j", "j-"):
+        tag = "pol_" + ("jm" if direction.endswith("-") else "jp")
+        prefix = tmp / f"medic_{tag}"
+        result = run_niimath(exe, [
+            "--medic",
+            "--magnitude", *mags,
+            "--phase", *phases,
+            "--te-ms", "10,30",
+            "--total-readout-time", "0.005",
+            "--phase-encoding-direction", direction,
+            "--out-prefix", str(prefix),
+            "--rank", "0",
+        ])
+        require_success(result, f"--medic --phase-encoding-direction {direction}")
+        native = medic_read_output(prefix, "_fieldmaps_native", tmp, tag)
+        disp = medic_read_output(prefix, "_displacementmaps", tmp, tag)
+        if native is None or disp is None:
+            raise AssertionError(f"--medic ({direction}) did not write its outputs")
+        fields[direction] = native
+        disps[direction] = disp
+
+    worst = max(abs(a - b) for a, b in zip(fields["j"], fields["j-"]))
+    if worst > 1e-6:
+        raise AssertionError(
+            f"--medic: _fieldmaps_native must not depend on phase-encoding polarity (max diff {worst:g} Hz)"
+        )
+
+    dj, dm = disps["j"], disps["j-"]
+    # Compare inside the mask and away from its j edges: the field drops to zero outside the mask,
+    # and the inversion samples ACROSS that discontinuity in opposite directions for the two
+    # polarities, so the two boundary rows legitimately differ by more than the fixed-point term.
+    nx, ny, nz = MEDIC_DIMS
+    pairs = []
+    for z in range(2, nz - 2):
+        for y in range(8, 16):
+            for x in range(4, nx - 4):
+                i = x + y * nx + z * nx * ny
+                pairs.append((dj[i], dm[i]))
+    peak = max(abs(a) for a, _ in pairs)
+    if peak < 1e-3:
+        raise AssertionError("--medic: the polarity fixture produced a degenerate displacement map")
+    residual = max(abs(a + b) for a, b in pairs)
+    # The two are exact negatives only in the limit; the inversion's fixed point makes the ratio
+    # -(1 - g*TRT)/(1 + g*TRT) for a field with gradient g along the PE axis, i.e. 4.9 % here.
+    # A polarity-blind implementation gives +1 and residual == 2*peak.
+    if residual > 0.15 * peak:
+        raise AssertionError(
+            f"--medic: j and j- displacement maps must be near-negatives; max|d_j + d_j-| = {residual:g} "
+            f"against a peak of {peak:g} (a polarity-blind run gives {2 * peak:g})"
+        )
+    for a, b in zip(dj, dm):
+        if abs(a) > 1e-3 and a * b >= 0.0:
+            raise AssertionError(
+                f"--medic: j and j- displacements must have opposite signs, saw {a:g} and {b:g}"
+            )
+
+
+def exercise_medic_nonfinite(exe: str, tmp: Path, mags: list[str], phases: list[str], frames: int) -> None:
+    """(2) A single NaN phase voxel must fail LOUDLY.
+
+    The bug lived in the low-rank filter: one NaN poisons the whole Gram matrix, every eigenvalue
+    becomes NaN, the retained rank collapses to zero and the projector multiplies the entire field
+    series by 0 -- three all-zero outputs and exit 0.  It needed T > rank to reach that code, hence
+    the 12-frame fixture with the default --rank 10."""
+    prefix = tmp / "medic_nan"
+    result = medic_run(exe, mags, phases, (10.0, 30.0), prefix, [])
+    message = result.stdout + result.stderr
+    if result.returncode == 0:
+        raise AssertionError(
+            "--medic exited 0 on phase data containing NaN; it must fail rather than emit a field map"
+        )
+    if "non-finite" not in message:
+        raise AssertionError(f"--medic rejected non-finite input without saying so:\n{message}")
+    for suffix in ("_fieldmaps_native", "_fieldmaps", "_displacementmaps"):
+        if medic_output_exists(prefix, suffix):
+            values = medic_read_output(prefix, suffix, tmp, "nan")
+            raise AssertionError(
+                f"--medic wrote <prefix>{suffix} despite failing on non-finite input"
+                + (" (and it is all zero -- the exact silent failure this guards)"
+                   if values is not None and not any(v != 0.0 for v in values) else "")
+            )
+
+    # --rank 0 skips the filter entirely.  Either it errors cleanly (the current behaviour: the
+    # non-finite gate now sits on the field series itself, independent of the filter) or it
+    # succeeds -- but it must never succeed with an all-zero or non-finite field map.
+    prefix0 = tmp / "medic_nan_rank0"
+    result0 = medic_run(exe, mags, phases, (10.0, 30.0), prefix0, ["--rank", "0"])
+    if result0.returncode == 0:
+        values = medic_read_output(prefix0, "_fieldmaps_native", tmp, "nan0")
+        if values is None:
+            raise AssertionError("--medic --rank 0 exited 0 without writing a field map")
+        if not any(v != 0.0 for v in values):
+            raise AssertionError("--medic --rank 0 wrote an all-zero field map and exited 0")
+        if any(v != v for v in values):
+            raise AssertionError("--medic --rank 0 wrote a non-finite field map and exited 0")
+    else:
+        if "non-finite" not in (result0.stdout + result0.stderr):
+            raise AssertionError("--medic --rank 0 failed on NaN input without a diagnostic")
+        if medic_output_exists(prefix0, "_fieldmaps_native"):
+            raise AssertionError("--medic --rank 0 left a field map behind after failing")
+
+
+def exercise_medic_three_echo(exe: str, tmp: Path) -> None:
+    """(6) Three echoes and the paper's Eq. 6, the cumulative through-origin fit that predicts each
+    echo's 2*pi branch from ALL the echoes already corrected.  The retired code predicted every
+    later echo from echo 1 alone (phi_n ~ phi_1 * TE_n/TE_1), which coincides with Eq. 6 only for
+    two echoes.  Two frames, so the temporal correction actually runs.
+
+    (a) Consistent data: the field must come back exactly.
+    (b) Discriminating data: a TE-independent phase offset with --phase-offset none, which makes
+        phi_e/TE_e differ between echoes and so separates the two prediction rules.  With
+        TEs 10/20/30 ms and an offset c the third echo's discrepancy is 0.8*c under Eq. 6 (rounds
+        to no shift) but 2*c under the retired rule (c = 2.5 rad rounds to a whole 2*pi), which
+        lands in the field map as a uniform +TE_3/sum(TE^2)/1000 = +21.43 Hz intercept shift."""
+    tes = (10.0, 20.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_e3", tes, 2, lambda t: 1.0)
+    prefix = tmp / "medic_e3_out"
+    require_success(medic_run(exe, mags, phases, tes, prefix, ["--rank", "0"]), "--medic three-echo run")
+    field = medic_read_output(prefix, "_fieldmaps_native", tmp, "e3")
+    if field is None:
+        raise AssertionError("--medic three-echo run wrote no field map")
+    expect_intercept = medic_expected_intercept()
+    for frame in (0, 1):
+        slope, intercept = medic_fit_along_j(field, frame)
+        if abs(slope - MEDIC_FIELD_J) > 0.02 * MEDIC_FIELD_J:
+            raise AssertionError(
+                f"--medic (3 echoes, frame {frame}): field slope {slope:.5f} Hz/voxel, expected {MEDIC_FIELD_J}"
+            )
+        if abs(intercept - expect_intercept) > 0.02 * abs(expect_intercept):
+            raise AssertionError(
+                f"--medic (3 echoes, frame {frame}): field intercept {intercept:.5f} Hz, expected {expect_intercept:.5f}"
+            )
+
+    offset_rad = 2.5
+    mags, phases = medic_write_series(tmp, "medic_e3off", tes, 2, lambda t: 1.0, offset_rad=offset_rad)
+    prefix = tmp / "medic_e3off_out"
+    require_success(
+        medic_run(exe, mags, phases, tes, prefix, ["--rank", "0", "--phase-offset", "none"]),
+        "--medic three-echo run with an uncorrected phase offset",
+    )
+    field = medic_read_output(prefix, "_fieldmaps_native", tmp, "e3off")
+    if field is None:
+        raise AssertionError("--medic three-echo offset run wrote no field map")
+    seconds = [te / 1000.0 for te in tes]
+    sum_t = sum(seconds)
+    sum_t2 = sum(t * t for t in seconds)
+    # An uncorrected offset c enters the weighted regression as a constant c*sum(t)/(2pi*sum(t^2)).
+    predicted = expect_intercept + offset_rad * sum_t / (MEDIC_TWO_PI * sum_t2)
+    # Multi-echo unwrapping cannot see a global TE-proportional branch, so the whole field may sit
+    # a multiple of 1/TE_1 away; that ambiguity is legitimate and deterministic, and reducing the
+    # residual modulo it keeps the check on the Eq. 6 term (21.43 Hz, not a multiple of 100 Hz).
+    quantum = 1.0 / seconds[0]
+    retired_rule_shift = seconds[2] / sum_t2
+    for frame in (0, 1):
+        slope, intercept = medic_fit_along_j(field, frame)
+        residual = (intercept - predicted) % quantum
+        if residual > quantum / 2.0:
+            residual -= quantum
+        if abs(slope - MEDIC_FIELD_J) > 0.02 * MEDIC_FIELD_J:
+            raise AssertionError(
+                f"--medic (3 echoes + offset, frame {frame}): field slope {slope:.5f}, expected {MEDIC_FIELD_J}"
+            )
+        if abs(residual) > 2.0:
+            raise AssertionError(
+                f"--medic (3 echoes + offset, frame {frame}): intercept {intercept:.4f} Hz is {residual:+.4f} Hz "
+                f"off the Eq. 6 prediction {predicted:.4f} (mod {quantum:g}); predicting echo 3 from echo 1 "
+                f"alone shifts it by {retired_rule_shift:.3f} Hz"
+            )
+
+
+def exercise_medic_rank(exe: str, tmp: Path, mags: list[str], phases: list[str], frames: int, amplitude) -> None:
+    """(7) --rank 0 versus the default --rank 10 on a series that is EXACTLY rank 1 in time
+    (field = amplitude(t) * f(voxel)).  Rank-10 truncation of a rank-1 matrix is the identity, so
+    the two must agree to round-off.  This is the only coverage of the Jacobi eigensolver and the
+    projector application; a broken sweep, a mis-transposed projector, or an off-by-one in the
+    retained rank shows up here as a large difference or a collapsed (all-zero) series."""
+    outputs: dict[str, list[float]] = {}
+    for rank in ("0", "10"):
+        prefix = tmp / f"medic_rank{rank}"
+        result = medic_run(exe, mags, phases, (10.0, 30.0), prefix, ["--rank", rank])
+        require_success(result, f"--medic --rank {rank}")
+        values = medic_read_output(prefix, "_fieldmaps_native", tmp, f"rank{rank}")
+        if values is None:
+            raise AssertionError(f"--medic --rank {rank} wrote no field map")
+        outputs[rank] = values
+    unfiltered, filtered = outputs["0"], outputs["10"]
+    peak = max(abs(v) for v in unfiltered)
+    if peak < 1.0:
+        raise AssertionError("--medic: the rank fixture produced a degenerate field map")
+    worst = max(abs(a - b) for a, b in zip(unfiltered, filtered))
+    if worst > 1e-3 * peak:
+        raise AssertionError(
+            f"--medic: rank-10 truncation of a rank-1 series changed it by {worst:g} Hz "
+            f"(peak {peak:g}); the two must agree to round-off"
+        )
+    # and the filtered series must still carry the known per-frame field, not a collapsed one
+    for frame in (0, frames - 1):
+        slope, _ = medic_fit_along_j(filtered, frame)
+        expect = MEDIC_FIELD_J * amplitude(frame)
+        if abs(slope - expect) > 0.02 * expect:
+            raise AssertionError(
+                f"--medic --rank 10 (frame {frame}): field slope {slope:.5f} Hz/voxel, expected {expect:.5f}"
+            )
+
+
+def exercise_medic_phase_offset_none(exe: str, tmp: Path) -> None:
+    """(8) --phase-offset none --save-intermediates must not write <prefix>_phase_offset.
+
+    Nothing computes an offset when MCPC-3D-S is disabled, so the retired code wrote the
+    uninitialised buffer out as if it were an image."""
+    tes = (10.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_off", tes, 1, lambda t: 1.0)
+    prefix_none = tmp / "medic_off_none"
+    require_success(
+        medic_run(exe, mags, phases, tes, prefix_none,
+                  ["--rank", "0", "--phase-offset", "none", "--save-intermediates"]),
+        "--medic --phase-offset none --save-intermediates",
+    )
+    if medic_output_exists(prefix_none, "_phase_offset"):
+        raise AssertionError("--medic --phase-offset none wrote a _phase_offset image (uninitialised heap)")
+    # the other intermediates ARE expected, so the absence above is not simply a dead option
+    for suffix in ("_masks", "_unwrapped_echo-1", "_unwrapped_echo-2"):
+        if not medic_output_exists(prefix_none, suffix):
+            raise AssertionError(f"--medic --save-intermediates did not write <prefix>{suffix}")
+
+    # positive control: with MCPC enabled the offset image IS written
+    prefix_mcpc = tmp / "medic_off_mcpc"
+    require_success(
+        medic_run(exe, mags, phases, tes, prefix_mcpc,
+                  ["--rank", "0", "--phase-offset", "mcpc", "--save-intermediates"]),
+        "--medic --phase-offset mcpc --save-intermediates",
+    )
+    if not medic_output_exists(prefix_mcpc, "_phase_offset"):
+        raise AssertionError("--medic --phase-offset mcpc --save-intermediates did not write _phase_offset")
+
+
+def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
+    """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
+    if "--medic" not in help_text:
+        print("  --medic regressions: not built (MEDIC=0) - skipping")
+        return
+
+    exercise_medic_unwarp_io(exe, tmp)
+    exercise_medic_polarity(exe, tmp)
+    exercise_medic_three_echo(exe, tmp)
+    exercise_medic_phase_offset_none(exe, tmp)
+
+    # One 12-frame series feeds both the rank check and (with a poisoned voxel) the non-finite
+    # check.  12 > the default --rank 10, which the low-rank bug required.
+    frames = 12
+    amplitude = lambda t: 1.0 + 0.4 * math.sin(0.9 * t)  # noqa: E731 - keeps the fixture inline
+    mags, phases = medic_write_series(tmp, "medic_series", (10.0, 30.0), frames, amplitude)
+    exercise_medic_rank(exe, tmp, mags, phases, frames, amplitude)
+
+    nx, ny, nz = MEDIC_DIMS
+    poisoned = 8 + 12 * nx + 4 * nx * ny  # an interior voxel of frame 0, well inside the mask
+    nan_mags, nan_phases = medic_write_series(tmp, "medic_nanseries", (10.0, 30.0), frames, amplitude,
+                                              nan_index=poisoned)
+    exercise_medic_nonfinite(exe, tmp, nan_mags, nan_phases, frames)
+
+    print("  --medic/-unwarp regressions: polarity, non-finite, scaling, grid, rank, offsets OK")
+
+
 def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
     """Regression for the -allineate -fill / -weight options and the -dilate fix — the
     niimath-only dispatch, chain integration, and CLI parsing that the shared allineate
@@ -1322,6 +1823,7 @@ def main() -> int:
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
         exercise_medic(exe, tmp, help_text)
+        exercise_medic_regressions(exe, tmp, help_text)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
