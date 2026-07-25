@@ -42,6 +42,52 @@ that the FP flags are the only difference between them.  Nothing in the reposito
 modified; objects and binaries land in the scratch directory.
 
 Analysis-only: NOT shipped, NOT run in CI, numpy is fine here (unlike release_smoke.py).
+
+RESULT RECORDED 2026-07-25 (Apple clang/gcc shim, arm64, 8 threads)
+------------------------------------------------------------------
+Codegen really differed: the fast object carries 65 fused multiply-add instructions
+(md_lowrank, md_pull, md_temporal, md_invert, md_offset_per_mm, md_rescale_phase and the
+MCPC/regression outlines), the strict object zero.  The `fast` binary built here is bit-identical to the ordinary `cd src && make -j8`
+binary on all seven demo outputs, so the experiment measures the SHIPPED build.
+
+32 configurations; 508,051,136 radian-unit voxels compared.
+
+  * whole-2*pi branch differences in the unwrapped phase : 0
+  * mask differences                                     : 0
+  * largest unwrapped-phase difference                   : 3.8e-6 rad (a few float32 ULP)
+
+  * md_rescale_phase() is CLEAN: every `*_raw,offset=none` configuration -- raw Siemens
+    scale (span 8190, so slope = 2*pi/8190 and inter are both non-terminating in binary,
+    and the FMA contraction of `p[i]*slope + inter` is live) with MCPC-3D-S off -- is
+    bit-identical.  Ditto `demo/offset=none` on real data.  Not one float32 phase value
+    moved.
+  * md_mcpc3ds() is where every phase-level difference comes from: ~1e-3 of voxels differ
+    in `_phase_offset`, up to 23/265696 in the unwrapped phase, all at 1-4 float32 ULP.
+  * The multi-frame post-unwrap arithmetic (md_temporal/md_regress/md_lowrank) adds
+    ULP-level differences to `_fieldmaps_native` (max 3.05e-5 Hz over 45.2 M voxels).
+  * ONE output amplifies: `_fieldmaps` / `_displacementmaps` after md_invert(), up to
+    29.2 Hz / 1.66 mm -- but at 21 voxels in 45,168,320, of which 20 lie in a PE column
+    whose forward map is folded or near-folded.  niimath already warns on this run that
+    the inversion did not converge and that ~27k columns are FOLDED, "so the inverse is
+    multi-valued and the branch chosen is arbitrary".  Part B reproduces the same
+    amplification (130 Hz / 7.9 mm) from a pure +-1 ULP perturbation with a SINGLE binary,
+    so this is fixed-point conditioning, not an FP-policy defect: strict FP would pick a
+    different arbitrary branch, not a well-defined one.
+
+Part D measures the QUANTISER itself, in romeo_plan.md's own units (differing weight bytes
+from `-romeo-dump c_weights.u8`).  Under the same 100 %-of-voxels +-1 ULP perturbation:
+1/221184 (smooth) and 4/221184 (fully inconsistent) 8-bit edge weights flip, and ZERO of
+them drop to bin 0 -- i.e. no edge is ever DELETED from the graph, which is the specific
+mechanism that breaks romeo.c.  For scale, romeo.c compiled -ffast-math moves 360/797088
+weight bytes (0.045 %) and does delete edges, leaving 66 voxels off by a full 2*pi.
+
+VERDICT: medic.c does NOT need strict FP.  medic.c has no quantiser of its own; the phase
+it computes is consumed by ROMEO as a continuous value.  The measured perturbation it can
+inject (1-4 float32 ULP, at ~1e-3 of voxels) is two orders of magnitude weaker than the
+saturating 100 % +-1 ULP probe in Parts B/D, and even that probe deletes no edge and flips
+no 2*pi branch.  The plan's original call (medic_plan.md line 247 -- "do not compile all of
+medic.c strict-FP merely because ROMEO requires it ... unless measurement identifies a real
+correctness issue") stands, now backed by measurement.
 """
 
 from __future__ import annotations
@@ -148,7 +194,7 @@ def _wrap(p):
     return (p + np.pi) % (2 * np.pi) - np.pi
 
 
-def _blob(shape, rng=None):
+def _blob(shape):
     """A smooth magnitude 'brain': no hard edge, robustmask-friendly."""
     nx, ny, nz = shape
     x, y, z = np.meshgrid(*[np.arange(n, dtype=np.float64) for n in shape], indexing="ij")
@@ -400,6 +446,56 @@ def part_b(binary, out_dir, nthread=8):
     return out
 
 
+# ------------------------------------------------------------------ Part D
+
+def part_d(binary, out_dir):
+    """Direct measurement of the QUANTISER, using ROMEO's own `-romeo-dump c_weights.u8`.
+
+    romeo_plan.md counts the exposure in differing WEIGHT BYTES (it reports 360/797088 for
+    the repo-wide -ffast-math build of romeo.c).  The same metric applies here: how many of
+    the 3N 8-bit edge weights flip when the phase medic.c hands to ROMEO moves by +-1
+    float32 ULP?  This runs `-romeo -no-rescale` (so the supplied float32 phase reaches the
+    weight computation verbatim) on a reference volume and on a 100 %-perturbed copy, and
+    diffs the dumped bytes.  It separates "the graph changed" from "the answer changed":
+    Part A/B show the ANSWER is unchanged; this shows how often the GRAPH moves at all."""
+    os.makedirs(out_dir, exist_ok=True)
+    shape = (48, 48, 32)
+    rng = np.random.default_rng(11)
+    mag = _blob(shape)
+    x, y, z = np.meshgrid(*[np.arange(n, dtype=np.float64) for n in shape], indexing="ij")
+    out = []
+    for tag, f in (("smooth", 90.0 * np.sin(x / 9.0) * np.cos(y / 6.0)),
+                   ("noisy", 400.0 * rng.standard_normal(shape))):
+        p = np.float32(_wrap(TWO_PI * f * 16.8e-3))
+        sgn = rng.integers(0, 2, shape) * 2 - 1
+        q = np.float32(np.where(sgn > 0, np.nextafter(p, np.float32(1e30)),
+                                np.nextafter(p, np.float32(-1e30))))
+        h = _hdr()
+        mp = os.path.join(out_dir, "%s_mag.nii" % tag)
+        nii.write(mp, mag, ref=h, dtype=np.float32)
+        dumps = []
+        for sub, arr in (("ref", p), ("ulp", q)):
+            pp = os.path.join(out_dir, "%s_%s.nii" % (tag, sub))
+            dd = os.path.join(out_dir, "%s_%s_dump" % (tag, sub))
+            os.makedirs(dd, exist_ok=True)
+            nii.write(pp, arr, ref=h, dtype=np.float32)
+            r = subprocess.run([binary, pp, "-gz", "0", "-romeo", mp, "-no-rescale", "-k", "nomask",
+                                "-romeo-dump", dd, os.path.join(out_dir, "%s_%s_uw.nii" % (tag, sub))],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError("-romeo failed: %s" % r.stderr[-800:])
+            dumps.append(os.path.join(dd, "c_weights.u8"))
+        a = np.fromfile(dumps[0], dtype=np.uint8)
+        b = np.fromfile(dumps[1], dtype=np.uint8)
+        ua, _ = nii.read(os.path.join(out_dir, "%s_ref_uw.nii" % tag))
+        ub, _ = nii.read(os.path.join(out_dir, "%s_ulp_uw.nii" % tag))
+        d = np.asarray(ua, np.float64) - np.asarray(ub, np.float64)
+        out.append(dict(tag=tag, nbyte=int(a.size), ndiff=int((a != b).sum()),
+                        ndeleted=int(((a != b) & ((a == 0) | (b == 0))).sum()),
+                        branch=int(np.count_nonzero(np.round(d / TWO_PI)))))
+    return out
+
+
 # ------------------------------------------------------------------ Part C
 
 def part_c(pa, pb, trt=float(TRT), pe_axis=1):
@@ -416,10 +512,8 @@ def part_c(pa, pb, trt=float(TRT), pe_axis=1):
     MD_INVERT_TOL (1e-3 Hz) should sit in a folded column, where the answer was already
     declared arbitrary, and Part B should reproduce the same amplification from a pure
     +-1 ULP input perturbation with a SINGLE binary."""
-    fn_a, _ = nii.read("%s_fieldmaps_native.nii" % pa)
     fu_a, _ = nii.read("%s_fieldmaps.nii" % pa)
     fu_b, _ = nii.read("%s_fieldmaps.nii" % pb)
-    fn_a = np.asarray(fn_a, dtype=np.float64)
     d = np.abs(np.asarray(fu_a, np.float64) - np.asarray(fu_b, np.float64))
     # fold: d(displacement)/d(PE index) <= -1, exactly md_invert()'s own detector
     dd = np.diff(np.asarray(fu_a, np.float64), axis=pe_axis) * trt
@@ -507,6 +601,13 @@ def main():
             for ln in lines:
                 print(ln)
             any_branch += 0   # reported separately; Part B is a bound, not the policy test
+
+    print("\n== PART D: does the QUANTISER move?  ROMEO's own c_weights.u8 under +-1 ULP")
+    for r in part_d(a.strict, os.path.join(work, "partd")):
+        print("  %-8s %d/%d 8-bit edge weights differ (%.3g%%); %d dropped to bin 0 "
+              "(edge deleted); unwrapped 2*pi branch differences: %d"
+              % (r["tag"], r["ndiff"], r["nbyte"], 100.0 * r["ndiff"] / r["nbyte"],
+                 r["ndeleted"], r["branch"]))
 
     if bold_prefixes:
         print("\n== PART C: attribution of the ONE amplified output (bold170/default)")
