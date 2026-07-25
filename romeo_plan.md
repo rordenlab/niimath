@@ -1,5 +1,20 @@
 # Plan: port ROMEO phase unwrapping to niimath (`-romeo`, `romeo.c`, `HAVE_ROMEO`)
 
+## STATUS (2026-07-25)
+
+**M0–M6 and M9 are DONE and merged** (`romeo` branch). `-romeo` matches the real ROMEO CLI app on all three supplied validation cases: unwrapped phase EQUAL at `--compare 1e-7`, mask EQUAL at `--compare 0`. 366/366 oracle checks pass across 4 real + 11 synthetic cases and 10 weight selections. Thread parity holds at `-p 1/2/4/8`; UBSan and `leaks` are clean; the WASI reactor agrees with the native binary exactly.
+
+**M7 and M8 are DEFERRED** to a follow-up, by decision at the start of the run. Every option they cover is rejected at parse time with a specific message rather than silently ignored: `-u`, `-e`, `-threshold`, `-B`/`-B0-phase-weighting`, `-w bestpath`, `-max-seeds > 1`, `-merge-regions`, `-correct-regions`, `-wrap-addition != 0`, `-fix-ge-phase`.
+
+Three corrections to the plan as written, all confirmed empirically and recorded in `src/romeo.c`:
+
+1. **§3.2 / quantile.** The pinned environment resolves the *registry* package `Statistics` v1.11.1, whose `_quantile` computes `aleph = n*p + m`. The copy bundled in Julia's stdlib tree (which the plan was written against) uses `fma(n, p, m)`. They differ in the last bits and move `maxmag` in the 11th digit.
+2. **§3.2 / `rem2pi`.** libc `remainder(x, 2π_double)` is not merely "not specified to match" — it is *systematically* different, because Julia's `rem2pi` reduces against an infinitely precise 2π. Julia's `rem_pio2_kernel` (Cody-Waite + Payne-Hanek) is ported literally, with a portable 128-bit emulation so MSVC and wasm produce the same reduction.
+3. **§3.3 / strict FP.** The plan asked for the exposure to be measured. It was: `-ffp-contract=off` and FMA-only are both bit-identical to the oracle, while the repository-wide `-ffast-math` changes 360/797088 weight bytes and leaves 66 voxels off by a full 2π. The mechanism is not rounding — reassociation pushes a weight past 1.0 and `rescale()`'s `0 ≤ w ≤ 1` guard then returns bin 0, deleting the edge from the graph. Median runtime is 0.07 s under either policy.
+
+One item in §3.1 is worth re-reading before touching the weights: `phaselinearity`'s return type is *data-dependent* (Float32 for the interior product, Float64 on its `isnan → 0.5` and boundary-`0.9` branches), and `unwrapedge!`'s `d = 0` is an **Int**, which silently selects a Float32 rather than Float64 subtraction inside `unwrapvoxel`.
+
+
 ## 1. Goal
 
 Add an optional, self-contained C module (`src/romeo.c` / `src/romeo.h`, guarded by `HAVE_ROMEO`) that is a **faithful port** of [ROMEO.jl](https://github.com/korbinian90/ROMEO.jl) plus the small set of `MriResearchTools.jl` functions its command-line app depends on (`robustmask`, `readphase` rescaling, `gaussiansmooth3d` box filtering, `calculateB0_unwrapped`). Both upstream projects are MIT-licensed.
