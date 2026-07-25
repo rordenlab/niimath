@@ -12,7 +12,7 @@
 
 Open, deliberately not guessed: a broadband residual survives the reference's rank-10 truncation on real 170-frame data while ours is strictly rank 10 (§7.5). `--rank 0` disables the filter, and a non-finite field-map series is now a hard error — checked on the field series itself immediately after the regression, so it applies whether or not the low-rank filter runs — rather than a silently all-zero output set.
 
-**One audit round has since landed** (`audit_response.md`): the phase-encoding polarity is now honoured by `--medic` (manifest §3.5b — the highest-value finding, since the supplied three-echo data is `j-`), `--weights` governs both unwrapping stages, the temporal correction implements the paper's Eq. 6 cumulative fit for three or more echoes from an order-independent snapshot, and the memory model, grid matching, unit handling and output atomicity were corrected as recorded below. Residual items are ranked at the end of `audit_response.md`; the top one is test coverage for those fixes.
+**One audit round has since landed** (`audit_response.md`): the phase-encoding polarity is now honoured by `--medic` (manifest §3.5b — the highest-value finding, since the supplied three-echo data is `j-`), `--weights` governs both unwrapping stages, the temporal correction implements the paper's Eq. 6 cumulative fit for three or more echoes from an order-independent snapshot, and the memory model, grid matching, unit handling and output publication were corrected as recorded below (a third round then made the publication a recoverable transaction and moved input loading to one echo pair at a time). Residual items are ranked at the end of `audit_response.md`; the top one is test coverage for those fixes.
 
 ### Decided: memory model is in-RAM, and that is not a defect
 
@@ -205,7 +205,7 @@ Keep validation at the public `--medic` boundary. Internal kernels may assume th
 
 ### 5.2 Streaming and bounded memory — **SUPERSEDED, not implemented**
 
-> Retained for history only. Streaming is a decided **non-goal** — see the Status section above: a 4D `.nii.gz` cannot be seeked, so every tool including the reference holds whole volumes in RAM anyway. What shipped instead is the documented, printed working-set budget and the fail-atomic output rule below. Do not implement the API described here without reopening that decision.
+> Retained for history only. Streaming is a decided **non-goal** — see the Status section above: a 4D `.nii.gz` cannot be seeked, so every tool including the reference holds whole volumes in RAM anyway. What shipped instead is the documented, printed working-set budget and the recoverable output transaction described at M9. Do not implement the API described here without reopening that decision.
 
 Loading every 4D echo at once defeats the design. The 170-frame, two-echo demo already requires hundreds of megabytes for the four inputs; a five-echo, 600-frame run can require tens of gigabytes.
 
@@ -484,7 +484,7 @@ Not implemented and not needed: the streaming premise was retired (see Status), 
 ### M9 — End-to-end `--medic`
 
 - Connect frame estimation, temporal correction, low-rank filtering, inversion, and output writing.
-- Make output creation fail-atomic — as shipped, sibling-temp-plus-`rename` via `md_write_temp()`.
+- Make output creation fail-safe. **As shipped this is a *recoverable* transaction, not an atomic one:** `md_write_temp()` writes three `<prefix>.medictmp<pid>` siblings, existing finals are moved aside to `<final>.medicbak<pid>` after a `stat` preflight that refuses non-regular destinations, the temporaries are renamed in, and any failure restores the backups. A crash between two renames can still leave a mixed set — say "recoverable", not "atomic".
 - Add clear stage-specific errors and concise progress reporting.
 
 **Gate:** the single-frame demo, 170-frame two-echo run, and three-echo run complete end to end. Compare native field, displacement, undistorted field, and corrected magnitudes separately. Report finite mismatch counts, median/95th/max absolute errors, normalized RMSE, and spatial correlation.

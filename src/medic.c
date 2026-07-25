@@ -451,6 +451,11 @@ static void md_jacobi_eigh(double *a, double *v, double *w, int n) {
 
 /* Rank-`rank` truncation of the Nvox x T matrix F, in place, UNCENTERED (manifest §3.8).
  *
+ * EXPERIMENTAL, and deliberately labelled so: rank 10 is the paper's figure and a synthetic probe
+ * confirmed the reference truncates at 10, but the reference's real 170-frame output retains a
+ * broadband residual past component 10 (manifest 5.2) whose origin is unresolved and has NOT been
+ * guessed at here.  This is the least reference-faithful stage; --rank 0 skips it entirely.
+ *
  * Uses the T x T Gram matrix G = F^T F, whose eigenvectors are the right singular vectors of F.
  * Projecting each voxel's time course onto the leading k of them is exactly the truncated SVD:
  * F_k = F V_k V_k^T.  Memory is O(T^2), independent of the voxel count. */
@@ -1027,6 +1032,10 @@ static void md_usage(void) {
 	printf("phase and converts it to an EPI displacement map.\n\n");
 	printf("Options:\n");
 	printf("  --rank <N>              low-rank truncation of the field-map series (default %d; 0 disables)\n", MD_RANK_DEFAULT);
+	printf("                          EXPERIMENTAL: rank 10 is what the paper specifies, but the\n");
+	printf("                          reference's own output retains a broadband residual past\n");
+	printf("                          component 10 whose origin is unresolved, so this stage is the\n");
+	printf("                          least reference-faithful part of the pipeline (--rank 0 skips it)\n");
 	printf("  --temporal-correction <0|1>  temporal 2*pi consistency correction (default 1)\n");
 	printf("  --phase-offset <mcpc|none>   MCPC-3D-S phase-offset correction (default mcpc)\n");
 	printf("  --noise-frames <N>, -f  drop N trailing frames from the outputs (default 0)\n");
