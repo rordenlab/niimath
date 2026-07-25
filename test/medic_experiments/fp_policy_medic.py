@@ -284,6 +284,11 @@ def configs(synthetics):
         c.append(("synth/%s" % tag, mags, phases, []))
         if tag.split("_")[0] in ("noisy", "binedge", "residual"):
             c.append(("synth/%s,weights=romeo3" % tag, mags, phases, ["--weights", "romeo3"]))
+        if tag.endswith("_raw"):
+            # ISOLATION: rescale runs (raw scale) but MCPC-3D-S does not.  If the unwrapped
+            # phase is bit-identical here, md_rescale_phase()'s fused multiply-add produced
+            # no float32 difference at all and the whole exposure lives in md_mcpc3ds().
+            c.append(("synth/%s,offset=none" % tag, mags, phases, ["--phase-offset", "none"]))
     return c
 
 
@@ -423,10 +428,19 @@ def part_c(pa, pb, trt=float(TRT), pe_axis=1):
     sl[pe_axis] = slice(0, d.shape[pe_axis] - 1)
     fold[tuple(sl)] = dd <= -1.0
     # a voxel counts as "in a folded column" if it or an immediate PE neighbour folded
-    fold |= np.roll(fold, 1, axis=pe_axis) | np.roll(fold, -1, axis=pe_axis)
+    adj = fold | np.roll(fold, 1, axis=pe_axis) | np.roll(fold, -1, axis=pe_axis)
+    # ... and "in a folded COLUMN" if the forward map is non-monotone anywhere in its PE line
+    col = np.broadcast_to(fold.any(axis=pe_axis, keepdims=True), fold.shape)
+    # the CONDITIONING of each voxel's column: the most contracting slope along its PE line.
+    # dd <= -1 is a hard fold (multi-valued inverse); dd approaching -1 from above is a
+    # marginally-contracting fixed point, i.e. still arbitrarily perturbation-sensitive.
+    worst = np.broadcast_to(dd.min(axis=pe_axis, keepdims=True), fold.shape)
     big = d > 1e-3
-    return dict(nbig=int(big.sum()), n=int(d.size),
-                nbig_in_fold=int((big & fold).sum()), maxd=float(d.max()))
+    w = worst[big]
+    return dict(nbig=int(big.sum()), n=int(d.size), maxd=float(d.max()),
+                nbig_in_fold=int((big & adj).sum()), nbig_in_col=int((big & col).sum()),
+                worst_max=float(w.max()) if w.size else 0.0,
+                n_le_half=int((w <= -0.5).sum()))
 
 
 # ------------------------------------------------------------------ main
@@ -499,8 +513,13 @@ def main():
         c = part_c(*bold_prefixes)
         print("  _fieldmaps voxels moved > MD_INVERT_TOL (1e-3 Hz): %d / %d (max %.4g Hz)"
               % (c["nbig"], c["n"], c["maxd"]))
-        print("  ... of which inside a FOLDED PE column (md_invert's own detector): %d (%.1f%%)"
+        print("  ... adjacent to a FOLDED voxel pair (md_invert's own detector): %d (%.1f%%)"
               % (c["nbig_in_fold"], 100.0 * c["nbig_in_fold"] / max(c["nbig"], 1)))
+        print("  ... inside a PE COLUMN that folds somewhere (inverse multi-valued): %d (%.1f%%)"
+              % (c["nbig_in_col"], 100.0 * c["nbig_in_col"] / max(c["nbig"], 1)))
+        print("  ... in a column with a contracting slope <= -0.5 (fold or near-fold): %d/%d;\n"
+              "      the LEAST ill-conditioned of them still has min d(disp)/d(PE) = %.3f"
+              % (c["n_le_half"], c["nbig"], c["worst_max"]))
         print("  niimath already warns on this run that the inversion did not converge and that\n"
               "  ~27k PE columns are folded, where 'the branch chosen is arbitrary'.  Part B\n"
               "  reproduces the same amplification from a pure +-1 ULP input perturbation with a\n"

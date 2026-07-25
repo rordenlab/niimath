@@ -172,6 +172,17 @@ This matters in practice: the supplied three-echo dataset is acquired `j-`. Disc
 
 `-unwarp` still ignores the suffix, and must: by then the sign is already baked into the stored map.
 
+**Support matters, and both earlier figures were right.** §3.4 quotes p95 = 0.006 mm and §3.5b quotes 0.045 mm for what looks like the same measurement. Re-run with the support stated explicitly (200 iterations, reference's own native field, `test/medic_experiments/exp08_inversion.py` conventions):
+
+| polarity | support | p50 | p95 |
+| --- | --- | --- | --- |
+| `j` | reference mask >= 1 (99 958 vox) | 0.00030 mm | **0.0392 mm** |
+| `j` | crude magnitude p60 (106 268 vox) | 0.00020 mm | **0.0059 mm** |
+| `j-` | reference mask >= 1 | 0.00024 mm | 0.0213 mm |
+| `j-` | crude magnitude p60 | 0.00016 mm | 0.0041 mm |
+
+The 7x spread is entirely the **choice of support**: the reference mask extends further into low-signal regions where the inversion is least well determined. All four are inside the 0.05 mm gate. Quote the support with the number, always.
+
 ### 3.6 Interpolation, fill, Jacobian — §7.9, §7.10 — B
 
 From the impulse response at a half-voxel shift (`exp09_interp_fill.py`), taps at |x| = 0.5…4.5 measured as

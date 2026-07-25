@@ -96,7 +96,7 @@ QC_WASM= $(QCFLAGS)
 # MEDIC in the default Emscripten build: --medic and -unwarp are useful in the browser and
 # -unwarp is cheap, so they ship. DELIBERATE LIMIT, not an oversight: wasm32 is a 4 GiB address
 # space and every wasm target sets -DFORCE_INT32_MAX, while --medic holds the whole run resident
-# (n3 * T * (3*echoes + 1) * 4 bytes). The 170-frame two-echo demo needs ~2.5 GB, so long
+# (n3 * T * (2*echoes + 3) * 4 bytes). The 170-frame two-echo demo needs ~1.9 GB, so long
 # multi-echo runs will not fit in the browser -- estimate on a native binary and apply -unwarp in
 # wasm. Omitted from tiny/nano (like every other optional feature) and from the WASI reactor,
 # which is a lean zlib-free compute backend.

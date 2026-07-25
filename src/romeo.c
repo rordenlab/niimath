@@ -31,7 +31,13 @@
  * That is not a theoretical worry - it was MEASURED, building this same source three ways and
  * comparing against the pinned Julia oracle. The middle column is the 76x76x46 validation volume
  * (phase0/mag0, -t 16.8); the right column is the FULL parity suite (test/romeo_compare.py
- * --weights-all: 4 real + 11 synthetic cases, 10 weight selections):
+ * --weights-all: 4 real + 11 synthetic cases, 10 weight selections).
+ *
+ * NOTE: the pass counts below are AS MEASURED WHEN THIS EXPERIMENT WAS RUN, when the suite had
+ * 422 checks. It has since grown to 602 (the six B0 weighting modes are now compared byte-exactly).
+ * The counts are left at their measured values rather than rewritten, because they record an
+ * experiment, not a current claim -- any re-measurement of the FP policy must re-run the suite and
+ * restate them:
  *
  *   FP policy for romeo.o              e0 weight bytes differing   FULL parity suite
  *   ---------------------------------  -------------------------   ---------------------------
