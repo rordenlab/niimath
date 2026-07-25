@@ -83,13 +83,21 @@ def cmp_exact(res: Result, label: str, ref: str, got: str) -> None:
     res.add(label, False, f"{ndiff}/{len(a)} bytes differ, first at {first} (oracle {a[first]} vs {b[first]})")
 
 
-def cmp_float(res: Result, label: str, ref: str, got: str, tol: float, wrap_check: bool = False) -> None:
+def cmp_float(res: Result, label: str, ref: str, got: str, tol: float, wrap_check: bool = False,
+              relative: bool = False) -> None:
     if not os.path.exists(ref) or not os.path.exists(got):
         missing = os.path.basename(ref if not os.path.exists(ref) else got)
         res.add(label, False, f"missing {missing}")
         return
     a = read_raw(ref, "f")
     b = read_raw(got, "f")
+    if len(a) == 1 and len(b) > 1:
+        # Upstream's B0 SNR collapses to ONE value when no magnitude is supplied: the app
+        # substitutes a voxel-independent exp(-TE/20) decay, so `sum(mag.*w)/sum(w)` has no
+        # spatial extent and ROMEO writes a 1x1x1 image. niimath writes the same constant across
+        # the working grid instead (every other side output lives on that grid). Values identical,
+        # shape deliberately different - compare the constant against every voxel.
+        a = array("f", [a[0]] * len(b))
     if len(a) != len(b):
         res.add(label, False, f"length {len(b)} != oracle {len(a)}")
         return
@@ -117,8 +125,12 @@ def cmp_float(res: Result, label: str, ref: str, got: str, tol: float, wrap_chec
                 maxwrap = max(maxwrap, abs(int(k)))
             r = abs((x - y) - k * TWO_PI)
             maxresid = max(maxresid, r)
-    ok = maxdiff <= tol and nonfinite == 0 and maxwrap == 0
-    detail = f"max|diff|={maxdiff:.3e} at {argmax}, tol={tol:g}, nonfinite-mismatch={nonfinite}"
+    scale = 1.0
+    if relative:
+        scale = max(1.0, max((abs(x) for x in a if math.isfinite(x)), default=1.0))
+    ok = maxdiff <= tol * scale and nonfinite == 0 and maxwrap == 0
+    detail = (f"max|diff|={maxdiff:.3e} at {argmax}, tol={tol:g}"
+              + (f"*{scale:.3g}" if relative else "") + f", nonfinite-mismatch={nonfinite}")
     if wrap_check:
         detail += f", wraps={maxwrap}, residual={maxresid:.3e}"
     res.add(label, ok, detail)
@@ -239,6 +251,25 @@ def check_case(binary: str, ref: str, tag: str, datadir: str, phase: str, mag: s
         cmp_ulp(res, f"{tag}: weights pre-rescale", R("weights_prerescale.f64"),
                 C("weights_prerescale.f64"), 4)
         cmp_float(res, f"{tag}: unwrapped", R("unwrapped.f32"), C("unwrapped.f32"), 1e-4, wrap_check=True)
+
+        # B0 (plan M8): every weighting mode, with and without a magnitude.
+        for wmode in ("phase_snr", "phase_var", "average", "TEs", "mag", "simulated_mag"):
+            if not os.path.exists(R(f"b0_{wmode}.f32")):
+                continue
+            tmpb = tempfile.mkdtemp(prefix="romeo_b0_")
+            try:
+                ab = [phase, "-romeo", mag if mag else "none"] + extra + \
+                     ["-B", "-B0-phase-weighting", wmode, "-romeo-dump", tmpb, os.path.join(tmpb, "o")]
+                rcb, logb = run_niimath(binary, ab, datadir)
+                if rcb != 0:
+                    res.add(f"{tag}: -B {wmode}", False, f"exit {rcb}: {logb.strip()[:150]}")
+                    continue
+                cmp_float(res, f"{tag}: -B {wmode}", R(f"b0_{wmode}.f32"),
+                          os.path.join(tmpb, "c_b0.f32"), 1e-6, relative=True)
+                cmp_float(res, f"{tag}: -B {wmode} snr", R(f"b0_snr_{wmode}.f32"),
+                          os.path.join(tmpb, "c_b0_snr.f32"), 1e-6, relative=True)
+            finally:
+                shutil.rmtree(tmpb, ignore_errors=True)
 
         # Variant runs. The oracle dumps these arrays (M5/M6 exit criteria); each needs its own
         # niimath invocation because they change the unwrapping, not just an output.

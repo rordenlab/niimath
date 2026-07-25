@@ -379,6 +379,8 @@ int show_help( void ) {
 	printf("                                  -template <n>  echo unwrapped spatially (default 1);  -i individual (not temporal) unwrapping\n");
 	printf("                                  -temporal-uncertain-unwrapping [x]  re-unwrap low-quality voxels spatially (0.5 when the flag is bare; off otherwise)\n");
 	printf("                                  -g correct global n2pi offset;  -q write <out>_quality;  -Q write <out>_quality_1..6\n");
+	printf("                                  -B [name]      also write a B0 field map in Hz: <out>_B0 and <out>_B0_snr (needs -t; [name] replaces the B0 stem)\n");
+	printf("                                  -B0-phase-weighting <mode>  phase_snr (default) | phase_var | average | TEs | mag | simulated_mag\n");
 	printf("                                  -no-phase-rescale;  -no-mask-out (suppress <out>_mask);  -v verbose\n");
 	printf("                            side outputs, nifti_save postfixes on <out>: <out>_mask (only when a mask was computed), <out>_quality (-q), <out>_quality_1..6 (-Q; a map that is uniformly 1.0 is skipped, as upstream)\n");
 	printf("                            phase is rescaled to [-pi,pi] (readphase) unless -no-phase-rescale; the rescale re-reads the UNSCALED file, so it requires -romeo to be the FIRST operation\n");

@@ -315,6 +315,17 @@ function run_case(tag; phasefile, magfile, TEs, template = 1)
         note("qmap_$(i)_all_one " * string(all(qm[1:end-1, 1:end-1, 1:end-1] .== 1.0f0)))
     end
 
+    # ---- B0 (plan M8). The app's computeB0 runs on the UNWRAPPED phase, and substitutes a
+    #      Float64 exp(-TE/20) T2* decay for the magnitude when none is supplied. Equivalent to
+    #      `romeo --compute-B0 --phase-offset-correction off` (MCPC-3D-S is out of scope).
+    for wmode in (:phase_snr, :phase_var, :average, :TEs, :mag, :simulated_mag)
+        b0mag = mag === nothing ? MRT.to_dim(exp.(-TEs / 20), 4) : mag
+        b0 = calculateB0_unwrapped(unwrapped, b0mag, TEs, wmode)
+        snr = get_B0_snr(b0mag, TEs, wmode)
+        dump_f32("$(tag)_b0_$(wmode).f32", b0)
+        dump_f32("$(tag)_b0_snr_$(wmode).f32", ndims(snr) >= 4 ? dropdims(snr; dims=4) : snr)
+    end
+
     # ---- variants required by later milestones ----------------------------------------------
     if neco > 1
         let u = copy(phase)

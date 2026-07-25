@@ -31,6 +31,16 @@ enum {
 	RM_W_FLAGS // explicit bit flags in opts.flags[]
 };
 
+// -B0-phase-weighting selection
+enum {
+	RM_B0_PHASE_SNR = 0, // default
+	RM_B0_PHASE_VAR,
+	RM_B0_AVERAGE,
+	RM_B0_TES,
+	RM_B0_MAG,
+	RM_B0_SIMULATED_MAG
+};
+
 // -k selection
 enum {
 	RM_MASK_ROBUST = 0, // default
@@ -54,6 +64,9 @@ typedef struct {
 	int verbose;             // -v
 	int write_quality;       // -q
 	int write_quality_all;   // -Q
+	int compute_b0;          // -B given
+	const char *b0_name;     // -B <name>: side-output stem, default "B0"
+	int b0_weighting;        // RM_B0_*
 	int no_mask_out;         // niimath-only: suppress the <base>_mask side output
 	int no_phase_rescale;    // -no-phase-rescale
 	int maxseeds;            // -max-seeds (only 1 supported)

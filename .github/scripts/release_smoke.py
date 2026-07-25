@@ -580,6 +580,25 @@ def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
         delta = value - original
         if abs(delta - round(delta / two_pi) * two_pi) > 1e-3:
             raise AssertionError("romeo multi-echo output does not rewrap to its input")
+    # 5. B0: for a SINGLE echo the weighting cancels, so B0 == (1000/2pi)*phase/TE exactly,
+    #    whichever mode is selected. Cheap exact oracle that needs no reference data.
+    for wmode in ("phase_snr", "average", "mag"):
+        out4 = tmp / ("romeo_b0_%s.nii" % wmode)
+        require_success(
+            run_niimath(exe, [str(phase_path), "-gz", "0", "-romeo", str(mag_path), "-t", "5.0",
+                              "-k", "nomask", "-no-phase-rescale", "-B",
+                              "-B0-phase-weighting", wmode, str(out4)]),
+            "romeo B0 (%s)" % wmode,
+        )
+        b0 = read_float32_nifti(tmp / ("romeo_b0_%s_B0.nii" % wmode))
+        unwrapped = read_float32_nifti(out4)
+        for value, ph in zip(b0, unwrapped):
+            want = (1000.0 / two_pi) * ph / 5.0
+            if abs(value - want) > 1e-3 * max(1.0, abs(want)):
+                raise AssertionError("romeo -B %s: %g != (1000/2pi)*phase/TE = %g" % (wmode, value, want))
+        if not (tmp / ("romeo_b0_%s_B0_snr.nii" % wmode)).exists():
+            raise AssertionError("romeo -B must also write <out>_B0_snr")
+
     check_romeo_primitives(exe, tmp, phase_path, mag_path)
     print("  -romeo: unwrap/mask/quality/multi-echo OK")
 

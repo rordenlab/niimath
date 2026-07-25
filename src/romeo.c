@@ -802,6 +802,70 @@ static int rm_voxelquality(const rm_wctx *c, float *qmap) {
 }
 
 /* ============================================================================================
+ * 5b. B0 field map (MriResearchTools romeofunctions.jl: calculateB0_unwrapped / get_B0_snr)
+ *
+ *   B0  = ((1000/2pi) * sum(phase./TEs .* w; dims=4)) ./ sum(w; dims=4),  non-finite -> 0
+ *   snr = sum(mag .* w; dims=4) ./ sum(w; dims=4)
+ *
+ * Note the association: upstream writes `(1000 / 2pi) * sum(...) ./ sum(...)`, and `*` and `./`
+ * are the same precedence and left-associative, so the constant multiplies the NUMERATOR before
+ * the division — not the quotient afterwards.
+ *
+ * WIDTHS: the weight is Float64 for every mode EXCEPT `mag` with a real (Float32) magnitude,
+ * where `mag .* weight` and both sums stay Float32.  Verified per mode against the pinned Julia.
+ * Without a magnitude the app substitutes a Float64 exp(-TE/20) decay, which also makes the
+ * `mag` mode Float64 - hence the `w32` flag depends on BOTH the mode and have_mag.
+ * ==========================================================================================*/
+
+static double rm_b0_weight_d(int mode, double m, double te) {
+	switch (mode) {
+	case RM_B0_PHASE_VAR: return m * m * te * te;
+	case RM_B0_AVERAGE: return 1.0;
+	case RM_B0_TES: return te;
+	case RM_B0_MAG: return m;
+	case RM_B0_SIMULATED_MAG: return exp(-te / 20.0) * te;
+	default: return m * te;   /* RM_B0_PHASE_SNR */
+	}
+}
+
+/* `mag` may be NULL: the app then uses a voxel-independent exp(-TE/20) T2* decay. */
+static void rm_compute_b0(const float *phase, const float *mag, int64_t n3, int neco,
+	const double *TEs, int mode, float *b0, float *snr) {
+	const int w32 = (mode == RM_B0_MAG) && (mag != NULL);
+	int64_t i;
+	int e;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) private(e)
+#endif
+	for (i = 0; i < n3; i++) {
+		double num = 0.0, den = 0.0, snum = 0.0;   /* num is Float64 in every mode */
+		float denf = 0.0f, snumf = 0.0f;
+		for (e = 0; e < neco; e++) {
+			double te = TEs[e];
+			double m = mag ? (double)mag[(int64_t)e * n3 + i] : exp(-te / 20.0);
+			double p = (double)phase[(int64_t)e * n3 + i];
+			if (w32) {
+				float w = (float)m;                /* weight == the Float32 magnitude itself */
+				denf += w;
+				snumf += (float)m * w;
+				num += p / te * (double)w;
+			} else {
+				double w = rm_b0_weight_d(mode, m, te);
+				den += w;
+				snum += m * w;
+				num += p / te * w;
+			}
+		}
+		{
+			double d = w32 ? (double)denf : den;
+			double v = (1000.0 / RM_2PI_F64) * num / d;
+			b0[i] = (fabs(v) <= DBL_MAX) ? (float)v : 0.0f;   /* B0[.!isfinite.(B0)] .= 0 */
+			snr[i] = w32 ? (snumf / denf) : (float)(snum / den);
+		}
+	}
+}
+
+/* ============================================================================================
  * 6. robustmask (MriResearchTools masking.jl + smoothing.jl)
  * ==========================================================================================*/
 
@@ -1429,6 +1493,8 @@ romeo_opts romeo_opts_default(void) {
 	o.template_echo = 1;
 	o.maxseeds = 1;
 	o.qmask_thresh = 0.1;
+	o.b0_name = "B0";
+	o.b0_weighting = RM_B0_PHASE_SNR;
 	return o;
 }
 
@@ -1604,6 +1670,31 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 		if (!strcmp(a, "-v")) { o->verbose = 1; ac++; continue; }
 		if (!strcmp(a, "-q")) { o->write_quality = 1; ac++; continue; }
 		if (!strcmp(a, "-Q")) { o->write_quality_all = 1; ac++; continue; }
+		if (!strcmp(a, "-B")) {
+			o->compute_b0 = 1;
+			ac++;
+			/* nargs='?' upstream: take the next token as the output stem only when it is not
+			   another option. The main parser already removed the trailing output filename. */
+			if (ac < argc && argv[ac][0] != '-') { o->b0_name = argv[ac]; ac++; }
+			continue;
+		}
+		if (!strcmp(a, "-B0-phase-weighting")) {
+			const char *m;
+			if (ac + 1 >= argc) { RM_ERR("-B0-phase-weighting requires a mode\n"); return 1; }
+			m = argv[ac + 1];
+			if (!strcmp(m, "phase_snr")) o->b0_weighting = RM_B0_PHASE_SNR;
+			else if (!strcmp(m, "phase_var")) o->b0_weighting = RM_B0_PHASE_VAR;
+			else if (!strcmp(m, "average")) o->b0_weighting = RM_B0_AVERAGE;
+			else if (!strcmp(m, "TEs")) o->b0_weighting = RM_B0_TES;
+			else if (!strcmp(m, "mag")) o->b0_weighting = RM_B0_MAG;
+			else if (!strcmp(m, "simulated_mag")) o->b0_weighting = RM_B0_SIMULATED_MAG;
+			else {
+				RM_ERR("the phase weighting option '%s' is not defined (phase_snr|phase_var|average|TEs|mag|simulated_mag)\n", m);
+				return 1;
+			}
+			ac += 2;
+			continue;
+		}
 		if (!strcmp(a, "-no-mask-out")) { o->no_mask_out = 1; ac++; continue; }
 		if (!strcmp(a, "-no-phase-rescale") || !strcmp(a, "-no-rescale")) { o->no_phase_rescale = 1; ac++; continue; }
 		if (!strcmp(a, "-romeo-dump")) {
@@ -1616,7 +1707,7 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 		   rather than letting them fall through to niimath as an unknown operation. */
 		if (!strcmp(a, "-u") || !strcmp(a, "-e") || !strcmp(a, "-threshold") ||
 			!strcmp(a, "-merge-regions") || !strcmp(a, "-correct-regions") ||
-			!strcmp(a, "-fix-ge-phase") || !strcmp(a, "-B") || !strcmp(a, "-B0-phase-weighting")) {
+			!strcmp(a, "-fix-ge-phase")) {
 			RM_ERR("'%s' is a ROMEO option that is not implemented in this build\n", a);
 			return 1;
 		}
@@ -1798,6 +1889,10 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		}
 	}
 
+	if (o->compute_b0 && o->nTE == 0) {
+		RM_ERR("echo times are required for B0 calculation (-B needs -t)\n");
+		return 1;
+	}
 	template_echo = o->template_echo;
 	if (template_echo < 1 || template_echo > neco) {   /* lower bound too: never index behind the buffer */
 		RM_ERR("-template %d is out of range (the image has %d echo(es))\n", template_echo, neco);
@@ -2148,6 +2243,28 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		if (mask && !o->no_mask_out) {
 			for (i = 0; i < n3; i++) tmp[i] = (float)mask[i];
 			save_rc |= rm_save_side(nim, "_mask", tmp, n3, gzMode);
+		}
+		if (o->compute_b0) {
+			float *snr = (float *)malloc((size_t)n3 * sizeof(float));
+			char pf[64];
+			if (!snr) { free(tmp); goto done; }
+			/* ROMEO's own multi-echo -B silently enables MCPC-3D-S monopolar phase-offset
+			   correction, which is out of scope here (plan section 7). Say so rather than imply
+			   full CLI equivalence. */
+			if (neco > 1)
+				fprintf(stderr, " + -romeo -B: B0 computed WITHOUT MCPC-3D-S phase-offset correction, which ROMEO's own multi-echo -B applies; the maps are comparable to `romeo --compute-B0 --phase-offset-correction off`\n");
+			if (!have_mag && neco > 1)
+				fprintf(stderr, " + -romeo -B: B0 frequency estimation without magnitude might result in poor handling of noise in later echoes!\n");
+			rm_compute_b0(phase, have_mag ? mag : NULL, n3, neco, TEs, o->b0_weighting, tmp, snr);
+			snprintf(pf, sizeof pf, "_%s", o->b0_name);
+			save_rc |= rm_save_side(nim, pf, tmp, n3, gzMode);
+			snprintf(pf, sizeof pf, "_%s_snr", o->b0_name);
+			save_rc |= rm_save_side(nim, pf, snr, n3, gzMode);
+			if (dump) {
+				drc |= rm_dump(dump, "c_b0.f32", tmp, sizeof(float), n3);
+				drc |= rm_dump(dump, "c_b0_snr.f32", snr, sizeof(float), n3);
+			}
+			free(snr);
 		}
 		if (o->write_quality || o->write_quality_all || dump) {
 			rm_wctx c;
