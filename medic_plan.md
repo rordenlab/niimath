@@ -6,7 +6,9 @@
 
 **M3 (`-unwarp`) passes its gate outright**: fed the reference's own displacement map it reproduces the reference's corrected magnitude at nrmse 3.5e-5 / 4.7e-5, corr 0.999999999, zero non-finite.
 
-**`--medic` does not yet match the reference end-to-end.** Given a shared mask the native field map matches to p99 = 0.0027 Hz — so the regression, MCPC-3D-S, unwrapping, rescaling and echo handling are all correct — but ~0.24 % of voxels land on a different 2*pi branch and the inversion smears that along the phase-encoding line. With the built-in `robustmask` default the divergence is larger (p95 ~46 Hz) because the two tools' masks differ. Per the §7.2 directive we are NOT chasing the reference's mask; `--mask` is the answer.
+**`--medic` does not yet match the reference end-to-end, and no equivalence is claimed** (bit identity is a stated non-goal, §11). Given a shared mask the native field map matches to p99 = 0.0027 Hz — so the regression, MCPC-3D-S, unwrapping, rescaling and echo handling are all correct — but ~0.24 % of voxels land on a different 2*pi branch and the inversion smears that along the phase-encoding line. With the built-in `robustmask` default the divergence is larger (p95 ~46 Hz) because the two tools' masks differ. Per the §7.2 directive we are NOT chasing the reference's mask; `--mask` is the answer.
+
+**M5's displacement gate is currently missed for `j`.** End to end on the sbref demo with the reference mask supplied, displacement p95 is 0.059 mm against a 0.05 mm gate (`j-` is at 0.029 mm and passes). The isolated inversion/scaling convention checks do pass the same threshold (manifest §3.4, §3.5b), but those feed the reference's own native field through one formula and are not pipeline results — manifest §5.4 attributes each figure. Stated here so the gate table below is not read as fully green.
 
 Open, deliberately not guessed: a broadband residual survives the reference's rank-10 truncation on real 170-frame data while ours is strictly rank 10 (§7.5). `--rank 0` disables the filter, and a non-finite field-map series is now a hard error — checked on the field series itself immediately after the regression, so it applies whether or not the low-rank filter runs — rather than a silently all-zero output set.
 
@@ -16,7 +18,7 @@ Open, deliberately not guessed: a broadband residual survives the reference's ra
 
 Streaming (the old §5.2) is a **non-goal**. A 4D `.nii.gz` cannot be seeked, so essentially every tool — including this one and the reference — reads and writes whole volumes in RAM anyway; a streaming layer would buy nothing for the dominant gzip case while adding a large validated surface. The requirement is instead to be **fast and honest about the RAM cost**: document the working-set formula, print it at startup, and state the wasm ceiling.
 
-- Resident working set: `phase + mag + fields + fu + disp` = `n3 * T * (2*echoes + 3) * 4` bytes (1.18 GiB on the 170-frame two-echo run), printed to stderr at startup, plus the inputs held until repacking and the output buffers. Phase is unwrapped **in place**; the separate unwrapped-phase series was deleted during the audit, taking measured peak RSS from 2.53 GB to **2.35 GB** gzipped, **2.19 GB** uncompressed at 8 threads and **1.99 GB** single-threaded. The reference needs 3.39–3.53 GB for the same work (manifest §5.3).
+- Work arrays: `phase + mag + fields + fu + disp` = `n3 * T * (2*echoes + 3) * 4` bytes (1.18 GiB on the 170-frame two-echo run), printed to stderr at startup. That banner is a **budget, not a peak**, and the load ordering is what keeps the two close: inputs are validated from their headers alone, so no payload is resident when the arrays are allocated, and the repack then loads and frees **one echo pair at a time** — a transient overshoot of one echo pair regardless of echo count. (An earlier revision read all `2*echoes` payloads during validation and freed them only after the allocation, making the real peak `(4*echoes + 3)` series, 1.85 GiB there, against a `(2*echoes + 3)` banner. Do not reinstate that ordering.) Phase is unwrapped **in place**; the separate unwrapped-phase series was deleted during the audit, taking the gzipped peak from 2.53 GB to **2.35 GB**. Measured peak RSS on the 170-frame run: **2.04 GB** single-threaded and **2.24 GB** at 8 threads writing uncompressed, **2.35 GB** gzipped, against the reference's **3.40 GB** for the same work (manifest §5.3, authoritative for every MEDIC timing and memory figure) — all measured **before** the per-echo-loading change, so they now bound the current binary rather than describing it.
 - **wasm32 has a 4 GiB address space** and every wasm target sets `-DFORCE_INT32_MAX`. `--medic` ships in the default Emscripten build but long multi-echo runs will not fit — roughly 10 GiB for 5 echoes × 600 frames at this resolution: estimate natively, apply `-unwarp` in the browser. MEDIC is omitted from `tiny`/`nano` and from the WASI reactor.
 
 ### Build requirement for any timing claim
@@ -193,8 +195,7 @@ MCPC-3D-S belongs beside the strict-FP ROMEO preprocessing code because its corr
   - narrow in-memory frame API;
   - MCPC-3D-S phase-offset correction.
 
-- `src/nifti_io.c`, `src/nifti_io.h`
-  - opaque sequential float32 volume reader and writer.
+- `src/nifti_io.c`, `src/nifti_io.h` — **not needed, never added.** The opaque sequential float32 volume reader/writer planned here belonged to the superseded streaming design (§5.2); `medic.c` uses the ordinary `nifti_image_read`/`nifti_save` path through its own `md_read_f32()`/`md_write()` helpers.
 
 - `medic.py`
   - BIDS discovery and JSON parsing;
@@ -244,28 +245,21 @@ Parallelize independent frames during MCPC/ROMEO. Do not create nested OpenMP te
 
 Benchmark both on the 170-frame reference before choosing. Thread-count parity is required within documented float tolerances; bit identity is desirable but not a requirement for SVD reductions.
 
+**Resolved: the first option shipped** — the per-frame MCPC/ROMEO loop is the `#pragma omp parallel for`, ROMEO's own regions stay serial inside it, and no nested teams are created. Measured scaling 1→8 threads is 3.47× (manifest §5.3).
+
 Do not compile all of `medic.c` strict-FP merely because ROMEO requires it. Keep branch-sensitive phase preprocessing in the existing strict-FP ROMEO translation unit. Compile SVD and resampling under the normal project policy unless measurement identifies a real correctness issue.
 
 ### 5.4 Low-rank implementation
 
-Do not plan to reuse `tensor.c` as a general eigensolver. In the default build its active readable implementation is specialized to 3×3 even though a function accepts `n`.
+Do not plan to reuse `tensor.c` as a general eigensolver. In the default build its active readable implementation is specialized to 3×3 even though a function accepts `n`. That still holds: `md_lowrank()` carries its own `md_jacobi_eigh()`.
 
-Also avoid assuming that a `T×T` Gram matrix can be accumulated with two sequential passes over a frame-major NIfTI. Exact `F^T F` needs access to multiple frames for each spatial block.
+**What shipped, replacing the on-disk design below.** The whole field-map series is already resident (§5.2 is a non-goal), so the `T×T` Gram matrix is accumulated in one in-memory pass, diagonalised by a deterministic Jacobi eigensolve, and the series is projected onto the leading `r` eigenvectors in place. Memory is `O(T^2)` **independent of voxel count** — no tiling, no scratch files, no Lanczos. The truncation is **uncentered** (measured, manifest §3.8). `md_lowrank()` scratch is preflighted before `F` is mutated, so a mid-way OOM cannot leave a half-filtered series.
 
-Initial exact design:
+> **Superseded, retained for history.** The original design assumed the series lived on disk: store the native field maps uncompressed and frame-major; read spatial tiles across all frames with bounded random reads; accumulate the symmetric `T×T` Gram in double; solve the largest `r` eigenpairs with a deterministic block-Lanczos or subspace iteration; accumulate `Nvox × r` coefficient volumes; reconstruct one output frame at a time — `O(T^2 + Nvox*r + block*T)`. None of that was built, because the streaming premise it rested on was dropped.
 
-1. Store the native field maps uncompressed and frame-major.
-2. Read spatial tiles across all frames using bounded random reads.
-3. Accumulate the symmetric `T×T` Gram matrix in double.
-4. Solve only for the largest `r` eigenpairs using a small, deterministic block-Lanczos or subspace-iteration implementation in `medic.c`.
-5. Accumulate `Nvox × r` spatial coefficient volumes in float or double, selected by an accuracy benchmark.
-6. Reconstruct and write one output frame at a time.
+Before committing to a solver, compare it against a trusted offline SVD on synthetic matrices with clustered singular values, rank deficiency, constant frames, and `T < 10`. If convergence or runtime is poor, use a separate permissively licensed small symmetric eigensolver rather than enlarging `tensor.c` with another hidden mode.
 
-Memory is `O(T^2 + Nvox*r + block*T)`, not `O(Nvox*T)`.
-
-Before committing to this solver, compare it against a trusted offline SVD on synthetic matrices with clustered singular values, rank deficiency, constant frames, and `T < 10`. If convergence or runtime is poor, use a separate permissively licensed small symmetric eigensolver rather than enlarging `tensor.c` with another hidden mode.
-
-Rank is `min(10, T, positive numerical rank)`. Zero and non-finite voxels need one clearly documented policy, determined in M0.
+Rank is `min(10, T, positive numerical rank)`; `--rank 0` disables the filter. A non-finite field series is a hard error raised on the series itself immediately after the regression, **not** inside `md_lowrank()` — that function returns early whenever `rank >= T`, which would make the guard frame-count dependent.
 
 ### 5.5 Python boundary
 
@@ -290,7 +284,9 @@ V1 wrapper behavior:
 - if `TotalReadoutTime` is absent, derive it only when both `EffectiveEchoSpacing` and `ReconMatrixPE` are present;
 - call `niimath --medic` once per run;
 - call `-unwarp` once per magnitude echo;
-- support `--dry-run`, `--niimath`, `--n-cpus`, `--scratch-dir`, and `--overwrite`.
+- support `--dry-run`, `--niimath`, `--n-cpus`, and `--overwrite`.
+
+**As shipped** `medic.py` takes `input`, `--out-dir` (required), `--niimath`, `--n-cpus`, `--noise-frames`, `--rank`, `--dry-run`, `--overwrite` and `--no-apply` (estimate only, skip `-unwarp`). There is no `--scratch-dir`: it belonged to the superseded streaming design and nothing writes scratch files. There is no `--jobs` either, as planned below.
 
 Do not claim full BIDS inheritance support in v1. Exact sidecars are present in both supplied datasets. Add inheritance only if a real target dataset needs it.
 
@@ -319,7 +315,7 @@ Useful controls:
 --rank <N>                 default 10; 0 disables
 --temporal-correction <0|1>
 --phase-offset <mcpc|none>
---mask <file>              external mask, used verbatim by every stage (see section 7.2)
+--mask <file>              external mask, used verbatim by every stage; in-mask is `>= 1` (see section 7.2)
 --weights <sel>            ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6 (governs BOTH unwrapping stages)
 --save-intermediates
 --gz <0|1>
@@ -373,7 +369,7 @@ Run these before implementing the affected component:
 
    **Do not attempt to reproduce the reference's mask exactly.** Both implementations use crude, heuristic masks and neither is authoritative, so bit-matching one to the other buys nothing scientific and is an open-ended reverse-engineering task. The requirement is instead:
 
-   - `--mask <file>` accepts an **external mask**, used verbatim by every stage that needs one.
+   - `--mask <file>` accepts an **external mask**, used verbatim by every stage that needs one. **In-mask means `>= 1`**, the measured reference contract (manifest §3.7) — not "non-zero". A fractional probability map must be thresholded first; NaN is treated as outside; a mask with no voxel `>= 1` is an error, not an empty run.
    - That option is what makes exact cross-validation possible: supply the *same* mask to both implementations and any remaining difference is a real algorithmic difference, not a masking difference.
    - It also lets users supply a **better** brain mask than either tool's built-in heuristic (e.g. mindgrab), which is the more useful capability in practice.
    - The built-in default remains ROMEO's `robustmask`; no attempt is made to match the reference's own construction.
@@ -432,13 +428,9 @@ Each experiment should be a small script or documented command with an analytic 
 
 **Gate:** existing ROMEO parity remains 602/602; real CLI outputs remain equal at their current thresholds; repeated in-memory calls have clean UBSan, malloc diagnostics, and `leaks`.
 
-### M2 — Sequential NIfTI volume I/O
+### M2 — Sequential NIfTI volume I/O — **DROPPED with §5.2**
 
-- Add opaque scaled-float32 reader and float32 writer handles.
-- Test `.nii`, `.nii.gz`, byte-swapped input, scaling, short/truncated input, and `.nii.zst` when enabled.
-- Verify that reading all streamed volumes reproduces `nifti_image_read()` plus the normal float conversion.
-
-**Gate:** byte- or tolerance-equivalent payloads and headers; no file-descriptor or temporary-file leaks; memory independent of frame count.
+Not implemented and not needed: the streaming premise was retired (see Status), so `medic.c` reads whole images through `md_read_f32()` (header preflight, then payload, converting datatype **or** scaling) and writes through `md_write()`. The original text — opaque scaled-float32 reader/writer handles, `.nii`/`.nii.gz`/byte-swapped/short-input tests, and a gate of memory independent of frame count — is retained here only as history.
 
 ### M3 — `-unwarp`
 
@@ -464,18 +456,20 @@ Each experiment should be a small script or documented command with an analytic 
 
 **Gate:** constant and analytic fields pass exact/property tests; reference displacement error is below 0.05 mm at the 95th percentile inside the valid mask; non-finite mismatch count is zero.
 
-### M6 — Streaming multi-frame estimator
+**Status: MET as a convention check, NOT met end to end for `j`.** The inversion and Hz→mm formulas, fed the reference's own native field, reproduce the reference's displacement map at p95 0.006 mm (manifest §3.4, `j`) and 0.045/0.024 mm (§3.5b, `j`/`j-`). The full `--medic` pipeline with the reference mask supplied is at p95 **0.059 mm for `j`** — over the gate — and 0.029 mm for `j-`; with the shipping `robustmask` default it is 2.40 mm, which is the mask difference of §7.2 and is not being chased. Manifest §5.4 attributes each figure. Non-finite mismatch count is zero throughout.
 
-- Process frame blocks in lockstep across echoes.
-- Write intermediate unwrapped phases, masks, and native field maps to bounded scratch storage.
-- Establish the chosen OpenMP structure.
+### M6 — Multi-frame estimator (**not** streaming; §5.2 dropped)
 
-**Gate:** results match independent single-frame M4/M5 runs; peak RSS remains below a documented budget on the 170-frame run; `-p 1`, `-p 2`, and `-p 8` agree within the documented tolerance.
+- Process every frame of every echo in one resident working set, repacked frame-major/echo-minor.
+- No scratch storage: unwrapped phases, masks and native field maps stay in RAM, and `--save-intermediates` writes them only on request.
+- Establish the chosen OpenMP structure: the frame loop is parallel and ROMEO's internal regions stay serial.
+
+**Gate:** results match independent single-frame M4/M5 runs; peak RSS stays within the documented budget on the 170-frame run; `-p 1`, `-p 2`, and `-p 8` agree within the documented tolerance.
 
 ### M7 — Temporal phase consistency
 
 - Implement the paper-defined correction after M0 resolves its remaining conventions.
-- Use on-disk/tiled phase access; do not materialize all echoes and frames in RAM.
+- Read the phase from the resident working set (the on-disk/tiled access this bullet used to require went with §5.2), taking group means from an immutable snapshot of the first-echo series so the result cannot depend on traversal order.
 - Optimize repeated or nearly identical correlation groups only after profiling.
 
 **Gate:** injected `2*pi` errors are removed and untouched frames remain unchanged; the real runs agree with the reference on which frames/echoes are corrected and on the resulting field maps.
@@ -485,12 +479,12 @@ Each experiment should be a small script or documented command with an analytic 
 - Implement and validate the rank-limited solver in §5.4.
 - Add border processing only if M0 shows material impact.
 
-**Gate:** synthetic matrices meet residual and subspace-angle tolerances against a trusted offline SVD; reference denoised field maps meet absolute Hz and displacement-mm thresholds; runtime and scratch usage are recorded.
+**Gate:** synthetic matrices meet residual and subspace-angle tolerances against a trusted offline SVD; reference denoised field maps meet absolute Hz and displacement-mm thresholds; runtime and memory are recorded (there is no scratch usage — nothing is written to disk).
 
 ### M9 — End-to-end `--medic`
 
-- Connect streaming, temporal correction, low-rank filtering, inversion, and output writing.
-- Make output creation fail-atomic.
+- Connect frame estimation, temporal correction, low-rank filtering, inversion, and output writing.
+- Make output creation fail-atomic — as shipped, sibling-temp-plus-`rename` via `md_write_temp()`.
 - Add clear stage-specific errors and concise progress reporting.
 
 **Gate:** the single-frame demo, 170-frame two-echo run, and three-echo run complete end to end. Compare native field, displacement, undistorted field, and corrected magnitudes separately. Report finite mismatch counts, median/95th/max absolute errors, normalized RMSE, and spatial correlation.
@@ -521,7 +515,7 @@ Each experiment should be a small script or documented command with an analytic 
 - Compare wall time and peak RSS with the recorded Warpkit baseline.
 - Optimize measured hotspots only.
 
-**Gate:** bounded memory on the target five-echo/600-frame geometry by calculation and on the 170-frame dataset by measurement. No performance optimization may weaken the component error gates.
+**Gate:** memory accounted for on the target five-echo/600-frame geometry by calculation and on the 170-frame dataset by measurement. No performance optimization may weaken the component error gates. **Note what this gate can and cannot say now that streaming is a non-goal:** the five-echo/600-frame calculation (~10 GiB of work arrays) is a statement of cost, not a bound — there is no mechanism that keeps a large run inside a fixed budget, which is exactly why `--medic` is documented as native-scale-only.
 
 ## 9. Validation policy
 
@@ -593,11 +587,11 @@ Keep these checks at orchestration boundaries. Kernels should not duplicate them
 
 1. Complete M0 and commit the reference manifest.
 2. Refactor the in-memory ROMEO API with no behavioral change.
-3. Add streaming NIfTI volume I/O.
+3. ~~Add streaming NIfTI volume I/O~~ — dropped with §5.2/M2; whole-image reads are used instead.
 4. Implement and validate `-unwarp` using reference displacement maps.
 5. Implement single-frame MCPC + ROMEO + weighted B0.
 6. Add displacement conversion and inversion.
-7. Scale to multi-frame streaming.
+7. Scale to the multi-frame resident estimator.
 8. Add temporal correction, then low-rank filtering.
 9. Join the stages under `--medic`.
 10. Add the minimal Python wrapper last, when the C command contract is stable.

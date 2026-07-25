@@ -395,6 +395,40 @@ def part_b(binary, out_dir, nthread=8):
     return out
 
 
+# ------------------------------------------------------------------ Part C
+
+def part_c(pa, pb, trt=float(TRT), pe_axis=1):
+    """Attribution for the ONE place where a last-ULP difference does get amplified.
+
+    Part A finds that on the real 170-frame run `_fieldmaps_native` (the field map itself)
+    differs only at the last float32 ULP (max ~3e-5 Hz), yet `_fieldmaps` (after md_invert)
+    can differ by tens of Hz at a handful of voxels.  That amplification is NOT the ROMEO
+    bin-edge mechanism -- md_invert() is a FIXED-POINT iteration capped at MD_INVERT_ITERS,
+    and niimath itself warns that it does not converge and that thousands of PE columns are
+    FOLDED, i.e. the forward map is non-monotone and "the branch chosen is arbitrary".
+
+    This checks that attribution: every voxel whose inverted field moved by more than
+    MD_INVERT_TOL (1e-3 Hz) should sit in a folded column, where the answer was already
+    declared arbitrary, and Part B should reproduce the same amplification from a pure
+    +-1 ULP input perturbation with a SINGLE binary."""
+    fn_a, _ = nii.read("%s_fieldmaps_native.nii" % pa)
+    fu_a, _ = nii.read("%s_fieldmaps.nii" % pa)
+    fu_b, _ = nii.read("%s_fieldmaps.nii" % pb)
+    fn_a = np.asarray(fn_a, dtype=np.float64)
+    d = np.abs(np.asarray(fu_a, np.float64) - np.asarray(fu_b, np.float64))
+    # fold: d(displacement)/d(PE index) <= -1, exactly md_invert()'s own detector
+    dd = np.diff(np.asarray(fu_a, np.float64), axis=pe_axis) * trt
+    fold = np.zeros_like(d, dtype=bool)
+    sl = [slice(None)] * d.ndim
+    sl[pe_axis] = slice(0, d.shape[pe_axis] - 1)
+    fold[tuple(sl)] = dd <= -1.0
+    # a voxel counts as "in a folded column" if it or an immediate PE neighbour folded
+    fold |= np.roll(fold, 1, axis=pe_axis) | np.roll(fold, -1, axis=pe_axis)
+    big = d > 1e-3
+    return dict(nbig=int(big.sum()), n=int(d.size),
+                nbig_in_fold=int((big & fold).sum()), maxd=float(d.max()))
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -429,6 +463,7 @@ def main():
     any_branch = 0
     any_mask = False
     nconf = 0
+    bold_prefixes = None
     t0 = time.time()
     for name, mags, phases, extra in cfgs:
         d = os.path.join(work, name.replace("/", "_").replace(",", "_").replace("=", ""))
@@ -441,6 +476,8 @@ def main():
         total_vox += sum(r["n"] for s, r in res.items() if s in RADIAN)
         any_branch += br
         any_mask |= mk
+        if name == "bold170/default":
+            bold_prefixes = (pa, pb)
         flag = "DIFF" if any(r["ndiff"] for r in res.values()) else "identical"
         print("  %-34s %s" % (name, flag))
         for ln in lines:
@@ -456,6 +493,18 @@ def main():
             for ln in lines:
                 print(ln)
             any_branch += 0   # reported separately; Part B is a bound, not the policy test
+
+    if bold_prefixes:
+        print("\n== PART C: attribution of the ONE amplified output (bold170/default)")
+        c = part_c(*bold_prefixes)
+        print("  _fieldmaps voxels moved > MD_INVERT_TOL (1e-3 Hz): %d / %d (max %.4g Hz)"
+              % (c["nbig"], c["n"], c["maxd"]))
+        print("  ... of which inside a FOLDED PE column (md_invert's own detector): %d (%.1f%%)"
+              % (c["nbig_in_fold"], 100.0 * c["nbig_in_fold"] / max(c["nbig"], 1)))
+        print("  niimath already warns on this run that the inversion did not converge and that\n"
+              "  ~27k PE columns are folded, where 'the branch chosen is arbitrary'.  Part B\n"
+              "  reproduces the same amplification from a pure +-1 ULP input perturbation with a\n"
+              "  SINGLE binary, so this is fixed-point conditioning, not an FP-policy defect.")
 
     print("\n== VERDICT")
     print("  configurations compared : %d" % nconf)

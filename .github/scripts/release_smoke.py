@@ -882,12 +882,19 @@ def medic_write_series(
     amplitude,
     nan_index: int | None = None,
     offset_rad: float = 0.0,
+    field_fn=None,
+    magnitude_fn=None,
 ) -> tuple[list[str], list[str]]:
     """Write one magnitude and one phase image per echo for a field amplitude(t)*medic_field(v).
 
     `nan_index` poisons a single voxel of the FIRST echo's phase (flat index into the whole
     series), which is how the silent all-zero-output bug is provoked.  `offset_rad` adds a
-    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove."""
+    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove.
+
+    `field_fn(x, y, z, t)` replaces amplitude(t)*medic_field(v) when a fixture needs a field whose
+    SPATIAL shape (not just its scale) changes with the frame -- the only way to build a series of
+    known temporal rank > 1.  `magnitude_fn(x, y, z, t)` likewise replaces medic_magnitude(v), so
+    a fixture can make ROMEO's per-frame robustmask differ between frames."""
     nx, ny, nz = MEDIC_DIMS
     mags: list[str] = []
     phases: list[str] = []
@@ -899,10 +906,11 @@ def medic_write_series(
             for z in range(nz):
                 for y in range(ny):
                     for x in range(nx):
-                        phase_values.append(
-                            medic_wrap(MEDIC_TWO_PI * scale * medic_field(x, y, z) * te / 1000.0 + offset_rad)
+                        hz = field_fn(x, y, z, t) if field_fn is not None else scale * medic_field(x, y, z)
+                        phase_values.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0 + offset_rad))
+                        mag_values.append(
+                            magnitude_fn(x, y, z, t) if magnitude_fn is not None else medic_magnitude(x, y, z)
                         )
-                        mag_values.append(medic_magnitude(x, y, z))
         if nan_index is not None and e == 0:
             phase_values[nan_index] = float("nan")
         mag_path = tmp / f"{tag}_mag{e}.nii"
@@ -1312,6 +1320,373 @@ def exercise_medic_phase_offset_none(exe: str, tmp: Path) -> None:
         raise AssertionError("--medic --phase-offset mcpc --save-intermediates did not write _phase_offset")
 
 
+def exercise_medic_mask_contract(exe: str, tmp: Path) -> None:
+    """(9) --mask is binarised at `>= 1`, NOT at `!= 0`.
+
+    The contract is measured (manifest section 3.7: the reference's unwrapped phase is nonzero
+    exactly on mask >= 1), so a probability map is not a mask.  Under the retired `!= 0` test a
+    uniform 0.5 probability map masked EVERY voxel in -- including pure background -- and the run
+    silently produced a field map fitted to noise.  It must now fail with an explanation instead."""
+    nx, ny, nz = MEDIC_DIMS
+    nvox = nx * ny * nz
+    tes = (10.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_mk", tes, 1, lambda t: 1.0)
+
+    # (a) fractional mask: no voxel satisfies `>= 1`, so there is no mask at all.
+    half = tmp / "medic_mask_half.nii"
+    write_float32_nifti(half, MEDIC_DIMS, [0.5] * nvox)
+    result = medic_run(exe, mags, phases, tes, tmp / "medic_mk_half", ["--rank", "0", "--mask", str(half)])
+    message = result.stdout + result.stderr
+    if result.returncode == 0:
+        raise AssertionError(
+            "--medic --mask accepted a uniform 0.5 probability map; the in-mask test is `>= 1`, so "
+            "no voxel qualifies and the run must fail rather than mask the whole volume in"
+        )
+    if ">= 1" not in message:
+        raise AssertionError(f"--medic rejected a fractional mask without naming the `>= 1` rule:\n{message}")
+    if medic_output_exists(tmp / "medic_mk_half", "_fieldmaps_native"):
+        raise AssertionError("--medic wrote a field map after rejecting a fractional mask")
+
+    # (b) NaN mask voxels: every comparison against NaN is false, so `>= 1` excludes them.  This
+    # doubles as the positive control -- the surrounding 1.0 voxels ARE a valid mask, so the run
+    # succeeds and its field map is nonzero there.
+    values = [1.0] * nvox
+    holes = [(x, 12, 4) for x in range(4, 12)]
+    for x, y, z in holes:
+        values[x + y * nx + z * nx * ny] = float("nan")
+    nan_mask = tmp / "medic_mask_nan.nii"
+    write_float32_nifti(nan_mask, MEDIC_DIMS, values)
+    prefix = tmp / "medic_mk_nan"
+    require_success(
+        medic_run(exe, mags, phases, tes, prefix, ["--rank", "0", "--mask", str(nan_mask)]),
+        "--medic --mask with NaN voxels",
+    )
+    field = medic_read_output(prefix, "_fieldmaps_native", tmp, "mknan")
+    if field is None:
+        raise AssertionError("--medic --mask (NaN voxels) wrote no field map")
+    for x, y, z in holes:
+        got = field[x + y * nx + z * nx * ny]
+        if got != 0.0:
+            raise AssertionError(
+                f"--medic: a NaN mask voxel fails `>= 1` and must be excluded; ({x},{y},{z}) holds {got:g} Hz"
+            )
+    if not any(v != 0.0 for v in field):
+        raise AssertionError("--medic --mask (NaN voxels) produced an all-zero field map")
+
+
+# Magnitude bump whose width grows slightly per frame, so ROMEO's robustmask -- and only the mask,
+# the phase is frame-independent -- differs between frames.  The widths are close enough that the
+# frames stay above MEDIC_CORR_THRESH (0.98) magnitude correlation and so form ONE temporal group.
+MEDIC_MASK_SIGMA = (5.0, 5.15, 5.3)
+
+
+def medic_mask_bump(x: int, y: int, z: int, t: int) -> float:
+    nx, ny, nz = MEDIC_DIMS
+    sigma = MEDIC_MASK_SIGMA[t]
+    r2 = (x - nx / 2.0) ** 2 + (y - ny / 2.0) ** 2 + ((z - nz / 2.0) * 2.0) ** 2
+    return 30.0 + 970.0 * math.exp(-r2 / (2.0 * sigma * sigma))
+
+
+def exercise_medic_mask_temporal(exe: str, tmp: Path) -> None:
+    """(10) Mask gating must SURVIVE the temporal 2*pi correction.
+
+    The unwrapped phase is zeroed outside each frame's mask, but the temporal correction runs
+    afterwards and moves every voxel toward its group's mean branch.  For a voxel masked out in
+    frame t yet inside the mask in the others, that mean is nonzero: if it exceeds pi the
+    correction adds a whole 2*pi and the excluded voxel comes back to life in the field map.  (The
+    bug: the masks were released before md_temporal(), so nothing could re-apply them.)
+
+    The fixture is built so the failure is REACHABLE rather than merely asserted-against: the
+    per-frame robustmasks genuinely differ, and TEs of 25/75 ms make the first-echo unwrapped phase
+    large enough that the group mean at the mask boundary passes pi.  Both preconditions are
+    checked below from the saved intermediates, so the test cannot quietly become vacuous."""
+    nx, ny, nz = MEDIC_DIMS
+    nvox = nx * ny * nz
+    frames = 3
+    tes = (25.0, 75.0)
+    mags, phases = medic_write_series(tmp, "medic_mt", tes, frames, lambda t: 1.0,
+                                      magnitude_fn=medic_mask_bump)
+    prefix = tmp / "medic_mt_out"
+    require_success(
+        medic_run(exe, mags, phases, tes, prefix,
+                  ["--rank", "0", "--temporal-correction", "1", "--save-intermediates"]),
+        "--medic --temporal-correction 1 with per-frame masks",
+    )
+    masks = medic_read_output(prefix, "_masks", tmp, "mtm")
+    unwrapped = medic_read_output(prefix, "_unwrapped_echo-1", tmp, "mtu")
+    field = medic_read_output(prefix, "_fieldmaps_native", tmp, "mtf")
+    if masks is None or unwrapped is None or field is None:
+        raise AssertionError("--medic --save-intermediates did not write the masks/unwrapped/field set")
+
+    boundary = [q for q in range(nvox)
+                if any(masks[t * nvox + q] == 0.0 for t in range(frames))
+                and any(masks[t * nvox + q] != 0.0 for t in range(frames))]
+    if not boundary:
+        raise AssertionError("the temporal-mask fixture no longer varies its mask between frames")
+    # md_temporal's reference for a voxel is the group mean of every frame's first-echo unwrapped
+    # phase, the masked-out frames contributing 0.  |mean| > pi is exactly the condition under
+    # which the correction rounds to a nonzero multiple of 2*pi.
+    movable = 0
+    for q in boundary:
+        mean = sum(unwrapped[t * nvox + q] for t in range(frames)) / float(frames)
+        if abs(mean) > math.pi:
+            movable += 1
+    if movable < 1:
+        raise AssertionError(
+            "the temporal-mask fixture is vacuous: no masked-out voxel has a group mean past pi, "
+            "so the temporal correction could not move one off zero even without the gating"
+        )
+    leaked = [i for i in range(len(field)) if masks[i] == 0.0 and field[i] != 0.0]
+    if leaked:
+        i = leaked[0]
+        raise AssertionError(
+            f"--medic: {len(leaked)} out-of-mask voxels are nonzero in _fieldmaps_native after the "
+            f"temporal correction (frame {i // nvox}, voxel {i % nvox} holds {field[i]:g} Hz); "
+            f"{movable} of them sit past the pi threshold that makes the correction add a full 2*pi"
+        )
+    if not any(v != 0.0 for v in field):
+        raise AssertionError("the temporal-mask fixture produced an all-zero field map")
+
+
+# A field series of EXACTLY temporal rank 2: a j ramp whose amplitude changes per frame, plus an
+# i/k ramp that does not.  Rank-1 truncation must therefore lose a real component of the series.
+MEDIC_RANK_AMPS = (1.0, 0.6, 1.3, 0.2)
+
+
+def medic_rank_field(x: int, y: int, z: int, t: int) -> float:
+    return (MEDIC_RANK_AMPS[t] * MEDIC_FIELD_J * (y - MEDIC_DIMS[1] / 2.0)
+            + MEDIC_FIELD_I * x + MEDIC_FIELD_K * z)
+
+
+def exercise_medic_rank_boundaries(exe: str, tmp: Path) -> None:
+    """(11) The three boundaries of the low-rank filter.
+
+    (a) An all-zero field series with T > rank must SUCCEED.  Its Gram matrix has no positive
+        eigenvalue, and the retired code read that as an error ("no positive spectrum") and killed
+        an otherwise valid run; the rank-k truncation of a zero matrix is that same zero matrix.
+    (b) --rank 1 on a series of genuine temporal rank 2 must MEASURABLY truncate it.  Test (7)
+        only shows that truncating a rank-1 series is a no-op, which a filter that silently did
+        nothing at all would also satisfy.
+    (c) --rank > T must be a harmless no-op, bit-identical to --rank 0."""
+    nx, ny, nz = MEDIC_DIMS
+    nvox = nx * ny * nz
+    tes = (10.0, 30.0)
+    frames = 4
+
+    # (a) all-zero phase in every echo and frame -> an all-zero field series; rank 2 < T = 4, so
+    # the filter really runs.
+    zero_mags, zero_phases = medic_write_series(tmp, "medic_zero", tes, frames, lambda t: 0.0,
+                                                field_fn=lambda x, y, z, t: 0.0)
+    prefix = tmp / "medic_zero_out"
+    result = medic_run(exe, zero_mags, zero_phases, tes, prefix, ["--rank", "2"])
+    require_success(result, "--medic --rank 2 on an all-zero field series")
+    zeros = medic_read_output(prefix, "_fieldmaps_native", tmp, "zero")
+    if zeros is None:
+        raise AssertionError("--medic wrote no field map for an all-zero series")
+    for i, v in enumerate(zeros):
+        if v != 0.0:
+            raise AssertionError(f"--medic: an all-zero field series must stay zero, voxel {i} holds {v:g}")
+
+    # (b)/(c) a rank-2 series.
+    mags, phases = medic_write_series(tmp, "medic_rk", tes, frames, lambda t: 1.0,
+                                      field_fn=medic_rank_field)
+    outputs: dict[str, list[float]] = {}
+    for rank in ("0", "1", "2", "99"):
+        p = tmp / f"medic_rk{rank}"
+        require_success(
+            medic_run(exe, mags, phases, tes, p, ["--rank", rank, "--temporal-correction", "0"]),
+            f"--medic --rank {rank} on a rank-2 series",
+        )
+        values = medic_read_output(p, "_fieldmaps_native", tmp, f"rk{rank}")
+        if values is None:
+            raise AssertionError(f"--medic --rank {rank} wrote no field map")
+        outputs[rank] = values
+
+    unfiltered = outputs["0"]
+    peak = max(abs(v) for v in unfiltered)
+    if peak < 1.0:
+        raise AssertionError("the rank-boundary fixture produced a degenerate field map")
+    # The fixture is only meaningful if the frames really do carry different spatial fields.
+    slopes = [medic_fit_along_j(unfiltered, t)[0] for t in range(frames)]
+    for t, slope in enumerate(slopes):
+        expect = MEDIC_FIELD_J * MEDIC_RANK_AMPS[t]
+        if abs(slope - expect) > 0.02 * expect:
+            raise AssertionError(
+                f"--medic --rank 0 (frame {t}): field slope {slope:.5f} Hz/voxel, expected {expect:.5f}"
+            )
+
+    # (c) rank 99 > T = 4: md_lowrank returns before touching the series, so the two runs share
+    # every code path and must agree exactly.
+    worst = max(abs(a - b) for a, b in zip(unfiltered, outputs["99"]))
+    if worst != 0.0:
+        raise AssertionError(
+            f"--medic --rank 99 on a {frames}-frame series must be a no-op, but it changed the "
+            f"field by {worst:g} Hz"
+        )
+    # (b) truncating BELOW the true rank must lose something; truncating AT it must not.
+    lost = max(abs(a - b) for a, b in zip(unfiltered, outputs["1"]))
+    kept = max(abs(a - b) for a, b in zip(unfiltered, outputs["2"]))
+    if lost < 0.05 * peak:
+        raise AssertionError(
+            f"--medic --rank 1 changed a rank-2 series by only {lost:g} Hz (peak {peak:g}); the "
+            f"low-rank filter is not truncating"
+        )
+    if kept > 0.05 * peak:
+        raise AssertionError(
+            f"--medic --rank 2 changed a rank-2 series by {kept:g} Hz (peak {peak:g}); truncation "
+            f"at the true rank must be nearly lossless (--rank 1 loses {lost:g})"
+        )
+
+
+# A 90-degree rotation about x as a NIfTI quaternion: a = b = cos(45 deg), c = d = 0.  With
+# qfac = -1 (pixdim[0]) the resulting qto_xyz 3x3 is [[1,0,0],[0,0,1],[0,1,0]], i.e. voxel-j runs
+# along world +z -- while the sform below is the identity, where voxel-j runs along world +y.
+MEDIC_QUAT_ROOT2 = 0.7071067811865476
+
+
+def medic_write_split_xform(path: Path, data: list[float], sform_code: int, qform_code: int) -> None:
+    """A float32 volume whose sform and qform DISAGREE about voxel-j's world axis, with the two
+    codes chosen by the caller.  nifti_header() hard-codes qform_code = sform_code = 3, so the
+    fields are written directly: pixdim[0]/qfac 76, qform_code 252, sform_code 254,
+    quatern_b/c/d 256/260/264, qoffset_x/y/z 268/272/276 (srow_* at 280/296/312 stay identity)."""
+    header = bytearray(nifti_header(MEDIC_DIMS, datatype=16, bitpix=32))
+    struct.pack_into("<f", header, 76, -1.0)                  # qfac
+    struct.pack_into("<h", header, 252, qform_code)
+    struct.pack_into("<h", header, 254, sform_code)
+    struct.pack_into("<3f", header, 256, MEDIC_QUAT_ROOT2, 0.0, 0.0)
+    struct.pack_into("<3f", header, 268, 0.0, 0.0, 0.0)
+    path.write_bytes(bytes(header) + struct.pack(f"<{len(data)}f", *data))
+
+
+def exercise_medic_xform_precedence(exe: str, tmp: Path) -> None:
+    """(12) -unwarp must resolve voxel->world exactly as core.c's xform() does: the sform, unless
+    sform_code < qform_code, in which case the qform.
+
+    md_xform3() used to prefer the sform unconditionally while md_same_grid() validated through
+    xform().  A header whose two transforms disagree therefore passed the grid check on one matrix
+    and was corrected using the other -- in the WRONG DIRECTION, doubling the distortion.
+
+    Both fixtures below carry the SAME pair of matrices and differ ONLY in the two codes.  On a
+    ramp of value j with a uniform +2 mm displacement map, the qform (voxel-j along world +z, an
+    axis with no RAS->LPS sign flip) pulls from j+2 while the sform (voxel-j along world +y, which
+    does flip) pulls from j-2.  Swapping the codes must swap the answer; the retired code returned
+    j-2 for both."""
+    nx, ny, nz = MEDIC_DIMS
+    nvox = nx * ny * nz
+
+    def index(x: int, y: int, z: int) -> int:
+        return x + y * nx + z * nx * ny
+
+    ramp = [float(i // nx % ny) for i in range(nvox)]
+    for codes, expect_shift, tag in (((1, 2), +2.0, "qform"), ((2, 1), -2.0, "sform")):
+        sform_code, qform_code = codes
+        ramp_path = tmp / f"medic_xf_{tag}_ramp.nii"
+        map_path = tmp / f"medic_xf_{tag}_map.nii"
+        out_path = tmp / f"medic_xf_{tag}_out.nii"
+        medic_write_split_xform(ramp_path, ramp, sform_code, qform_code)
+        medic_write_split_xform(map_path, [2.0] * nvox, sform_code, qform_code)
+        require_success(
+            run_niimath(exe, [str(ramp_path), "-unwarp", str(map_path), "j", str(out_path)]),
+            f"-unwarp with sform_code={sform_code} qform_code={qform_code}",
+        )
+        written = out_path if out_path.exists() else Path(str(out_path) + ".gz")
+        if not written.exists():
+            raise AssertionError(f"-unwarp wrote no output for the {tag} fixture")
+        if written.suffix == ".gz":
+            plain = tmp / f"medic_xf_{tag}_plain.nii"
+            plain.write_bytes(gzip.decompress(written.read_bytes()))
+            written = plain
+        got = read_float32_nifti(written)
+        for z in range(2, nz - 2):
+            for y in range(6, ny - 6):
+                for x in range(2, nx - 2):
+                    want = float(y) + expect_shift
+                    actual = got[index(x, y, z)]
+                    if abs(actual - want) > 1e-3:
+                        raise AssertionError(
+                            f"-unwarp: sform_code={sform_code}, qform_code={qform_code} must honour "
+                            f"the {tag}; at ({x},{y},{z}) expected {want} got {actual} (the other "
+                            f"transform gives {float(y) - expect_shift})"
+                        )
+
+
+def exercise_medic_parsing(exe: str, tmp: Path) -> None:
+    """(13) Every numeric option is parsed strictly and names itself when it rejects a token.
+
+    atoi()/atof() read "5xyz" as 5 and "abc" as 0, which turns a typo into a plausible-looking run
+    on the wrong parameters rather than an error.  These four exit before any image is read, so
+    they cost nothing."""
+    tes = (10.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_parse", tes, 1, lambda t: 1.0)
+    cases = (
+        (["--rank", "5xyz"], "--rank"),
+        (["--total-readout-time", "abc"], "--total-readout-time"),
+        (["--n-cpus", "0"], "--n-cpus"),
+        (["--gz", "2"], "--gz"),
+    )
+    for extra, option in cases:
+        prefix = tmp / "medic_parse_out"
+        result = medic_run(exe, mags, phases, tes, prefix, extra)
+        message = result.stdout + result.stderr
+        if result.returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(extra)}; it must be a hard error")
+        if option not in message:
+            raise AssertionError(f"--medic rejected {' '.join(extra)} without naming {option}:\n{message}")
+        if medic_output_exists(prefix, "_fieldmaps_native"):
+            raise AssertionError(f"--medic wrote outputs after rejecting {' '.join(extra)}")
+
+
+def exercise_medic_output_transaction(exe: str, tmp: Path) -> None:
+    """(14) A failed write must leave a PREVIOUS run's outputs byte-for-byte intact.
+
+    An earlier revision wrote straight to the final names and, when a later output failed, removed
+    all three in every extension -- destroying results this invocation had never produced.  The
+    outputs are now staged under a sibling temporary prefix and renamed in only once all three
+    exist, so an unwritable destination is a clean no-op.
+
+    Skipped where the permission cannot be made to bite (root, or a filesystem that ignores the
+    mode) -- detected by probing rather than by guessing the platform."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
+        print("  --medic output transaction: running as root - skipping")
+        return
+    tes = (10.0, 30.0)
+    mags, phases = medic_write_series(tmp, "medic_txn", tes, 1, lambda t: 1.0)
+    outdir = tmp / "medic_txn_dir"
+    outdir.mkdir(exist_ok=True)
+    prefix = outdir / "run"
+    require_success(medic_run(exe, mags, phases, tes, prefix, ["--rank", "0"]), "--medic first run")
+    before = {p.name: p.read_bytes() for p in sorted(outdir.iterdir())}
+    if len(before) != 3:
+        raise AssertionError(f"--medic wrote {len(before)} outputs, expected 3: {sorted(before)}")
+
+    os.chmod(str(outdir), 0o500)
+    try:
+        probe = outdir / "writable.probe"
+        try:
+            probe.write_text("x")
+            probe.unlink()
+            print("  --medic output transaction: destination stayed writable - skipping")
+            return
+        except OSError:
+            pass
+        result = medic_run(exe, mags, phases, tes, prefix, ["--rank", "0"])
+        message = result.stdout + result.stderr
+        if result.returncode == 0:
+            raise AssertionError("--medic exited 0 with an unwritable output directory")
+        if "failed to write" not in message:
+            raise AssertionError(f"--medic failed to write its outputs without saying so:\n{message}")
+    finally:
+        os.chmod(str(outdir), 0o700)
+
+    after = {p.name: p.read_bytes() for p in sorted(outdir.iterdir())}
+    if after != before:
+        raise AssertionError(
+            "--medic destroyed or altered a previous run's outputs when its own write failed: "
+            f"had {sorted(before)}, now {sorted(after)}"
+        )
+
+
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
     if "--medic" not in help_text:
@@ -1322,6 +1697,12 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_polarity(exe, tmp)
     exercise_medic_three_echo(exe, tmp)
     exercise_medic_phase_offset_none(exe, tmp)
+    exercise_medic_mask_contract(exe, tmp)
+    exercise_medic_mask_temporal(exe, tmp)
+    exercise_medic_rank_boundaries(exe, tmp)
+    exercise_medic_xform_precedence(exe, tmp)
+    exercise_medic_parsing(exe, tmp)
+    exercise_medic_output_transaction(exe, tmp)
 
     # One 12-frame series feeds both the rank check and (with a poisoned voxel) the non-finite
     # check.  12 > the default --rank 10, which the low-rank bug required.
@@ -1336,7 +1717,8 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
                                               nan_index=poisoned)
     exercise_medic_nonfinite(exe, tmp, nan_mags, nan_phases, frames)
 
-    print("  --medic/-unwarp regressions: polarity, non-finite, scaling, grid, rank, offsets OK")
+    print("  --medic/-unwarp regressions: polarity, non-finite, scaling, grid, rank, offsets, "
+          "mask contract, xform precedence, parsing, output transaction OK")
 
 
 def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:

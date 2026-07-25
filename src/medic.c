@@ -713,8 +713,8 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 	const int64_t n3 = c->n3;
 	const int T = c->nframe;
 	double *mu = NULL, *sd = NULL, *corr = NULL;
-	float *acc = NULL, *snap = NULL;
-	int32_t *cnt = NULL;   /* per-voxel count of frames valid at that voxel */
+	float *acc = NULL, *snap = NULL, *allacc = NULL;
+	int32_t *cnt = NULL, *allcnt = NULL;   /* per-voxel count of frames valid at that voxel */
 	int t, u, e, rc = 1;
 	int64_t i;
 	size_t bytes;
@@ -765,6 +765,27 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 		int ng = 0;
 		for (u = 0; u < T; u++) if (corr[(size_t)t * T + u] >= MD_CORR_THRESH) ng++;
 		if (ng < 2) continue;   /* a frame alone in its group has no reference to move toward */
+		/* Fast path: when EVERY frame is in this frame's group -- the common case, because a
+		   quiescent run has all magnitudes correlating well above 0.98 -- the accumulation is
+		   identical for every t, so compute it once and reuse it.  EXACT, not an approximation:
+		   the same values summed in the same order, hoisted out of the t loop.  Takes the inner
+		   work from O(T * group * n3) (~7.7e9 adds on the 170-frame demo) to O(T * n3). */
+		if (ng == T) {
+			if (!allacc) {
+				allacc = (float *)malloc((size_t)n3 * sizeof(float));
+				allcnt = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
+				if (!allacc || !allcnt) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
+				for (i = 0; i < n3; i++) { allacc[i] = 0.0f; allcnt[i] = 0; }
+				for (u = 0; u < T; u++) {
+					const float *pu = snap + (int64_t)u * n3;
+					const uint8_t *mu2 = masks ? masks + (int64_t)u * n3 : NULL;
+					if (mu2) for (i = 0; i < n3; i++) { allacc[i] += pu[i]; allcnt[i] += mu2[i]; }
+					else     for (i = 0; i < n3; i++) { allacc[i] += pu[i]; allcnt[i]++; }
+				}
+			}
+			memcpy(acc, allacc, (size_t)n3 * sizeof(float));
+			memcpy(cnt, allcnt, (size_t)n3 * sizeof(int32_t));
+		} else {
 		/* Accumulate the group mean PER VOXEL over the frames that are valid AT THAT VOXEL.
 		 *
 		 * Masks are per frame and generally differ between frames, so a fixed group size would
@@ -777,7 +798,13 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 			const uint8_t *mu_ = masks ? masks + (int64_t)u * n3 : NULL;
 			if (corr[(size_t)t * T + u] < MD_CORR_THRESH) continue;
 			p = snap + (int64_t)u * n3;   /* snapshot, not the live (partly corrected) series */
-			for (i = 0; i < n3; i++) if (!mu_ || mu_[i]) { acc[i] += p[i]; cnt[i]++; }
+			/* Branchless: the phase is ALREADY zero outside the mask (gated before this
+			   function runs), so the sum needs no test -- only the per-voxel valid count does.
+			   This inner loop runs T * group_size * n3 times (~7.7e9 on the 170-frame demo), so a
+			   per-voxel branch here is worth removing. */
+			if (mu_) for (i = 0; i < n3; i++) { acc[i] += p[i]; cnt[i] += mu_[i]; }
+			else     for (i = 0; i < n3; i++) { acc[i] += p[i]; cnt[i]++; }
+		}
 		}
 		{
 			float *p1 = uw + ((int64_t)t * c->neco) * n3;
@@ -812,7 +839,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 	}
 	rc = 0;
 done:
-	free(mu); free(sd); free(corr); free(acc); free(snap); free(cnt);
+	free(mu); free(sd); free(corr); free(acc); free(snap); free(cnt); free(allacc); free(allcnt);
 	return rc;
 }
 
@@ -830,7 +857,8 @@ done:
  * and a displacement map that is very nearly negated (corr -0.918, median ratio -0.973).  Getting
  * it wrong on a `j-` acquisition doubles the distortion instead of correcting it.  Verified for
  * both polarities against the reference at displacement p95 0.045 mm (j) and 0.024 mm (j-). */
-static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold, int64_t *nunconv) {
+static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold, int64_t *nunconv,
+	int allow_omp) {
 	const int nx = c->nx, ny = c->ny, nz = c->nz;
 	const int m = c->pe_axis;
 	const int64_t n3 = c->n3;
@@ -847,7 +875,7 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 		const int last = (it == MD_INVERT_ITERS - 1);
 		slow = 0;
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(static) reduction(max:worst) reduction(+:slow)
+		#pragma omp parallel for schedule(static) reduction(max:worst) reduction(+:slow) if (allow_omp)
 #endif
 		for (z = 0; z < nz; z++) {
 			int x, y;
@@ -1078,6 +1106,11 @@ int nii_medic(int argc, char *argv[]) {
 	int64_t n3;
 	int Tin = 0, T = 0;
 
+#ifdef _OPENMP
+	/* Belt and braces against an OMP_NESTED=true / OMP_MAX_ACTIVE_LEVELS>1 environment: every
+	   parallel region below is designed as the single active level. */
+	omp_set_max_active_levels(1);
+#endif
 	memset(&c, 0, sizeof c);
 	memset(ph, 0, sizeof ph);
 	memset(mg, 0, sizeof mg);
@@ -1422,6 +1455,11 @@ int nii_medic(int argc, char *argv[]) {
 	{
 		double vox;
 		int64_t inv_folds = 0, inv_unconv = 0;
+#ifdef _OPENMP
+		const int outer_par = (T >= omp_get_max_threads());
+#else
+		const int outer_par = 0;
+#endif
 		{	/* Phase-encoding voxel size in MILLIMETRES (pixdim is in the header's xyz_units). */
 			double A[3][3], s = 0.0, unit = xyz_units_to_mm(c.tmpl->xyz_units);
 			int r;
@@ -1432,12 +1470,22 @@ int nii_medic(int argc, char *argv[]) {
 			vox *= unit;
 			if (!(vox > 0.0)) { MD_ERR("phase-encoding voxel size is zero\n"); goto done; }
 		}
+		/* ONE active level of parallelism, CHOSEN BY FRAME COUNT.
+		 *
+		 * md_invert() is itself parallel over slices, so a parallel frame loop around it nested
+		 * two regions: with nesting disabled (the default) the inner team collapsed to one thread;
+		 * with OMP_NESTED=true it oversubscribed.  Neither is right for both shapes, and picking
+		 * the inner level unconditionally cost 70 % on the 170-frame run (170 frames x 64
+		 * iterations = ~10 900 parallel-region entries).  So: with more frames than threads,
+		 * parallelise the FRAME loop and run md_invert serially; otherwise run frames serially and
+		 * let md_invert parallelise, which keeps every core busy at T = 1.  The accumulators use
+		 * reductions either way, so the diagnostics are exact and thread-count independent. */
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(static)
+		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) if (outer_par)
 #endif
 		for (t = 0; t < T; t++) {
 			int64_t q, nf = 0, nu = 0;
-			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu);
+			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu, !outer_par);
 			inv_folds += nf; inv_unconv += nu;
 			for (q = 0; q < n3; q++)
 				disp[(int64_t)t * n3 + q] =
