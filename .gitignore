@@ -48,3 +48,6 @@ coreg_plan.md
 # allineate object-flag signature stamp (Makefile flag-change detection)
 .al_obj_flags
 *.d
+
+# ROMEO parity oracle: large derived goldens, regenerate with test/romeo_oracle.sh
+/src/.romeo_obj_flags

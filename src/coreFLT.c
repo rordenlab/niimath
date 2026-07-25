@@ -90,6 +90,12 @@
 #include "qwarp.h"
 #endif
 #endif
+#ifdef HAVE_ROMEO
+#include "romeo.h" // MIT port of ROMEO.jl phase unwrapping (compiled strict-FP as romeo.o)
+#endif
+#ifdef HAVE_MEDIC
+#include "medic.h" // MEDIC multi-echo distortion correction (--medic, -unwarp)
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -6899,6 +6905,98 @@ staticx int nifti_qwarp_wrap(nifti_image *nim, char *basefile) {
 #endif
 #endif
 
+#ifdef HAVE_ROMEO
+/* -romeo <mag|none> [options]: ROMEO minimum-spanning-tree phase unwrapping (romeo.c, an MIT
+   port of ROMEO.jl + the MriResearchTools.jl helpers its CLI uses).  The magnitude is a REQUIRED
+   positional token — pass the literal "none" for magnitude-free unwrapping — because an optional
+   positional followed by dashed options is ambiguous with the rest of the niimath chain.  An
+   ordinary chain operation: further niimath operations may follow.  DT32 only.
+
+   Side outputs (<out>_mask, <out>_quality[_1..6]) go through nifti_save postfixes on the already
+   assigned output filename, NOT through `fin` (which is the INPUT name here).
+
+   The world-transform check is a WARNING, not an error: ROMEO itself does not compare the phase
+   and magnitude transforms, so rejecting a mismatch would be a behavioural divergence. */
+staticx int nifti_romeo_wrap(nifti_image *nim, char *fin, int *pac, int argc, char *argv[],
+	int is_first_op, in_hdr *ihdr, gzModes gzMode) {
+#ifdef DT32
+	romeo_opts o = romeo_opts_default();
+	char *magfile = NULL;
+	int ac = *pac;
+	if (ac >= argc) {
+		printfx("-romeo requires a magnitude image or the literal 'none' (-romeo <mag|none> [options])\n");
+		return 1;
+	}
+	magfile = argv[ac];
+	ac++;
+	if (romeo_parse_subopts(&ac, argc, argv, &o, "-romeo")) { *pac = ac; return 1; }
+	*pac = ac;
+	if (magfile && strcmp(magfile, "none") != 0) {
+		if (nii_reject_oversize_aux(magfile, "romeo magnitude")) return 1;
+	} else magfile = NULL;
+	if (o.mask_sel == RM_MASK_FILE && nii_reject_oversize_aux(o.mask_file, "romeo mask")) return 1;
+	if (o.mask_sel == RM_MASK_FILE) { // same non-fatal check as the magnitude: equal dims can still be a shifted mask
+		nifti_image *kh = nifti_image_read(o.mask_file, 0);
+		if (kh) {
+			if (max_displacement_mm(nim, kh) > 0.5f)
+				printfx("Warning: phase and mask have different spatial transforms (>0.5mm)\n");
+			nifti_image_free(kh);
+		}
+	}
+	if (magfile) { // header-only read: warn on a world-frame mismatch, as ROMEO does not check it
+		nifti_image *mh = nifti_image_read(magfile, 0);
+		if (mh) {
+			if (max_displacement_mm(nim, mh) > 0.5f)
+				printfx("Warning: phase and magnitude have different spatial transforms (>0.5mm)\n");
+			nifti_image_free(mh);
+		}
+	}
+	return romeo_run(nim, magfile, (fin && strcmp(fin, "-")) ? fin : NULL, ihdr, is_first_op, &o, gzMode);
+#else
+	(void)nim; (void)fin; (void)argc; (void)argv; (void)is_first_op; (void)ihdr; (void)gzMode;
+	// consume the sub-options so the error is about the datatype, not a stray token
+	{
+		romeo_opts o = romeo_opts_default();
+		int ac = *pac;
+		if (ac < argc) ac++;
+		romeo_parse_subopts(&ac, argc, argv, &o, "-romeo");
+		*pac = ac;
+	}
+	printfx("'-dt double' does not support -romeo (phase unwrapping is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_ROMEO
+
+#ifdef HAVE_MEDIC
+/* -unwarp <displacement-map> <axis>: resample the working image through a scalar EPI displacement
+   map (millimetres) along one phase-encoding axis.  An ordinary chain operation, DT32 only.
+
+   The map's sign is used as stored -- the axis letter's optional '-' suffix is accepted and
+   IGNORED, matching the reference, which applies no sign from the letter (manifest section 3.5).
+   Applying it a second time here would double-correct. */
+staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *mapfile, *axis;
+	if (ac + 1 >= argc) {
+		printfx("-unwarp requires a displacement map and an axis (-unwarp <map> <i|j|k>)\n");
+		return 1;
+	}
+	mapfile = argv[ac];
+	axis = argv[ac + 1];
+	*pac = ac + 2;
+	if (nii_reject_oversize_aux(mapfile, "unwarp displacement map")) return 1;
+	return medic_unwarp(nim, mapfile, axis);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 1 < argc) *pac += 2;
+	printfx("'-dt double' does not support -unwarp (displacement resampling is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_MEDIC
+
 /* Huge-image (> INT_MAX voxel) support, issue #67. The core calculator ops below are
    nvox_t-clean (see core.h). Any op NOT in this EXACT list keeps int-sized indexing, so a
    huge image is rejected before that op runs rather than silently corrupted (fail-closed,
@@ -7193,6 +7291,11 @@ int main64(int argc, char *argv[]) {
 #endif
 
 	// read operations
+	/* -romeo's phase rescale re-reads the UNSCALED input file, so it is only well defined before
+	   any image-MUTATING operation. Pointer-comparing against `first_op` was wrong: -p/-gz/-odt
+	   are execution/output modifiers that leave the voxels untouched, yet they became first_op
+	   and wrongly disqualified the rescale (reproduced with `-gz 0` before -romeo). */
+	int nmutating = 0;
 	int nkernel = 0; // number of voxels in kernel
 	int *kernel = NULL; // default 3x3x3 kernel is created lazily by the first kernel op
 	char *end = NULL;
@@ -7209,6 +7312,13 @@ int main64(int argc, char *argv[]) {
 				free(kernel);
 			return 2;
 		}
+		int op_is_first = (nmutating == 0);
+		/* Tokens that leave the VOXELS untouched: threading, output format/datatype, kernel
+		   scratch setup, the RNG seed, and writing an intermediate copy. None of them may
+		   disqualify -romeo's raw-phase rescale. */
+		if (strcmp(argv[ac], "-p") && strcmp(argv[ac], "-gz") && strcmp(argv[ac], "-odt") &&
+			strcmp(argv[ac], "-kernel") && strcmp(argv[ac], "-seed") && strcmp(argv[ac], "-save"))
+			nmutating++;
 		enum eOp op = unknown;
 		if (!strcmp(argv[ac], "-add"))
 			op = add;
@@ -7825,6 +7935,32 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_qwarp_wrap(nim, argv[ac]);
 		}
 #endif
+#endif
+#ifdef HAVE_MEDIC
+		else if (!strcmp(argv[ac], "-unwarp")) {
+			ac++;
+			ok = nifti_unwarp_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the map and axis
+		}
+#endif
+#ifdef HAVE_ROMEO
+		else if (!strcmp(argv[ac], "-romeo")) {
+			/* -romeo <mag|none> [options]: ROMEO phase unwrapping. Phase rescaling inspects the
+			   unscaled stored values, so it is only well defined when -romeo is the first
+			   computational operation (romeo_run enforces that, unless -no-phase-rescale). */
+			ac++;
+			ok = nifti_romeo_wrap(nim, fin, &ac, argc, argv, op_is_first, &ihdr, gzMode);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past every consumed sub-option
+		}
+#else
+		else if (!strcmp(argv[ac], "-romeo")) {
+			printfx("-romeo requires a build with ROMEO phase unwrapping enabled (rebuild without ROMEO=0 / with -DENABLE_ROMEO=ON)\n");
+			goto fail;
+		}
 #endif
 #ifdef HAVE_GPL
 		/* "-spmcoreg" kept as a silent backward-compat alias for "-spm_coreg" */
