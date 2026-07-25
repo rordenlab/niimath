@@ -398,6 +398,34 @@ describe("ROMEO phase unwrapping (-romeo)", () => {
     expect(inside).toBeLessThan(N);
   });
 
+  test("numeric primitives are byte-identical to native (transitively, to the Julia golden)", async () => {
+    // release_smoke.py checks the NATIVE binary's primitive tables against the embedded Julia
+    // golden; comparing wasm to native here closes the loop without duplicating those bytes in TS.
+    const dumpDir = tmp("romeo_primdump");
+    rmSync(dumpDir, { recursive: true, force: true });
+    mkdirSync(dumpDir, { recursive: true });
+    const pPath = tmp("romeo_p_prim.nii"), mPath = tmp("romeo_m_prim.nii");
+    writeFileSync(pPath, phaseNii);
+    writeFileSync(mPath, magNii);
+    nativeRaw([pPath, "-romeo", mPath, "-t", "5.0", "-k", "nomask", "-no-phase-rescale",
+               "-romeo-dump", dumpDir, tmp("romeo_prim_native.nii")]);
+    const names = ["c_prim_rem2pi64.f64", "c_prim_rem2pi32_gamma.f32",
+                   "c_prim_rescale.u8", "c_prim_unwrapvoxel.f32"];
+    const r = await runner.runFiles({
+      argv: ["p.nii", "-romeo", "m.nii", "-t", "5.0", "-k", "nomask", "-no-phase-rescale",
+             "-romeo-dump", ".", "o.nii"],
+      inputs: { "p.nii": phaseNii, "m.nii": magNii },
+      outputs: ["o.nii", ...names],
+    });
+    expect(r.exitCode).toBe(0);
+    for (const n of names) {
+      const nat = rd(`${dumpDir}/${n}`);
+      const wasi = r.files[n];
+      expect(wasi, `${n} missing from the reactor dump`).toBeDefined();
+      expect(Buffer.compare(Buffer.from(wasi), Buffer.from(nat)), `${n} differs from native`).toBe(0);
+    }
+  });
+
   test("an unported ROMEO option fails with a specific message, not a silent no-op", async () => {
     const r = await runner.runFiles({
       argv: ["p.nii", "-romeo", "m.nii", "-t", "5.0", "-w", "bestpath", "o.nii"],

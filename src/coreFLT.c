@@ -7281,7 +7281,11 @@ int main64(int argc, char *argv[]) {
 			return 2;
 		}
 		int op_is_first = (nmutating == 0);
-		if (strcmp(argv[ac], "-p") && strcmp(argv[ac], "-gz") && strcmp(argv[ac], "-odt"))
+		/* Tokens that leave the VOXELS untouched: threading, output format/datatype, kernel
+		   scratch setup, the RNG seed, and writing an intermediate copy. None of them may
+		   disqualify -romeo's raw-phase rescale. */
+		if (strcmp(argv[ac], "-p") && strcmp(argv[ac], "-gz") && strcmp(argv[ac], "-odt") &&
+			strcmp(argv[ac], "-kernel") && strcmp(argv[ac], "-seed") && strcmp(argv[ac], "-save"))
 			nmutating++;
 		enum eOp op = unknown;
 		if (!strcmp(argv[ac], "-add"))

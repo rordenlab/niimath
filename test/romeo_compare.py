@@ -197,6 +197,22 @@ def cmp_ulp(res: Result, label: str, ref: str, got: str, max_ulp: int) -> None:
     res.add(label, ok, f"max {worst} ULP at {argworst} (limit {max_ulp}), nonfinite-mismatch={nonfinite}")
 
 
+def cmp_b0_snr(res: Result, label: str, ref: str, got: str) -> None:
+    """Exact, but tolerating the deliberate SHAPE difference: without a magnitude upstream's SNR
+    collapses to one value (the substituted exp(-TE/20) decay is voxel-independent), while
+    niimath writes that constant across the working grid."""
+    if not os.path.exists(ref) or not os.path.exists(got):
+        res.add(label, False, "missing " + os.path.basename(ref if not os.path.exists(ref) else got))
+        return
+    a = read_raw(ref, "f")
+    b = read_raw(got, "f")
+    if len(a) == 1 and len(b) > 1:
+        bad = sum(1 for x in b if x != a[0])
+        res.add(label, bad == 0, "constant %g broadcast over %d voxels, %d mismatches" % (a[0], len(b), bad))
+        return
+    cmp_exact(res, label, ref, got)
+
+
 def run_niimath(binary: str, args: list[str], cwd: str) -> tuple[int, str]:
     p = subprocess.run([binary] + args, cwd=cwd, capture_output=True, text=True)
     return p.returncode, (p.stdout + p.stderr)
@@ -264,10 +280,10 @@ def check_case(binary: str, ref: str, tag: str, datadir: str, phase: str, mag: s
                 if rcb != 0:
                     res.add(f"{tag}: -B {wmode}", False, f"exit {rcb}: {logb.strip()[:150]}")
                     continue
-                cmp_float(res, f"{tag}: -B {wmode}", R(f"b0_{wmode}.f32"),
-                          os.path.join(tmpb, "c_b0.f32"), 1e-6, relative=True)
-                cmp_float(res, f"{tag}: -B {wmode} snr", R(f"b0_snr_{wmode}.f32"),
-                          os.path.join(tmpb, "c_b0_snr.f32"), 1e-6, relative=True)
+                cmp_exact(res, f"{tag}: -B {wmode}", R(f"b0_{wmode}.f32"),
+                          os.path.join(tmpb, "c_b0.f32"))
+                cmp_b0_snr(res, f"{tag}: -B {wmode} snr", R(f"b0_snr_{wmode}.f32"),
+                           os.path.join(tmpb, "c_b0_snr.f32"))
             finally:
                 shutil.rmtree(tmpb, ignore_errors=True)
 

@@ -382,6 +382,7 @@ int show_help( void ) {
 	printf("                                  -B [name]      also write a B0 field map in Hz: <out>_B0 and <out>_B0_snr (needs -t; [name] replaces the B0 stem)\n");
 	printf("                                  -B0-phase-weighting <mode>  phase_snr (default) | phase_var | average | TEs | mag | simulated_mag\n");
 	printf("                                  -no-phase-rescale;  -no-mask-out (suppress <out>_mask);  -v verbose\n");
+	printf("                            place -gz/-p BEFORE -romeo: side outputs are written during the operation, so a later -gz cannot affect them\n");
 	printf("                            side outputs, nifti_save postfixes on <out>: <out>_mask (only when a mask was computed), <out>_quality (-q), <out>_quality_1..6 (-Q; a map that is uniformly 1.0 is skipped, as upstream)\n");
 	printf("                            phase is rescaled to [-pi,pi] (readphase) unless -no-phase-rescale; the rescale re-reads the UNSCALED file, so it requires -romeo to be the FIRST operation\n");
 	printf("                            -t is required for multi-echo input, optional for a single echo; -no-rescale is a silent alias of -no-phase-rescale\n");

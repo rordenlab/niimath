@@ -411,12 +411,13 @@ def assert_payload_size(path: Path, datatype: int, bitpix: int, dims: tuple[int,
         raise AssertionError(f"{path}: expected {expected_size} bytes from header, saw {len(blob)}")
 
 
-# Golden numeric-primitive tables (638 bytes total), captured from the pinned Julia oracle.
-# Embedded rather than read from test/romeo_ref/ because that directory is gitignored and is not
-# present inside a built wheel — this is what lets release CI verify ROMEO's numeric core on
-# EVERY target (gcc/Linux, MSVC/Windows, AppleClang, wasm) without a Julia install. The tables
-# cover rem2pi in both widths (including the Payne-Hanek branch and subnormal inputs, the FTZ/DAZ
-# canary), gamma, rescale's bin boundaries, and both unwrapvoxel subtraction widths.
+# Golden numeric-primitive tables, captured from the pinned Julia oracle. Embedded rather than
+# read from test/romeo_ref/ because that directory is gitignored and is absent from a built
+# wheel, so this runs wherever release_smoke.py runs: the cibuildwheel matrix (gcc/Linux,
+# MSVC/Windows, AppleClang) plus any local `make test`. It does NOT by itself cover the
+# Emscripten or WASI builds — the WASI suite checks its own dump against this same native binary
+# instead. The tables cover rem2pi in both widths (Payne-Hanek branch included), gamma, rescale's
+# bin boundaries, and both unwrapvoxel subtraction widths.
 ROMEO_PRIMITIVE_GOLDEN = {
     "rem2pi64.f64":
         "AAAAAAAAAAAAAAAAAADwPwAAAAAAAPC/GC1EVPshCUAYLURU+yEJwBgtRFT7Ifk/GC1EVPsh+b8ZLURU+yH5vwdc"
@@ -460,6 +461,81 @@ def check_romeo_primitives(exe: str, tmp: Path, phase: Path, mag: Path) -> None:
                 % (name, ndiff, len(want), len(got), len(want))
             )
     print("  -romeo: numeric primitives match the Julia golden")
+
+
+def check_romeo_b0_modes(exe: str, tmp: Path) -> None:
+    """All six B0 weighting formulas, on TWO echoes with analytically known values.
+
+    A single echo cancels every nonzero weight, so the one-echo check cannot tell the modes
+    apart — an incorrect weighting formula passes it. Here phase and magnitude are constant per
+    echo, so each mode's expected B0 and SNR are closed-form.
+    """
+    dims = (4, 4, 4)
+    nvox = dims[0] * dims[1] * dims[2]
+    tes = [5.0, 11.0]
+    two_pi = 6.283185307179586
+    ph = [0.4, 1.1]          # radians, small enough that no unwrapping changes them
+    mg = [700.0, 300.0]
+    phase = tmp / "b0_phase.nii"
+    mag = tmp / "b0_mag.nii"
+    write_float32_nifti(phase, dims, [ph[0]] * nvox + [ph[1]] * nvox, nt=2)
+    write_float32_nifti(mag, dims, [mg[0]] * nvox + [mg[1]] * nvox, nt=2)
+
+    def weights(mode):
+        if mode == "phase_snr":
+            return [mg[e] * tes[e] for e in (0, 1)]
+        if mode == "phase_var":
+            return [mg[e] * mg[e] * tes[e] * tes[e] for e in (0, 1)]
+        if mode == "average":
+            return [1.0, 1.0]
+        if mode == "TEs":
+            return [tes[e] for e in (0, 1)]
+        if mode == "mag":
+            return [mg[e] for e in (0, 1)]
+        return [math.exp(-tes[e] / 20.0) * tes[e] for e in (0, 1)]   # simulated_mag
+
+    for mode in ("phase_snr", "phase_var", "average", "TEs", "mag", "simulated_mag"):
+        w = weights(mode)
+        num = sum(ph[e] / tes[e] * w[e] for e in (0, 1))
+        den = sum(w)
+        want_b0 = (1000.0 / two_pi) * num / den
+        want_snr = sum(mg[e] * w[e] for e in (0, 1)) / den
+        out = tmp / ("b0m_%s.nii" % mode)
+        require_success(
+            run_niimath(exe, [str(phase), "-gz", "0", "-romeo", str(mag), "-t", "5.0,11.0",
+                              "-k", "nomask", "-no-phase-rescale", "-B",
+                              "-B0-phase-weighting", mode, str(out)]),
+            "romeo B0 two-echo (%s)" % mode,
+        )
+        got_b0 = read_float32_nifti(tmp / ("b0m_%s_B0.nii" % mode))
+        got_snr = read_float32_nifti(tmp / ("b0m_%s_B0_snr.nii" % mode))
+        for label, got, want in (("B0", got_b0, want_b0), ("SNR", got_snr, want_snr)):
+            worst = max(abs(v - want) for v in got)
+            if worst > 1e-4 * max(1.0, abs(want)):
+                raise AssertionError(
+                    "romeo -B %s %s: got %g, expected %g (max|diff| %g)"
+                    % (mode, label, got[0], want, worst)
+                )
+    print("  -romeo: all six B0 weighting modes match closed-form values")
+
+
+def check_romeo_raw_mask(exe: str, tmp: Path, phase: Path) -> None:
+    """`-k <file>` truth is `raw != 0` in the STORED width. A float64 mask of 1e-300 is entirely
+    true; narrowing it to float32 first would round every voxel to a false zero."""
+    dims = (12, 10, 8)
+    nvox = dims[0] * dims[1] * dims[2]
+    maskf = tmp / "tiny_mask.nii"
+    header = bytearray(nifti_header(dims, datatype=64, bitpix=64))   # DT_FLOAT64
+    maskf.write_bytes(bytes(header) + struct.pack("<%dd" % nvox, *([1e-300] * nvox)))
+    out = tmp / "rawmask_out.nii"
+    require_success(
+        run_niimath(exe, [str(phase), "-gz", "0", "-romeo", "none", "-t", "5.0",
+                          "-k", str(maskf), "-no-phase-rescale", str(out)]),
+        "romeo float64 subnormal-ish raw mask",
+    )
+    if not out.exists():
+        raise AssertionError("romeo produced no output for a float64 raw mask")
+    print("  -romeo: float64 raw mask truth preserved")
 
 
 def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
@@ -599,6 +675,8 @@ def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
         if not (tmp / ("romeo_b0_%s_B0_snr.nii" % wmode)).exists():
             raise AssertionError("romeo -B must also write <out>_B0_snr")
 
+    check_romeo_b0_modes(exe, tmp)
+    check_romeo_raw_mask(exe, tmp, phase_path)
     check_romeo_primitives(exe, tmp, phase_path, mag_path)
     print("  -romeo: unwrap/mask/quality/multi-echo OK")
 

@@ -817,13 +817,16 @@ static int rm_voxelquality(const rm_wctx *c, float *qmap) {
  * `mag` mode Float64 - hence the `w32` flag depends on BOTH the mode and have_mag.
  * ==========================================================================================*/
 
-static double rm_b0_weight_d(int mode, double m, double te) {
+/* `m32` is 1 when the magnitude is a real Float32 image: upstream's `mag .* mag .* TEs .* TEs`
+   rounds the SQUARE in Float32 and only then widens. Rounding it in double drifts the B0 map by
+   ~1.5e-5 Hz and the SNR by ~2e-3. The magnitude-free fallback is Float64 throughout. */
+static double rm_b0_weight_d(int mode, double m, double te, int m32, double sim) {
 	switch (mode) {
-	case RM_B0_PHASE_VAR: return m * m * te * te;
+	case RM_B0_PHASE_VAR: return (m32 ? (double)((float)m * (float)m) : m * m) * te * te;
 	case RM_B0_AVERAGE: return 1.0;
 	case RM_B0_TES: return te;
 	case RM_B0_MAG: return m;
-	case RM_B0_SIMULATED_MAG: return exp(-te / 20.0) * te;
+	case RM_B0_SIMULATED_MAG: return sim * te;
 	default: return m * te;   /* RM_B0_PHASE_SNR */
 	}
 }
@@ -832,8 +835,10 @@ static double rm_b0_weight_d(int mode, double m, double te) {
 static void rm_compute_b0(const float *phase, const float *mag, int64_t n3, int neco,
 	const double *TEs, int mode, float *b0, float *snr) {
 	const int w32 = (mode == RM_B0_MAG) && (mag != NULL);
+	double synth[ROMEO_MAX_TE];   /* exp(-TE/20): echo-only, so hoist it out of the voxel loop */
 	int64_t i;
 	int e;
+	for (e = 0; e < neco; e++) synth[e] = exp(-TEs[e] / 20.0);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) private(e)
 #endif
@@ -842,7 +847,7 @@ static void rm_compute_b0(const float *phase, const float *mag, int64_t n3, int 
 		float denf = 0.0f, snumf = 0.0f;
 		for (e = 0; e < neco; e++) {
 			double te = TEs[e];
-			double m = mag ? (double)mag[(int64_t)e * n3 + i] : exp(-te / 20.0);
+			double m = mag ? (double)mag[(int64_t)e * n3 + i] : synth[e];
 			double p = (double)phase[(int64_t)e * n3 + i];
 			if (w32) {
 				float w = (float)m;                /* weight == the Float32 magnitude itself */
@@ -850,7 +855,7 @@ static void rm_compute_b0(const float *phase, const float *mag, int64_t n3, int 
 				snumf += (float)m * w;
 				num += p / te * (double)w;
 			} else {
-				double w = rm_b0_weight_d(mode, m, te);
+				double w = rm_b0_weight_d(mode, m, te, mag != NULL, synth[e]);
 				den += w;
 				snum += m * w;
 				num += p / te * w;
@@ -959,37 +964,37 @@ static int rm_fill_holes(uint8_t *mask, int nx, int ny, int nz) {
 	int64_t n = (int64_t)nx * ny * nz, i;
 	double maxhole = (double)n / 20.0;
 	int32_t *lab = NULL;
-	int64_t *stack = NULL, *sizes = NULL;
-	int64_t nlab = 0, sp;
+	int32_t *stack = NULL, *sizes = NULL;   /* n <= INT_MAX, so 32-bit halves this scratch */
+	int32_t nlab = 0, sp;
 	if (1.0 > maxhole) {
 		RM_ERR("robustmask needs at least 20 voxels (upstream fill_holes passes (1, n/20) to imfill, which rejects n < 20)\n");
 		return 1;
 	}
 	lab = (int32_t *)calloc((size_t)n, sizeof(int32_t));
-	stack = (int64_t *)malloc((size_t)n * sizeof(int64_t));
-	sizes = (int64_t *)malloc((size_t)(n + 1) * sizeof(int64_t));
+	stack = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+	sizes = (int32_t *)malloc((size_t)(n + 1) * sizeof(int32_t));
 	if (!lab || !stack || !sizes) { free(lab); free(stack); free(sizes); return 1; }
 	for (i = 0; i < n; i++) {
 		if (mask[i] || lab[i]) continue;
 		nlab++;
 		sizes[nlab] = 0;
-		sp = 0; stack[sp++] = i; lab[i] = (int32_t)nlab;
+		sp = 0; stack[sp++] = (int32_t)i; lab[i] = nlab;
 		while (sp > 0) {
 			int64_t v = stack[--sp];
 			int64_t z = v / ((int64_t)nx * ny), rem = v % ((int64_t)nx * ny);
 			int64_t y = rem / nx, x = rem % nx;
 			sizes[nlab]++;
-			if (x > 0 && !mask[v - 1] && !lab[v - 1]) { lab[v - 1] = (int32_t)nlab; stack[sp++] = v - 1; }
-			if (x < nx - 1 && !mask[v + 1] && !lab[v + 1]) { lab[v + 1] = (int32_t)nlab; stack[sp++] = v + 1; }
-			if (y > 0 && !mask[v - nx] && !lab[v - nx]) { lab[v - nx] = (int32_t)nlab; stack[sp++] = v - nx; }
-			if (y < ny - 1 && !mask[v + nx] && !lab[v + nx]) { lab[v + nx] = (int32_t)nlab; stack[sp++] = v + nx; }
-			if (z > 0 && !mask[v - (int64_t)nx * ny] && !lab[v - (int64_t)nx * ny]) { lab[v - (int64_t)nx * ny] = (int32_t)nlab; stack[sp++] = v - (int64_t)nx * ny; }
-			if (z < nz - 1 && !mask[v + (int64_t)nx * ny] && !lab[v + (int64_t)nx * ny]) { lab[v + (int64_t)nx * ny] = (int32_t)nlab; stack[sp++] = v + (int64_t)nx * ny; }
+			if (x > 0 && !mask[v - 1] && !lab[v - 1]) { lab[v - 1] = nlab; stack[sp++] = (int32_t)(v - 1); }
+			if (x < nx - 1 && !mask[v + 1] && !lab[v + 1]) { lab[v + 1] = nlab; stack[sp++] = (int32_t)(v + 1); }
+			if (y > 0 && !mask[v - nx] && !lab[v - nx]) { lab[v - nx] = nlab; stack[sp++] = (int32_t)(v - nx); }
+			if (y < ny - 1 && !mask[v + nx] && !lab[v + nx]) { lab[v + nx] = nlab; stack[sp++] = (int32_t)(v + nx); }
+			if (z > 0 && !mask[v - (int64_t)nx * ny] && !lab[v - (int64_t)nx * ny]) { lab[v - (int64_t)nx * ny] = nlab; stack[sp++] = (int32_t)(v - (int64_t)nx * ny); }
+			if (z < nz - 1 && !mask[v + (int64_t)nx * ny] && !lab[v + (int64_t)nx * ny]) { lab[v + (int64_t)nx * ny] = nlab; stack[sp++] = (int32_t)(v + (int64_t)nx * ny); }
 		}
 	}
 	for (i = 0; i < n; i++) {
 		if (!mask[i]) {
-			int64_t c = sizes[lab[i]];
+			int32_t c = sizes[lab[i]];
 			if (1 <= c && (double)c <= maxhole) mask[i] = 1; /* hole filled */
 		}
 	}
@@ -1060,33 +1065,37 @@ static int rm_robustmask(const float *weight, int nx, int ny, int nz,
 		st->threshold = threshold;
 	}
 
+	/* Allocated as each stage is reached, not all six up front: without -romeo-dump the peak is
+	   then ~2 live buffers instead of 6 (12 bytes/voxel -> ~5). */
 	st->s1 = (uint8_t *)malloc((size_t)n);
 	st->sm1 = (float *)malloc((size_t)n * sizeof(float));
-	st->s2 = (uint8_t *)malloc((size_t)n);
-	st->s3 = (uint8_t *)malloc((size_t)n);
-	st->sm2 = (float *)malloc((size_t)n * sizeof(float));
-	st->s4 = (uint8_t *)malloc((size_t)n);
-	if (!st->s1 || !st->sm1 || !st->s2 || !st->s3 || !st->sm2 || !st->s4) {
-		rm_mask_stages_free(st); return 1;
-	}
+	if (!st->s1 || !st->sm1) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->s1[i] = (weight[i] > threshold) ? 1 : 0;
 	for (i = 0; i < n; i++) st->sm1[i] = (float)st->s1[i];
 	{
 		int boxes1[1] = { 5 };
 		if (rm_boxsmooth3d(st->sm1, nx, ny, nz, 1, boxes1)) { rm_mask_stages_free(st); return 1; }
 	}
+	st->s2 = (uint8_t *)malloc((size_t)n);
+	if (!st->s2) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->s2[i] = ((double)st->sm1[i] > 0.4) ? 1 : 0;
 	RM_DROP(st->sm1);
 	RM_DROP(st->s1);
+	st->s3 = (uint8_t *)malloc((size_t)n);
+	if (!st->s3) { rm_mask_stages_free(st); return 1; }
 	memcpy(st->s3, st->s2, (size_t)n);
 	RM_DROP(st->s2);
 	if (rm_fill_holes(st->s3, nx, ny, nz)) { rm_mask_stages_free(st); return 1; }
+	st->sm2 = (float *)malloc((size_t)n * sizeof(float));
+	if (!st->sm2) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->sm2[i] = (float)st->s3[i];
 	RM_DROP(st->s3);
 	{
 		int boxes2[2] = { 3, 3 };
 		if (rm_boxsmooth3d(st->sm2, nx, ny, nz, 2, boxes2)) { rm_mask_stages_free(st); return 1; }
 	}
+	st->s4 = (uint8_t *)malloc((size_t)n);
+	if (!st->s4) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->s4[i] = ((double)st->sm2[i] > 0.6) ? 1 : 0;
 	RM_DROP(st->sm2);
 	return 0;
@@ -1132,7 +1141,13 @@ static int rm_pq_enqueue(rm_pq *q, int64_t item, int w) {
 	if (w < 1 || w > q->nbins) { q->oom = 1; return 1; }
 	if (q->len[w] == q->cap[w]) {
 		int64_t nc = q->cap[w] ? q->cap[w] * 2 : 64;
-		int64_t *nb = (int64_t *)realloc(q->bin[w], (size_t)nc * sizeof(int64_t));
+		size_t bytes;
+		int64_t *nb;
+		/* The queue holds DUPLICATE edge insertions, so its power-of-two growth is not bounded by
+		   the top-level n3 guard; on a 32-bit target nc*8 can wrap to 0 and realloc(p,0) may
+		   return non-NULL, letting the store below run through a zero-sized allocation. */
+		if (nii_mul_size((size_t)nc, sizeof(int64_t), &bytes)) { q->oom = 1; return 1; }
+		nb = (int64_t *)realloc(q->bin[w], bytes);
 		if (!nb) { q->oom = 1; return 1; }
 		q->bin[w] = nb; q->cap[w] = nc;
 	}
@@ -1146,58 +1161,30 @@ static int64_t rm_pq_dequeue(rm_pq *q) {
 	return e;
 }
 
-/* The seed queue is built once from sum(weights; dims=1) — with every ZERO weight first
-   substituted by 255, so a voxel with non-existent edges sorts as WORST rather than best — in
-   ascending linear index and only
-   ever dequeued, so a counting sort reproduces the bucket layout exactly: within a bin the
-   entries are ascending and pop-from-the-end yields the HIGHEST linear index first. */
-typedef struct {
-	int64_t *items;   /* concatenated bins */
-	int64_t *start;   /* bin offsets, 1..nbins+1 */
-	int64_t *len;
-	int nbins;
-	int min;
-} rm_seedq;
-
-static void rm_seedq_free(rm_seedq *s) { free(s->items); free(s->start); free(s->len); memset(s, 0, sizeof *s); }
-
-static int rm_seedq_build(rm_seedq *s, const uint8_t *w, int64_t n) {
-	int64_t i;
-	int b;
-	int64_t *fill = NULL;
-	s->nbins = 3 * RM_NBINS;
-	s->items = (int64_t *)malloc((size_t)n * sizeof(int64_t));
-	s->start = (int64_t *)calloc((size_t)s->nbins + 2, sizeof(int64_t));
-	s->len = (int64_t *)calloc((size_t)s->nbins + 2, sizeof(int64_t));
-	fill = (int64_t *)calloc((size_t)s->nbins + 2, sizeof(int64_t));
-	if (!s->items || !s->start || !s->len || !fill) { free(fill); rm_seedq_free(s); return 1; }
+/* getseedqueue + findseed!, collapsed to one scan.
+ *
+ * Upstream builds a 3*NBINS bucket queue over sum(weights; dims=1) -- with every ZERO weight
+ * first substituted by 255, so a voxel with non-existent edges sorts as WORST rather than best
+ * -- inserts every voxel in ascending linear index, and pops from the END of the lowest
+ * non-empty bin. With maxseeds capped at 1 (the only value this build accepts) the queue is
+ * dequeued exactly ONCE against an all-zero `visited`, so the result is simply: the smallest
+ * substituted weight sum, ties broken toward the HIGHEST linear index. That is one O(n) scan
+ * instead of an int64_t[n3] plus bucket metadata (128 MiB at 256^3).
+ *
+ * If -max-seeds > 1 is ever ported, the bucket queue must come back: later seeds depend on the
+ * ordering of the remainder and on which voxels have since been visited. */
+static int64_t rm_find_seed(const uint8_t *w, int64_t n) {
+	int64_t i, best = 0;
+	int bestsum = 3 * 255 + 1;
 	for (i = 0; i < n; i++) {
 		int a = w[3 * i] ? w[3 * i] : 255;
-		int b1 = w[3 * i + 1] ? w[3 * i + 1] : 255;
+		int b = w[3 * i + 1] ? w[3 * i + 1] : 255;
 		int c = w[3 * i + 2] ? w[3 * i + 2] : 255;
-		s->len[a + b1 + c]++;
+		int sum = a + b + c;
+		if (sum <= bestsum) { bestsum = sum; best = i + 1; }   /* <= : highest index wins ties */
 	}
-	s->start[1] = 0;
-	for (b = 1; b <= s->nbins; b++) s->start[b + 1] = s->start[b] + s->len[b];
-	for (i = 0; i < n; i++) {
-		int a = w[3 * i] ? w[3 * i] : 255;
-		int b1 = w[3 * i + 1] ? w[3 * i + 1] : 255;
-		int c = w[3 * i + 2] ? w[3 * i + 2] : 255;
-		int bb = a + b1 + c;
-		s->items[s->start[bb] + fill[bb]++] = i + 1;   /* 1-based voxel index, ascending */
-	}
-	free(fill);
-	s->min = s->nbins + 1;
-	for (b = 1; b <= s->nbins; b++) if (s->len[b]) { s->min = b; break; }
-	return 0;
+	return best;   /* 1-based voxel index; n >= 1 so always found */
 }
-
-static int64_t rm_seedq_dequeue(rm_seedq *s) {
-	int64_t e = s->items[s->start[s->min] + (--s->len[s->min])];
-	while (s->min <= s->nbins && s->len[s->min] == 0) s->min++;
-	return e;
-}
-static int rm_seedq_isempty(const rm_seedq *s) { return s->min > s->nbins; }
 
 /* ============================================================================================
  * 8. grow_region_unwrap! (ROMEO.jl src/algorithm.jl + src/seed.jl)
@@ -1285,14 +1272,10 @@ static double rm_seed_thresh(int w1, int w2, int w3) {
 }
 
 /* Returns the new seed threshold, or 255 when no unvisited voxel remains. */
-static double rm_addseed(rm_grow *g, rm_seedq *sq, rm_pq *pq, int64_t *seeds, int *nseeds) {
-	int64_t seed = 0;
+static double rm_addseed(rm_grow *g, rm_pq *pq, int64_t *seeds, int *nseeds) {
+	int64_t seed = rm_find_seed(g->weights, g->n);
 	int i;
-	while (!rm_seedq_isempty(sq)) {
-		int64_t ind = rm_seedq_dequeue(sq);
-		if (g->visited[ind - 1] == 0) { seed = ind; break; }
-	}
-	if (seed == 0) return 255.0;
+	if (seed == 0 || g->visited[seed - 1] != 0) return 255.0;
 	for (i = 1; i <= 6; i++) {
 		int64_t e = rm_getnewedge(g, seed, i);
 		if (e != 0 && g->weights[e - 1] > 0) rm_pq_enqueue(pq, e, g->weights[e - 1]);
@@ -1309,14 +1292,14 @@ static double rm_addseed(rm_grow *g, rm_seedq *sq, rm_pq *pq, int64_t *seeds, in
 /* grow_region_unwrap!.  maxseeds is capped at 255 upstream; only 1 is supported here (the
    experimental multi-seed/region-merging path is not ported). `pq` may already hold seed edges
    (the temporal-uncertain re-entry), in which case no seed is created. */
-static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds) {
+static int rm_grow_region(rm_grow *g, rm_pq *pq, int seeded_externally, int maxseeds) {
 	int64_t seeds[256];
 	int nseeds = 0;
 	double new_seed_thresh = 256.0;
 	int seeded = 0;
 	if (rm_pq_isempty(pq)) {
-		if (!sq) return 1;
-		new_seed_thresh = rm_addseed(g, sq, pq, seeds, &nseeds);
+		if (seeded_externally) return 1;
+		new_seed_thresh = rm_addseed(g, pq, seeds, &nseeds);
 		seeded = 1;
 		if (pq->oom) return 1;
 	}
@@ -1324,7 +1307,7 @@ static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds) {
 		int64_t edge, oldvox, newvox, vox, neighbor;
 		int dim, i;
 		if (seeded && nseeds < maxseeds && (double)pq->min > new_seed_thresh)
-			new_seed_thresh = rm_addseed(g, sq, pq, seeds, &nseeds);
+			new_seed_thresh = rm_addseed(g, pq, seeds, &nseeds);
 		edge = rm_pq_dequeue(pq);
 		dim = rm_getdimfromedge(edge);
 		vox = rm_getfirstvoxfromedge(edge);
@@ -1379,7 +1362,6 @@ static int rm_unwrap3d(float *wrapped, const uint8_t *weights, int nx, int ny, i
 	int64_t n = (int64_t)nx * ny * nz, i;
 	rm_grow g;
 	rm_pq pq;
-	rm_seedq sq;
 	int rc;
 	uint8_t *visited = (uint8_t *)calloc((size_t)n, 1);
 	int64_t wsum = 0;
@@ -1391,10 +1373,8 @@ static int rm_unwrap3d(float *wrapped, const uint8_t *weights, int nx, int ny, i
 	g.wrap_addition = wrap_addition;
 	g.phase2 = phase2; g.TE1 = TE1; g.TE2 = TE2; g.have_p2 = have_p2;
 	if (rm_pq_init(&pq, RM_NBINS)) { free(visited); return 1; }
-	if (rm_seedq_build(&sq, weights, n)) { rm_pq_free(&pq); free(visited); return 1; }
-	rc = rm_grow_region(&g, &pq, &sq, maxseeds);
+	rc = rm_grow_region(&g, &pq, 0, maxseeds);
 	rm_pq_free(&pq);
-	rm_seedq_free(&sq);
 	if (visited_out) memcpy(visited_out, visited, (size_t)n);
 	free(visited);
 	return rc;
@@ -1437,8 +1417,11 @@ static const double RM_PRIM_D[] = {
 	/* >= 2^20*pi/2 == the Payne-Hanek branch */
 	1650000.0, -1650000.0, 1.0e7, -1.0e7, 1.0e10, -1.0e10, 1.0e15, 1.0e20, 1.0e30, 1.0e100,
 	0.5, -0.5, 1.5, 2.5000000000000004,
-	/* subnormals: the FTZ/DAZ canary. A gcc -ffast-math LINK sets MXCSR flush-to-zero
-	   process-wide, which would turn these into 0 even inside this strict-FP object. */
+	/* Subnormal inputs. NOTE, correcting an earlier over-claim in this file: these are NOT an
+	   FTZ/DAZ probe. Every one takes the |x| <= pi pass-through, and ROMEO's real operands
+	   (weights in [0,1], phase ~[-pi,pi], magnitudes ~1e3) never reach the denormal range at
+	   all -- which is precisely why a gcc -ffast-math link's process-wide MXCSR FTZ/DAZ has nil
+	   exposure here. They pin the accepted input DOMAIN, not the FP mode. */
 	5e-324, -5e-324, 1e-310, 2.2250738585072011e-308
 };
 static const float RM_PRIM_F[] = {
@@ -1675,7 +1658,33 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 			ac++;
 			/* nargs='?' upstream: take the next token as the output stem only when it is not
 			   another option. The main parser already removed the trailing output filename. */
-			if (ac < argc && argv[ac][0] != '-') { o->b0_name = argv[ac]; ac++; }
+			if (ac < argc && argv[ac][0] != '-') {
+				/* The stem becomes a nifti_save POSTFIX (<out>_<stem>, <out>_<stem>_snr), so it
+				   must not truncate, must not carry a path or extension, and must not collide
+				   with a side output this command already writes. */
+				static const char *const reserved[] = { "mask", "quality", "quality_1", "quality_2",
+					"quality_3", "quality_4", "quality_5", "quality_6" };
+				const char *nm = argv[ac];
+				size_t k, len = strlen(nm);
+				if (len < 1 || len > 24) {
+					RM_ERR("-B name '%s' must be 1-24 characters\n", nm);
+					return 1;
+				}
+				for (k = 0; k < len; k++) {
+					if (!((nm[k] >= 'A' && nm[k] <= 'Z') || (nm[k] >= 'a' && nm[k] <= 'z') ||
+						  (nm[k] >= '0' && nm[k] <= '9') || nm[k] == '_' || nm[k] == '-')) {
+						RM_ERR("-B name '%s' may only contain letters, digits, '_' and '-' (it is a filename POSTFIX on the output, not a path)\n", nm);
+						return 1;
+					}
+				}
+				for (k = 0; k < sizeof reserved / sizeof reserved[0]; k++)
+					if (!strcmp(nm, reserved[k])) {
+						RM_ERR("-B name '%s' would overwrite the <out>_%s side output; choose another\n", nm, nm);
+						return 1;
+					}
+				o->b0_name = nm;
+				ac++;
+			}
 			continue;
 		}
 		if (!strcmp(a, "-B0-phase-weighting")) {
@@ -1946,8 +1955,12 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		for (i = 0; i < neco; i++) TEs[i] = o->TEs[0];
 	} else if (o->nTE == neco) {
 		for (i = 0; i < neco; i++) TEs[i] = o->TEs[i];
-	} else if (neco == 1 && o->nTE >= 1) {
+	} else if (neco == 1 && o->nTE == 1) {
 		TEs[0] = o->TEs[0];
+	} else if (neco == 1 && o->nTE > 1) {
+		RM_ERR("%d echo times given for a single-volume image; supply one (-t %g) or a 4D phase\n",
+			o->nTE, o->TEs[0]);
+		goto done;
 	} else {
 		RM_ERR("%d echo time(s) given for %d echo(es) in the data\n", o->nTE, neco);
 		goto done;
@@ -2043,9 +2056,8 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 				/* Seed scalars: the plan's M5 gate names them explicitly, so make them
 				   directly comparable with the oracle manifest rather than implied by the
 				   (bit-exact) weights they are derived from. */
-				rm_seedq sq;
-				if (!rm_seedq_build(&sq, weights, n3)) {
-					int64_t sd = rm_seedq_isempty(&sq) ? 0 : rm_seedq_dequeue(&sq);
+				{
+					int64_t sd = rm_find_seed(weights, n3);
 					fprintf(manifest, "seed_index %lld\n", (long long)sd);
 					if (sd > 0) {
 						int w1 = weights[rm_getedgeindex(sd, 1) - 1];
@@ -2054,7 +2066,6 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 						fprintf(manifest, "seed_w1 %d\nseed_w2 %d\nseed_w3 %d\n", w1, w2, w3);
 						fprintf(manifest, "new_seed_thresh %.17g\n", rm_seed_thresh(w1, w2, w3));
 					}
-					rm_seedq_free(&sq);
 				}
 				fprintf(manifest, "flags_active %d%d%d%d%d%d\n",
 					c.flags[0], c.flags[1], c.flags[2], c.flags[3], c.flags[4], c.flags[5]);
@@ -2221,7 +2232,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 							}
 						}
 					}
-					if (rm_grow_region(&g, &pq, NULL, o->maxseeds)) {
+					if (rm_grow_region(&g, &pq, 1, o->maxseeds)) {
 						rm_pq_free(&pq);
 						free(qual); free(halfw); free(halfr); free(vis); free(refvalue);
 						RM_ERR("out of memory during temporal-uncertain re-unwrapping\n");
@@ -2237,9 +2248,11 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 
 	/* ---- side outputs ------------------------------------------------------------------------ */
 	{
-		float *tmp = (float *)malloc((size_t)n3 * sizeof(float));
+		int want_side = (mask && !o->no_mask_out) || o->compute_b0 || o->write_quality ||
+			o->write_quality_all || (dump != NULL);
+		float *tmp = want_side ? (float *)malloc((size_t)n3 * sizeof(float)) : NULL;
 		int save_rc = 0;
-		if (!tmp) goto done;
+		if (want_side && !tmp) goto done;
 		if (mask && !o->no_mask_out) {
 			for (i = 0; i < n3; i++) tmp[i] = (float)mask[i];
 			save_rc |= rm_save_side(nim, "_mask", tmp, n3, gzMode);
