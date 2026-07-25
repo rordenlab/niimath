@@ -420,7 +420,7 @@ def assert_payload_size(path: Path, datatype: int, bitpix: int, dims: tuple[int,
 
 
 # Golden numeric-primitive tables, captured from the pinned Julia oracle. Embedded rather than
-# read from test/romeo_ref/ because that directory is gitignored and is absent from a built
+# read from the oracle's romeo_ref/ output because that directory is gitignored and is absent from a built
 # wheel, so this runs wherever release_smoke.py runs: the cibuildwheel matrix (gcc/Linux,
 # MSVC/Windows, AppleClang) plus any local `make test`. It does NOT by itself cover the
 # Emscripten or WASI builds — the WASI suite checks its own dump against this same native binary
@@ -697,7 +697,7 @@ def exercise_medic(exe: str, tmp: Path, help_text: str) -> None:
       -unwarp  a ramp whose value equals its j index, pulled by a CONSTANT displacement map of
                exactly N voxels, must come back shifted by exactly -N in the interior.  This
                catches a sign flip, a wrong axis, a wrong length unit, and a broken kernel.
-               (The convention is measured; see test/medic_reference_manifest.md section 3.5.)
+               (The convention is measured; see medic_bench's test/medic_reference_manifest.md section 3.5.)
 
       --medic  phase synthesised as wrap(2*pi*f*TE) for a known linear field f must be recovered
                by the magnitude-weighted regression.  The field is checked by least-squares slope

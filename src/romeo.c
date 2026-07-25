@@ -30,7 +30,7 @@
  *
  * That is not a theoretical worry - it was MEASURED, building this same source three ways and
  * comparing against the pinned Julia oracle. The middle column is the 76x76x46 validation volume
- * (phase0/mag0, -t 16.8); the right column is the FULL parity suite (test/romeo_compare.py
+ * (phase0/mag0, -t 16.8); the right column is the FULL parity suite (test/romeo_compare.py (medic_bench repo)
  * --weights-all: 4 real + 11 synthetic cases, 10 weight selections).
  *
  * NOTE: the pass counts below are AS MEASURED WHEN THIS EXPERIMENT WAS RUN, when the suite had
@@ -70,11 +70,11 @@
  * -ffast-math on the LINK line pulls in crtfastmath.o, which sets MXCSR FTZ/DAZ process-wide -
  * including inside this strict-FP object. ROMEO's operands (weights in [0,1], phase ~[-pi,pi],
  * magnitudes ~1e3) never reach the denormal range, so the exposure is nil, but every measurement
- * above was made on arm64 macOS. Re-run test/romeo_compare.py on a Linux gcc release build
+ * above was made on arm64 macOS. Re-run test/romeo_compare.py (medic_bench repo) on a Linux gcc release build
  * before claiming bit-identity there. Do NOT "fix" this by removing -ffast-math from the link.
  *
  * ---------------------------------------------------------------------------------------------
- * NUMERIC TYPE AUDIT (romeo_plan.md §3.1).  Julia's promotion rules are NOT uniform across the
+ * NUMERIC TYPE AUDIT.  Julia's promotion rules are NOT uniform across the
  * six weight terms; each row was confirmed with typeof(...) under the pinned environment above.
  * The C column is what this file implements.  Getting one row wrong is the single most likely
  * cause of a near-miss.
@@ -499,7 +499,8 @@ static int rm_isapprox_f(float a, float b) {
 
 /* Statistics.quantile(v::Vector{Float32}, p) — type 7 (alpha=beta=1), returns Float64.
    Destroys the ordering of `v`.  n must be > 0.
-   PINNED-VERSION GOTCHA: the environment in romeo_plan.md §2.1 resolves the REGISTRY package
+   PINNED-VERSION GOTCHA: the pinned oracle environment (see test/romeo_oracle.jl in the medic_bench repo)
+   resolves the REGISTRY package
    Statistics v1.11.1, not the copy bundled with Julia's own stdlib tree.  1.11.1 computes
    `aleph = n*p + m` with a plain multiply-add; the newer stdlib copy uses `fma(n, p, m)`.  The
    two differ in the last bits (for n=265696, p=0.95: 252411.24999999997 vs 252411.25), which
@@ -1408,11 +1409,11 @@ static int rm_dump(const char *dir, const char *name, const void *p, size_t elem
 
 /* ------------------------------------------------------------------------------------------
  * Primitive self-dump (test hook).  The 2*pi range reduction, gamma, rescale and unwrapvoxel are
- * exercised on a FIXED input table that is duplicated verbatim in test/romeo_oracle.jl, so the
+ * exercised on a FIXED input table that is duplicated verbatim in test/romeo_oracle.jl (medic_bench repo), so the
  * two sides can be byte-compared.  This is the ONLY coverage of the Payne-Hanek branch: real
  * phase data never reaches |x| >= 2^20*pi/2, but -no-phase-rescale lets a caller feed already
  * unwrapped phase, and phaselinearity would then take arbitrarily large arguments.
- * KEEP THE TABLES IN SYNC WITH test/romeo_oracle.jl.
+ * KEEP THE TABLES IN SYNC WITH test/romeo_oracle.jl (medic_bench repo).
  * ----------------------------------------------------------------------------------------*/
 
 static const double RM_PRIM_D[] = {

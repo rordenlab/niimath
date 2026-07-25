@@ -3,7 +3,7 @@
 // Clean-room emulation of the workflow in Van et al., Imaging Neuroscience 4 (2026),
 // doi:10.1162/IMAG.a.1262.  No Warpkit implementation, test, build product or debug symbol was
 // read.  Conventions the paper does not fix were measured through the public executables; every
-// one of them is recorded, with its experiment, in test/medic_reference_manifest.md.  Section
+// one of them is recorded, with its experiment, in test/medic_reference_manifest.md of the medic_bench repository.  Section
 // numbers in the comments below refer to that manifest.
 //
 // Pipeline (manifest §3.12):
@@ -1070,7 +1070,7 @@ static void md_usage(void) {
 	printf("Emulates the MEDIC workflow of Van et al., Imaging Neuroscience 4 (2026),\n");
 	printf("doi:10.1162/IMAG.a.1262. Phase unwrapping is the MIT ROMEO port (Dymerska et al. 2020,\n");
 	printf("doi:10.1002/mrm.28563). Clean-room: developed from the paper and black-box measurement,\n");
-	printf("see test/medic_reference_manifest.md.\n");
+	printf("see test/medic_reference_manifest.md in the medic_bench repository.\n");
 }
 
 /* Strict integer parse: the whole token must be consumed and fit.  atoi() silently accepts
@@ -1294,7 +1294,7 @@ int nii_medic(int argc, char *argv[]) {
 
 	{	/* Working set, all resident (plan §5.2 as scoped: in-RAM, documented budget).
 		   phase (unwrapped in place) + mag + fields + fu + disp
-		   = n3 * T * (2*neco + 3) * 4 bytes.  See medic_plan.md: streaming is a decided
+		   = n3 * T * (2*neco + 3) * 4 bytes.  Streaming is a decided
 		   non-goal because a 4D .nii.gz cannot be seeked anyway. */
 		double gb = (double)n3 * T * (2.0 * c.neco + 3.0) * 4.0 / 1073741824.0;
 		fprintf(stderr, "--medic: %dx%dx%d, %d echo(es), %d frame(s); working set ~%.2f GiB\n",

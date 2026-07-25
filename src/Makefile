@@ -83,7 +83,7 @@ DTFLAGS= -DHAVE_DTIFIT dtifit.c
 QCFLAGS= -DHAVE_QC qc.c
 
 #MEDIC multi-echo distortion correction (--medic, -unwarp). Clean-room emulation of the workflow
-#in Van et al. 2026 (doi:10.1162/IMAG.a.1262); see test/medic_reference_manifest.md. REQUIRES
+#in Van et al. 2026 (doi:10.1162/IMAG.a.1262); see test/medic_reference_manifest.md in the medic_bench repository. REQUIRES
 #ROMEO (it calls romeo_unwrap_frame), so "ROMEO=0" implies "MEDIC=0". Ordinary FP: unlike
 #romeo.c, nothing here is reassociation-sensitive, so medic.c rides the normal source line.
 MEDICFLAGS= -DHAVE_MEDIC medic.c
