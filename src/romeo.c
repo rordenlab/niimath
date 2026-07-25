@@ -1854,6 +1854,360 @@ static int rm_build_ctx(rm_wctx *c, const float *phase, const float *mag, int ma
 	return 0;
 }
 
+/* ---- shared unwrapping core ------------------------------------------------------------------
+ *
+ * Everything between "phase is in radians in memory" and "the phase is unwrapped": mask
+ * selection, weight calculation and the three unwrapping dispatches.  Both entry points run this
+ * ONE body, so the file-oriented `-romeo` and the in-memory frame API used by `--medic` cannot
+ * drift.  `romeo_run` additionally owns loading, readphase rescaling, the parity dump and the side
+ * outputs; `romeo_unwrap_frame` owns none of those.
+ *
+ * The struct carries the outputs the caller still needs afterwards (mask, weights, flags) and, for
+ * `romeo_run` only, the parity-dump plumbing.  On failure rm_core_run returns non-zero having left
+ * the struct in a state rm_core_free can release. */
+typedef struct {
+	/* caller-supplied */
+	float *phase;         /* in/out, n3 * neco, radians */
+	const float *mag;     /* borrowed, n3 * magvol, or NULL */
+	int magvol;
+	int nx, ny, nz, neco;
+	const double *TEs;
+	const romeo_opts *o;
+	/* derived / owned */
+	int64_t n3;
+	uint8_t *mask;
+	uint8_t *weights;
+	uint8_t *visited;     /* dump only */
+	float *magmasked;
+	rm_mask_stages stages;
+	int flags[6];
+	int template_echo, p2ref;
+	double TE1, TE2;
+	int have_mag;
+	/* romeo_run-only parity dump */
+	const char *dump;
+	FILE *manifest;
+	int drc;
+} rm_core;
+
+static void rm_core_free(rm_core *c) {
+	rm_mask_stages_free(&c->stages);
+	free(c->mask); free(c->weights); free(c->magmasked); free(c->visited);
+	c->mask = NULL; c->weights = NULL; c->magmasked = NULL; c->visited = NULL;
+}
+
+static int rm_core_run(rm_core *c) {
+	const romeo_opts *o = c->o;
+	const int nx = c->nx, ny = c->ny, nz = c->nz, neco = c->neco;
+	const int64_t n3 = c->n3;
+	const double *TEs = c->TEs;
+	const char *dump = c->dump;
+	float *phase = c->phase;
+	int64_t i;
+
+	c->template_echo = o->template_echo;
+	c->p2ref = 0;
+	c->TE1 = c->TE2 = 1.0;
+
+	/* ---- weight selection (needed before the mask: -k qualitymask uses it) ------------------ */
+	rm_flags_from_sel(o->weights_sel, c->have_mag, c->flags);
+	if (o->weights_sel == RM_W_FLAGS) for (i = 0; i < 6; i++) c->flags[i] = o->flags[i];
+	if (neco > 1) {
+		c->p2ref = (c->template_echo == 1) ? 2 : c->template_echo - 1;
+		c->TE1 = TEs[c->template_echo - 1];
+		c->TE2 = TEs[c->p2ref - 1];
+	}
+	if (c->have_mag) {
+		c->magmasked = (float *)malloc((size_t)n3 * sizeof(float));
+		if (!c->magmasked) return 1;
+	}
+
+	/* ---- mask ------------------------------------------------------------------------------ */
+	if (o->mask_sel == RM_MASK_ROBUST && !c->have_mag) {
+		/* load_data_and_resolve_args!: robustmask without a magnitude degrades to nomask */
+		fprintf(stderr, " + -romeo: robustmask was chosen but no magnitude is available. No mask is used!\n");
+	} else if (o->mask_sel == RM_MASK_ROBUST) {
+		int te = c->template_echo < c->magvol ? c->template_echo : c->magvol;
+		if (rm_robustmask(c->mag + (int64_t)(te - 1) * n3, nx, ny, nz, 0, 0.0, dump != NULL, &c->stages)) return 1;
+		c->mask = c->stages.s4; c->stages.s4 = NULL;
+	} else if (o->mask_sel == RM_MASK_QUALITY) {
+		/* set_mask!: qmap = voxelquality(phase; get_keyargs(...)) — computed on the still-WRAPPED
+		   phase and WITHOUT a mask (data["mask"] does not exist yet), then robustmask(qmap; threshold).
+		   voxelquality's own 4D overload defaults p2ref to 2 regardless of `template`. */
+		rm_wctx qc;
+		float *qmap = (float *)malloc((size_t)n3 * sizeof(float));
+		if (!qmap) return 1;
+		if (rm_build_ctx(&qc, phase, c->have_mag ? c->mag : NULL, c->magvol, NULL, c->magmasked, TEs, neco,
+				c->template_echo, 2, nx, ny, nz, c->flags)) { free(qmap); return 1; }
+		if (rm_voxelquality(&qc, qmap)) { free(qmap); return 1; }
+		if (dump) c->drc |= rm_dump(dump, "c_qmap_wrapped.f32", qmap, sizeof(float), n3);
+		if (rm_robustmask(qmap, nx, ny, nz, 1, o->qmask_thresh, dump != NULL, &c->stages)) { free(qmap); return 1; }
+		free(qmap);
+		c->mask = c->stages.s4; c->stages.s4 = NULL;
+	} else if (o->mask_sel == RM_MASK_FILE) {
+		float *mv = NULL;
+		int mnx, mny, mnz, mnv;
+		if (rm_read_f32(o->mask_file, RM_RD_NONZERO, &mv, &mnx, &mny, &mnz, &mnv)) return 1;
+		if (mnx != nx || mny != ny || mnz != nz || mnv != 1) {
+			free(mv); RM_ERR("mask dimensions do not match the phase\n"); return 1;
+		}
+		c->mask = (uint8_t *)malloc((size_t)n3);
+		if (!c->mask) { free(mv); return 1; }
+		for (i = 0; i < n3; i++) c->mask[i] = (mv[i] != 0.0f) ? 1 : 0; /* RM_RD_NONZERO already applied the raw test */
+		free(mv);
+	}
+
+	/* ---- weights ---------------------------------------------------------------------------- */
+	{
+		rm_wctx wc;
+		if (rm_build_ctx(&wc, phase, c->have_mag ? c->mag : NULL, c->magvol, c->mask, c->magmasked, TEs, neco,
+				c->template_echo, neco > 1 ? c->p2ref : 1, nx, ny, nz, c->flags)) return 1;
+		c->weights = (uint8_t *)malloc((size_t)3 * (size_t)n3);
+		if (!c->weights) return 1;
+		rm_calculateweights(&wc, RM_WOUT_U8, c->weights);
+
+		if (dump) {
+			char path[2048];
+			snprintf(path, sizeof path, "%s/c_manifest.txt", dump);
+			c->manifest = fopen(path, "w");
+			c->drc |= rm_dump_primitives(dump);
+			if (rm_dump(dump, "c_weights.u8", c->weights, 1, 3 * n3)) return 1;
+			{
+				double *wd = (double *)malloc((size_t)3 * (size_t)n3 * sizeof(double));
+				if (wd) {
+					rm_calculateweights(&wc, RM_WOUT_F64, wd);
+					c->drc |= rm_dump(dump, "c_weights_prerescale.f64", wd, sizeof(double), 3 * n3);
+					free(wd);
+				}
+			}
+			if (c->manifest) {
+				/* Seed scalars: the plan's M5 gate names them explicitly, so make them
+				   directly comparable with the oracle manifest rather than implied by the
+				   (bit-exact) weights they are derived from. */
+				{
+					int64_t sd = rm_find_seed(c->weights, n3);
+					fprintf(c->manifest, "seed_index %lld\n", (long long)sd);
+					if (sd > 0) {
+						int w1 = c->weights[rm_getedgeindex(sd, 1) - 1];
+						int w2 = c->weights[rm_getedgeindex(sd, 2) - 1];
+						int w3 = c->weights[rm_getedgeindex(sd, 3) - 1];
+						fprintf(c->manifest, "seed_w1 %d\nseed_w2 %d\nseed_w3 %d\n", w1, w2, w3);
+						fprintf(c->manifest, "new_seed_thresh %.17g\n", rm_seed_thresh(w1, w2, w3));
+					}
+				}
+				fprintf(c->manifest, "flags_active %d%d%d%d%d%d\n",
+					wc.flags[0], wc.flags[1], wc.flags[2], wc.flags[3], wc.flags[4], wc.flags[5]);
+				if (c->have_mag) fprintf(c->manifest, "maxmag %.17g\n", wc.maxmag);
+				if (c->stages.s1) {
+					fprintf(c->manifest, "rm_sample_len %lld\n", (long long)c->stages.sample_len);
+					fprintf(c->manifest, "rm_q05 %.17g\nrm_q15 %.17g\nrm_q8 %.17g\nrm_q99 %.17g\n",
+						c->stages.q05, c->stages.q15, c->stages.q8, c->stages.q99);
+					fprintf(c->manifest, "rm_high_intensity %.9g\nrm_noise %.9g\nrm_noise_stage %d\nrm_threshold %.9g\n",
+						(double)c->stages.high_intensity, (double)c->stages.noise, c->stages.noise_stage, (double)c->stages.threshold);
+				}
+			}
+			if (c->stages.s1) {
+				c->drc |= rm_dump(dump, "c_mask_s1_thresh.u8", c->stages.s1, 1, n3);
+				c->drc |= rm_dump(dump, "c_mask_sm1.f32", c->stages.sm1, sizeof(float), n3);
+				c->drc |= rm_dump(dump, "c_mask_s2_smooth1.u8", c->stages.s2, 1, n3);
+				c->drc |= rm_dump(dump, "c_mask_s3_fill.u8", c->stages.s3, 1, n3);
+				c->drc |= rm_dump(dump, "c_mask_sm2.f32", c->stages.sm2, sizeof(float), n3);
+			}
+			if (c->mask) c->drc |= rm_dump(dump, "c_mask_s4_final.u8", c->mask, 1, n3);
+			if (c->drc) { RM_ERR("one or more -romeo-dump writes failed\n"); return 1; }
+		}
+	}
+
+	if (o->verbose)
+		fprintf(stderr, " + -romeo: weights %d%d%d%d%d%d, mask=%s, template echo %d\n",
+			c->flags[0], c->flags[1], c->flags[2], c->flags[3], c->flags[4], c->flags[5],
+			c->mask ? (o->mask_sel == RM_MASK_FILE ? "file" : (o->mask_sel == RM_MASK_QUALITY ? "qualitymask" : "robustmask")) : "none",
+			c->template_echo);
+
+	/* ---- unwrap ----------------------------------------------------------------------------- */
+	if (dump) {   /* the outer copy feeds the parity dump only; rm_unwrap3d owns its working set */
+		c->visited = (uint8_t *)calloc((size_t)n3, 1);
+		if (!c->visited) return 1;
+	}
+	if (neco == 1) {
+		if (rm_unwrap3d(phase, c->weights, nx, ny, nz, NULL, c->TE1, c->TE2, 0,
+				o->wrap_addition, o->maxseeds, c->visited)) return 1;
+		if (o->correctglobal && rm_correctglobal(phase, n3, c->mask)) return 1;
+	} else if (o->individual) {
+		/* unwrap_individual!: each echo is unwrapped spatially with its own weights, using the
+		   PREVIOUS echo (echo 2 for echo 1) as phase2.  Echoes are processed in ascending order,
+		   so when echo i>1 is unwrapped its reference echo i-1 is ALREADY unwrapped — that is
+		   upstream behaviour (Threads.@threads with a shared Dict; the oracle pins 1 thread). */
+		int ie;
+		for (ie = 1; ie <= neco; ie++) {
+			int e2 = (ie == 1) ? 2 : ie - 1;
+			rm_wctx ic;
+			float *p2copy = (float *)malloc((size_t)n3 * sizeof(float));
+			uint8_t *w2 = NULL;
+			if (!p2copy) return 1;
+			memcpy(p2copy, phase + (int64_t)(e2 - 1) * n3, (size_t)n3 * sizeof(float));
+			if (rm_build_ctx(&ic, phase, c->have_mag ? c->mag : NULL, c->magvol, c->mask, c->magmasked, TEs, neco,
+					ie, e2, nx, ny, nz, c->flags)) { free(p2copy); return 1; }
+			w2 = (uint8_t *)malloc((size_t)3 * (size_t)n3);
+			if (!w2) { free(p2copy); return 1; }
+			rm_calculateweights(&ic, RM_WOUT_U8, w2);
+			if (rm_unwrap3d(phase + (int64_t)(ie - 1) * n3, w2, nx, ny, nz, p2copy,
+					ic.TE1, ic.TE2, 1, o->wrap_addition, o->maxseeds, c->visited)) {
+				free(p2copy); free(w2); return 1;
+			}
+			if (o->correctglobal && rm_correctglobal(phase + (int64_t)(ie - 1) * n3, n3, c->mask)) {
+				free(p2copy); free(w2); return 1;
+			}
+			free(p2copy); free(w2);
+		}
+		if (o->correctglobal) {
+			/* correct_multi_echo_wraps!
+			 *
+			 * DELIBERATE DIVERGENCE (safer): upstream filters the reference and current echoes
+			 * INDEPENDENTLY before subtracting them, so a NaN present in only one echo either
+			 * throws on a length mismatch or silently pairs mismatched voxels. Here a voxel
+			 * contributes only when BOTH echoes are finite at that voxel, which is what the
+			 * expression means. Identical whenever the two echoes share a finite mask, i.e.
+			 * every real image. */
+			int ie2;
+			double *v = (double *)malloc((size_t)n3 * sizeof(double));
+			if (!v) return 1;
+			for (ie2 = 2; ie2 <= neco; ie2++) {
+				int iref = ie2 - 1;
+				double fac = TEs[ie2 - 1] / TEs[iref - 1], nwraps;
+				const float *pr = phase + (int64_t)(iref - 1) * n3;
+				float *pe = phase + (int64_t)(ie2 - 1) * n3;
+				int64_t m = 0;
+				for (i = 0; i < n3; i++) {
+					if (c->mask && !c->mask[i]) continue;
+					if (!isfinite(pr[i]) || !isfinite(pe[i])) continue;
+					v[m++] = nearbyint(((double)pr[i] * fac - (double)pe[i]) / RM_2PI_F64);
+				}
+				if (m == 0) continue;
+				nwraps = rm_median_d(v, m);
+				for (i = 0; i < n3; i++) pe[i] = (float)((double)pe[i] + RM_2PI_F64 * nwraps);
+			}
+			free(v);
+		}
+	} else {
+		/* 4D: spatially unwrap the template echo, then propagate temporally. */
+		float *tpl = phase + (int64_t)(c->template_echo - 1) * n3;
+		const float *p2 = phase + (int64_t)(c->p2ref - 1) * n3;
+		float *p2copy = (float *)malloc((size_t)n3 * sizeof(float));
+		int order_i;
+		if (!p2copy) return 1;
+		memcpy(p2copy, p2, (size_t)n3 * sizeof(float)); /* args[:phase2] is a COPY taken up front */
+		if (rm_unwrap3d(tpl, c->weights, nx, ny, nz, p2copy, c->TE1, c->TE2, 1,
+				o->wrap_addition, o->maxseeds, c->visited)) { free(p2copy); return 1; }
+		free(p2copy);
+		if (o->correctglobal && rm_correctglobal(tpl, n3, c->mask)) return 1;
+		for (order_i = 0; order_i < neco - 1; order_i++) {
+			/* iteration order: (template-1):-1:1, then (template+1):neco */
+			int ieco = (order_i < c->template_echo - 1) ? (c->template_echo - 1 - order_i) : (order_i + 2);
+			int iref = (ieco < c->template_echo) ? ieco + 1 : ieco - 1;
+			double fac = TEs[ieco - 1] / TEs[iref - 1];
+			float *w = phase + (int64_t)(ieco - 1) * n3;
+			const float *r = phase + (int64_t)(iref - 1) * n3;
+			double *refvalue = (double *)malloc((size_t)n3 * sizeof(double));
+			if (!refvalue) return 1;
+			for (i = 0; i < n3; i++) refvalue[i] = (double)r[i] * fac;
+			for (i = 0; i < n3; i++) w[i] = rm_unwrapvoxel_fd(w[i], refvalue[i]);
+			if (o->temporal_uncertain > 0.0) {
+				/* temporal_uncertain_unwrapping!: spatially re-unwrap low-quality voxels */
+				rm_wctx qc;
+				float *qual = (float *)malloc((size_t)n3 * sizeof(float));
+				float *halfw = (float *)malloc((size_t)n3 * sizeof(float));
+				double *halfr = (double *)malloc((size_t)n3 * sizeof(double));
+				uint8_t *vis = (uint8_t *)malloc((size_t)n3);
+				int any = 0, all = 1;
+				if (!qual || !halfw || !halfr || !vis) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); return 1; }
+				for (i = 0; i < n3; i++) { halfw[i] = w[i] / 2.0f; halfr[i] = refvalue[i] / 2.0; }
+				memset(&qc, 0, sizeof qc);
+				qc.P = halfw; qc.P2d = halfr; qc.TE1 = 1.0; qc.TE2 = 1.0;
+				qc.nx = nx; qc.ny = ny; qc.nz = nz; qc.n = n3;
+				qc.flags[0] = 1; qc.flags[1] = 1; qc.flags[2] = 1; /* :romeo, no mag -> 4..6 off */
+				if (rm_voxelquality(&qc, qual)) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); return 1; }
+				for (i = 0; i < n3; i++) vis[i] = ((double)qual[i] > o->temporal_uncertain) ? 1 : 0;
+				for (i = 0; i < n3; i++) {
+					int inmask;
+					if (c->mask) inmask = c->mask[i] != 0;
+					else {
+						int64_t s = (int64_t)c->weights[3 * i] + c->weights[3 * i + 1] + c->weights[3 * i + 2];
+						inmask = (s < 100);
+					}
+					if (!inmask) vis[i] = 1;
+					if (vis[i]) any = 1; else all = 0;
+				}
+				if (any && !all) {
+					rm_grow g;
+					rm_pq pq;
+					int64_t stride[3];
+					int dim;
+					stride[0] = 1; stride[1] = nx; stride[2] = (int64_t)nx * ny;
+					g.wrapped = w; g.weights = c->weights; g.visited = vis; g.n = n3;
+					g.stride[0] = stride[0]; g.stride[1] = stride[1]; g.stride[2] = stride[2];
+					g.wrap_addition = o->wrap_addition;
+					g.phase2 = NULL; g.TE1 = c->TE1; g.TE2 = c->TE2; g.have_p2 = 0;
+					if (rm_pq_init(&pq, RM_NBINS)) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); return 1; }
+					for (dim = 1; dim <= 3; dim++) {
+						int64_t I;
+						for (I = 1; I <= n3; I++) {
+							int64_t J = I + stride[dim - 1];
+							if (J > n3) continue;
+							if ((int)vis[I - 1] + (int)vis[J - 1] == 1) {
+								int64_t ed = rm_getedgeindex(I, dim);
+								if (c->weights[ed - 1] != 0) rm_pq_enqueue(&pq, ed, c->weights[ed - 1]);
+							}
+						}
+					}
+					if (rm_grow_region(&g, &pq, 1, o->maxseeds)) {
+						rm_pq_free(&pq);
+						free(qual); free(halfw); free(halfr); free(vis); free(refvalue);
+						RM_ERR("out of memory during temporal-uncertain re-unwrapping\n");
+						return 1;
+					}
+					rm_pq_free(&pq);
+				}
+				free(qual); free(halfw); free(halfr); free(vis);
+			}
+			free(refvalue);
+		}
+	}
+	return 0;
+}
+
+/* ---- in-memory frame API (used by --medic) ---------------------------------------------------
+ *
+ * No file I/O, no side outputs, no nifti_image.  `phase` is caller-owned, echo-major
+ * (n3 floats per echo) and ALREADY in radians -- readphase rescaling and any phase-offset
+ * correction are the caller's business.  It is unwrapped IN PLACE.  `mag` is caller-owned and may
+ * be NULL.  `mask_out`, when non-NULL, receives the n3-byte mask (all zero if the options select
+ * no mask).  Options that only make sense for the CLI (dump, side outputs, rescaling) are ignored.
+ */
+int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
+	int nx, int ny, int nz, int neco, const double *TEs,
+	const romeo_opts *o, uint8_t *mask_out) {
+	rm_core c;
+	int rc;
+	if (!phase || !o || nx < 1 || ny < 1 || nz < 1 || neco < 1 || !TEs) return 1;
+	memset(&c, 0, sizeof c);
+	c.phase = phase;
+	c.mag = mag; c.magvol = mag ? magvol : 0;
+	c.nx = nx; c.ny = ny; c.nz = nz; c.neco = neco;
+	c.n3 = (int64_t)nx * ny * nz;
+	c.TEs = TEs; c.o = o;
+	c.have_mag = (mag != NULL);
+	if (o->template_echo < 1 || o->template_echo > neco) return 1;
+	if (c.have_mag && magvol < neco) return 1;
+	rc = rm_core_run(&c);
+	if (mask_out) {
+		if (!rc && c.mask) memcpy(mask_out, c.mask, (size_t)c.n3);
+		else memset(mask_out, 0, (size_t)c.n3);
+	}
+	rm_core_free(&c);
+	return rc;
+}
+
 /* ---- the runner ---------------------------------------------------------------------------- */
 
 int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
@@ -1863,21 +2217,15 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	float *phase = NULL;     /* owned working copy, [n3 * neco] */
 	float *mag = NULL;       /* owned, [n3 * magvol] or NULL */
 	int magvol = 0;
-	uint8_t *mask = NULL;    /* owned or NULL */
-	uint8_t *weights = NULL;
-	float *magmasked = NULL;
-	uint8_t *visited = NULL;
-	rm_mask_stages stages;
-	int flags[6];
-	int template_echo, p2ref = 0;
-	double TE1 = 1.0, TE2 = 1.0;
+	uint8_t *mask = NULL;    /* borrowed from core (core owns it) */
 	double *TEs = NULL;
 	int have_mag = 0;
+	int template_echo;
 	const char *dump = o->dumpdir;
-	FILE *manifest = NULL;
+	rm_core core;
 	int drc = 0;   /* accumulated -romeo-dump status: a PARTIAL parity dump must not read as complete */
 
-	memset(&stages, 0, sizeof stages);
+	memset(&core, 0, sizeof core);
 
 	if (nim->datatype != DT_FLOAT32) { RM_ERR("internal error: expected float32 working image\n"); return 1; }
 	if (nim->nu > 1 || nim->nv > 1 || nim->nw > 1) { RM_ERR("input must be 3D or 4D (echoes on dim 4)\n"); return 1; }
@@ -1981,270 +2329,18 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		have_mag = 1;
 	}
 
-	/* ---- weight selection (needed before the mask: -k qualitymask uses it) ------------------ */
-	rm_flags_from_sel(o->weights_sel, have_mag, flags);
-	if (o->weights_sel == RM_W_FLAGS) for (i = 0; i < 6; i++) flags[i] = o->flags[i];
-	if (neco > 1) {
-		p2ref = (template_echo == 1) ? 2 : template_echo - 1;
-		TE1 = TEs[template_echo - 1];
-		TE2 = TEs[p2ref - 1];
-	}
-	if (have_mag) {
-		magmasked = (float *)malloc((size_t)n3 * sizeof(float));
-		if (!magmasked) goto done;
-	}
-
-	/* ---- mask ------------------------------------------------------------------------------ */
-	if (o->mask_sel == RM_MASK_ROBUST && !have_mag) {
-		/* load_data_and_resolve_args!: robustmask without a magnitude degrades to nomask */
-		fprintf(stderr, " + -romeo: robustmask was chosen but no magnitude is available. No mask is used!\n");
-	} else if (o->mask_sel == RM_MASK_ROBUST) {
-		int te = template_echo < magvol ? template_echo : magvol;
-		if (rm_robustmask(mag + (int64_t)(te - 1) * n3, nx, ny, nz, 0, 0.0, dump != NULL, &stages)) goto done;
-		mask = stages.s4; stages.s4 = NULL;
-	} else if (o->mask_sel == RM_MASK_QUALITY) {
-		/* set_mask!: qmap = voxelquality(phase; get_keyargs(...)) — computed on the still-WRAPPED
-		   phase and WITHOUT a mask (data["mask"] does not exist yet), then robustmask(qmap; threshold).
-		   voxelquality's own 4D overload defaults p2ref to 2 regardless of `template`. */
-		rm_wctx qc;
-		float *qmap = (float *)malloc((size_t)n3 * sizeof(float));
-		if (!qmap) goto done;
-		if (rm_build_ctx(&qc, phase, have_mag ? mag : NULL, magvol, NULL, magmasked, TEs, neco,
-				template_echo, 2, nx, ny, nz, flags)) { free(qmap); goto done; }
-		if (rm_voxelquality(&qc, qmap)) { free(qmap); goto done; }
-		if (dump) drc |= rm_dump(dump, "c_qmap_wrapped.f32", qmap, sizeof(float), n3);
-		if (rm_robustmask(qmap, nx, ny, nz, 1, o->qmask_thresh, dump != NULL, &stages)) { free(qmap); goto done; }
-		free(qmap);
-		mask = stages.s4; stages.s4 = NULL;
-	} else if (o->mask_sel == RM_MASK_FILE) {
-		float *mv = NULL;
-		int mnx, mny, mnz, mnv;
-		if (rm_read_f32(o->mask_file, RM_RD_NONZERO, &mv, &mnx, &mny, &mnz, &mnv)) goto done;
-		if (mnx != nx || mny != ny || mnz != nz || mnv != 1) {
-			free(mv); RM_ERR("mask dimensions do not match the phase\n"); goto done;
-		}
-		mask = (uint8_t *)malloc((size_t)n3);
-		if (!mask) { free(mv); goto done; }
-		for (i = 0; i < n3; i++) mask[i] = (mv[i] != 0.0f) ? 1 : 0; /* RM_RD_NONZERO already applied the raw test */
-		free(mv);
-	}
-
-	/* ---- weights ---------------------------------------------------------------------------- */
-	{
-		rm_wctx c;
-		if (rm_build_ctx(&c, phase, have_mag ? mag : NULL, magvol, mask, magmasked, TEs, neco,
-				template_echo, neco > 1 ? p2ref : 1, nx, ny, nz, flags)) goto done;
-		weights = (uint8_t *)malloc((size_t)3 * (size_t)n3);
-		if (!weights) goto done;
-		rm_calculateweights(&c, RM_WOUT_U8, weights);
-
-		if (dump) {
-			char path[2048];
-			snprintf(path, sizeof path, "%s/c_manifest.txt", dump);
-			manifest = fopen(path, "w");
-			drc |= rm_dump_primitives(dump);
-			if (rm_dump(dump, "c_weights.u8", weights, 1, 3 * n3)) goto done;
-			{
-				double *wd = (double *)malloc((size_t)3 * (size_t)n3 * sizeof(double));
-				if (wd) {
-					rm_calculateweights(&c, RM_WOUT_F64, wd);
-					drc |= rm_dump(dump, "c_weights_prerescale.f64", wd, sizeof(double), 3 * n3);
-					free(wd);
-				}
-			}
-			if (manifest) {
-				/* Seed scalars: the plan's M5 gate names them explicitly, so make them
-				   directly comparable with the oracle manifest rather than implied by the
-				   (bit-exact) weights they are derived from. */
-				{
-					int64_t sd = rm_find_seed(weights, n3);
-					fprintf(manifest, "seed_index %lld\n", (long long)sd);
-					if (sd > 0) {
-						int w1 = weights[rm_getedgeindex(sd, 1) - 1];
-						int w2 = weights[rm_getedgeindex(sd, 2) - 1];
-						int w3 = weights[rm_getedgeindex(sd, 3) - 1];
-						fprintf(manifest, "seed_w1 %d\nseed_w2 %d\nseed_w3 %d\n", w1, w2, w3);
-						fprintf(manifest, "new_seed_thresh %.17g\n", rm_seed_thresh(w1, w2, w3));
-					}
-				}
-				fprintf(manifest, "flags_active %d%d%d%d%d%d\n",
-					c.flags[0], c.flags[1], c.flags[2], c.flags[3], c.flags[4], c.flags[5]);
-				if (have_mag) fprintf(manifest, "maxmag %.17g\n", c.maxmag);
-				if (stages.s1) {
-					fprintf(manifest, "rm_sample_len %lld\n", (long long)stages.sample_len);
-					fprintf(manifest, "rm_q05 %.17g\nrm_q15 %.17g\nrm_q8 %.17g\nrm_q99 %.17g\n",
-						stages.q05, stages.q15, stages.q8, stages.q99);
-					fprintf(manifest, "rm_high_intensity %.9g\nrm_noise %.9g\nrm_noise_stage %d\nrm_threshold %.9g\n",
-						(double)stages.high_intensity, (double)stages.noise, stages.noise_stage, (double)stages.threshold);
-				}
-			}
-			if (stages.s1) {
-				drc |= rm_dump(dump, "c_mask_s1_thresh.u8", stages.s1, 1, n3);
-				drc |= rm_dump(dump, "c_mask_sm1.f32", stages.sm1, sizeof(float), n3);
-				drc |= rm_dump(dump, "c_mask_s2_smooth1.u8", stages.s2, 1, n3);
-				drc |= rm_dump(dump, "c_mask_s3_fill.u8", stages.s3, 1, n3);
-				drc |= rm_dump(dump, "c_mask_sm2.f32", stages.sm2, sizeof(float), n3);
-			}
-			if (mask) drc |= rm_dump(dump, "c_mask_s4_final.u8", mask, 1, n3);
-			if (drc) { RM_ERR("one or more -romeo-dump writes failed\n"); goto done; }
-		}
-	}
-
-	if (o->verbose)
-		fprintf(stderr, " + -romeo: weights %d%d%d%d%d%d, mask=%s, template echo %d\n",
-			flags[0], flags[1], flags[2], flags[3], flags[4], flags[5],
-			mask ? (o->mask_sel == RM_MASK_FILE ? "file" : (o->mask_sel == RM_MASK_QUALITY ? "qualitymask" : "robustmask")) : "none",
-			template_echo);
-
-	/* ---- unwrap ----------------------------------------------------------------------------- */
-	if (dump) {   /* the outer copy feeds the parity dump only; rm_unwrap3d owns its working set */
-		visited = (uint8_t *)calloc((size_t)n3, 1);
-		if (!visited) goto done;
-	}
-	if (neco == 1) {
-		if (rm_unwrap3d(phase, weights, nx, ny, nz, NULL, TE1, TE2, 0,
-				o->wrap_addition, o->maxseeds, visited)) goto done;
-		if (o->correctglobal && rm_correctglobal(phase, n3, mask)) goto done;
-	} else if (o->individual) {
-		/* unwrap_individual!: each echo is unwrapped spatially with its own weights, using the
-		   PREVIOUS echo (echo 2 for echo 1) as phase2.  Echoes are processed in ascending order,
-		   so when echo i>1 is unwrapped its reference echo i-1 is ALREADY unwrapped — that is
-		   upstream behaviour (Threads.@threads with a shared Dict; the oracle pins 1 thread). */
-		int ie;
-		for (ie = 1; ie <= neco; ie++) {
-			int e2 = (ie == 1) ? 2 : ie - 1;
-			rm_wctx c;
-			float *p2copy = (float *)malloc((size_t)n3 * sizeof(float));
-			uint8_t *w2 = NULL;
-			if (!p2copy) goto done;
-			memcpy(p2copy, phase + (int64_t)(e2 - 1) * n3, (size_t)n3 * sizeof(float));
-			if (rm_build_ctx(&c, phase, have_mag ? mag : NULL, magvol, mask, magmasked, TEs, neco,
-					ie, e2, nx, ny, nz, flags)) { free(p2copy); goto done; }
-			w2 = (uint8_t *)malloc((size_t)3 * (size_t)n3);
-			if (!w2) { free(p2copy); goto done; }
-			rm_calculateweights(&c, RM_WOUT_U8, w2);
-			if (rm_unwrap3d(phase + (int64_t)(ie - 1) * n3, w2, nx, ny, nz, p2copy,
-					c.TE1, c.TE2, 1, o->wrap_addition, o->maxseeds, visited)) {
-				free(p2copy); free(w2); goto done;
-			}
-			if (o->correctglobal && rm_correctglobal(phase + (int64_t)(ie - 1) * n3, n3, mask)) {
-				free(p2copy); free(w2); goto done;
-			}
-			free(p2copy); free(w2);
-		}
-		if (o->correctglobal) {
-			/* correct_multi_echo_wraps!
-			 *
-			 * DELIBERATE DIVERGENCE (safer): upstream filters the reference and current echoes
-			 * INDEPENDENTLY before subtracting them, so a NaN present in only one echo either
-			 * throws on a length mismatch or silently pairs mismatched voxels. Here a voxel
-			 * contributes only when BOTH echoes are finite at that voxel, which is what the
-			 * expression means. Identical whenever the two echoes share a finite mask, i.e.
-			 * every real image. */
-			int ie2;
-			double *v = (double *)malloc((size_t)n3 * sizeof(double));
-			if (!v) goto done;
-			for (ie2 = 2; ie2 <= neco; ie2++) {
-				int iref = ie2 - 1;
-				double fac = TEs[ie2 - 1] / TEs[iref - 1], nwraps;
-				const float *pr = phase + (int64_t)(iref - 1) * n3;
-				float *pe = phase + (int64_t)(ie2 - 1) * n3;
-				int64_t m = 0;
-				for (i = 0; i < n3; i++) {
-					if (mask && !mask[i]) continue;
-					if (!isfinite(pr[i]) || !isfinite(pe[i])) continue;
-					v[m++] = nearbyint(((double)pr[i] * fac - (double)pe[i]) / RM_2PI_F64);
-				}
-				if (m == 0) continue;
-				nwraps = rm_median_d(v, m);
-				for (i = 0; i < n3; i++) pe[i] = (float)((double)pe[i] + RM_2PI_F64 * nwraps);
-			}
-			free(v);
-		}
-	} else {
-		/* 4D: spatially unwrap the template echo, then propagate temporally. */
-		float *tpl = phase + (int64_t)(template_echo - 1) * n3;
-		const float *p2 = phase + (int64_t)(p2ref - 1) * n3;
-		float *p2copy = (float *)malloc((size_t)n3 * sizeof(float));
-		int order_i;
-		if (!p2copy) goto done;
-		memcpy(p2copy, p2, (size_t)n3 * sizeof(float)); /* args[:phase2] is a COPY taken up front */
-		if (rm_unwrap3d(tpl, weights, nx, ny, nz, p2copy, TE1, TE2, 1,
-				o->wrap_addition, o->maxseeds, visited)) { free(p2copy); goto done; }
-		free(p2copy);
-		if (o->correctglobal && rm_correctglobal(tpl, n3, mask)) goto done;
-		for (order_i = 0; order_i < neco - 1; order_i++) {
-			/* iteration order: (template-1):-1:1, then (template+1):neco */
-			int ieco = (order_i < template_echo - 1) ? (template_echo - 1 - order_i) : (order_i + 2);
-			int iref = (ieco < template_echo) ? ieco + 1 : ieco - 1;
-			double fac = TEs[ieco - 1] / TEs[iref - 1];
-			float *w = phase + (int64_t)(ieco - 1) * n3;
-			const float *r = phase + (int64_t)(iref - 1) * n3;
-			double *refvalue = (double *)malloc((size_t)n3 * sizeof(double));
-			if (!refvalue) goto done;
-			for (i = 0; i < n3; i++) refvalue[i] = (double)r[i] * fac;
-			for (i = 0; i < n3; i++) w[i] = rm_unwrapvoxel_fd(w[i], refvalue[i]);
-			if (o->temporal_uncertain > 0.0) {
-				/* temporal_uncertain_unwrapping!: spatially re-unwrap low-quality voxels */
-				rm_wctx qc;
-				float *qual = (float *)malloc((size_t)n3 * sizeof(float));
-				float *halfw = (float *)malloc((size_t)n3 * sizeof(float));
-				double *halfr = (double *)malloc((size_t)n3 * sizeof(double));
-				uint8_t *vis = (uint8_t *)malloc((size_t)n3);
-				int any = 0, all = 1;
-				if (!qual || !halfw || !halfr || !vis) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); goto done; }
-				for (i = 0; i < n3; i++) { halfw[i] = w[i] / 2.0f; halfr[i] = refvalue[i] / 2.0; }
-				memset(&qc, 0, sizeof qc);
-				qc.P = halfw; qc.P2d = halfr; qc.TE1 = 1.0; qc.TE2 = 1.0;
-				qc.nx = nx; qc.ny = ny; qc.nz = nz; qc.n = n3;
-				qc.flags[0] = 1; qc.flags[1] = 1; qc.flags[2] = 1; /* :romeo, no mag -> 4..6 off */
-				if (rm_voxelquality(&qc, qual)) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); goto done; }
-				for (i = 0; i < n3; i++) vis[i] = ((double)qual[i] > o->temporal_uncertain) ? 1 : 0;
-				for (i = 0; i < n3; i++) {
-					int inmask;
-					if (mask) inmask = mask[i] != 0;
-					else {
-						int64_t s = (int64_t)weights[3 * i] + weights[3 * i + 1] + weights[3 * i + 2];
-						inmask = (s < 100);
-					}
-					if (!inmask) vis[i] = 1;
-					if (vis[i]) any = 1; else all = 0;
-				}
-				if (any && !all) {
-					rm_grow g;
-					rm_pq pq;
-					int64_t stride[3];
-					int dim;
-					stride[0] = 1; stride[1] = nx; stride[2] = (int64_t)nx * ny;
-					g.wrapped = w; g.weights = weights; g.visited = vis; g.n = n3;
-					g.stride[0] = stride[0]; g.stride[1] = stride[1]; g.stride[2] = stride[2];
-					g.wrap_addition = o->wrap_addition;
-					g.phase2 = NULL; g.TE1 = TE1; g.TE2 = TE2; g.have_p2 = 0;
-					if (rm_pq_init(&pq, RM_NBINS)) { free(qual); free(halfw); free(halfr); free(vis); free(refvalue); goto done; }
-					for (dim = 1; dim <= 3; dim++) {
-						int64_t I;
-						for (I = 1; I <= n3; I++) {
-							int64_t J = I + stride[dim - 1];
-							if (J > n3) continue;
-							if ((int)vis[I - 1] + (int)vis[J - 1] == 1) {
-								int64_t ed = rm_getedgeindex(I, dim);
-								if (weights[ed - 1] != 0) rm_pq_enqueue(&pq, ed, weights[ed - 1]);
-							}
-						}
-					}
-					if (rm_grow_region(&g, &pq, 1, o->maxseeds)) {
-						rm_pq_free(&pq);
-						free(qual); free(halfw); free(halfr); free(vis); free(refvalue);
-						RM_ERR("out of memory during temporal-uncertain re-unwrapping\n");
-						goto done;
-					}
-					rm_pq_free(&pq);
-				}
-				free(qual); free(halfw); free(halfr); free(vis);
-			}
-			free(refvalue);
-		}
-	}
+	/* ---- mask, weights and unwrapping: the shared core -------------------------------------- */
+	core.phase = phase;
+	core.mag = have_mag ? mag : NULL;
+	core.magvol = magvol;
+	core.nx = nx; core.ny = ny; core.nz = nz; core.neco = neco;
+	core.n3 = n3;
+	core.TEs = TEs; core.o = o;
+	core.have_mag = have_mag;
+	core.dump = dump;
+	if (rm_core_run(&core)) { drc |= core.drc; goto done; }
+	drc |= core.drc;
+	mask = core.mask;
 
 	/* ---- side outputs ------------------------------------------------------------------------ */
 	{
@@ -2285,8 +2381,8 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			/* write_qualitymap runs AFTER unwrapping, on data["phase"], and voxelquality's own 4D
 			   overload defaults p2ref to 2 regardless of `template` (it does NOT use the
 			   template-1 rule that unwrap! applies). */
-			if (rm_build_ctx(&c, phase, have_mag ? mag : NULL, magvol, mask, magmasked, TEs, neco,
-					template_echo, 2, nx, ny, nz, flags)) { free(tmp); goto done; }
+			if (rm_build_ctx(&c, phase, have_mag ? mag : NULL, magvol, mask, core.magmasked, TEs, neco,
+					template_echo, 2, nx, ny, nz, core.flags)) { free(tmp); goto done; }
 			if (o->write_quality || dump) {
 				if (rm_voxelquality(&c, tmp)) { free(tmp); goto done; }
 				if (dump) drc |= rm_dump(dump, "c_qmap.f32", tmp, sizeof(float), n3);
@@ -2319,7 +2415,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	}
 
 	if (dump) {
-		drc |= rm_dump(dump, "c_visited.u8", visited, 1, n3);
+		drc |= rm_dump(dump, "c_visited.u8", core.visited, 1, n3);
 		drc |= rm_dump(dump, "c_unwrapped.f32", phase, sizeof(float), (int64_t)nim->nvox);
 		if (drc) { RM_ERR("one or more -romeo-dump writes failed\n"); goto done; }
 	}
@@ -2329,9 +2425,9 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	ret = 0;
 
 done:
-	if (manifest) fclose(manifest);
-	rm_mask_stages_free(&stages);
-	free(phase); free(mag); free(mask); free(weights); free(magmasked); free(visited); free(TEs);
+	if (core.manifest) fclose(core.manifest);
+	rm_core_free(&core);   /* owns mask, weights, magmasked, visited and the mask stages */
+	free(phase); free(mag); free(TEs);
 	(void)ihdr;
 	return ret;
 }

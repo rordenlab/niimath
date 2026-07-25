@@ -93,6 +93,23 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	const in_hdr *ihdr, int is_first_op, const romeo_opts *o, gzModes gzMode);
 
+// In-memory single-frame unwrapping, used by --medic.  Shares ONE implementation with
+// romeo_run() (see rm_core_run in romeo.c), so the two cannot drift.
+//
+//   phase     caller-owned, echo-major (n3 floats per echo, n3 = nx*ny*nz), ALREADY in radians.
+//             Unwrapped IN PLACE.  readphase rescaling and phase-offset correction are the
+//             caller's business -- this entry point performs neither.
+//   mag       caller-owned, n3 * magvol floats, or NULL.  magvol must be >= neco when non-NULL.
+//   TEs       neco echo times, milliseconds, same units romeo_run uses.
+//   mask_out  optional caller-owned n3 bytes; receives the mask, or all zeros when the options
+//             select no mask or the call fails.
+//
+// Performs no file I/O and writes no side outputs; the dump, rescale and side-output fields of
+// `o` are ignored.  Returns 0 on success.
+int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
+	int nx, int ny, int nz, int neco, const double *TEs,
+	const romeo_opts *o, uint8_t *mask_out);
+
 #ifdef __cplusplus
 }
 #endif
