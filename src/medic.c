@@ -203,11 +203,14 @@ static double md_lanczos(double t) {
    `disp` is the scalar map in header length units; `s_per_mm` converts it to a voxel offset.
    in/out are one 3D volume each and must not alias. */
 static void md_pull(const float *in, float *out, int nx, int ny, int nz,
-	const float *disp, const double s_per_mm[3]) {
+	const float *disp, const double s_per_mm[3], int allow_omp) {
 	const int64_t nxy = (int64_t)nx * ny;
 	int z;
+#ifndef _OPENMP
+	(void)allow_omp;   /* the caller's level choice is meaningless without OpenMP */
+#endif
 #ifdef _OPENMP
-	#pragma omp parallel for schedule(static)
+	#pragma omp parallel for schedule(static) if (allow_omp)
 #endif
 	for (z = 0; z < nz; z++) {
 		int x, y;
@@ -347,6 +350,7 @@ int medic_unwarp(nifti_image *nim, const char *mapfile, const char *axis) {
 	nifti_image *map = NULL;
 	double s_per_mm[3];
 	int m, nx, ny, nz, nt, mt, t, rc = 1;
+	int frame_parallel = 0;
 	int64_t n3;
 	float *out = NULL;
 	const float *in;
@@ -377,9 +381,14 @@ int medic_unwarp(nifti_image *nim, const char *mapfile, const char *axis) {
 
 	out = (float *)nii_malloc((size_t)nim->nvox, sizeof(float));
 	in = (const float *)nim->data;
+#ifdef _OPENMP
+	frame_parallel = (nt >= omp_get_max_threads());
+	#pragma omp parallel for schedule(static) if (frame_parallel)
+#endif
 	for (t = 0; t < nt; t++)
 		md_pull(in + (int64_t)t * n3, out + (int64_t)t * n3, nx, ny, nz,
-			((const float *)map->data) + (int64_t)(mt == 1 ? 0 : t) * n3, s_per_mm);
+			((const float *)map->data) + (int64_t)(mt == 1 ? 0 : t) * n3, s_per_mm,
+			!frame_parallel);
 	memcpy(nim->data, out, (size_t)nim->nvox * sizeof(float));
 	rc = 0;
 done:
@@ -486,7 +495,7 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 	P = (double *)malloc((size_t)T * T * sizeof(double));
 	if (!G || !V || !w || !P) { MD_ERR("out of memory in the low-rank filter\n"); goto done; }
 
-	/* G = F^T F, accumulated in double.  One pass over the series, frame-major access. */
+	/* G = F^T F, accumulated in double. */
 	for (i = 0; i < T; i++) {
 		for (j = i; j < T; j++) {
 			double s = 0.0;
@@ -712,9 +721,8 @@ static void md_regress(const md_ctx *c, const float *phase, const float *mag, fl
  * the case that matters (manifest §3.9).  The grouping threshold is the paper's; it is the one
  * parameter here that the black box could not be made to reveal.
  *
- * `uw` is neco * nframe volumes, echo-major within frame.  `mag1` is the first echo's magnitude
- * series (n3 * nframe). */
-static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint8_t *masks) {
+ * `uw` and `mag` are neco * nframe volumes, echo-major within frame. */
+static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8_t *masks) {
 	const int64_t n3 = c->n3;
 	const int T = c->nframe;
 	double *mu = NULL, *sd = NULL, *corr = NULL;
@@ -743,7 +751,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 		memcpy(snap + (int64_t)t * n3, uw + ((int64_t)t * c->neco) * n3, (size_t)n3 * sizeof(float));
 
 	for (t = 0; t < T; t++) {
-		const float *m = mag1 + (int64_t)t * n3;
+		const float *m = mag + (int64_t)t * c->neco * n3;
 		double s = 0.0, s2 = 0.0;
 		for (i = 0; i < n3; i++) s += (double)m[i];
 		mu[t] = s / (double)n3;
@@ -756,7 +764,8 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1, const uint
 	for (t = 0; t < T; t++) {
 		int v;
 		for (v = 0; v < T; v++) {
-			const float *a = mag1 + (int64_t)t * n3, *b = mag1 + (int64_t)v * n3;
+			const float *a = mag + (int64_t)t * c->neco * n3;
+			const float *b = mag + (int64_t)v * c->neco * n3;
 			double s = 0.0;
 			int64_t q;
 			if (v < t) { corr[(size_t)t * T + v] = 0.0; continue; }   /* filled by symmetry below */
@@ -871,6 +880,9 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 	const int len = (m == 0) ? nx : ((m == 1) ? ny : nz);
 	int it, converged = 0;
 	int64_t i, folds = 0, slow = 0;
+#ifndef _OPENMP
+	(void)allow_omp;
+#endif
 	for (i = 0; i < n3; i++) fu[i] = 0.0f;
 	for (it = 0; it < MD_INVERT_ITERS; it++) {
 		double worst = 0.0;
@@ -912,8 +924,8 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 		}
 		if (worst < MD_INVERT_TOL) { converged = 1; break; }
 	}
-	/* Folding detector: where d(displacement)/d(PE index) <= -1 the forward map is not monotone,
-	   so the inverse is genuinely multi-valued and the fixed point picks one branch arbitrarily.
+	/* Folding detector: where pe_sign*d(field*TRT)/d(PE index) <= -1 the forward map is not
+	   monotone, so the inverse is genuinely multi-valued and the fixed point picks one branch.
 	   That is where the reference and this implementation disagree most (manifest 3.4 records
 	   p99 1.4 mm, max 9.0 mm there), so it is worth reporting rather than hiding. */
 	{
@@ -926,7 +938,8 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 				int idx = (m == 0) ? x : ((m == 1) ? y : z);
 				double dd;
 				if (idx + 1 >= len) continue;
-				dd = ((double)fu[o + stride2] - (double)fu[o]) * c->trt;
+				dd = (double)c->pe_sign *
+					((double)fu[o + stride2] - (double)fu[o]) * c->trt;
 				if (dd <= -1.0) folds++;
 			}
 		}
@@ -940,6 +953,15 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 
 #define MD_PATH_MAX 2048
 
+static void md_restore_backups(char bak[][MD_PATH_MAX], char final[][MD_PATH_MAX], int n) {
+	int i;
+	for (i = 0; i < n; i++) {
+		if (!bak[i][0]) continue;
+		if (rename(bak[i], final[i]) != 0)
+			MD_ERR("rollback could not restore %s; its backup remains at %s\n", final[i], bak[i]);
+	}
+}
+
 static int md_write(const md_ctx *c, const char *suffix, const float *vol, int nframe, gzModes gz) {
 	nifti_image *n = c->tmpl;
 	void *savedata = n->data;
@@ -948,21 +970,19 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	float saved_slope = n->scl_slope, saved_inter = n->scl_inter;
 	char *saved_fname = n->fname, *saved_iname = n->iname;
 	/* n->data is NULL here by design: the template's payload is freed after repacking and only
-	   its header is retained.  We swap in our own buffer for the write and restore NULL after. */
+	   its header is retained.  We lend the output buffer for the write and restore NULL after. */
 	char *fname = NULL;
 	int rc;
-	size_t nb = (size_t)c->n3 * (size_t)nframe;
-	float *buf;
 	/* nifti_save() derives the output name by stripping the extension from nim->fname and
 	   appending the postfix, so point fname at "<prefix>.nii" for the duration of the write. */
 	fname = (char *)malloc(strlen(c->prefix) + 8);
 	if (!fname) return 1;
 	snprintf(fname, strlen(c->prefix) + 8, "%s.nii", c->prefix);
-	buf = (float *)nii_malloc(nb, sizeof(float));
-	memcpy(buf, vol, nb * sizeof(float));
 	n->fname = fname;
 	n->iname = fname;
-	n->data = buf;
+	/* The writer consumes data synchronously and does not take ownership.  Borrow the resident
+	   series directly: copying each 4D output added pure memory bandwidth and an allocation. */
+	n->data = (void *)vol;
 	n->nt = nframe; n->dim[4] = nframe;
 	n->ndim = (nframe > 1) ? 4 : 3; n->dim[0] = n->ndim;
 	n->nvox = (int64_t)c->n3 * nframe;
@@ -979,7 +999,6 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	n->nvox = saved_nvox;
 	n->datatype = saved_dt; n->nbyper = saved_nbyper;
 	n->scl_slope = saved_slope; n->scl_inter = saved_inter;
-	free(buf);
 	return rc;
 }
 
@@ -1114,6 +1133,9 @@ int nii_medic(int argc, char *argv[]) {
 	ro.weights_sel = RM_W_ROMEO4;
 	int64_t n3;
 	int Tin = 0, T = 0;
+#ifdef _OPENMP
+	int frame_parallel = 0;
+#endif
 
 #ifdef _OPENMP
 	/* Belt and braces against an OMP_NESTED=true / OMP_MAX_ACTIVE_LEVELS>1 environment: every
@@ -1254,6 +1276,21 @@ int nii_medic(int argc, char *argv[]) {
 	T = Tin - c.noiseframes;
 	if (T < 1) { MD_ERR("--noise-frames %d leaves no frames (input has %d)\n", c.noiseframes, Tin); goto done; }
 	c.nframe = T;
+#ifdef _OPENMP
+	/* Parallelise the per-frame loops whenever there is more than one frame.
+	 *
+	 * NOT `T >= omp_get_max_threads()`: the inner regions these loops would be yielding to are
+	 * too small to compensate.  romeo.c has exactly two OpenMP regions -- rm_calculateweights and
+	 * rm_compute_b0 (unused here) -- so romeo_robustmask has NO inner parallelism at all, and the
+	 * unwrap keeps only the weight kernel while MCPC and the region growing stay serial.  Gating
+	 * on the thread count therefore made every run with fewer frames than cores fall off a cliff:
+	 * measured on a 7-frame 64x64x40 case, 0.05 s at 7 threads versus 0.15 s at 8 -- three times
+	 * slower for asking for one more thread, and worse on a many-core node, where most task-fMRI
+	 * runs have fewer frames than cores.  With `T > 1` the outer region is active whenever it can
+	 * do anything, and omp_set_max_active_levels(1) keeps the inner regions from nesting under
+	 * it; at T == 1 the outer region is inactive, so the inner ones still get the team. */
+	frame_parallel = (T > 1);
+#endif
 
 	{	/* Working set, all resident (plan §5.2 as scoped: in-RAM, documented budget).
 		   phase (unwrapped in place) + mag + fields + fu + disp
@@ -1355,7 +1392,7 @@ int nii_medic(int argc, char *argv[]) {
 			}
 		} else {
 #ifdef _OPENMP
-			#pragma omp parallel for schedule(dynamic)
+			#pragma omp parallel for schedule(dynamic) if (frame_parallel)
 #endif
 			for (t = 0; t < T; t++)
 				frc[t] = romeo_robustmask(mag + (int64_t)t * c.neco * n3, c.nx, c.ny, c.nz,
@@ -1367,7 +1404,7 @@ int nii_medic(int argc, char *argv[]) {
 			}
 		}
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(dynamic)
+		#pragma omp parallel for schedule(dynamic) if (frame_parallel)
 #endif
 		for (t = 0; t < T; t++) {
 			/* Unwrapped IN PLACE: the wrapped phase is dead once this frame is unwrapped, so a
@@ -1429,13 +1466,7 @@ int nii_medic(int argc, char *argv[]) {
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
 	if (c.temporal) {
-		float *mag1 = (float *)malloc((size_t)n3 * T * sizeof(float));
-		int trc;
-		if (!mag1) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
-		for (t = 0; t < T; t++) memcpy(mag1 + (int64_t)t * n3, mag + (int64_t)t * c.neco * n3, (size_t)n3 * sizeof(float));
-		trc = md_temporal(&c, phase, mag1, maskbuf);
-		free(mag1);
-		if (trc) goto done;
+		if (md_temporal(&c, phase, mag, maskbuf)) goto done;
 	}
 
 	/* ---- regression -> raw native field ------------------------------------------------------ */
@@ -1465,7 +1496,7 @@ int nii_medic(int argc, char *argv[]) {
 		double vox;
 		int64_t inv_folds = 0, inv_unconv = 0;
 #ifdef _OPENMP
-		const int outer_par = (T >= omp_get_max_threads());
+		const int outer_par = frame_parallel;
 #else
 		const int outer_par = 0;
 #endif
@@ -1479,16 +1510,15 @@ int nii_medic(int argc, char *argv[]) {
 			vox *= unit;
 			if (!(vox > 0.0)) { MD_ERR("phase-encoding voxel size is zero\n"); goto done; }
 		}
-		/* ONE active level of parallelism, CHOSEN BY FRAME COUNT.
+		/* ONE active level of parallelism, chosen by frame count.
 		 *
 		 * md_invert() is itself parallel over slices, so a parallel frame loop around it nested
 		 * two regions: with nesting disabled (the default) the inner team collapsed to one thread;
-		 * with OMP_NESTED=true it oversubscribed.  Neither is right for both shapes, and picking
-		 * the inner level unconditionally cost 70 % on the 170-frame run (170 frames x 64
-		 * iterations = ~10 900 parallel-region entries).  So: with more frames than threads,
-		 * parallelise the FRAME loop and run md_invert serially; otherwise run frames serially and
-		 * let md_invert parallelise, which keeps every core busy at T = 1.  The accumulators use
-		 * reductions either way, so the diagnostics are exact and thread-count independent. */
+		 * with OMP_NESTED=true it oversubscribed.  For T > 1, parallelise frames and run
+		 * md_invert serially: each frame also has useful work without an inner OpenMP region.
+		 * For T = 1, leave the outer loop serial and parallelise md_invert over slices.  The
+		 * accumulators use reductions either way, so diagnostics are exact and thread-count
+		 * independent. */
 #ifdef _OPENMP
 		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) if (outer_par)
 #endif
@@ -1505,9 +1535,9 @@ int nii_medic(int argc, char *argv[]) {
 		if (inv_unconv || inv_folds) {
 			double tot = (double)n3 * T;
 			fprintf(stderr, "--medic: displacement inversion: %lld voxel(s) (%.3f%%) still moving "
-				"by >%g Hz after %d iterations; %lld (%.3f%%) lie in FOLDED columns where the "
-				"forward map is not monotone, so the inverse is multi-valued and the branch chosen "
-				"is arbitrary\n",
+				"by >%g Hz after %d iterations; %lld folded adjacent pair(s) (%.3f%% of voxels) "
+				"mark columns where the forward map is not monotone, so the inverse is "
+				"multi-valued and the branch chosen is arbitrary\n",
 				(long long)inv_unconv, 100.0 * (double)inv_unconv / tot, (double)MD_INVERT_TOL,
 				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot);
 		}
@@ -1531,8 +1561,9 @@ int nii_medic(int argc, char *argv[]) {
 		const float *bufs[3];
 		char tmppfx[MD_PATH_MAX], made[3][MD_PATH_MAX];
 		char final[3][MD_PATH_MAX], bak[3][MD_PATH_MAX];
+		int had_final[3] = { 0, 0, 0 };
 		const char *saved_prefix = c.prefix;
-		int k, q, wrc = 0, nmade = 0, nbak = 0, npub = 0;
+		int k, q, wrc = 0, nmade = 0, npub = 0;
 		bufs[0] = fields; bufs[1] = fu; bufs[2] = disp;
 		/* Reserve room for the longest suffix we ever append: "<out>.medictmp<pid>.nii.gz". */
 		if ((int)strlen(saved_prefix) + 64 >= MD_PATH_MAX) { MD_ERR("--out-prefix is too long\n"); goto done; }
@@ -1563,30 +1594,44 @@ int nii_medic(int argc, char *argv[]) {
 		   cannot then be cleaned up. */
 		for (k = 0; k < 3; k++) {
 			struct stat st;
-			if (stat(final[k], &st) == 0 && !S_ISREG(st.st_mode)) {
+			if (stat(final[k], &st) == 0) {
+				had_final[k] = 1;
+				if (S_ISREG(st.st_mode)) continue;
 				MD_ERR("%s exists and is not a regular file; refusing to replace it\n", final[k]);
+				for (q = 0; q < 3; q++) remove(made[q]);
+				goto done;
+			}
+			if (errno != ENOENT) {
+				MD_ERR("cannot inspect existing output %s; refusing to replace it\n", final[k]);
 				for (q = 0; q < 3; q++) remove(made[q]);
 				goto done;
 			}
 		}
 		for (k = 0; k < 3; k++) {   /* move existing finals aside (absent is fine) */
+			/* Clear any stale backup FIRST, even when there is no final to move aside: a
+			   leftover <final>.medicbak<pid> from a crashed run that reused this PID would
+			   otherwise sit on disk forever, since nothing later renames or removes it. */
 			remove(bak[k]);
-			if (rename(final[k], bak[k]) == 0) nbak++;
-			else bak[k][0] = '\0';
+			if (!had_final[k]) { bak[k][0] = '\0'; continue; }
+			if (rename(final[k], bak[k]) != 0) {
+				MD_ERR("failed to preserve existing output %s; aborting publication\n", final[k]);
+				md_restore_backups(bak, final, k);
+				for (q = 0; q < 3; q++) remove(made[q]);
+				goto done;
+			}
 		}
 		for (k = 0; k < 3; k++) {
 			remove(final[k]);   /* MSVC rename() will not replace an existing destination */
 			if (rename(made[k], final[k]) != 0) {
 				MD_ERR("failed to publish %s; rolling back\n", final[k]);
 				for (q = 0; q < npub; q++) remove(final[q]);              /* undo our publishes */
-				for (q = 0; q < 3; q++) if (bak[q][0]) rename(bak[q], final[q]);  /* restore */
+				md_restore_backups(bak, final, 3);
 				for (q = k; q < 3; q++) remove(made[q]);
 				goto done;
 			}
 			npub++;
 		}
 		for (k = 0; k < 3; k++) if (bak[k][0]) remove(bak[k]);
-		(void)nbak;
 	}
 	rc = EXIT_SUCCESS;
 done:

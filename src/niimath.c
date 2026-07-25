@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260724"
+#define kMTHdate "v1.0.20260725"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH

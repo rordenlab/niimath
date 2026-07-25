@@ -377,16 +377,16 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 | threads | tool | wall | CPU | parallelism | peak RAM |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `wk-medic` | 44.37 s | 53.29 s | 1.2x | 3.40 GB |
-| 1 | **`niimath --medic`** | **14.38 s** | **13.96 s** | 1.0x | **1.70 GB** |
+| 1 | **`niimath --medic`** | **14.52 s** | **13.96 s** | 1.0x | **1.70 GB** |
 | 8 | `wk-medic` | 15.23 s | 65.51 s | 4.3x | 3.40 GB |
-| 8 | **`niimath --medic`** | **3.42 s** | **15.16 s** | 4.4x | **1.89 GB** |
+| 8 | **`niimath --medic`** | **3.87 s** | **15.16 s** | 3.9x | **1.89 GB** |
 
-**3.09x faster single-threaded, 4.45x faster at 8 threads**, using ~4x less CPU and ~1.5x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.47x for niimath and 2.91x for the reference. Note the reference spends 53 s of CPU to do single-threaded what niimath does in 14.0 s, so its higher parallel efficiency is recovering overhead rather than winning work.
+**3.06x faster single-threaded, 3.94x faster at 8 threads**, using ~4x less CPU and ~1.8x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.75x for niimath and 2.91x for the reference. niimath now scales BETTER as well as running faster (3.75x versus 2.91x). Note also that the reference spends 53 s of CPU to do single-threaded what niimath does in 14.5 s: its parallel gain is largely recovering its own overhead.
 
 These are the current revision. Two changes moved them since the previous round, in opposite directions and both deliberately:
 
 - **Peak RAM fell 2.04 → 1.70 GB (1 thread) and 2.24 → 1.89 GB (8 threads)** once geometry validation moved to headers alone and each echo pair is loaded, repacked and freed in turn. Previously all `2E` input payloads were still resident when the work arrays were allocated, so the true peak was ~`(4E+3)` series while the banner reported `(2E+3)`.
-- **Wall time fell 4.15 → 3.42 s at 8 threads despite this round ADDING correctness work** (mask gating, per-voxel temporal validity counting, fold detection), because the group-mean accumulation is hoisted when every frame falls in one temporal group — exact, the same values summed in the same order, removing ~7.7e9 float adds on this dataset.
+- **Wall time fell despite that round ADDING correctness work** (4.15 → 3.42 s at 8 threads as measured then; the table above is the current figure) (mask gating, per-voxel temporal validity counting, fold detection), because the group-mean accumulation is hoisted when every frame falls in one temporal group — exact, the same values summed in the same order, removing ~7.7e9 float adds on this dataset.
 
 The mask retention that costs a little memory bought a 3.3x improvement in end-to-end displacement agreement on the sbref demo with the reference mask supplied (p95 0.197 → 0.059 mm for `j`, 0.096 → 0.029 mm for `j-`; §5, §5.4).
 
@@ -400,7 +400,7 @@ The mask retention that costs a little memory bought a 3.3x improvement in end-t
 | `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.35 GB** |
 | `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.19 GB |
 
-(Those three rows are separate runs from the like-for-like table above, and the two `niimath` rows were measured before the mask-retention change. Their **2.19 GB `--gz 0` peak is superseded by the 2.24 GB** of the 8-thread like-for-like row — same configuration, current revision. **2.35 GB remains the quoted peak for the gzipped run** and is what the other documents cite; it was not re-run after the change, so treat it as good to a few tens of MB rather than as a fresh measurement. Wall and CPU times here were likewise not re-run.)
+(Those three rows are **historical** — separate runs, taken before the per-echo loading, the removal of `md_write()`'s output copy and the OpenMP level change. Every figure in them is superseded by the like-for-like table above, which is the authoritative one; the `--gz 0` peak of 2.19 GB there reads **1.89 GB** now. The gzipped peak has not been re-measured since those changes, so no current gzipped figure is quoted anywhere — use the uncompressed numbers.)
 
 **Apply stage** (one echo, 170 frames):
 
@@ -422,7 +422,7 @@ Two build gotchas that invalidate this table if ignored:
 
 The **work arrays** are `phase + mag + fields + fu + disp` = `n3 * T * (2*echoes + 3) * 4` bytes — 1.18 GiB on this run, and that is the figure `--medic` prints at startup. It grows linearly with frames x echoes, so a 5-echo/600-frame run at this resolution needs roughly 10 GiB of work arrays — fine natively, and **impossible in wasm32**, whose 4 GiB address space (and `-DFORCE_INT32_MAX` on every wasm target) is why `--medic` is documented as native-scale-only while `-unwarp` is browser-friendly.
 
-**The banner is the work-array budget, not the peak — and the ordering that keeps the two close is load-bearing.** In the current `medic.c` every input is validated from its **header alone**, so no payload is resident when the five work arrays are allocated, and the repack loop then loads, rescales and frees **one echo pair at a time**. The transient overshoot is one echo pair (2 series) regardless of echo count, plus the per-output copy `md_write()` makes. The revision that produced the measurements in this section did *not* do that — it read all `2*echoes` payloads during validation and freed them only during the repack, i.e. after the work allocation, so its true peak was `(4*echoes + 3)` series (1.85 GiB here) against a `(2*echoes + 3)` banner. **The peaks tabulated above therefore predate the per-echo-loading change and have not been re-measured; read them as upper bounds on the current binary, not as fresh figures.**
+**The banner is the work-array budget, not the peak — and the ordering that keeps the two close is load-bearing.** In the current `medic.c` every input is validated from its **header alone**, so no payload is resident when the five work arrays are allocated, and the repack loop then loads, rescales and frees **one echo pair at a time**. The transient input overshoot is one echo pair (2 series) regardless of echo count; `md_write()` now lends each resident output directly to the synchronous writer instead of copying another complete series. An earlier revision read all `2*echoes` payloads during validation and freed them only during the repack, i.e. after the work allocation, so its true peak was `(4*echoes + 3)` series against a `(2*echoes + 3)` banner.
 
 An earlier revision carried a separate unwrapped-phase series; it was removed during the audit (phase is unwrapped in place), taking the gzipped peak from 2.53 GB to 2.35 GB.
 

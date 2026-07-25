@@ -498,7 +498,7 @@ def part_d(binary, out_dir):
 
 # ------------------------------------------------------------------ Part C
 
-def part_c(pa, pb, trt=float(TRT), pe_axis=1):
+def part_c(pa, pb, trt=float(TRT), pe_axis=1, pe_sign=1.0):
     """Attribution for the ONE place where a last-ULP difference does get amplified.
 
     Part A finds that on the real 170-frame run `_fieldmaps_native` (the field map itself)
@@ -515,8 +515,8 @@ def part_c(pa, pb, trt=float(TRT), pe_axis=1):
     fu_a, _ = nii.read("%s_fieldmaps.nii" % pa)
     fu_b, _ = nii.read("%s_fieldmaps.nii" % pb)
     d = np.abs(np.asarray(fu_a, np.float64) - np.asarray(fu_b, np.float64))
-    # fold: d(displacement)/d(PE index) <= -1, exactly md_invert()'s own detector
-    dd = np.diff(np.asarray(fu_a, np.float64), axis=pe_axis) * trt
+    # fold: pe_sign*d(field*TRT)/d(PE index) <= -1, exactly md_invert()'s detector
+    dd = pe_sign * np.diff(np.asarray(fu_a, np.float64), axis=pe_axis) * trt
     fold = np.zeros_like(d, dtype=bool)
     sl = [slice(None)] * d.ndim
     sl[pe_axis] = slice(0, d.shape[pe_axis] - 1)

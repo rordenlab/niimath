@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -1140,6 +1141,63 @@ def exercise_medic_polarity(exe: str, tmp: Path) -> None:
                 f"--medic: j and j- displacements must have opposite signs, saw {a:g} and {b:g}"
             )
 
+    # The fold detector must use the SAME polarity as the inversion. Two checks, because either
+    # alone is worthless:
+    #
+    #   liveness      -- a steep field must make it fire at all, else an always-zero detector
+    #                    would pass the discriminator below.
+    #   discriminator -- a CONVERGED field (|slope*TRT| < 1) with a NEGATIVE slope run as `j-`
+    #                    must report NO folds.
+    #
+    # The discriminator is the load-bearing one. For a linear field of slope b with u = b*TRT,
+    # the inverted field has gradient b/(1+u) for j-, so the correct test (-u/(1+u) <= -1) is
+    # false for every convergent u, while the polarity-blind test (u/(1+u) <= -1) is TRUE for
+    # u <= -0.5. Measured against a binary built with the pe_sign factor removed: the correct
+    # code reports 0 folds here and the broken one reports 1024. An earlier version of this test
+    # only checked that SOME fold was reported on a non-convergent fixture, where both builds
+    # report a fold (127 vs 128) -- it passed with the bug restored.
+    full_mask = tmp / "medic_pol_full_mask.nii"
+    nvox_mask = MEDIC_DIMS[0] * MEDIC_DIMS[1] * MEDIC_DIMS[2]
+    write_float32_nifti(full_mask, MEDIC_DIMS, [1.0] * nvox_mask)
+
+    def fold_count(direction: str, trt: str, phase_files: list, tag: str) -> int:
+        res = run_niimath(exe, [
+            "--medic", "--magnitude", *mags, "--phase", *phase_files,
+            "--te-ms", "10,30", "--total-readout-time", trt,
+            "--phase-encoding-direction", direction, "--mask", str(full_mask),
+            "--out-prefix", str(tmp / ("medic_fold_" + tag)), "--rank", "0", "--gz", "0",
+        ])
+        require_success(res, "--medic fold diagnostic (%s, TRT %s)" % (direction, trt))
+        m = re.search(r"(\d+) folded adjacent pair", res.stdout + res.stderr)
+        return int(m.group(1)) if m else 0
+
+    if fold_count("j-", "0.25", phases, "live") <= 0:
+        raise AssertionError("--medic fold detector reported nothing on a folding field; "
+                             "an always-zero detector would make the polarity check below vacuous")
+
+    # Negative slope, |slope * TRT| = 0.6 -> the inversion converges, so no genuine fold exists.
+    conv_dims = MEDIC_DIMS
+    nvox = conv_dims[0] * conv_dims[1] * conv_dims[2]
+    conv_phase = []
+    for idx, te in enumerate((10.0, 30.0)):
+        vals = [0.0] * nvox
+        for z in range(conv_dims[2]):
+            for y in range(conv_dims[1]):
+                for x in range(conv_dims[0]):
+                    f = -3.0 * (y - conv_dims[1] / 2.0)
+                    ang = 2.0 * math.pi * f * (te / 1000.0)
+                    vals[x + y * conv_dims[0] + z * conv_dims[0] * conv_dims[1]] = (
+                        ang - 2.0 * math.pi * math.floor(ang / (2.0 * math.pi) + 0.5))
+        p = tmp / ("medic_fold_conv_p%d.nii" % idx)
+        write_float32_nifti(p, conv_dims, vals)
+        conv_phase.append(str(p))
+    folds = fold_count("j-", "0.2", conv_phase, "conv")
+    if folds != 0:
+        raise AssertionError(
+            "--medic reported %d fold(s) on a CONVERGENT j- field that cannot fold; the detector "
+            "is ignoring the phase-encoding polarity (a build without the pe_sign factor reports "
+            "1024 here)" % folds)
+
 
 def exercise_medic_nonfinite(exe: str, tmp: Path, mags: list[str], phases: list[str], frames: int) -> None:
     """(2) A single NaN phase voxel must fail LOUDLY.
@@ -1636,6 +1694,26 @@ def exercise_medic_parsing(exe: str, tmp: Path) -> None:
             raise AssertionError(f"--medic wrote outputs after rejecting {' '.join(extra)}")
 
 
+def _is_native_executable(path: str) -> bool:
+    """Is `path` a real ELF/Mach-O binary rather than a script that re-spawns one?
+
+    The pip wheel ships a Python console script named `niimath`; a test that assumes the process
+    it launches is the one running medic.c is wrong there. Sniff the magic rather than guessing
+    from the name or the platform.
+    """
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return False
+    return magic in (
+        b"\x7fELF",                                     # ELF
+        b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",   # Mach-O 64/32 little-endian
+        b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",   # Mach-O big-endian
+        b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",   # Mach-O universal
+    )
+
+
 def exercise_medic_output_transaction(exe: str, tmp: Path) -> None:
     """(14) A failed write must leave a PREVIOUS run's outputs byte-for-byte intact.
 
@@ -1644,21 +1722,70 @@ def exercise_medic_output_transaction(exe: str, tmp: Path) -> None:
     outputs are now staged under a sibling temporary prefix and renamed in only once all three
     exist, so an unwritable destination is a clean no-op.
 
-    Skipped where the permission cannot be made to bite (root, or a filesystem that ignores the
-    mode) -- detected by probing rather than by guessing the platform."""
-    geteuid = getattr(os, "geteuid", None)
-    if geteuid is not None and geteuid() == 0:
-        print("  --medic output transaction: running as root - skipping")
-        return
+    The backup-rename check needs the PID of the process that will run medic.c, which it gets by
+    exec-ing the binary from a launcher (exec preserves the PID) after a short delay so the
+    obstacle can be planted first. That identity only holds when `exe` IS the native binary: the
+    pip wheel installs a console script that SUBPROCESS-SPAWNS niimath, so medic.c would see a
+    different PID, the obstacle would never collide, the run would succeed and the assertion would
+    fire -- failing CIBW_TEST_COMMAND on every non-Windows wheel and blocking the PyPI upload.
+    So it is gated on `exe` actually being a native executable, and skipped with a reason
+    otherwise. The permission check is skipped where permissions cannot be made to bite."""
     tes = (10.0, 30.0)
     mags, phases = medic_write_series(tmp, "medic_txn", tes, 1, lambda t: 1.0)
     outdir = tmp / "medic_txn_dir"
     outdir.mkdir(exist_ok=True)
     prefix = outdir / "run"
-    require_success(medic_run(exe, mags, phases, tes, prefix, ["--rank", "0"]), "--medic first run")
+    require_success(medic_run(exe, mags, phases, tes, prefix, ["--rank", "0", "--gz", "0"]),
+                    "--medic first run")
     before = {p.name: p.read_bytes() for p in sorted(outdir.iterdir())}
     if len(before) != 3:
         raise AssertionError(f"--medic wrote {len(before)} outputs, expected 3: {sorted(before)}")
+
+    exec_path = shutil.which(exe) or exe
+    if os.name != "nt" and _is_native_executable(exec_path):
+        mags2, phases2 = medic_write_series(tmp, "medic_txn_changed", tes, 1, lambda t: 0.7)
+        args = [
+            "--medic",
+            "--magnitude", *mags2,
+            "--phase", *phases2,
+            "--te-ms", "10,30",
+            "--total-readout-time", "0.02",
+            "--phase-encoding-direction", "j",
+            "--out-prefix", str(prefix),
+            "--rank", "0",
+            "--gz", "0",
+        ]
+        launcher = "import os,sys,time; time.sleep(.2); os.execv(sys.argv[1], sys.argv[1:])"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", launcher, exec_path, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        obstacle = Path(str(prefix) + f"_fieldmaps_native.nii.medicbak{proc.pid}")
+        obstacle.mkdir()
+        blocker = obstacle / "keep"
+        blocker.write_text("do not remove")
+        try:
+            stdout, stderr = proc.communicate()
+        finally:
+            blocker.unlink()
+            obstacle.rmdir()
+        if proc.returncode == 0:
+            raise AssertionError("--medic replaced old outputs after its backup rename failed")
+        if "failed to preserve existing output" not in stdout + stderr:
+            raise AssertionError(f"--medic backup failure had no clear diagnostic:\n{stdout}{stderr}")
+        after_backup_failure = {p.name: p.read_bytes() for p in sorted(outdir.iterdir())}
+        if after_backup_failure != before:
+            raise AssertionError("--medic changed old outputs after its backup rename failed")
+    elif os.name != "nt":
+        print("  --medic backup-rename transaction: %r is not a native binary (console script or "
+              "wrapper), so its PID cannot be predicted - skipping" % exec_path)
+
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
+        print("  --medic output permission transaction: running as root - skipping")
+        return
 
     os.chmod(str(outdir), 0o500)
     try:
