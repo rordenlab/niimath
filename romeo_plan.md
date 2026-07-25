@@ -12,6 +12,21 @@ Three corrections to the plan as written, all confirmed empirically and recorded
 2. **§3.2 / `rem2pi`.** libc `remainder(x, 2π_double)` is not merely "not specified to match" — it is *systematically* different, because Julia's `rem2pi` reduces against an infinitely precise 2π. Julia's `rem_pio2_kernel` (Cody-Waite + Payne-Hanek) is ported literally, with a portable 128-bit emulation so MSVC and wasm produce the same reduction.
 3. **§3.3 / strict FP.** The plan asked for the exposure to be measured. It was, three ways: `-ffp-contract=off` (shipped) passes the full parity suite 422/422; FMA contraction is bit-identical on the validation volume but fails 9 checks on the full corpus; the repository-wide `-ffast-math` changes 360/797088 weight bytes and leaves 66 voxels off by a full 2π. The mechanism is not rounding — reassociation pushes a weight past 1.0 and `rescale()`'s `0 ≤ w ≤ 1` guard then returns bin 0, deleting the edge from the graph. Compute is 0.02 s under either policy (0.07 s wall including gzip output), so contraction buys nothing. **Any future FP-policy change must be re-measured on the full suite, not on one volume** — that single-volume shortcut is exactly what produced a wrong "FMA is clean" claim in the first place.
 
+## Audit outcome and residual items (for the next session)
+
+A three-agent audit (security/bugs, refactor, docs) ran over the branch. Everything it found that mattered is FIXED and committed; what follows is what was deliberately left.
+
+**Fixed:** an MSVC build break (`strtok_r`, which would have failed the Windows release job); a `-template` `long`→`int` truncation giving SIGSEGV/SIGBUS and a silent wrong-echo run; a heap-use-after-free in `rm_read_f32`'s unsupported-datatype error path; undefined behaviour in the Payne-Hanek reduction (`idx << 6` on a negative int); `rm_pq_enqueue` failures being dropped (fail-open OOM → a region silently left wrapped, exit 0); unchecked `snprintf` truncation in `-romeo-dump` that could alias two dumps onto one filename; `-v` accepted but doing nothing; and several documentation errors, including one claim of mine that was flatly wrong (see §3 above).
+
+**Deliberately NOT done, with reasons:**
+
+- Hoisting the temporal-uncertain scratch buffers out of their loop (three duplicated free-blocks). Mechanical, low risk, but touches the one loop where a missed `free` becomes a leak — worth doing only alongside another edit in that function.
+- Replacing the six per-target `$(if $(ROMEOOBJS),…)` Makefile lines with a `define`/`$(call)`. The audit judged the cure a wash: still six lines, plus a `$(call)`-inside-a-recipe escaping gotcha, against a Makefile whose house style is explicit-and-repetitive throughout.
+- `rm_sample_capacity` over-allocates (`max(len², n)` because of the rare all-non-finite fallback), so `rm_robustmask` transiently costs ~134 MB on a 256³ magnitude. Pure allocation change, no effect on values; only worth doing if someone hits it.
+- Unifying `rm_select_kth_f`/`rm_select_kth_d` behind a macro: numerically safe but saves 16 lines at the cost of macro-obscured debugging in the file you most want to read literally.
+
+**Verified clean, so do not re-audit speculatively:** the 1-based↔0-based index conversions (ASan over 104 volume shapes × 4 option sets), leaks/double-free on all `goto done` paths (0 leaks over 6 success + 9 error paths), NaN/Inf reaching an index or allocation size, quickselect on non-finite input (400k fuzz trials), the `coreFLT.c` dispatch, and the 128-bit Payne-Hanek emulation — validated against 3000-bit mpmath over ~3000 values spanning the full double exponent range, worst error 0.4998 ULP.
+
 One item in §3.1 is worth re-reading before touching the weights: `phaselinearity`'s return type is *data-dependent* (Float32 for the interior product, Float64 on its `isnan → 0.5` and boundary-`0.9` branches), and `unwrapedge!`'s `d = 0` is an **Int**, which silently selects a Float32 rather than Float64 subtraction inside `unwrapvoxel`.
 
 

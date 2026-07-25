@@ -73,8 +73,10 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 // `phasefile` is the ORIGINAL input filename, needed by the readphase rescale branch that
 // inspects unscaled stored values; pass NULL when unavailable (stdin), which makes a required
 // rescale fail loudly rather than silently.  `is_first_op` records whether -romeo is the first
-// computational operation (phase rescaling requires it).  On success nim->data holds the
-// unwrapped phase and side outputs have been written.  Returns 0 on success.
+// computational operation (phase rescaling requires it).  `ihdr` is currently UNUSED: it is kept
+// because the deferred `-fix-ge-phase` (plan M7) needs the ORIGINAL stored datatype to choose
+// between the integer and float branches of MriResearchTools' fix_ge_phase!.  On success
+// nim->data holds the unwrapped phase and side outputs have been written.  Returns 0 on success.
 int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	const in_hdr *ihdr, int is_first_op, const romeo_opts *o, gzModes gzMode);
 

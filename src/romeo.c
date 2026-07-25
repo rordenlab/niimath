@@ -60,6 +60,13 @@
  * so no vectorisation is given up; only reassociation is. Change ROMEO_STRICT_FP in
  * src/Makefile to revisit - and re-run the FULL suite, not one volume.
  *
+ * PLATFORM CAVEAT on the "bit-identical" claim: on Linux/x86 with gcc, the whole-program
+ * -ffast-math on the LINK line pulls in crtfastmath.o, which sets MXCSR FTZ/DAZ process-wide -
+ * including inside this strict-FP object. ROMEO's operands (weights in [0,1], phase ~[-pi,pi],
+ * magnitudes ~1e3) never reach the denormal range, so the exposure is nil, but every measurement
+ * above was made on arm64 macOS. Re-run test/romeo_compare.py on a Linux gcc release build
+ * before claiming bit-identity there. Do NOT "fix" this by removing -ffast-math from the link.
+ *
  * ---------------------------------------------------------------------------------------------
  * NUMERIC TYPE AUDIT (romeo_plan.md §3.1).  Julia's promotion rules are NOT uniform across the
  * six weight terms; each row was confirmed with typeof(...) under the pinned environment above.
@@ -1308,7 +1315,11 @@ static int rm_dump(const char *dir, const char *name, const void *p, size_t elem
 	char path[2048];
 	FILE *f;
 	if (!dir) return 0;
-	snprintf(path, sizeof path, "%s/%s", dir, name);
+	if (snprintf(path, sizeof path, "%s/%s", dir, name) >= (int)sizeof path) {
+		/* Truncation would silently alias two dumps onto one filename (c_qmap_1 / c_qmap_2). */
+		RM_ERR("-romeo-dump directory path is too long for '%s'\n", name);
+		return 1;
+	}
 	f = fopen(path, "wb");
 	if (!f) { RM_ERR("cannot write dump '%s'\n", path); return 1; }
 	if (n > 0 && fwrite(p, elem, (size_t)n, f) != (size_t)n) { fclose(f); RM_ERR("short write to '%s'\n", path); return 1; }
@@ -1350,8 +1361,9 @@ static const float RM_PRIM_UV[][2] = { /* (new, old) pairs for unwrapvoxel */
 	{ 2.0f, 2.0f + 3.1415927f }, { -2.0f, -2.0f - 3.1415927f }
 };
 
-static void rm_dump_primitives(const char *dir) {
+static int rm_dump_primitives(const char *dir) {
 	size_t i;
+	int drc = 0;
 	size_t nd = sizeof RM_PRIM_D / sizeof RM_PRIM_D[0];
 	size_t nf = sizeof RM_PRIM_F / sizeof RM_PRIM_F[0];
 	size_t nw = sizeof RM_PRIM_W / sizeof RM_PRIM_W[0];
@@ -1360,7 +1372,7 @@ static void rm_dump_primitives(const char *dir) {
 	float *of = (float *)malloc(nf * sizeof(float) * 2);
 	uint8_t *ow = (uint8_t *)malloc(nw);
 	float *ou = (float *)malloc(nu * sizeof(float) * 2);
-	if (!od || !of || !ow || !ou) { free(od); free(of); free(ow); free(ou); return; }
+	if (!od || !of || !ow || !ou) { free(od); free(of); free(ow); free(ou); return 1; }
 	for (i = 0; i < nd; i++) od[i] = rm_rem2pi_d(RM_PRIM_D[i]);
 	for (i = 0; i < nf; i++) { of[i] = rm_rem2pi_f(RM_PRIM_F[i]); of[nf + i] = rm_gamma_f(RM_PRIM_F[i]); }
 	for (i = 0; i < nw; i++) ow[i] = rm_rescale(RM_PRIM_W[i]);
@@ -1368,11 +1380,12 @@ static void rm_dump_primitives(const char *dir) {
 		ou[i] = rm_unwrapvoxel_ff(RM_PRIM_UV[i][0], RM_PRIM_UV[i][1]);
 		ou[nu + i] = rm_unwrapvoxel_fd(RM_PRIM_UV[i][0], (double)RM_PRIM_UV[i][1]);
 	}
-	rm_dump(dir, "c_prim_rem2pi64.f64", od, sizeof(double), (int64_t)nd);
-	rm_dump(dir, "c_prim_rem2pi32_gamma.f32", of, sizeof(float), (int64_t)(2 * nf));
-	rm_dump(dir, "c_prim_rescale.u8", ow, 1, (int64_t)nw);
-	rm_dump(dir, "c_prim_unwrapvoxel.f32", ou, sizeof(float), (int64_t)(2 * nu));
+	drc |= rm_dump(dir, "c_prim_rem2pi64.f64", od, sizeof(double), (int64_t)nd);
+	drc |= rm_dump(dir, "c_prim_rem2pi32_gamma.f32", of, sizeof(float), (int64_t)(2 * nf));
+	drc |= rm_dump(dir, "c_prim_rescale.u8", ow, 1, (int64_t)nw);
+	drc |= rm_dump(dir, "c_prim_unwrapvoxel.f32", ou, sizeof(float), (int64_t)(2 * nu));
 	free(od); free(of); free(ow); free(ou);
+	return drc;
 }
 
 romeo_opts romeo_opts_default(void) {
@@ -1519,7 +1532,13 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 		}
 		if (!strcmp(a, "-template")) {
 			long v;
-			if (ac + 1 >= argc || rm_parse_int(argv[ac + 1], &v) || v < 1) { RM_ERR("-template requires a positive integer\n"); return 1; }
+			/* Range-check BEFORE narrowing to int: a value above INT_MAX wraps NEGATIVE, and a
+			   negative echo index reaches `phase + (template-1)*n3` as a wild pointer (SIGSEGV),
+			   while e.g. 4294967297 truncates to 1 and silently unwraps the WRONG echo. */
+			if (ac + 1 >= argc || rm_parse_int(argv[ac + 1], &v) || v < 1 || v > INT_MAX) {
+				RM_ERR("-template requires a positive integer echo index (1..%d)\n", INT_MAX);
+				return 1;
+			}
 			o->template_echo = (int)v;
 			ac += 2;
 			continue;
@@ -1605,10 +1624,13 @@ static int rm_read_f32(const char *fn, int raw, float **out, int *nx, int *ny, i
 	case DT_UINT64: RM_CVT(uint64_t); break;
 	case DT_FLOAT32: RM_CVT(float); break;
 	case DT_FLOAT64: RM_CVT(double); break;
-	default:
-		free(d); nifti_image_free(n);
-		RM_ERR("'%s' has an unsupported datatype (%d)\n", fn, n->datatype);
+	default: {
+		int dt = n->datatype;   /* read BEFORE the free: nifti_image_free(n) invalidates n */
+		free(d);
+		nifti_image_free(n);
+		RM_ERR("'%s' has an unsupported datatype (%d)\n", fn, dt);
 		return 1;
+	}
 	}
 #undef RM_CVT
 	*out = d;
@@ -1700,6 +1722,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	int have_mag = 0;
 	const char *dump = o->dumpdir;
 	FILE *manifest = NULL;
+	int drc = 0;   /* accumulated -romeo-dump status: a PARTIAL parity dump must not read as complete */
 
 	memset(&stages, 0, sizeof stages);
 
@@ -1711,9 +1734,22 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	neco = (int)((int64_t)nim->nvox / n3);
 	if (neco < 1) { RM_ERR("invalid image geometry\n"); return 1; }
 	if ((int64_t)nim->nvox > INT_MAX) { RM_ERR("images with more than INT_MAX voxels are not supported\n"); return 1; }
+	{	/* The weight arrays are 3 per voxel and up to 8 bytes wide. On a 32-bit/wasm target
+		   (FORCE_INT32_MAX, where romeo.c IS linked) those products could wrap size_t and
+		   under-allocate, so use the project's checked multiply rather than trusting them. */
+		size_t chk;
+		if (nii_mul_size((size_t)n3, 3 * sizeof(double), &chk) ||
+			nii_mul_size((size_t)nim->nvox, sizeof(float), &chk)) {
+			RM_ERR("image is too large for this build's address space\n");
+			return 1;
+		}
+	}
 
 	template_echo = o->template_echo;
-	if (template_echo > neco) { RM_ERR("-template %d exceeds the %d echo(es) present\n", template_echo, neco); return 1; }
+	if (template_echo < 1 || template_echo > neco) {   /* lower bound too: never index behind the buffer */
+		RM_ERR("-template %d is out of range (the image has %d echo(es))\n", template_echo, neco);
+		return 1;
+	}
 
 	/* ---- phase: readphase rescale branch ---------------------------------------------- */
 	phase = (float *)malloc((size_t)nim->nvox * sizeof(float));
@@ -1815,7 +1851,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		if (rm_build_ctx(&qc, phase, have_mag ? mag : NULL, magvol, NULL, magmasked, TEs, neco,
 				template_echo, 2, nx, ny, nz, flags)) { free(qmap); goto done; }
 		if (rm_voxelquality(&qc, qmap)) { free(qmap); goto done; }
-		if (dump) rm_dump(dump, "c_qmap_wrapped.f32", qmap, sizeof(float), n3);
+		if (dump) drc |= rm_dump(dump, "c_qmap_wrapped.f32", qmap, sizeof(float), n3);
 		if (rm_robustmask(qmap, nx, ny, nz, 1, o->qmask_thresh, &stages)) { free(qmap); goto done; }
 		free(qmap);
 		mask = stages.s4; stages.s4 = NULL;
@@ -1845,13 +1881,13 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			char path[2048];
 			snprintf(path, sizeof path, "%s/c_manifest.txt", dump);
 			manifest = fopen(path, "w");
-			rm_dump_primitives(dump);
+			drc |= rm_dump_primitives(dump);
 			if (rm_dump(dump, "c_weights.u8", weights, 1, 3 * n3)) goto done;
 			{
 				double *wd = (double *)malloc((size_t)3 * (size_t)n3 * sizeof(double));
 				if (wd) {
 					rm_calculateweights(&c, RM_WOUT_F64, wd);
-					rm_dump(dump, "c_weights_prerescale.f64", wd, sizeof(double), 3 * n3);
+					drc |= rm_dump(dump, "c_weights_prerescale.f64", wd, sizeof(double), 3 * n3);
 					free(wd);
 				}
 			}
@@ -1884,13 +1920,14 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 				}
 			}
 			if (stages.s1) {
-				rm_dump(dump, "c_mask_s1_thresh.u8", stages.s1, 1, n3);
-				rm_dump(dump, "c_mask_sm1.f32", stages.sm1, sizeof(float), n3);
-				rm_dump(dump, "c_mask_s2_smooth1.u8", stages.s2, 1, n3);
-				rm_dump(dump, "c_mask_s3_fill.u8", stages.s3, 1, n3);
-				rm_dump(dump, "c_mask_sm2.f32", stages.sm2, sizeof(float), n3);
+				drc |= rm_dump(dump, "c_mask_s1_thresh.u8", stages.s1, 1, n3);
+				drc |= rm_dump(dump, "c_mask_sm1.f32", stages.sm1, sizeof(float), n3);
+				drc |= rm_dump(dump, "c_mask_s2_smooth1.u8", stages.s2, 1, n3);
+				drc |= rm_dump(dump, "c_mask_s3_fill.u8", stages.s3, 1, n3);
+				drc |= rm_dump(dump, "c_mask_sm2.f32", stages.sm2, sizeof(float), n3);
 			}
-			if (mask) rm_dump(dump, "c_mask_s4_final.u8", mask, 1, n3);
+			if (mask) drc |= rm_dump(dump, "c_mask_s4_final.u8", mask, 1, n3);
+			if (drc) { RM_ERR("one or more -romeo-dump writes failed\n"); goto done; }
 		}
 	}
 
@@ -2060,7 +2097,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 					template_echo, 2, nx, ny, nz, flags)) { free(tmp); goto done; }
 			if (o->write_quality || dump) {
 				if (rm_voxelquality(&c, tmp)) { free(tmp); goto done; }
-				if (dump) rm_dump(dump, "c_qmap.f32", tmp, sizeof(float), n3);
+				if (dump) drc |= rm_dump(dump, "c_qmap.f32", tmp, sizeof(float), n3);
 				if (o->write_quality) save_rc |= rm_save_side(nim, "_quality", tmp, n3, gzMode);
 			}
 			if (o->write_quality_all || dump) {
@@ -2073,7 +2110,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 					c1.flags[qi] = 1;
 					rm_updateflags(c1.flags, c1.P2 != NULL, 1, c1.M != NULL);
 					if (rm_voxelquality(&c1, tmp)) { free(tmp); goto done; }
-					if (dump) { snprintf(nm, sizeof nm, "c_qmap_%d.f32", qi + 1); rm_dump(dump, nm, tmp, sizeof(float), n3); }
+					if (dump) { snprintf(nm, sizeof nm, "c_qmap_%d.f32", qi + 1); drc |= rm_dump(dump, nm, tmp, sizeof(float), n3); }
 					if (!o->write_quality_all) continue;
 					/* `all(qm[1:end-1,1:end-1,1:end-1] .== 1.0)` — an empty range makes all() true,
 					   so a singleton dimension skips the map, exactly as upstream. */
@@ -2090,8 +2127,9 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 	}
 
 	if (dump) {
-		rm_dump(dump, "c_visited.u8", visited, 1, n3);
-		rm_dump(dump, "c_unwrapped.f32", phase, sizeof(float), (int64_t)nim->nvox);
+		drc |= rm_dump(dump, "c_visited.u8", visited, 1, n3);
+		drc |= rm_dump(dump, "c_unwrapped.f32", phase, sizeof(float), (int64_t)nim->nvox);
+		if (drc) { RM_ERR("one or more -romeo-dump writes failed\n"); goto done; }
 	}
 
 	if (o->verbose) fprintf(stderr, " + -romeo: unwrapping finished\n");
