@@ -47,7 +47,11 @@ def find_runs(root: Path) -> dict[str, dict]:
         stem = m.group("stem")
         echo = int(m.group("echo"))
         part = m.group("part")
-        run = runs.setdefault(stem, {"dir": f.parent, "mag": {}, "phase": {}})
+        run = runs.setdefault(stem, {"mag": {}, "phase": {}, "dupes": []})
+        if echo in run[part]:
+            # Two files claiming the same echo/part (e.g. a .nii and a .nii.gz side by side).
+            # Silently keeping the last one would quietly change which data was processed.
+            run["dupes"].append((part, echo, run[part][echo], f))
         run[part][echo] = f
     return runs
 
@@ -100,6 +104,19 @@ def read_meta(phase_files: dict[int, Path]) -> dict:
     return {"tes": tes, "trt": trt, "ped": ped, "echoes": echoes}
 
 
+OUTPUT_SUFFIXES = ("_fieldmaps_native", "_fieldmaps", "_displacementmaps")
+
+
+def emitted(prefix: Path, suffix: str) -> Path | None:
+    """Which file did --medic actually write?  It honours FSLOUTPUTTYPE, so the extension is not
+    knowable in advance -- assuming .nii.gz silently broke NIFTI and NIFTI_ZST runs."""
+    for ext in (".nii.gz", ".nii", ".nii.zst"):
+        cand = Path(str(prefix) + suffix + ext)
+        if cand.is_file():
+            return cand
+    return None
+
+
 def run_cmd(cmd: list[str], dry: bool) -> None:
     printable = " ".join(shlex_quote(c) for c in cmd)
     print(printable, flush=True)
@@ -139,19 +156,31 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"no *_echo-<N>_part-{{mag,phase}}_bold.nii* under {args.input}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    processed = skipped = failed = 0
     for stem in sorted(runs):
         run = runs[stem]
         mag_e, pha_e = sorted(run["mag"]), sorted(run["phase"])
         if mag_e != pha_e:
-            print(f"skipping {stem}: magnitude echoes {mag_e} != phase echoes {pha_e}", file=sys.stderr)
+            print(f"error: {stem}: magnitude echoes {mag_e} != phase echoes {pha_e}", file=sys.stderr)
+            failed += 1
             continue
         if len(mag_e) < 2:
-            print(f"skipping {stem}: needs at least two echoes, found {len(mag_e)}", file=sys.stderr)
+            print(f"error: {stem}: needs at least two echoes, found {len(mag_e)}", file=sys.stderr)
+            failed += 1
+            continue
+        if run["dupes"]:
+            for part, echo, first, second in run["dupes"]:
+                print(f"error: {stem}: two files claim echo {echo} part {part}:\n  {first}\n  {second}",
+                      file=sys.stderr)
+            failed += 1
             continue
         meta = read_meta(run["phase"])
         prefix = args.out_dir / stem
-        if not args.overwrite and Path(str(prefix) + "_displacementmaps.nii.gz").exists():
-            print(f"skipping {stem}: outputs exist (use --overwrite)", file=sys.stderr)
+        # Check the COMPLETE output set, not just one file: a partial set from an interrupted run
+        # would otherwise read as "already done".
+        if not args.overwrite and all(emitted(prefix, sfx) for sfx in OUTPUT_SUFFIXES):
+            print(f"skipping {stem}: all outputs exist (use --overwrite)", file=sys.stderr)
+            skipped += 1
             continue
 
         cmd = [exe, "--medic",
@@ -169,15 +198,41 @@ def main(argv: list[str] | None = None) -> int:
             cmd += ["--rank", str(args.rank)]
         run_cmd(cmd, args.dry_run)
 
+        processed += 1
         if args.no_apply:
             continue
         # One displacement map series corrects every echo: all echoes share one EPI readout.
-        dmap = str(prefix) + "_displacementmaps.nii.gz"
+        found = emitted(prefix, "_displacementmaps")
+        if found is None and not args.dry_run:
+            print(f"error: {stem}: --medic wrote no displacement map", file=sys.stderr)
+            failed += 1
+            continue
+        dmap = found if found is not None else Path(str(prefix) + "_displacementmaps.nii.gz")
+        if args.noise_frames:
+            # --medic drops N trailing frames, so the map is shorter than the magnitude and
+            # -unwarp correctly refuses the pairing. Say so rather than emit a failing command.
+            print(f"error: {stem}: --noise-frames {args.noise_frames} makes the displacement map "
+                  f"shorter than the magnitude series, which -unwarp will reject. Trim the "
+                  f"magnitudes first (niimath <mag> -crop 0 N ...) or drop --noise-frames.",
+                  file=sys.stderr)
+            failed += 1
+            continue
         axis = meta["ped"][0]  # the sign already lives in the map; -unwarp ignores a '-' suffix
         for e in mag_e:
             src = run["mag"][e]
             out = args.out_dir / (src.name.split(".nii")[0] + "_undistorted.nii.gz")
-            run_cmd([exe, str(src), "-unwarp", dmap, axis, str(out)], args.dry_run)
+            cmd = [exe, str(src)]
+            if args.n_cpus:
+                cmd += ["-p", str(args.n_cpus)]   # was not propagated to the apply step
+            cmd += ["-unwarp", str(dmap), axis, str(out)]
+            run_cmd(cmd, args.dry_run)
+    if failed:
+        print(f"{processed} run(s) processed, {skipped} skipped, {failed} FAILED", file=sys.stderr)
+        return 1
+    if processed == 0 and skipped == 0:
+        print("no runs processed", file=sys.stderr)
+        return 1
+    print(f"{processed} run(s) processed, {skipped} skipped", file=sys.stderr)
     return 0
 
 

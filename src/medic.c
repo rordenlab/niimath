@@ -21,6 +21,7 @@
 // regression, SVD and resampling here are ordinary numerics.  See AGENTS.md.
 
 #include <ctype.h>
+#include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
@@ -884,16 +885,42 @@ static void md_usage(void) {
 	printf("see test/medic_reference_manifest.md.\n");
 }
 
+/* Strict integer parse: the whole token must be consumed and fit.  atoi() silently accepts
+   "8abc" as 8 and "abc" as 0, which turns a typo into a wrong run rather than an error. */
+static int md_parse_int(const char *s, long *out) {
+	char *end;
+	long v;
+	if (!s || !*s) return 1;
+	errno = 0;
+	v = strtol(s, &end, 10);
+	if (end == s || *end != '\0' || errno == ERANGE) return 1;
+	*out = v;
+	return 0;
+}
+
+/* Strict double parse, same contract. */
+static int md_parse_one_double(const char *s, double *out) {
+	char *end;
+	double v;
+	if (!s || !*s) return 1;
+	errno = 0;
+	v = strtod(s, &end);
+	if (end == s || *end != '\0') return 1;
+	*out = v;
+	return 0;
+}
+
 static int md_parse_doubles(const char *s, double *out, int maxn) {
 	int n = 0;
 	const char *p = s;
-	while (*p && n < maxn) {
+	while (*p) {
 		char *end;
 		double v;
 		while (*p == ',' || *p == ' ' || *p == '[' || *p == ']') p++;
 		if (!*p) break;
 		v = strtod(p, &end);
 		if (end == p) return -1;
+		if (n >= maxn) return -2;   /* too many: report, never silently truncate */
 		out[n++] = v;
 		p = end;
 	}
@@ -943,27 +970,38 @@ int nii_medic(int argc, char *argv[]) {
 			}
 		} else if (!strcmp(a, "--te-ms") && ac + 1 < argc) {
 			nTE = md_parse_doubles(argv[++ac], c.TEs, MD_MAX_ECHO);
+			if (nTE == -2) { MD_ERR("--te-ms lists more than %d echo times\n", MD_MAX_ECHO); goto done; }
 			if (nTE < 1) { MD_ERR("could not parse --te-ms '%s'\n", argv[ac]); goto done; }
 		} else if (!strcmp(a, "--total-readout-time") && ac + 1 < argc) {
-			c.trt = atof(argv[++ac]); have_trt = 1;
+			if (md_parse_one_double(argv[++ac], &c.trt)) { MD_ERR("--total-readout-time '%s' is not a number\n", argv[ac]); goto done; }
+			have_trt = 1;
 		} else if (!strcmp(a, "--phase-encoding-direction") && ac + 1 < argc) {
 			c.pe_axis = md_axis_index(argv[++ac], &c.pe_sign); have_pe = 1;
 			if (c.pe_axis < 0) { MD_ERR("--phase-encoding-direction must be one of i j k x y z, optionally with a trailing '-' (the polarity is used: j and j- give opposite displacement maps)\n"); goto done; }
 		} else if (!strcmp(a, "--out-prefix") && ac + 1 < argc) {
 			c.prefix = argv[++ac];
 		} else if (!strcmp(a, "--rank") && ac + 1 < argc) {
-			c.rank = atoi(argv[++ac]);
+			long v;
+			if (md_parse_int(argv[++ac], &v) || v < 0 || v > 100000) { MD_ERR("--rank '%s' must be a non-negative integer\n", argv[ac]); goto done; }
+			c.rank = (int)v;
 		} else if (!strcmp(a, "--temporal-correction") && ac + 1 < argc) {
-			c.temporal = atoi(argv[++ac]) != 0;
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--temporal-correction must be 0 or 1\n"); goto done; }
+			c.temporal = (int)v;
 		} else if (!strcmp(a, "--phase-offset") && ac + 1 < argc) {
 			const char *v = argv[++ac];
 			if (!strcmp(v, "mcpc")) c.mcpc = 1;
 			else if (!strcmp(v, "none")) c.mcpc = 0;
 			else { MD_ERR("--phase-offset must be 'mcpc' or 'none'\n"); goto done; }
 		} else if ((!strcmp(a, "--noise-frames") || !strcmp(a, "-f")) && ac + 1 < argc) {
-			c.noiseframes = atoi(argv[++ac]);
+			long v;
+			if (md_parse_int(argv[++ac], &v) || v < 0 || v > INT_MAX) { MD_ERR("--noise-frames '%s' must be a non-negative integer\n", argv[ac]); goto done; }
+			c.noiseframes = (int)v;
 		} else if ((!strcmp(a, "--n-cpus") || !strcmp(a, "-n")) && ac + 1 < argc) {
-			int nt = atoi(argv[++ac]);
+			long lv;
+			int nt;
+			if (md_parse_int(argv[++ac], &lv) || lv < 1 || lv > 4096) { MD_ERR("--n-cpus '%s' must be a positive integer\n", argv[ac]); goto done; }
+			nt = (int)lv;
 #ifdef _OPENMP
 			if (nt > 0) omp_set_num_threads(nt);
 #else
@@ -982,7 +1020,9 @@ int nii_medic(int argc, char *argv[]) {
 		} else if (!strcmp(a, "--save-intermediates")) {
 			c.save_intermediates = 1;
 		} else if (!strcmp(a, "--gz") && ac + 1 < argc) {
-			gz = atoi(argv[++ac]) ? GZ_TRUE : GZ_FALSE;
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--gz must be 0 or 1\n"); goto done; }
+			gz = v ? GZ_TRUE : GZ_FALSE;
 		} else {
 			MD_ERR("unrecognized option '%s' (try --medic --help)\n", a);
 			goto done;

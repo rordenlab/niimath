@@ -39,7 +39,11 @@ def timed(cmd: list[str], tag: str, scratch: Path) -> dict:
     """Run under /usr/bin/time -l and return {wall, cpu, rss, footprint}."""
     tf = scratch / f"{tag}.time"
     with open(scratch / f"{tag}.log", "w") as out, open(tf, "w") as err:
-        subprocess.run(["/usr/bin/time", "-l"] + cmd, stdout=out, stderr=err)
+        r = subprocess.run(["/usr/bin/time", "-l"] + cmd, stdout=out, stderr=err)
+    # A failed command still produces a plausible-looking time; refuse to report it as a result.
+    if r.returncode != 0:
+        raise SystemExit(f"{tag}: command failed with exit {r.returncode}\n"
+                         f"  {' '.join(cmd)}\n  see {scratch}/{tag}.log and {tf}")
     txt = tf.read_text()
     # macOS puts the number BEFORE the label: "  15.50 real  65.50 user  4.06 sys"
     def num(label: str, pat: str = r"([\d.]+)\s+%s") -> float:

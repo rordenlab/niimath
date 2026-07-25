@@ -28,7 +28,11 @@ WK = HOME / "src/warpkit/.venv/bin"
 def timed(cmd: list[str], tag: str, scratch: Path) -> dict:
     tf = scratch / f"{tag}.time"
     with open(scratch / f"{tag}.log", "w") as out, open(tf, "w") as err:
-        subprocess.run(["/usr/bin/time", "-l"] + cmd, stdout=out, stderr=err)
+        r = subprocess.run(["/usr/bin/time", "-l"] + cmd, stdout=out, stderr=err)
+    # A failed command still produces a plausible-looking time; refuse to report it as a result.
+    if r.returncode != 0:
+        raise SystemExit(f"{tag}: command failed with exit {r.returncode}\n"
+                         f"  {' '.join(cmd)}\n  see {scratch}/{tag}.log and {tf}")
     txt = tf.read_text()
 
     def num(label: str) -> float:

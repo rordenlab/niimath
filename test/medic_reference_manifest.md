@@ -24,7 +24,8 @@ Experiment scripts (`test/medic_experiments/`, analysis-only, not shipped, not i
 | `exp07b_axis_sweep.py` | §7.7 full 10-grid × 3-letter physical-displacement sweep |
 | `exp01_08_known_field.py` | §7.1 phase scaling, §7.8 inversion, analytic field |
 | `exp04_05_12_multiframe.py` | §7.4 temporal, §7.5 low-rank, §7.12 noise frames |
-| `bench170.py` | M12 wall time / CPU time / peak RAM head-to-head |
+| `bench170.py` | M12 wall time / CPU time / peak RAM head-to-head (gzipped output, plus the apply stage) |
+| `bench_threads.py` | M12 like-for-like head-to-head at 1 and 8 threads, both tools writing uncompressed `.nii` |
 
 ## 2. Reference run inventory
 
@@ -345,7 +346,7 @@ Hypotheses not yet discriminated: truncation applied per temporal-correlation gr
 
 ## 5.3 Performance vs the reference (M12)
 
-Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), 8 threads, Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench170.py`.
+Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench_threads.py` (the like-for-like table, 1 and 8 threads, both tools uncompressed) and `test/medic_experiments/bench170.py` (the gzipped-output and apply-stage tables, 8 threads).
 
 **Estimate stage, like for like** — both writing UNCOMPRESSED `.nii`, so this compares compute rather than gzip (`test/medic_experiments/bench_threads.py`):
 
@@ -391,6 +392,8 @@ An earlier revision carried a separate unwrapped-phase series; it was removed du
 **The reference: also yes, and more.** Peak footprint is 3.40 GB against inputs that are 0.67 GiB as float32 and 1.35 GiB as float64, so it is holding every series resident (float64, on the evidence of the ratio) plus unwrapped phase, intermediates and Python overhead. Neither tool streams; niimath simply keeps a smaller resident set by working in float32 throughout.
 
 ## 6. What still needs porting
+
+> **M0 snapshot, since delivered.** MCPC-3D-S landed in M4 (`md_mcpc3ds()`, ordinary-FP in `medic.c` rather than beside the strict-FP ROMEO unit) and reproduces the reference's own `phase_offset` exactly under a shared mask — see §4. Retained because the measurements below are the record that motivated it.
 
 `--debug` also writes `phase_offset0.nii` (range ±π, the MCPC-3D-S zero-echo offset) and `phase{0,1}.nii` (per-echo unwrapped phase). Comparing niimath's current `-romeo` against `phase{0,1}.nii` shows the expected large disagreement — median 4.40 rad at echo 1, with 49 441 of 64 877 in-mask voxels off by a whole 2π — because niimath does **not** yet remove the phase offset before unwrapping. Once offsets are removed the unwrapped phases are near-perfectly linear in TE: `median(phi_2/phi_1) = 2.295230` versus `TE_2/TE_1 = 2.295238`.
 

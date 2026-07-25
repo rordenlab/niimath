@@ -8,14 +8,16 @@
 
 **`--medic` does not yet match the reference end-to-end.** Given a shared mask the native field map matches to p99 = 0.0027 Hz — so the regression, MCPC-3D-S, unwrapping, rescaling and echo handling are all correct — but ~0.24 % of voxels land on a different 2*pi branch and the inversion smears that along the phase-encoding line. With the built-in `robustmask` default the divergence is larger (p95 ~46 Hz) because the two tools' masks differ. Per the §7.2 directive we are NOT chasing the reference's mask; `--mask` is the answer.
 
-Open, deliberately not guessed: a broadband residual survives the reference's rank-10 truncation on real 170-frame data while ours is strictly rank 10 (§7.5).
+Open, deliberately not guessed: a broadband residual survives the reference's rank-10 truncation on real 170-frame data while ours is strictly rank 10 (§7.5). `--rank 0` disables the filter, and a non-finite field-map series is now a hard error — checked on the field series itself immediately after the regression, so it applies whether or not the low-rank filter runs — rather than a silently all-zero output set.
+
+**One audit round has since landed** (`audit_response.md`): the phase-encoding polarity is now honoured by `--medic` (manifest §3.5b — the highest-value finding, since the supplied three-echo data is `j-`), `--weights` governs both unwrapping stages, the temporal correction implements the paper's Eq. 6 cumulative fit for three or more echoes from an order-independent snapshot, and the memory model, grid matching, unit handling and output atomicity were corrected as recorded below. Residual items are ranked at the end of `audit_response.md`; the top one is test coverage for those fixes.
 
 ### Decided: memory model is in-RAM, and that is not a defect
 
 Streaming (the old §5.2) is a **non-goal**. A 4D `.nii.gz` cannot be seeked, so essentially every tool — including this one and the reference — reads and writes whole volumes in RAM anyway; a streaming layer would buy nothing for the dominant gzip case while adding a large validated surface. The requirement is instead to be **fast and honest about the RAM cost**: document the working-set formula, print it at startup, and state the wasm ceiling.
 
-- Resident working set: `n3 * T * (3*echoes + 1) * 4` bytes, plus the inputs held until repacking. Measured peak 2.53 GB on the 170-frame two-echo run (the reference needs 3.40 GB for the same work).
-- **wasm32 has a 4 GiB address space** and every wasm target sets `-DFORCE_INT32_MAX`. `--medic` ships in the default Emscripten build but long multi-echo runs will not fit: estimate natively, apply `-unwarp` in the browser. MEDIC is omitted from `tiny`/`nano` and from the WASI reactor.
+- Resident working set: `phase + mag + fields + fu + disp` = `n3 * T * (2*echoes + 3) * 4` bytes (1.18 GiB on the 170-frame two-echo run), printed to stderr at startup, plus the inputs held until repacking and the output buffers. Phase is unwrapped **in place**; the separate unwrapped-phase series was deleted during the audit, taking measured peak RSS from 2.53 GB to **2.35 GB** gzipped, **2.19 GB** uncompressed at 8 threads and **1.99 GB** single-threaded. The reference needs 3.39–3.53 GB for the same work (manifest §5.3).
+- **wasm32 has a 4 GiB address space** and every wasm target sets `-DFORCE_INT32_MAX`. `--medic` ships in the default Emscripten build but long multi-echo runs will not fit — roughly 10 GiB for 5 echoes × 600 frames at this resolution: estimate natively, apply `-unwarp` in the browser. MEDIC is omitted from `tiny`/`nano` and from the WASI reactor.
 
 ### Build requirement for any timing claim
 
@@ -200,7 +202,9 @@ MCPC-3D-S belongs beside the strict-FP ROMEO preprocessing code because its corr
 
 Keep validation at the public `--medic` boundary. Internal kernels may assume the context has already validated dimensions, counts, echo times, transforms, and allocation sizes. Avoid repeating defensive checks at every layer.
 
-### 5.2 Streaming and bounded memory
+### 5.2 Streaming and bounded memory — **SUPERSEDED, not implemented**
+
+> Retained for history only. Streaming is a decided **non-goal** — see the Status section above: a 4D `.nii.gz` cannot be seeked, so every tool including the reference holds whole volumes in RAM anyway. What shipped instead is the documented, printed working-set budget and the fail-atomic output rule below. Do not implement the API described here without reopening that decision.
 
 Loading every 4D echo at once defeats the design. The 170-frame, two-echo demo already requires hundreds of megabytes for the four inputs; a five-echo, 600-frame run can require tens of gigabytes.
 
@@ -316,11 +320,12 @@ Useful controls:
 --temporal-correction <0|1>
 --phase-offset <mcpc|none>
 --mask <file>              external mask, used verbatim by every stage (see section 7.2)
---weights <sel>            ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6
---block-frames <N>
---scratch-dir <path>
+--weights <sel>            ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6 (governs BOTH unwrapping stages)
 --save-intermediates
+--gz <0|1>
 ```
+
+`--block-frames` and `--scratch-dir` were part of the superseded §5.2 streaming design and were never implemented; see the Status section.
 
 Avoid exposing speculative border-filter controls until M0 establishes their semantics and importance.
 
@@ -354,7 +359,7 @@ Contract:
 - no Jacobian modulation unless M0 proves otherwise;
 - reject oversized inputs; this is not a huge-image-safe operation.
 
-The signed phase-encoding direction may be needed only while generating the displacement map. M0 must determine whether the stored map already contains the sign. Do not make `-unwarp` negate it a second time.
+The signed phase-encoding direction may be needed only while generating the displacement map. M0 must determine whether the stored map already contains the sign. Do not make `-unwarp` negate it a second time. **Answered (manifest §3.5/§3.5b):** the stored map already carries the sign, so `-unwarp` accepts a trailing `-`/`+` and ignores it — while `--medic --phase-encoding-direction` **honours** it, because the polarity drives the inversion and the displacement sign. The two are deliberately different and both are measured.
 
 ## 7. Unknown conventions and decisive experiments
 
