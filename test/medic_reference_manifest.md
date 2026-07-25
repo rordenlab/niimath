@@ -377,13 +377,20 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 | threads | tool | wall | CPU | parallelism | peak RAM |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `wk-medic` | 44.37 s | 53.29 s | 1.2x | 3.40 GB |
-| 1 | **`niimath --medic`** | **14.38 s** | **13.96 s** | 1.0x | **2.04 GB** |
+| 1 | **`niimath --medic`** | **14.38 s** | **13.96 s** | 1.0x | **1.70 GB** |
 | 8 | `wk-medic` | 15.23 s | 65.51 s | 4.3x | 3.40 GB |
-| 8 | **`niimath --medic`** | **4.15 s** | **14.91 s** | 3.6x | **2.24 GB** |
+| 8 | **`niimath --medic`** | **3.42 s** | **15.16 s** | 4.4x | **1.89 GB** |
 
-**3.09x faster single-threaded, 3.67x faster at 8 threads**, using ~4x less CPU and ~1.5x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.47x for niimath and 2.91x for the reference. Note the reference spends 53 s of CPU to do single-threaded what niimath does in 14.0 s, so its higher parallel efficiency is recovering overhead rather than winning work.
+**3.09x faster single-threaded, 4.45x faster at 8 threads**, using ~4x less CPU and ~1.5x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). Thread scaling 1→8 is 3.47x for niimath and 2.91x for the reference. Note the reference spends 53 s of CPU to do single-threaded what niimath does in 14.0 s, so its higher parallel efficiency is recovering overhead rather than winning work.
 
-These are post-audit, post-mask-gating figures — the current revision. Peak rose ~50 MB from the previous revision because the per-frame masks are now retained long enough to zero the unwrapped phase outside them, which bought a 3.3x improvement in end-to-end displacement agreement on the sbref demo with the reference mask supplied (p95 0.197 → 0.059 mm for `j`, 0.096 → 0.029 mm for `j-`; §5, §5.4), so it is a deliberate trade.
+These are the current revision. Two changes moved them since the previous round, in opposite directions and both deliberately:
+
+- **Peak RAM fell 2.04 → 1.70 GB (1 thread) and 2.24 → 1.89 GB (8 threads)** once geometry validation moved to headers alone and each echo pair is loaded, repacked and freed in turn. Previously all `2E` input payloads were still resident when the work arrays were allocated, so the true peak was ~`(4E+3)` series while the banner reported `(2E+3)`.
+- **Wall time fell 4.15 → 3.42 s at 8 threads despite this round ADDING correctness work** (mask gating, per-voxel temporal validity counting, fold detection), because the group-mean accumulation is hoisted when every frame falls in one temporal group — exact, the same values summed in the same order, removing ~7.7e9 float adds on this dataset.
+
+The mask retention that costs a little memory bought a 3.3x improvement in end-to-end displacement agreement on the sbref demo with the reference mask supplied (p95 0.197 → 0.059 mm for `j`, 0.096 → 0.029 mm for `j-`; §5, §5.4).
+
+**Treat the RATIO as the robust quantity.** Runs taken while other jobs competed for cores showed both tools ~1.5x slower with the ratio preserved (3.1x single-threaded, 4.1x at 8 threads). Re-measure on an idle machine before quoting absolute seconds.
 
 **Estimate stage, gzipped output** (`wk-medic` vs `niimath --medic`):
 
