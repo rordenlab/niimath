@@ -1765,6 +1765,23 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 				}
 			}
 			if (manifest) {
+				/* Seed scalars: the plan's M5 gate names them explicitly, so make them
+				   directly comparable with the oracle manifest rather than implied by the
+				   (bit-exact) weights they are derived from. */
+				rm_seedq sq;
+				if (!rm_seedq_build(&sq, weights, n3)) {
+					int64_t sd = rm_seedq_isempty(&sq) ? 0 : rm_seedq_dequeue(&sq);
+					fprintf(manifest, "seed_index %lld\n", (long long)sd);
+					if (sd > 0) {
+						int w1 = weights[rm_getedgeindex(sd, 1) - 1];
+						int w2 = weights[rm_getedgeindex(sd, 2) - 1];
+						int w3 = weights[rm_getedgeindex(sd, 3) - 1];
+						fprintf(manifest, "seed_w1 %d\nseed_w2 %d\nseed_w3 %d\n", w1, w2, w3);
+						fprintf(manifest, "new_seed_thresh %.17g\n",
+							(double)RM_NBINS - trunc(((double)RM_NBINS - (double)(w1 + w2 + w3) / 3.0) / 2.0));
+					}
+					rm_seedq_free(&sq);
+				}
 				fprintf(manifest, "flags_active %d%d%d%d%d%d\n",
 					c.flags[0], c.flags[1], c.flags[2], c.flags[3], c.flags[4], c.flags[5]);
 				if (have_mag) fprintf(manifest, "maxmag %.17g\n", c.maxmag);

@@ -124,6 +124,36 @@ def cmp_float(res: Result, label: str, ref: str, got: str, tol: float, wrap_chec
     res.add(label, ok, detail)
 
 
+def cmp_seed_scalars(res: Result, tag: str, ref: str, cmanifest: str) -> None:
+    """Seed voxel index and new_seed_thresh (plan M5 gate) — compared directly, not merely
+    implied by the byte-exact weights they are derived from."""
+    label = f"{tag}: seed scalars"
+    orapath = os.path.join(ref, "manifest.txt")
+    if not os.path.exists(orapath) or not os.path.exists(cmanifest):
+        res.add(label, False, "missing manifest")
+        return
+    want = {}
+    for line in open(orapath):
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "scalar" and parts[1].startswith(tag + "_"):
+            key = parts[1][len(tag) + 1:]
+            if key in ("seed_index", "seed_w1", "seed_w2", "seed_w3", "new_seed_thresh"):
+                want[key] = float(parts[2])
+    got = {}
+    for line in open(cmanifest):
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in ("seed_index", "seed_w1", "seed_w2", "seed_w3", "new_seed_thresh"):
+            got[parts[0]] = float(parts[1])
+    if not want:
+        res.add(label, False, "oracle has no seed scalars")
+        return
+    bad = [k for k in want if k not in got or got[k] != want[k]]
+    if bad:
+        res.add(label, False, "mismatch: " + ", ".join("%s oracle=%g c=%s" % (k, want[k], got.get(k)) for k in bad))
+    else:
+        res.add(label, True, "seed=%d new_seed_thresh=%g exact" % (int(want["seed_index"]), want.get("new_seed_thresh", 0)))
+
+
 def run_niimath(binary: str, args: list[str], cwd: str) -> tuple[int, str]:
     p = subprocess.run([binary] + args, cwd=cwd, capture_output=True, text=True)
     return p.returncode, (p.stdout + p.stderr)
@@ -171,10 +201,36 @@ def check_case(binary: str, ref: str, tag: str, datadir: str, phase: str, mag: s
             for st in ("mask_s1_thresh.u8", "mask_s2_smooth1.u8", "mask_s3_fill.u8", "mask_s4_final.u8"):
                 cmp_exact(res, f"{tag}: {st.split('.')[0]}", R(st), C(st))
         cmp_exact(res, f"{tag}: visited", R("visited.u8"), C("visited.u8"))
+        cmp_seed_scalars(res, tag, ref, os.path.join(tmp, "c_manifest.txt"))
         cmp_float(res, f"{tag}: qmap", R("qmap.f32"), C("qmap.f32"), 1e-6)
         for qi in range(1, 7):
             cmp_float(res, f"{tag}: qmap_{qi}", R(f"qmap_{qi}.f32"), C(f"qmap_{qi}.f32"), 1e-6)
         cmp_float(res, f"{tag}: unwrapped", R("unwrapped.f32"), C("unwrapped.f32"), 1e-4, wrap_check=True)
+
+        # Variant runs. The oracle dumps these arrays (M5/M6 exit criteria); each needs its own
+        # niimath invocation because they change the unwrapping, not just an output.
+        variants = [("correct-global", ["-g"], "unwrapped_correctglobal.f32")]
+        if tag in ("me", "me_a"):
+            variants += [
+                ("individual", ["-i"], "unwrapped_individual.f32"),
+                ("tuu 0.5", ["-temporal-uncertain-unwrapping", "0.5"], "unwrapped_tuu05.f32"),
+                ("template 2", ["-template", "2"], "unwrapped_template2.f32"),
+            ]
+        for label, extra_args, refname in variants:
+            if not os.path.exists(R(refname)):
+                continue
+            tmpv = tempfile.mkdtemp(prefix="romeo_v_")
+            try:
+                av = [phase, "-romeo", mag if mag else "none"] + extra + extra_args + \
+                     ["-romeo-dump", tmpv, os.path.join(tmpv, "o")]
+                rcv, logv = run_niimath(binary, av, datadir)
+                if rcv != 0:
+                    res.add(f"{tag}: {label}", False, f"exit {rcv}: {logv.strip()[:150]}")
+                    continue
+                cmp_float(res, f"{tag}: {label}", R(refname),
+                          os.path.join(tmpv, "c_unwrapped.f32"), 1e-4, wrap_check=True)
+            finally:
+                shutil.rmtree(tmpv, ignore_errors=True)
 
         if weights_all:
             for sel in WEIGHT_SELECTIONS:
@@ -193,6 +249,80 @@ def check_case(binary: str, ref: str, tag: str, datadir: str, phase: str, mag: s
                     shutil.rmtree(tmp2, ignore_errors=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def write_f32_nifti(path: str, dims: tuple[int, int, int], data: list[float]) -> None:
+    """Minimal NIfTI-1 (n+1) float32 writer for the synthetic property fixtures."""
+    hdr = bytearray(348)
+    struct.pack_into("<i", hdr, 0, 348)
+    struct.pack_into("<8h", hdr, 40, 3, dims[0], dims[1], dims[2], 1, 1, 1, 1)
+    struct.pack_into("<h", hdr, 70, 16)   # DT_FLOAT32
+    struct.pack_into("<h", hdr, 72, 32)   # bitpix
+    struct.pack_into("<8f", hdr, 76, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    struct.pack_into("<f", hdr, 108, 352.0)
+    struct.pack_into("<f", hdr, 112, 1.0)
+    hdr[123] = 2                          # xyz_units = mm
+    struct.pack_into("<h", hdr, 252, 1)
+    struct.pack_into("<h", hdr, 254, 1)
+    struct.pack_into("<4f", hdr, 280, 1.0, 0.0, 0.0, 0.0)
+    struct.pack_into("<4f", hdr, 296, 0.0, 1.0, 0.0, 0.0)
+    struct.pack_into("<4f", hdr, 312, 0.0, 0.0, 1.0, 0.0)
+    hdr[344:348] = b"n+1\0"
+    with open(path, "wb") as f:
+        f.write(bytes(hdr) + b"\0\0\0\0" + struct.pack("<%df" % len(data), *data))
+
+
+def check_features_property(binary: str, res: Result) -> None:
+    """ROMEO.jl test/features.jl, reimplemented against the C port (plan M5 exit criterion).
+
+        for l in 7:5:20, offset in 2pi*[0,2,-1,10,-50], mag in [nothing, 10:1, 1:10]
+            unwrap(rem2pi(phase_uw) + offset; mag, correctglobal=true) ~= phase_uw
+
+    The library call takes the array directly, so the app-level behaviours must be switched off
+    to match it: -no-phase-rescale (readphase would rescale this input), -k nomask (the library
+    default mask is `trues`; robustmask also needs >=20 voxels), and -w romeo4, which is the
+    LIBRARY's :romeo flag set (1-4) — the CLI would otherwise resolve bare `romeo` to romeo3.
+    """
+    tmp = tempfile.mkdtemp(prefix="romeo_feat_")
+    npass = 0
+    try:
+        for length in range(7, 21, 5):
+            uw = [-TWO_PI + 2.0 * TWO_PI * i / (length - 1) for i in range(length)]
+            for offset in [TWO_PI * k for k in (0, 2, -1, 10, -50)]:
+                wrapped = [x - TWO_PI * round(x / TWO_PI) + offset for x in uw]
+                phase_path = os.path.join(tmp, "p.nii")
+                write_f32_nifti(phase_path, (length, 1, 1), wrapped)
+                mags = [None,
+                        [10.0 - 9.0 * i / (length - 1) for i in range(length)],
+                        [1.0 + 9.0 * i / (length - 1) for i in range(length)]]
+                for mi, magvals in enumerate(mags):
+                    if magvals is None:
+                        magarg = "none"
+                    else:
+                        magarg = os.path.join(tmp, "m.nii")
+                        write_f32_nifti(magarg, (length, 1, 1), magvals)
+                    out = os.path.join(tmp, "o.nii")
+                    label = "features l=%d off=%dpi mag=%d" % (length, round(offset / math.pi), mi)
+                    rc, log = run_niimath(binary, [phase_path, "-gz", "0", "-romeo", magarg,
+                                                   "-w", "romeo4", "-k", "nomask",
+                                                   "-no-phase-rescale", "-g", out], tmp)
+                    if rc != 0:
+                        res.add(label, False, "exit %d: %s" % (rc, log.strip()[:120]))
+                        continue
+                    got = read_raw(out, "f")[352 // 4:] if False else None
+                    with open(out, "rb") as f:
+                        blob = f.read()
+                    off = int(struct.unpack_from("<f", blob, 108)[0])
+                    got = list(struct.unpack_from("<%df" % length, blob, off))
+                    worst = max(abs(a - b) for a, b in zip(got, uw))
+                    if worst > 1e-4:
+                        res.add(label, False, "max|diff| from ground truth = %.3e" % worst)
+                    else:
+                        npass += 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    res.add("features.jl property (%d cases)" % npass, True,
+            "unwrap(...; correctglobal) == ground truth for l in 7:5:20 x 5 offsets x 3 magnitudes")
 
 
 def main() -> int:
@@ -232,6 +362,8 @@ def main() -> int:
         if not wanted or "me_a" in (wanted or []):
             check_case(binary, ref, "me_a", fixdir, "me_a_phase.nii", "me_a_mag.nii",
                        ["-t", "[16.8,38.56]"], res, args.weights_all)
+
+    check_features_property(binary, res)
 
     failed = res.report()
     total = len(res.rows)

@@ -269,7 +269,9 @@ function run_case(tag; phasefile, magfile, TEs, template = 1)
     for (wname, wsel) in WEIGHT_SELECTIONS
         w = R.calculateweights(ptemplate; wkey..., weights = wsel)
         dump_u8("$(tag)_weights_$(wname).u8", w)
-        wname == "romeo3" && (wref = w)
+        # capture the DEFAULT selection's weights for the seed scalars below -- hardcoding
+        # "romeo3" here silently used the wrong weight set for every magnitude-free case.
+        wname == string(mag === nothing ? :romeo4 : :romeo3) && (wref = w)
     end
     # the resolved default: `romeo` -> romeo3 with magnitude, romeo4 without
     wdefault = mag === nothing ? :romeo4 : :romeo3
@@ -324,8 +326,15 @@ function run_case(tag; phasefile, magfile, TEs, template = 1)
             dump_f32("$(tag)_unwrapped_individual.f32", u)
         end
         if neco >= 2
+            # The app rebuilds the mask for the SELECTED template: set_mask! uses
+            # `robustmask(mag[:,:,:,min(settings["template"], size(mag,4))])`.  Reusing the
+            # template-1 mask here would make this variant a run the CLI can never produce.
             let u = copy(phase), k2 = Dict{Symbol,Any}(key)
                 k2[:template] = 2
+                if mag !== nothing
+                    te2 = min(2, size(mag, 4))
+                    k2[:mask] = robustmask(ndims(mag) == 4 ? mag[:, :, :, te2] : mag)
+                end
                 unwrap!(u; k2...)
                 dump_f32("$(tag)_unwrapped_template2.f32", u)
             end
