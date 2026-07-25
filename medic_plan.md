@@ -298,6 +298,8 @@ Useful controls:
 --rank <N>                 default 10; 0 disables
 --temporal-correction <0|1>
 --phase-offset <mcpc|none>
+--mask <file>              external mask, used verbatim by every stage (see section 7.2)
+--weights <sel>            ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6
 --block-frames <N>
 --scratch-dir <path>
 --save-intermediates
@@ -345,7 +347,16 @@ Run these before implementing the affected component:
    Feed integer phase with known stored range and scaling. Determine whether the reference uses header scaling, observed extrema, a fixed scanner range, or radians declared in JSON.
 
 2. **Mask generation and use.**
-   Capture reference masks with public debug/intermediate output. Compare against ROMEO robustmask. Determine whether the mask controls unwrapping, regression, SVD, border processing, output zeroing, or some subset.
+   Capture reference masks with public debug/intermediate output. Determine *what the mask controls* — unwrapping, regression, SVD, border processing, output zeroing, or some subset — and whether one mask is shared across stages.
+
+   **Do not attempt to reproduce the reference's mask exactly.** Both implementations use crude, heuristic masks and neither is authoritative, so bit-matching one to the other buys nothing scientific and is an open-ended reverse-engineering task. The requirement is instead:
+
+   - `--mask <file>` accepts an **external mask**, used verbatim by every stage that needs one.
+   - That option is what makes exact cross-validation possible: supply the *same* mask to both implementations and any remaining difference is a real algorithmic difference, not a masking difference.
+   - It also lets users supply a **better** brain mask than either tool's built-in heuristic (e.g. mindgrab), which is the more useful capability in practice.
+   - The built-in default remains ROMEO's `robustmask`; no attempt is made to match the reference's own construction.
+
+   Consequently, parity gates below are evaluated **with a shared supplied mask**. Differences attributable solely to mask choice are reported, not chased.
 
 3. **MCPC smoothing.**
    Compare raw Eq. 4 and the pinned MriResearchTools MCPC-3D-S result against reference unwrapped phases.
@@ -480,6 +491,9 @@ Each experiment should be a small script or documented command with an analytic 
 **Gate:** normal regression tests pass; serial UBSan passes; `MallocScribble=1 MallocGuardEdges=1` passes the small end-to-end fixture; Darwin `leaks` is clean; build-off configurations do not reference MEDIC symbols.
 
 ### M12 — Performance
+
+**Build against zlib-ng (or zlib-cloudflare), not system zlib.** Plain `make` links `-lz`; use `make -C src ZLIBNG_ROOT=<path-to-zlib-compat-build>`, or the CMake release path, which defaults to `ZLIB_IMPLEMENTATION=zlib-ng`. On the 170-frame run this is not a rounding error: gzip of the three float32 output series dominates the serial tail, and switching to zlib-ng took the estimate stage from 16.2 s to 10.6 s wall. Any timing comparison made with a system-zlib build understates niimath by ~35 % and should be rejected.
+
 
 - Profile decompression, ROMEO, temporal correlations, SVD, inversion, and output compression separately.
 - Compare wall time and peak RSS with the recorded Warpkit baseline.

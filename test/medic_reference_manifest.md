@@ -319,6 +319,38 @@ There is a clean factor-2 drop at index 10 (770.6 -> 383.3), so a rank-10 trunca
 
 Hypotheses not yet discriminated: truncation applied per temporal-correlation group rather than globally; a residual add-back (Eq. 9 read as a correction rather than a replacement); or truncation applied before a later full-rank stage. **Deliberately not guessed.** `--rank 0` disables the filter for anyone who wants the raw regression.
 
+## 5.3 Performance vs the reference (M12)
+
+Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + phase), 8 threads, Apple Silicon (10P+4E, 48 GB). Reproduce with `test/medic_experiments/bench170.py`.
+
+**Estimate stage** (`wk-medic` vs `niimath --medic`):
+
+| tool | wall | CPU | parallelism | peak RAM |
+| --- | --- | --- | --- | --- |
+| `wk-medic` | 15.63 s | 65.07 s | 4.2x | 3.40 GB |
+| `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.53 GB** |
+| `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.53 GB |
+
+**Apply stage** (one echo, 170 frames):
+
+| tool | wall | CPU | parallelism | peak RAM |
+| --- | --- | --- | --- | --- |
+| `wk-apply-warp` | 50.72 s | 485.62 s | 9.6x | 1.14 GB |
+| `niimath -unwarp` | **4.68 s** | **17.47 s** | 3.7x | **0.59 GB** |
+
+So: 1.5x faster and 3.3x less CPU on the estimate, 10.8x faster and 28x less CPU on the apply, at 1.3-1.9x less RAM — while writing float32 (172 MB/series) against the reference's uint16 (86 MB/series). The reference parallelises harder (4.2x / 9.6x) but spends far more total CPU to get there.
+
+Two build gotchas that invalidate this table if ignored:
+
+- **Verify OpenMP is actually linked.** `./src/niimath <img> -p 8 -s 1 out.nii` must print `Using 8 threads`. A stale object from a `make OMP=0 / ROMEO=0 / MEDIC=0` build silently yields a serial binary; a first run of this benchmark measured 1.0x parallelism for exactly that reason and had to be discarded.
+- **Build against zlib-ng, not system zlib** (`make -C src ZLIBNG_ROOT=...`, or the CMake release path, which defaults to it). Output gzip is the dominant serial tail: system zlib gives 16.21 s where zlib-ng gives 10.64 s. `--gz 0` isolates it at 4.29 s, and is the like-for-like comparison since the reference writes uncompressed `.nii`.
+
+### Is everything held in RAM?
+
+**niimath: yes, by design** (the plan's streaming module was deliberately descoped). The working set is `n3 * T * (3*echoes + 1) * 4` bytes — printed at startup, 1.18 GiB here — and peak RSS of 2.53 GB adds the transient input images held before repacking plus the three output buffers. Memory grows linearly with frames x echoes; a 5-echo/600-frame run at this resolution would need roughly 12 GiB, which is where `--block-frames` streaming would have to come back.
+
+**The reference: also yes, and more.** Peak footprint is 3.40 GB against inputs that are 0.67 GiB as float32 and 1.35 GiB as float64, so it is holding every series resident (float64, on the evidence of the ratio) plus unwrapped phase, intermediates and Python overhead. Neither tool streams; niimath simply keeps a smaller resident set by working in float32 throughout.
+
 ## 6. What still needs porting
 
 `--debug` also writes `phase_offset0.nii` (range ±π, the MCPC-3D-S zero-echo offset) and `phase{0,1}.nii` (per-echo unwrapped phase). Comparing niimath's current `-romeo` against `phase{0,1}.nii` shows the expected large disagreement — median 4.40 rad at echo 1, with 49 441 of 64 877 in-mask voxels off by a whole 2π — because niimath does **not** yet remove the phase offset before unwrapping. Once offsets are removed the unwrapped phases are near-perfectly linear in TE: `median(phi_2/phi_1) = 2.295230` versus `TE_2/TE_1 = 2.295238`.
