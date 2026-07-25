@@ -52,3 +52,4 @@ coreg_plan.md
 # ROMEO parity oracle: large derived goldens, regenerate with test/romeo_oracle.sh
 /test/romeo_ref/
 /src/.romeo_obj_flags
+/test/medic_ref/
