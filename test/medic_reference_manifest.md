@@ -352,8 +352,8 @@ Same workload as `demo/run170.sh` (76x76x46 x 170 frames, 2 echoes, magnitude + 
 | tool | wall | CPU | parallelism | peak RAM |
 | --- | --- | --- | --- | --- |
 | `wk-medic` | 15.63 s | 65.07 s | 4.2x | 3.40 GB |
-| `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.53 GB** |
-| `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.53 GB |
+| `niimath --medic` (gz out) | **10.64 s** | **19.95 s** | 1.9x | **2.35 GB** |
+| `niimath --medic` (`--gz 0`) | **4.29 s** | 13.39 s | 3.1x | 2.35 GB |
 
 **Apply stage** (one echo, 170 frames):
 
@@ -371,7 +371,11 @@ Two build gotchas that invalidate this table if ignored:
 
 ### Is everything held in RAM?
 
-**niimath: yes, by design** (the plan's streaming module was deliberately descoped). The working set is `n3 * T * (3*echoes + 1) * 4` bytes — printed at startup, 1.18 GiB here — and peak RSS of 2.53 GB adds the transient input images held before repacking plus the three output buffers. Memory grows linearly with frames x echoes; a 5-echo/600-frame run at this resolution would need roughly 12 GiB, which is where `--block-frames` streaming would have to come back.
+**niimath: yes, by design, and that is a decided position rather than an omission.** A 4D `.nii.gz` cannot be seeked, so every tool — including the reference — reads and writes whole volumes in RAM anyway; a streaming layer would buy nothing for the dominant gzip case. The requirement is instead to be fast and honest about the cost.
+
+The resident working set is `n3 * T * (2*echoes + 3) * 4` bytes, printed at startup (1.18 GiB here); peak RSS of 2.35 GB adds the input images held until repacking plus the output buffers. It grows linearly with frames x echoes, so a 5-echo/600-frame run at this resolution needs roughly 10 GiB — fine natively, and **impossible in wasm32**, whose 4 GiB address space (and `-DFORCE_INT32_MAX` on every wasm target) is why `--medic` is documented as native-scale-only while `-unwarp` is browser-friendly.
+
+An earlier revision carried a separate unwrapped-phase series; it was removed during the audit (phase is unwrapped in place), taking peak from 2.53 GB to 2.35 GB.
 
 **The reference: also yes, and more.** Peak footprint is 3.40 GB against inputs that are 0.67 GiB as float32 and 1.35 GiB as float64, so it is holding every series resident (float64, on the evidence of the ratio) plus unwrapped phase, intermediates and Python overhead. Neither tool streams; niimath simply keeps a smaller resident set by working in float32 throughout.
 
