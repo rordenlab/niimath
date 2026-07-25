@@ -92,7 +92,15 @@ MEDICFLAGS= -DHAVE_MEDIC medic.c
 DT_WASM= $(TFILES) $(DTFLAGS)
 #QC metrics for the WASM target; grouped so "QC=0 make wasm" drops it (qc.c is
 #self-contained and wasm-safe: only core.h helpers, comparator-free quickselect, no OpenMP)
-QC_WASM= $(QCFLAGS) $(MEDICFLAGS)
+QC_WASM= $(QCFLAGS)
+# MEDIC in the default Emscripten build: --medic and -unwarp are useful in the browser and
+# -unwarp is cheap, so they ship. DELIBERATE LIMIT, not an oversight: wasm32 is a 4 GiB address
+# space and every wasm target sets -DFORCE_INT32_MAX, while --medic holds the whole run resident
+# (n3 * T * (3*echoes + 1) * 4 bytes). The 170-frame two-echo demo needs ~2.5 GB, so long
+# multi-echo runs will not fit in the browser -- estimate on a native binary and apply -unwarp in
+# wasm. Omitted from tiny/nano (like every other optional feature) and from the WASI reactor,
+# which is a lean zlib-free compute backend.
+MEDIC_WASM= $(MEDICFLAGS)
 #Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spm_coreg. OFF by
 #default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
 #provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).
@@ -396,7 +404,7 @@ wasm_al_objs:
 WASM_OUT= ../js/src/niimath.js
 
 wasm: $(WASM_AL_PREREQ) $(WASM_ROMEO_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 

@@ -21,6 +21,7 @@
 // regression, SVD and resampling here are ordinary numerics.  See AGENTS.md.
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,6 +47,10 @@
 #define MD_INVERT_ITERS 64      /* fixed point; converged well before this (manifest §3.4) */
 #define MD_INVERT_TOL 1e-6f     /* Hz; early exit */
 #define MD_CORR_THRESH 0.98     /* paper §2.1.3 magnitude-correlation grouping */
+/* Guards against undefined float->int conversion.  Any displacement or sample position outside
+   these bounds (including NaN and +-Inf, which fail the comparisons) is treated as out of FOV. */
+#define MD_DISP_LIMIT 1.0e9
+#define MD_POS_LIMIT 1.0e9
 
 /* ============================== small helpers ============================== */
 
@@ -56,8 +61,12 @@ static float md_wrapf(double x) {
 }
 
 static int md_axis_index(const char *s, int *sign_suffix) {
-	/* i/x -> 0, j/y -> 1, k/z -> 2.  A trailing '-' is accepted and IGNORED: the reference
-	   applies no sign from the letter, the sign already lives in the stored map (manifest §3.5). */
+	/* i/x -> 0, j/y -> 1, k/z -> 2, with the polarity reported through `sign_suffix`.
+	   The two callers treat that polarity DIFFERENTLY, and both are measured:
+	     --medic  HONOURS it -- the reference returns an identical native field for j and j- but a
+	              near-negated displacement map (corr -0.918), so the sign drives the inversion.
+	     -unwarp  IGNORES it -- by then the sign already lives in the stored map (manifest 3.5),
+	              and applying it again would double-correct. */
 	int idx = -1;
 	size_t n;
 	if (!s) return -1;
@@ -122,13 +131,17 @@ static int md_inv3(const double A[3][3], double Inv[3][3]) {
  * Verified on 30 synthetic grid/letter combinations exactly, and on the real oblique demo data at
  * nrmse 3.5e-5 (versus 4.3e-2 for the image's own column direction).
  *
- * Units cancel: A and the map are both in the header's xyz_units, so A^-1 @ d is dimensionless
- * voxels whether the header declares mm, metres or microns.  No unit normalisation is needed here. */
+ * The map is in MILLIMETRES by contract, so A is normalised to millimetres via xyz_units_to_mm()
+ * before inversion.  A mm-unit header (every real neuroimaging NIfTI) scales by exactly 1.0 and is
+ * bit-identical to the un-normalised form; a metre- or micron-unit header would otherwise be off
+ * by 1000x. */
 static int md_offset_per_mm(const nifti_image *nim, int m, double s_per_mm[3]) {
 	double A[3][3], Inv[3][3], u[3], nrm = 0.0, kappa[3] = { -1.0, -1.0, 1.0 };
 	double delta[3] = { 0.0, 0.0, 0.0 };
-	int r, w = 0;
+	double unit = xyz_units_to_mm(nim->xyz_units);
+	int r, c, w = 0;
 	md_xform3(nim, A);
+	if (unit != 1.0) for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) A[r][c] *= unit;
 	for (r = 0; r < 3; r++) nrm += A[r][m] * A[r][m];
 	nrm = sqrt(nrm);
 	if (!(nrm > 1e-12)) return 1;
@@ -171,11 +184,19 @@ static void md_pull(const float *in, float *out, int nx, int ny, int nz,
 			for (x = 0; x < nx; x++) {
 				int64_t o = (int64_t)x + (int64_t)y * nx + (int64_t)z * nxy;
 				double d = (double)disp[o];
-				double px = x + d * s_per_mm[0], py = y + d * s_per_mm[1], pz = z + d * s_per_mm[2];
+				double px, py, pz;
 				double wx[2 * MD_LANCZOS_R], wy[2 * MD_LANCZOS_R], wz[2 * MD_LANCZOS_R];
-				int bx = (int)floor(px), by = (int)floor(py), bz = (int)floor(pz);
+				int bx, by, bz;
 				double acc = 0.0;
 				int tx, ty, tz;
+				/* A non-finite map value would make floor() non-finite and the cast to int
+				   UNDEFINED. Treat such a voxel as fully out of FOV (the documented fill). */
+				if (!(d >= -MD_DISP_LIMIT && d <= MD_DISP_LIMIT)) { out[o] = 0.0f; continue; }
+				px = x + d * s_per_mm[0]; py = y + d * s_per_mm[1]; pz = z + d * s_per_mm[2];
+				if (!(px >= -MD_POS_LIMIT && px <= MD_POS_LIMIT) ||
+					!(py >= -MD_POS_LIMIT && py <= MD_POS_LIMIT) ||
+					!(pz >= -MD_POS_LIMIT && pz <= MD_POS_LIMIT)) { out[o] = 0.0f; continue; }
+				bx = (int)floor(px); by = (int)floor(py); bz = (int)floor(pz);
 				/* Fast path: an exactly-zero displacement is the identity for this kernel
 				   (sinc vanishes at every nonzero integer), which keeps unshifted background
 				   voxels bit-exact and skips 1000 taps for them. */
@@ -217,39 +238,47 @@ static void md_pull(const float *in, float *out, int nx, int ny, int nz,
 /* Read a NIfTI as float32.  Returns the image (caller frees with nifti_image_free) with
    ->data already converted, or NULL. */
 static nifti_image *md_read_f32(const char *fn, const char *what) {
-	nifti_image *n = nifti_image_read(fn, 1);
+	nifti_image *n;
 	in_hdr ihdr;
+	{	/* Header-only preflight: reject an oversized or malformed image BEFORE decompressing
+		   and allocating its payload, rather than after. */
+		nifti_image *h = nifti_image_read(fn, 0);
+		int bad = 0;
+		if (!h) { MD_ERR("failed to read the header of %s '%s'\n", what, fn); return NULL; }
+		if (h->nvox < 1 || h->nx < 1 || h->ny < 1 || h->nz < 1) {
+			MD_ERR("%s '%s' has invalid dimensions\n", what, fn); bad = 1;
+		} else if (h->nu > 1 || h->nv > 1 || h->nw > 1) {
+			MD_ERR("%s '%s' has more than 4 dimensions (5D input is out of scope)\n", what, fn); bad = 1;
+		} else if ((int64_t)h->nvox > INT_MAX) {
+			MD_ERR("%s '%s' exceeds INT_MAX voxels; --medic is not a huge-image-safe operation\n", what, fn);
+			bad = 1;
+		}
+		nifti_image_free(h);
+		if (bad) return NULL;
+	}
+	n = nifti_image_read(fn, 1);   /* the preflight above already validated dims / 4D / INT_MAX */
 	if (!n) { MD_ERR("failed to read %s '%s'\n", what, fn); return NULL; }
-	if (n->nvox < 1 || n->nx < 1 || n->ny < 1 || n->nz < 1) {
-		MD_ERR("%s '%s' has invalid dimensions\n", what, fn); nifti_image_free(n); return NULL;
-	}
-	if (n->nu > 1 || n->nv > 1 || n->nw > 1) {
-		MD_ERR("%s '%s' has more than 4 dimensions (5D input is out of scope)\n", what, fn);
-		nifti_image_free(n); return NULL;
-	}
-	if ((int64_t)n->nvox > INT_MAX) {
-		MD_ERR("%s '%s' exceeds INT_MAX voxels; --medic is not a huge-image-safe operation\n", what, fn);
-		nifti_image_free(n); return NULL;
-	}
 	ihdr = set_input_hdr(n);
-	if (n->datatype != DT_FLOAT32 && nifti_image_change_datatype(n, DT_FLOAT32, &ihdr) != 0) {
-		MD_ERR("failed to convert %s '%s' to float32\n", what, fn);
-		nifti_image_free(n); return NULL;
+	/* Convert when the stored type is not float32, but ALSO when it IS float32 and carries a
+	   non-trivial scl_slope/scl_inter -- otherwise a scaled float32 image is silently used raw.
+	   That bit anyone storing a displacement map as float32 with a slope. */
+	if (n->datatype != DT_FLOAT32 ||
+		(n->scl_slope != 0.0f && n->scl_slope != 1.0f) || n->scl_inter != 0.0f) {
+		if (nifti_image_change_datatype(n, DT_FLOAT32, &ihdr) != 0) {
+			MD_ERR("failed to convert %s '%s' to float32\n", what, fn);
+			nifti_image_free(n); return NULL;
+		}
 	}
 	return n;
 }
 
-/* Do two images share a grid?  Dimensions exactly, and the world transform to a tight tolerance. */
-static int md_same_grid(const nifti_image *a, const nifti_image *b) {
-	double A[3][3], B[3][3];
-	int r, c;
-	if (a->nx != b->nx || a->ny != b->ny || a->nz != b->nz) return 0;
-	md_xform3(a, A); md_xform3(b, B);
-	for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) {
-		double s = fabs(A[r][c]) + fabs(B[r][c]) + 1e-6;
-		if (fabs(A[r][c] - B[r][c]) > 1e-4 * s) return 0;
-	}
-	return 1;
+/* Do two images share a grid?  Dimensions exactly, plus the project's existing world-transform
+   metric -- max_displacement_mm() measures true 3D corner displacement AND normalises each header
+   to millimetres via xyz_units, so it covers rotation, scale, origin and units in one call.  This
+   is the same 0.001 mm gate --qc uses for its own same-grid requirement. */
+static int md_same_grid(nifti_image *a, nifti_image *b) {
+	return a->nx == b->nx && a->ny == b->ny && a->nz == b->nz &&
+		max_displacement_mm(a, b) <= 0.001f;
 }
 
 /* ============================== -unwarp ============================== */
@@ -403,11 +432,23 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 		int64_t chunk;
 		const int64_t CH = 1 << 16;
 		float *tmp = NULL;
+		int oom = 0;
+		{	/* Check the scratch SIZE ARITHMETIC up front.  The malloc itself still happens per
+			   thread inside the region, so an OOM there can leave some chunks unfiltered before
+			   the reduction reports it -- hence the error text below says so.  Fail-loud, not
+			   atomic. */
+			size_t bytes;
+			if (nii_mul_size((size_t)(CH < nvox ? CH : nvox) * T, sizeof(float), &bytes)) {
+				MD_ERR("low-rank scratch size overflows this build's address space\n");
+				goto done;
+			}
+		}
 #ifdef _OPENMP
-		#pragma omp parallel private(tmp)
+		#pragma omp parallel private(tmp) reduction(|:oom)
 #endif
 		{
 			tmp = (float *)malloc((size_t)(CH < nvox ? CH : nvox) * T * sizeof(float));
+			if (!tmp) oom = 1;
 #ifdef _OPENMP
 			#pragma omp for schedule(static)
 #endif
@@ -429,6 +470,7 @@ static int md_lowrank(float *F, int64_t nvox, int T, int rank) {
 			}
 			free(tmp);
 		}
+		if (oom) { MD_ERR("out of memory in the low-rank filter (the field series may be partly filtered)\n"); goto done; }
 	}
 	rc = 0;
 done:
@@ -444,6 +486,7 @@ typedef struct {
 	double TEs[MD_MAX_ECHO];      /* milliseconds */
 	double trt;                   /* seconds */
 	int pe_axis;                  /* 0/1/2 */
+	int pe_sign;                  /* +1 for i/j/k, -1 for i-/j-/k-  (see md_invert) */
 	int rank;
 	int temporal;
 	int mcpc;
@@ -506,6 +549,10 @@ static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const rom
 	}
 	{	/* Single-echo spatial unwrap of the phase difference.
 		 *
+		 * The weight preset comes from the caller (`--weights`, default romeo4) and is applied
+		 * here as well as to the multi-echo unwrap -- the reference uses one preset for both, so
+		 * overriding it here would make --weights a half-measure.
+		 *
 		 * Both choices here are MEASURED, not defaults: with the SHARED mask and romeo4 weights
 		 * the resulting offset reproduces the reference's own phase_offset EXACTLY (frac exact
 		 * 1.0000, p95 0.0000 rad).  romeo3 / a per-HIP robustmask / nomask all leave 11-18 % of
@@ -514,7 +561,6 @@ static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const rom
 		romeo_opts o = *ro;
 		o.nTE = 1; o.TEs[0] = te1; o.te_epi = 0; o.template_echo = 1;
 		o.individual = 0; o.correctglobal = 0;
-		o.weights_sel = RM_W_ROMEO4;
 		if (romeo_unwrap_frame(hipp, hipm, 1, c->nx, c->ny, c->nz, 1, &te1, &o, mask, NULL)) {
 			MD_ERR("ROMEO failed while unwrapping the MCPC-3D-S phase difference\n");
 			goto done;
@@ -555,7 +601,18 @@ static void md_regress(const md_ctx *c, const float *phase, const float *mag, fl
  *
  * Frames are grouped by magnitude correlation >= MD_CORR_THRESH on the FIRST echo; each frame's
  * first-echo unwrapped phase is moved to the 2*pi branch nearest its group mean, and every later
- * echo to the branch predicted by the already-corrected first echo (phi_e ~ phi_1 * TE_e/TE_1).
+ * echo to the branch predicted by ALL previously corrected echoes.
+ *
+ * That prediction is the paper's Eq. 6: a through-origin fit over the echoes already corrected,
+ *
+ *     phi_n_predicted = t_n * sum_{i<n}(phi_i * t_i) / sum_{i<n}(t_i^2)
+ *
+ * which reduces to phi_1 * t_n/t_1 for n = 2 -- so two-echo data cannot distinguish it from the
+ * naive "scale echo 1" form, and three-or-more-echo data can.
+ *
+ * The group mean is taken from an IMMUTABLE SNAPSHOT: correcting in place while reading would make
+ * later frames see already-corrected earlier ones and earlier frames not, i.e. a result that
+ * depends on traversal order.
  *
  * The reference's observed behaviour -- a spatially uniform whole-2*pi shift per frame per echo --
  * is reproduced by this per-voxel rounding whenever the discrepancy is itself uniform, which is
@@ -568,15 +625,25 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 	const int64_t n3 = c->n3;
 	const int T = c->nframe;
 	double *mu = NULL, *sd = NULL, *corr = NULL;
-	float *acc = NULL;
+	float *acc = NULL, *snap = NULL;
 	int t, u, e, rc = 1;
 	int64_t i;
+	size_t bytes;
 	if (T < 2) return 0;
+	if (nii_mul_size((size_t)T, (size_t)T * sizeof(double), &bytes) ||
+		nii_mul_size((size_t)n3, (size_t)T * sizeof(float), &bytes)) {
+		MD_ERR("frame count %d is too large for the temporal correction on this build\n", T);
+		return 1;
+	}
 	mu = (double *)malloc((size_t)T * sizeof(double));
 	sd = (double *)malloc((size_t)T * sizeof(double));
 	corr = (double *)malloc((size_t)T * T * sizeof(double));
 	acc = (float *)malloc((size_t)n3 * sizeof(float));
-	if (!mu || !sd || !corr || !acc) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
+	/* snapshot of every frame's FIRST-echo unwrapped phase, so group means are order-independent */
+	snap = (float *)malloc((size_t)n3 * T * sizeof(float));
+	if (!mu || !sd || !corr || !acc || !snap) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
+	for (t = 0; t < T; t++)
+		memcpy(snap + (int64_t)t * n3, uw + ((int64_t)t * c->neco) * n3, (size_t)n3 * sizeof(float));
 
 	for (t = 0; t < T; t++) {
 		const float *m = mag1 + (int64_t)t * n3;
@@ -610,7 +677,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 		for (u = 0; u < T; u++) {
 			const float *p;
 			if (corr[(size_t)t * T + u] < MD_CORR_THRESH) continue;
-			p = uw + ((int64_t)u * c->neco) * n3;
+			p = snap + (int64_t)u * n3;   /* snapshot, not the live (partly corrected) series */
 			for (i = 0; i < n3; i++) acc[i] += p[i];
 		}
 		{
@@ -621,11 +688,19 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 				p1[i] = (float)((double)p1[i] + MD_2PI * n);
 			}
 			for (e = 1; e < c->neco; e++) {
+				/* Eq. 6: through-origin fit over the echoes already corrected (0..e-1).
+				   denom is voxel-independent, so hoist it out of the voxel loop. */
 				float *pe = uw + ((int64_t)t * c->neco + e) * n3;
-				double fac = c->TEs[e] / c->TEs[0];
+				double tn = c->TEs[e], denom = 0.0;
+				int k;
+				for (k = 0; k < e; k++) denom += c->TEs[k] * c->TEs[k];
+				if (!(denom > 0.0)) continue;
 				for (i = 0; i < n3; i++) {
-					double pred = (double)p1[i] * fac;
-					double n = nearbyint((pred - (double)pe[i]) / MD_2PI);
+					double num = 0.0, pred, n;
+					for (k = 0; k < e; k++)
+						num += (double)uw[((int64_t)t * c->neco + k) * n3 + i] * c->TEs[k];
+					pred = tn * num / denom;
+					n = nearbyint((pred - (double)pe[i]) / MD_2PI);
 					pe[i] = (float)((double)pe[i] + MD_2PI * n);
 				}
 			}
@@ -633,18 +708,24 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag1) {
 	}
 	rc = 0;
 done:
-	free(mu); free(sd); free(corr); free(acc);
+	free(mu); free(sd); free(corr); free(acc); free(snap);
 	return rc;
 }
 
 /* Scalar displacement inversion along the PE VOXEL axis (manifest §3.4):
  *
- *     f_undistorted(y) = f_native( y + f_undistorted(y) * TRT )     [voxels]
+ *     f_undistorted(y) = f_native( y + s * f_undistorted(y) * TRT )     [voxels]
  *
  * solved by direct iteration from zero with LINEAR interpolation and edge clamping -- measured to
  * be the reference's sampling (linear p95 0.041 Hz; cubic 2.05; nearest 4.07).  Note the
  * composition runs along the voxel axis, unlike the RESAMPLING in §3.5, which runs along the
- * canonical world axis; both were measured separately. */
+ * canonical world axis; both were measured separately.
+ *
+ * `s` is the phase-encoding POLARITY (+1 for `j`, -1 for `j-`).  It is load-bearing: the reference
+ * returns an IDENTICAL native field for j and j-, but an inverted field that differs (corr 0.918)
+ * and a displacement map that is very nearly negated (corr -0.918, median ratio -0.973).  Getting
+ * it wrong on a `j-` acquisition doubles the distortion instead of correcting it.  Verified for
+ * both polarities against the reference at displacement p95 0.045 mm (j) and 0.024 mm (j-). */
 static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 	const int nx = c->nx, ny = c->ny, nz = c->nz;
 	const int m = c->pe_axis;
@@ -666,9 +747,14 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 				int64_t o = (int64_t)x + (int64_t)y * nx + (int64_t)z * nx * ny;
 				int idx = (m == 0) ? x : ((m == 1) ? y : z);
 				int64_t base = o - (int64_t)idx * stride;
-				double pos = (double)idx + (double)fu[o] * c->trt;
+				double cur = (double)fu[o];
+				double pos;
 				int lo;
 				double frac, a, b, nv;
+				if (!(cur >= -MD_DISP_LIMIT && cur <= MD_DISP_LIMIT)) cur = 0.0; /* NaN/Inf -> no shift */
+				pos = (double)idx + (double)c->pe_sign * cur * c->trt;
+				if (!(pos >= -MD_POS_LIMIT && pos <= MD_POS_LIMIT)) pos = (double)idx;
+				if (len < 2) { fu[o] = fn[o]; continue; }   /* single slice along PE: nothing to interpolate */
 				if (pos < 0.0) pos = 0.0;
 				if (pos > (double)(len - 1)) pos = (double)(len - 1);
 				lo = (int)pos;
@@ -702,7 +788,7 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	   appending the postfix, so point fname at "<prefix>.nii" for the duration of the write. */
 	fname = (char *)malloc(strlen(c->prefix) + 8);
 	if (!fname) return 1;
-	sprintf(fname, "%s.nii", c->prefix);
+	snprintf(fname, strlen(c->prefix) + 8, "%s.nii", c->prefix);
 	buf = (float *)nii_malloc(nb, sizeof(float));
 	memcpy(buf, vol, nb * sizeof(float));
 	n->fname = fname;
@@ -734,18 +820,22 @@ static void md_usage(void) {
 	printf("Usage: niimath --medic --magnitude <e1> [<e2> ...] --phase <e1> [<e2> ...] \\\n");
 	printf("                --te-ms <t1,t2,...> --total-readout-time <sec> \\\n");
 	printf("                --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> [options]\n\n");
+	printf("The phase-encoding POLARITY is significant: 'j' and 'j-' give opposite displacement maps\n");
+	printf("(the native field map is the same). Take it from the BIDS PhaseEncodingDirection.\n\n");
 	printf("Multi-Echo DIstortion Correction: estimates a B0 field map per frame from multi-echo\n");
 	printf("phase and converts it to an EPI displacement map.\n\n");
 	printf("Options:\n");
 	printf("  --rank <N>              low-rank truncation of the field-map series (default %d; 0 disables)\n", MD_RANK_DEFAULT);
 	printf("  --temporal-correction <0|1>  temporal 2*pi consistency correction (default 1)\n");
 	printf("  --phase-offset <mcpc|none>   MCPC-3D-S phase-offset correction (default mcpc)\n");
-	printf("  --noise-frames <N>      drop N trailing frames from the outputs (default 0)\n");
-	printf("  --n-cpus <N>            OpenMP threads\n");
+	printf("  --noise-frames <N>, -f  drop N trailing frames from the outputs (default 0)\n");
+	printf("  --n-cpus <N>, -n        OpenMP threads\n");
+	printf("  --gz <0|1>              output compression (default: the FSLOUTPUTTYPE environment)\n");
 	printf("  --weights <sel>         ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6 (default romeo4)\n");
 	printf("  --mask <file>           use this mask verbatim for both unwrapping stages\n");
 	printf("                          (default: ROMEO robustmask of the first echo's magnitude)\n");
-	printf("  --save-intermediates    also write per-echo unwrapped phase and the mask\n\n");
+	printf("  --save-intermediates    also write per-echo unwrapped phase, the masks, and (when\n");
+	printf("                          MCPC-3D-S runs) the estimated phase offset\n\n");
 	printf("Outputs: <prefix>_fieldmaps_native (Hz, distorted grid), <prefix>_fieldmaps (Hz,\n");
 	printf("undistorted grid), <prefix>_displacementmaps (mm, pull map), all float32.\n\n");
 	printf("Emulates the MEDIC workflow of Van et al., Imaging Neuroscience 4 (2026),\n");
@@ -773,10 +863,11 @@ static int md_parse_doubles(const char *s, double *out, int maxn) {
 int nii_medic(int argc, char *argv[]) {
 	md_ctx c;
 	const char *magf[MD_MAX_ECHO], *phaf[MD_MAX_ECHO];
-	int nmag = 0, npha = 0, i, e, t, ac, rc = EXIT_FAILURE;
+	int nmag = 0, npha = 0, e, t, ac, rc = EXIT_FAILURE;
 	int nTE = 0, have_trt = 0, have_pe = 0;
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
-	float *phase = NULL, *mag = NULL, *uw = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
+	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
+	int *frc = NULL;
 	romeo_opts ro = romeo_opts_default();
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
@@ -794,6 +885,7 @@ int nii_medic(int argc, char *argv[]) {
 	c.temporal = 1;
 	c.mcpc = 1;
 	c.pe_axis = -1;
+	c.pe_sign = 1;
 
 	for (ac = 2; ac < argc; ac++) {
 		const char *a = argv[ac];
@@ -814,8 +906,8 @@ int nii_medic(int argc, char *argv[]) {
 		} else if (!strcmp(a, "--total-readout-time") && ac + 1 < argc) {
 			c.trt = atof(argv[++ac]); have_trt = 1;
 		} else if (!strcmp(a, "--phase-encoding-direction") && ac + 1 < argc) {
-			c.pe_axis = md_axis_index(argv[++ac], NULL); have_pe = 1;
-			if (c.pe_axis < 0) { MD_ERR("--phase-encoding-direction must be one of i j k x y z (a trailing '-' is accepted and ignored)\n"); goto done; }
+			c.pe_axis = md_axis_index(argv[++ac], &c.pe_sign); have_pe = 1;
+			if (c.pe_axis < 0) { MD_ERR("--phase-encoding-direction must be one of i j k x y z, optionally with a trailing '-' (the polarity is used: j and j- give opposite displacement maps)\n"); goto done; }
 		} else if (!strcmp(a, "--out-prefix") && ac + 1 < argc) {
 			c.prefix = argv[++ac];
 		} else if (!strcmp(a, "--rank") && ac + 1 < argc) {
@@ -899,19 +991,29 @@ int nii_medic(int argc, char *argv[]) {
 	c.nframe = T;
 
 	{	/* Working set, all resident (plan §5.2 as scoped: in-RAM, documented budget).
-		   phase + mag + unwrapped + fields ~= n3 * T * (2*neco + neco + 1) * 4 bytes. */
-		double gb = (double)n3 * T * (2.0 * c.neco + c.neco + 1.0) * 4.0 / 1073741824.0;
+		   phase (unwrapped in place) + mag + fields + fu + disp
+		   = n3 * T * (2*neco + 3) * 4 bytes.  See medic_plan.md: streaming is a decided
+		   non-goal because a 4D .nii.gz cannot be seeked anyway. */
+		double gb = (double)n3 * T * (2.0 * c.neco + 3.0) * 4.0 / 1073741824.0;
 		fprintf(stderr, "--medic: %dx%dx%d, %d echo(es), %d frame(s); working set ~%.2f GiB\n",
 			c.nx, c.ny, c.nz, c.neco, T, gb);
 	}
 
+	{	/* Checked: n3 * neco * T * 4 can wrap size_t on a 32-bit / FORCE_INT32_MAX build. */
+		size_t bytes;
+		if (nii_mul_size((size_t)n3 * c.neco, (size_t)T, &bytes) ||
+			nii_mul_size(bytes, sizeof(float), &bytes) ||
+			nii_mul_size((size_t)n3, (size_t)T * sizeof(float), &bytes)) {
+			MD_ERR("%d frame(s) x %d echo(es) exceeds this build's address space\n", T, c.neco);
+			goto done;
+		}
+	}
 	phase = (float *)malloc((size_t)n3 * c.neco * T * sizeof(float));
 	mag = (float *)malloc((size_t)n3 * c.neco * T * sizeof(float));
-	uw = (float *)malloc((size_t)n3 * c.neco * T * sizeof(float));
 	fields = (float *)malloc((size_t)n3 * T * sizeof(float));
 	fu = (float *)malloc((size_t)n3 * T * sizeof(float));
 	disp = (float *)malloc((size_t)n3 * T * sizeof(float));
-	if (!phase || !mag || !uw || !fields || !fu || !disp) { MD_ERR("out of memory allocating the working set\n"); goto done; }
+	if (!phase || !mag || !fields || !fu || !disp) { MD_ERR("out of memory allocating the working set\n"); goto done; }
 
 	/* Repack to frame-major, echo-minor and rescale each echo's phase series as readphase does. */
 	for (e = 0; e < c.neco; e++) {
@@ -928,12 +1030,16 @@ int nii_medic(int argc, char *argv[]) {
 	/* ---- per-frame: MCPC-3D-S -> ROMEO -> weighted regression ------------------------------- */
 	{
 		int failed = 0;
-		float *offs = c.save_intermediates ? (float *)malloc((size_t)n3 * T * sizeof(float)) : NULL;
+		/* Only when MCPC RUNS: with --phase-offset none nothing fills this, and writing it would
+		   emit uninitialised heap as if it were an image. */
+		float *offs = (c.save_intermediates && c.mcpc) ? (float *)malloc((size_t)n3 * T * sizeof(float)) : NULL;
 		uint8_t *masks = (uint8_t *)malloc((size_t)n3 * T);
 		if (!masks) { free(offs); MD_ERR("out of memory allocating the per-frame masks\n"); goto done; }
 		/* ONE mask per frame, shared by the MCPC-3D-S phase-difference unwrap and the multi-echo
 		   unwrap, as the reference does (manifest section 4).  Either the user's --mask, used
 		   verbatim, or ROMEO's robustmask of that frame's first-echo magnitude. */
+		frc = (int *)calloc((size_t)T, sizeof(int));
+		if (!frc) { free(offs); free(masks); MD_ERR("out of memory\n"); goto done; }
 		if (c.maskfile) {
 			nifti_image *mk = md_read_f32(c.maskfile, "mask");
 			int64_t q;
@@ -951,44 +1057,51 @@ int nii_medic(int argc, char *argv[]) {
 			#pragma omp parallel for schedule(dynamic)
 #endif
 			for (t = 0; t < T; t++)
-				if (romeo_robustmask(mag + (int64_t)t * c.neco * n3, c.nx, c.ny, c.nz,
-						masks + (int64_t)t * n3)) failed = 1;
-			if (failed) { free(offs); free(masks); MD_ERR("robustmask failed\n"); goto done; }
+				frc[t] = romeo_robustmask(mag + (int64_t)t * c.neco * n3, c.nx, c.ny, c.nz,
+						masks + (int64_t)t * n3) ? 1 : 0;
+			for (t = 0; t < T; t++) failed |= frc[t];
+			if (failed) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("robustmask failed for frame %d\n", t); goto done; }
 		}
 #ifdef _OPENMP
 		#pragma omp parallel for schedule(dynamic)
 #endif
 		for (t = 0; t < T; t++) {
-			float *p = uw + (int64_t)t * c.neco * n3;
+			/* Unwrapped IN PLACE: the wrapped phase is dead once this frame is unwrapped, so a
+			   separate `uw` series would just be a third full copy of the run. */
+			float *p = phase + (int64_t)t * c.neco * n3;
 			const float *m = mag + (int64_t)t * c.neco * n3;
 			const uint8_t *mk = masks + (int64_t)t * n3;
-			if (failed) continue;
-			memcpy(p, phase + (int64_t)t * c.neco * n3, (size_t)n3 * c.neco * sizeof(float));
-			if (c.mcpc && md_mcpc3ds(&c, p, m, &ro, mk, offs ? offs + (int64_t)t * n3 : NULL)) { failed = 1; continue; }
-			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro,
-					mk, NULL)) { failed = 1; continue; }
+			/* Each frame records its own status: a shared `failed` flag written from several
+			   threads is a data race, and reading it to skip work makes the result
+			   thread-count-dependent. */
+			if (c.mcpc && md_mcpc3ds(&c, p, m, &ro, mk, offs ? offs + (int64_t)t * n3 : NULL)) { frc[t] = 1; continue; }
+			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro, mk, NULL)) frc[t] = 1;
 		}
-		if (failed) { free(offs); free(masks); MD_ERR("phase unwrapping failed\n"); goto done; }
+		for (t = 0; t < T; t++) if (frc[t]) { failed = 1; break; }
+		if (failed) {
+			MD_ERR("phase unwrapping failed for frame %d\n", t);
+			free(offs); free(masks); free(frc); frc = NULL; goto done;
+		}
 		if (c.save_intermediates) {
 			float *tmp = (float *)malloc((size_t)n3 * T * sizeof(float));
-			if (tmp) {
-				int64_t q;
-				for (e = 0; e < c.neco; e++) {
-					char sfx[64];
-					for (t = 0; t < T; t++)
-						memcpy(tmp + (int64_t)t * n3, uw + ((int64_t)t * c.neco + e) * n3, (size_t)n3 * sizeof(float));
-					snprintf(sfx, sizeof sfx, "_unwrapped_echo-%d", e + 1);
-					md_write(&c, sfx, tmp, T, gz);
-				}
-				if (masks) {
-					for (q = 0; q < (int64_t)n3 * T; q++) tmp[q] = (float)masks[q];
-					md_write(&c, "_masks", tmp, T, gz);
-				}
-				if (offs) md_write(&c, "_phase_offset", offs, T, gz);
-				free(tmp);
+			int wrc = 0;
+			int64_t q;
+			if (!tmp) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("out of memory writing intermediates\n"); goto done; }
+			for (e = 0; e < c.neco; e++) {
+				char sfx[64];
+				for (t = 0; t < T; t++)
+					memcpy(tmp + (int64_t)t * n3, phase + ((int64_t)t * c.neco + e) * n3, (size_t)n3 * sizeof(float));
+				snprintf(sfx, sizeof sfx, "_unwrapped_echo-%d", e + 1);
+				wrc |= md_write(&c, sfx, tmp, T, gz);
 			}
+			for (q = 0; q < (int64_t)n3 * T; q++) tmp[q] = (float)masks[q];
+			wrc |= md_write(&c, "_masks", tmp, T, gz);
+			if (offs) wrc |= md_write(&c, "_phase_offset", offs, T, gz);
+			free(tmp);
+			/* --save-intermediates is an explicit request; a failure to honour it is an error. */
+			if (wrc) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("failed to write an intermediate\n"); goto done; }
 		}
-		free(offs); free(masks);
+		free(offs); free(masks); free(frc); frc = NULL;
 	}
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
@@ -997,7 +1110,7 @@ int nii_medic(int argc, char *argv[]) {
 		int trc;
 		if (!mag1) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 		for (t = 0; t < T; t++) memcpy(mag1 + (int64_t)t * n3, mag + (int64_t)t * c.neco * n3, (size_t)n3 * sizeof(float));
-		trc = md_temporal(&c, uw, mag1);
+		trc = md_temporal(&c, phase, mag1);
 		free(mag1);
 		if (trc) goto done;
 	}
@@ -1007,8 +1120,7 @@ int nii_medic(int argc, char *argv[]) {
 	#pragma omp parallel for schedule(static)
 #endif
 	for (t = 0; t < T; t++) {
-		md_ctx c1 = c;
-		md_regress(&c1, uw + (int64_t)t * c.neco * n3, mag + (int64_t)t * c.neco * n3, fields + (int64_t)t * n3);
+		md_regress(&c, phase + (int64_t)t * c.neco * n3, mag + (int64_t)t * c.neco * n3, fields + (int64_t)t * n3);
 	}
 
 	/* ---- rank-10 truncation ------------------------------------------------------------------ */
@@ -1017,34 +1129,54 @@ int nii_medic(int argc, char *argv[]) {
 	/* ---- inversion and displacement ---------------------------------------------------------- */
 	{
 		double vox;
-		{
-			double A[3][3], s = 0.0;
+		{	/* Phase-encoding voxel size in MILLIMETRES (pixdim is in the header's xyz_units). */
+			double A[3][3], s = 0.0, unit = xyz_units_to_mm(c.tmpl->xyz_units);
 			int r;
 			md_xform3(c.tmpl, A);
 			for (r = 0; r < 3; r++) s += A[r][c.pe_axis] * A[r][c.pe_axis];
 			vox = c.tmpl->pixdim[c.pe_axis + 1];
 			if (!(vox > 0.0)) vox = sqrt(s);
+			vox *= unit;
 			if (!(vox > 0.0)) { MD_ERR("phase-encoding voxel size is zero\n"); goto done; }
 		}
 #ifdef _OPENMP
 		#pragma omp parallel for schedule(static)
 #endif
 		for (t = 0; t < T; t++) {
-			md_ctx c1 = c;
 			int64_t q;
-			md_invert(&c1, fields + (int64_t)t * n3, fu + (int64_t)t * n3);
+			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3);
 			for (q = 0; q < n3; q++)
-				disp[(int64_t)t * n3 + q] = (float)(-(double)fu[(int64_t)t * n3 + q] * c.trt * vox);
+				disp[(int64_t)t * n3 + q] =
+					(float)(-(double)c.pe_sign * (double)fu[(int64_t)t * n3 + q] * c.trt * vox);
 		}
 	}
 
-	if (md_write(&c, "_fieldmaps_native", fields, T, gz)) { MD_ERR("failed to write the native field maps\n"); goto done; }
-	if (md_write(&c, "_fieldmaps", fu, T, gz)) { MD_ERR("failed to write the undistorted field maps\n"); goto done; }
-	if (md_write(&c, "_displacementmaps", disp, T, gz)) { MD_ERR("failed to write the displacement maps\n"); goto done; }
+	/* Fail-atomic: every stage has already completed, so the only remaining failure is I/O.
+	   If any of the three writes fails, remove whichever already landed rather than leaving an
+	   apparently valid partial result set behind. */
+	{
+		static const char *const outs[3] = { "_fieldmaps_native", "_fieldmaps", "_displacementmaps" };
+		const float *bufs[3];
+		int k, wrc = 0;
+		bufs[0] = fields; bufs[1] = fu; bufs[2] = disp;
+		for (k = 0; k < 3 && !wrc; k++) wrc = md_write(&c, outs[k], bufs[k], T, gz);
+		if (wrc) {
+			MD_ERR("failed to write %s; removing partial outputs\n", outs[k > 0 ? k - 1 : 0]);
+			for (k = 0; k < 3; k++) {
+				char path[2048];
+				const char *ext[3] = { ".nii", ".nii.gz", ".nii.zst" };
+				int x;
+				for (x = 0; x < 3; x++) {
+					snprintf(path, sizeof path, "%s%s%s", c.prefix, outs[k], ext[x]);
+					remove(path);
+				}
+			}
+			goto done;
+		}
+	}
 	rc = EXIT_SUCCESS;
 done:
-	free(phase); free(mag); free(uw); free(fields); free(fu); free(disp);
+	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc);
 	for (e = 0; e < MD_MAX_ECHO; e++) { if (ph[e]) nifti_image_free(ph[e]); if (mg[e]) nifti_image_free(mg[e]); }
-	(void)i;
 	return rc;
 }

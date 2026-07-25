@@ -1,8 +1,25 @@
 # Plan: clean-room MEDIC emulation using niimath and ROMEO
 
-## Status
+## Status (2026-07-25)
 
-Design only. No MEDIC code has been implemented.
+**M0-M12 implemented and merged** on the `romeo` branch: `src/medic.c`/`medic.h` behind `HAVE_MEDIC` (requires `HAVE_ROMEO`), `--medic` and `-unwarp`, the stdlib-only `medic.py` wrapper, build wiring across Makefile/CMake/SuperBuild/notarize.sh, and an analytic check in `release_smoke.py`. The black-box measurement record is `test/medic_reference_manifest.md`; the MCPC-3D-S patent analysis is `prior_art.md`.
+
+**M3 (`-unwarp`) passes its gate outright**: fed the reference's own displacement map it reproduces the reference's corrected magnitude at nrmse 3.5e-5 / 4.7e-5, corr 0.999999999, zero non-finite.
+
+**`--medic` does not yet match the reference end-to-end.** Given a shared mask the native field map matches to p99 = 0.0027 Hz — so the regression, MCPC-3D-S, unwrapping, rescaling and echo handling are all correct — but ~0.24 % of voxels land on a different 2*pi branch and the inversion smears that along the phase-encoding line. With the built-in `robustmask` default the divergence is larger (p95 ~46 Hz) because the two tools' masks differ. Per the §7.2 directive we are NOT chasing the reference's mask; `--mask` is the answer.
+
+Open, deliberately not guessed: a broadband residual survives the reference's rank-10 truncation on real 170-frame data while ours is strictly rank 10 (§7.5).
+
+### Decided: memory model is in-RAM, and that is not a defect
+
+Streaming (the old §5.2) is a **non-goal**. A 4D `.nii.gz` cannot be seeked, so essentially every tool — including this one and the reference — reads and writes whole volumes in RAM anyway; a streaming layer would buy nothing for the dominant gzip case while adding a large validated surface. The requirement is instead to be **fast and honest about the RAM cost**: document the working-set formula, print it at startup, and state the wasm ceiling.
+
+- Resident working set: `n3 * T * (3*echoes + 1) * 4` bytes, plus the inputs held until repacking. Measured peak 2.53 GB on the 170-frame two-echo run (the reference needs 3.40 GB for the same work).
+- **wasm32 has a 4 GiB address space** and every wasm target sets `-DFORCE_INT32_MAX`. `--medic` ships in the default Emscripten build but long multi-echo runs will not fit: estimate natively, apply `-unwarp` in the browser. MEDIC is omitted from `tiny`/`nano` and from the WASI reactor.
+
+### Build requirement for any timing claim
+
+Build against **zlib-ng** (or zlib-cloudflare), not system zlib — see M12.
 
 niimath's ROMEO port is complete and is the foundation for this work. It already provides strict-FP, multi-echo ROMEO unwrapping, robust masks, quality maps, and B0 estimation with all six ROMEO weighting modes. The current parity suite reports 602/602 checks. MEDIC must reuse these kernels; it must not duplicate ROMEO or invoke the niimath CLI once per frame.
 

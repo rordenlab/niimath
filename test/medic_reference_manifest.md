@@ -24,6 +24,7 @@ Experiment scripts (`test/medic_experiments/`, analysis-only, not shipped, not i
 | `exp07b_axis_sweep.py` | §7.7 full 10-grid × 3-letter physical-displacement sweep |
 | `exp01_08_known_field.py` | §7.1 phase scaling, §7.8 inversion, analytic field |
 | `exp04_05_12_multiframe.py` | §7.4 temporal, §7.5 low-rank, §7.12 noise frames |
+| `bench170.py` | M12 wall time / CPU time / peak RAM head-to-head |
 
 ## 2. Reference run inventory
 
@@ -141,6 +142,29 @@ Two consequences:
 
 - **The `-`/`+` suffix is ignored.** `j` and `j-` produce byte-identical output. The sign already lives in the stored map (§3.3 carries the minus). Plan §6.2's open question is answered: **`-unwarp` must not negate again.**
 - This is arguably a Warpkit quirk for oblique acquisitions — the physically correct EPI shift is along the voxel PE column, and using the canonical world axis costs a factor `cos(14.4°) = 0.968` plus spurious off-axis components on this data. We implement the measured convention because `--medic` and `-unwarp` must be self-consistent with the reference; recorded here so the choice is deliberate and reversible.
+
+### 3.5b Phase-encoding POLARITY is load-bearing for `--medic` — B
+
+§3.5 establishes that `wk-apply-warp` ignores the `-` suffix. **`wk-medic` does not.** Running it on the sbref demo with `--phase-encoding-direction j` and then `j-`, everything else identical:
+
+| output | max abs difference | corr(j, j-) |
+| --- | --- | --- |
+| `_fieldmaps_native` | **0.0000** | +1.000000 |
+| `_fieldmaps` | 128.79 Hz | +0.917584 |
+| `_displacementmaps` | 16.72 mm | **−0.917584** (median ratio −0.973) |
+
+So the native field map does not depend on polarity — correctly, it is just the weighted regression — but the **inversion direction and the displacement sign do**. The model that reproduces both polarities is §3.4 and §3.3 with a polarity term `s = ±1`:
+
+```text
+f_undistorted(y) = f_native( y + s * f_undistorted(y) * TRT )
+displacement_mm  = -s * f_undistorted * TRT * pixdim[PE axis]
+```
+
+Verified against the reference at displacement p95 **0.045 mm** for `j` and **0.024 mm** for `j-`, both inside the 0.05 mm gate.
+
+This matters in practice: the supplied three-echo dataset is acquired `j-`. Discarding the sign would apply the correction backwards and roughly double the distortion instead of removing it. Found by external review after the first implementation dropped the suffix — every M0 experiment had used `j` only, so the black-box coverage had a genuine hole.
+
+`-unwarp` still ignores the suffix, and must: by then the sign is already baked into the stored map.
 
 ### 3.6 Interpolation, fill, Jacobian — §7.9, §7.10 — B
 
