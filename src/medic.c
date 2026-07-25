@@ -77,6 +77,7 @@ static int md_axis_index(const char *s, int *sign_suffix) {
 	              and applying it again would double-correct. */
 	int idx = -1;
 	size_t n;
+	if (sign_suffix) *sign_suffix = 1;   /* defined on EVERY return, including the error ones */
 	if (!s) return -1;
 	n = strlen(s);
 	if (n < 1 || n > 2) return -1;
@@ -91,19 +92,25 @@ static int md_axis_index(const char *s, int *sign_suffix) {
 	return idx;
 }
 
-/* Voxel->world (RAS) 3x3 of an image, preferring sform then qform then pixdim. */
+/* Voxel->world (RAS) 3x3 of an image.
+ *
+ * Precedence MUST match core.c's xform(), because md_same_grid() validates images through
+ * max_displacement_mm() -- which uses xform() -- while md_offset_per_mm() resamples with the
+ * matrix returned here.  A different rule in the two places means the grid check can pass on one
+ * matrix while the physics runs on another: an image with sform_code=1, qform_code=2 and
+ * disagreeing sform/qform was accepted as "same grid" and then corrected in the WRONG DIRECTION.
+ * xform()'s rule is: sform, unless sform_code < qform_code, then qform; pixdim if both unknown. */
 static void md_xform3(const nifti_image *nim, double A[3][3]) {
 	nifti_dmat44 m;
 	int r, c;
-	if (nim->sform_code > 0) m = nim->sto_xyz;
-	else if (nim->qform_code > 0) m = nim->qto_xyz;
-	else {
+	if (nim->sform_code == NIFTI_XFORM_UNKNOWN && nim->qform_code == NIFTI_XFORM_UNKNOWN) {
 		memset(A, 0, 9 * sizeof(double));
 		A[0][0] = nim->dx != 0.0 ? nim->dx : 1.0;
 		A[1][1] = nim->dy != 0.0 ? nim->dy : 1.0;
 		A[2][2] = nim->dz != 0.0 ? nim->dz : 1.0;
 		return;
 	}
+	m = (nim->sform_code < nim->qform_code) ? nim->qto_xyz : nim->sto_xyz;
 	for (r = 0; r < 3; r++) for (c = 0; c < 3; c++) A[r][c] = m.m[r][c];
 }
 
@@ -264,8 +271,17 @@ static nifti_image *md_read_f32(const char *fn, const char *what) {
 		nifti_image_free(h);
 		if (bad) return NULL;
 	}
-	n = nifti_image_read(fn, 1);   /* the preflight above already validated dims / 4D / INT_MAX */
+	n = nifti_image_read(fn, 1);
 	if (!n) { MD_ERR("failed to read %s '%s'\n", what, fn); return NULL; }
+	/* Re-check after the load as well as before it.  The preflight is what stops us decompressing
+	   a huge payload; this is the fail-closed guarantee, and it costs nothing.  Dropping it left a
+	   TOCTOU window if the file changed between the two reads, and departed from the project's
+	   "re-check at use" pattern (nii_admit_current_op). */
+	if (n->nvox < 1 || n->nx < 1 || n->ny < 1 || n->nz < 1 ||
+		n->nu > 1 || n->nv > 1 || n->nw > 1 || (int64_t)n->nvox > INT_MAX) {
+		MD_ERR("%s '%s' changed on disk or has unusable dimensions\n", what, fn);
+		nifti_image_free(n); return NULL;
+	}
 	ihdr = set_input_hdr(n);
 	/* Convert when the stored type is not float32, but ALSO when it IS float32 and carries a
 	   non-trivial scl_slope/scl_inter -- otherwise a scaled float32 image is silently used raw.
@@ -797,21 +813,6 @@ static void md_invert(const md_ctx *c, const float *fn, float *fu) {
 
 #define MD_PATH_MAX 2048
 
-/* Which extension did nifti_save() actually choose?  Returns 1 and fills `out` on success. */
-static int md_find_written(const char *prefix, const char *suffix, char *out, size_t outsz) {
-	static const char *const ext[3] = { ".nii.gz", ".nii.zst", ".nii" };
-	int i;
-	for (i = 0; i < 3; i++) {
-		FILE *f;
-		snprintf(out, outsz, "%s%s%s", prefix, suffix, ext[i]);
-		f = fopen(out, "rb");
-		if (f) { fclose(f); return 1; }
-	}
-	out[0] = '\0';
-	return 0;
-}
-
-
 static int md_write(const md_ctx *c, const char *suffix, const float *vol, int nframe, gzModes gz) {
 	nifti_image *n = c->tmpl;
 	void *savedata = n->data;
@@ -854,6 +855,35 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	free(buf);
 	return rc;
 }
+
+static const char *const MD_EXT[3] = { ".nii.gz", ".nii.zst", ".nii" };
+
+/* Write one output under the temporary prefix and report the path actually produced.
+ *
+ * The extension nifti_save() picks depends on gzMode and FSLOUTPUTTYPE, so it has to be
+ * discovered by probing -- which means any STALE candidate must be removed first.  A leftover
+ * temporary from a crashed run that happened to reuse this PID would otherwise be found by the
+ * probe and renamed into place AS THE RESULT, orphaning the file we just wrote.  PID reuse is
+ * routine in containers and HPC schedulers. */
+static int md_write_temp(md_ctx *c, const char *tmppfx, const char *suffix,
+	const float *buf, int T, gzModes gz, char *out, size_t outsz) {
+	int i;
+	for (i = 0; i < 3; i++) {
+		snprintf(out, outsz, "%s%s%s", tmppfx, suffix, MD_EXT[i]);
+		remove(out);
+	}
+	if (md_write(c, suffix, buf, T, gz)) return 1;
+	for (i = 0; i < 3; i++) {
+		FILE *f;
+		snprintf(out, outsz, "%s%s%s", tmppfx, suffix, MD_EXT[i]);
+		f = fopen(out, "rb");
+		if (f) { fclose(f); return 0; }
+	}
+	out[0] = '\0';
+	return 1;
+}
+
+
 
 /* ============================== --medic ============================== */
 
@@ -935,7 +965,6 @@ int nii_medic(int argc, char *argv[]) {
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
 	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
 	int *frc = NULL;
-	uint8_t *maskbuf = NULL;   /* per-frame masks, owned until teardown */
 	romeo_opts ro = romeo_opts_default();
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
@@ -1179,6 +1208,24 @@ int nii_medic(int argc, char *argv[]) {
 			MD_ERR("phase unwrapping failed for frame %d\n", t);
 			free(offs); free(masks); free(frc); frc = NULL; goto done;
 		}
+		/* Restrict the unwrapped phase to the mask BEFORE anything reads or writes it.
+		 *
+		 * MEASURED (manifest 3.7): the reference's per-echo unwrapped phase is nonzero exactly on
+		 * mask >= 1.  ROMEO's region growing constrains which voxels it VISITS but leaves the rest
+		 * holding their wrapped values, so without this the excluded background carries arbitrary
+		 * phase into the regression, the temporal grouping and the SVD basis.  It also has to
+		 * happen before --save-intermediates writes the unwrapped phase, or the saved diagnostic
+		 * contradicts the pipeline it is supposed to document. */
+		{
+			int64_t q;
+			for (t = 0; t < T; t++) {
+				const uint8_t *mk = masks + (int64_t)t * n3;
+				for (e = 0; e < c.neco; e++) {
+					float *p = phase + ((int64_t)t * c.neco + e) * n3;
+					for (q = 0; q < n3; q++) if (!mk[q]) p[q] = 0.0f;
+				}
+			}
+		}
 		if (c.save_intermediates) {
 			float *tmp = (float *)malloc((size_t)n3 * T * sizeof(float));
 			int wrc = 0;
@@ -1198,24 +1245,7 @@ int nii_medic(int argc, char *argv[]) {
 			/* --save-intermediates is an explicit request; a failure to honour it is an error. */
 			if (wrc) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("failed to write an intermediate\n"); goto done; }
 		}
-		free(offs); free(frc); frc = NULL;
-		maskbuf = masks;   /* kept: the mask gates the unwrapped phase below */
-	}
-
-	/* ---- restrict the unwrapped phase to the mask --------------------------------------------
-	   MEASURED (manifest 3.7): the reference's per-echo unwrapped phase is nonzero exactly on
-	   mask >= 1.  ROMEO's region growing constrains which voxels it VISITS but leaves unvisited
-	   voxels holding their wrapped values, so without this the excluded background carries
-	   arbitrary phase into the regression, the temporal grouping and the SVD basis. */
-	{
-		int64_t q;
-		for (t = 0; t < T; t++) {
-			const uint8_t *mk = maskbuf + (int64_t)t * n3;
-			for (e = 0; e < c.neco; e++) {
-				float *p = phase + ((int64_t)t * c.neco + e) * n3;
-				for (q = 0; q < n3; q++) if (!mk[q]) p[q] = 0.0f;
-			}
-		}
+		free(offs); free(masks); free(frc); frc = NULL;
 	}
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
@@ -1299,32 +1329,48 @@ int nii_medic(int argc, char *argv[]) {
 		snprintf(tmppfx, sizeof tmppfx, "%s.medictmp%ld", saved_prefix, (long)getpid());
 		c.prefix = tmppfx;
 		for (k = 0; k < 3 && !wrc; k++) {
-			wrc = md_write(&c, outs[k], bufs[k], T, gz);
-			if (!wrc && md_find_written(tmppfx, outs[k], made[nmade], MD_PATH_MAX)) nmade++;
-			else if (!wrc) wrc = 1;   /* wrote something we cannot name: treat as failure */
+			wrc = md_write_temp(&c, tmppfx, outs[k], bufs[k], T, gz, made[nmade], MD_PATH_MAX);
+			if (!wrc) nmade++;
 		}
 		c.prefix = saved_prefix;
 		if (wrc) {
+			/* Nothing has been renamed yet, so no final output exists or has been disturbed. */
+			int q;
 			MD_ERR("failed to write %s%s; previous outputs left untouched\n",
 				saved_prefix, outs[k > 0 ? k - 1 : 0]);
-			for (k = 0; k < nmade; k++) remove(made[k]);
+			for (q = 0; q < nmade; q++) remove(made[q]);
 			goto done;
 		}
+		/* All three temporaries exist; publish them.
+		 *
+		 * Per-file rename() is atomic, but three of them are not atomic AS A SET: if the second
+		 * fails, the first is already published and cannot be put back.  That window is tiny (same
+		 * directory, same filesystem, no I/O) but it is real, so on failure we report EXACTLY
+		 * which outputs are in place rather than claiming a clean rollback we cannot perform. */
 		for (k = 0; k < 3; k++) {
 			char final[MD_PATH_MAX];
-			const char *ext = strrchr(made[k], '/');
-			ext = strstr(ext ? ext : made[k], ".nii");
-			snprintf(final, sizeof final, "%s%s%s", saved_prefix, outs[k], ext ? ext : ".nii");
+			/* The extension sits immediately after "<tmppfx><suffix>" -- computed by offset, not
+			   by searching for ".nii", which finds the FIRST occurrence and mangles a legitimate
+			   --out-prefix such as "out.nii". */
+			const char *ext = made[k] + strlen(tmppfx) + strlen(outs[k]);
+			snprintf(final, sizeof final, "%s%s%s", saved_prefix, outs[k], ext);
 			if (rename(made[k], final) != 0) {
+				int q;
 				MD_ERR("failed to move %s into place\n", final);
-				for (k = 0; k < 3; k++) remove(made[k]);
+				if (k > 0) {
+					MD_ERR("  %d of 3 outputs were already published and CANNOT be rolled back:\n", k);
+					for (q = 0; q < k; q++) MD_ERR("    %s%s%s\n", saved_prefix, outs[q],
+						made[q] + strlen(tmppfx) + strlen(outs[q]));
+					MD_ERR("  the output set is INCOMPLETE; delete it before reusing this prefix\n");
+				}
+				for (q = k; q < 3; q++) remove(made[q]);
 				goto done;
 			}
 		}
 	}
 	rc = EXIT_SUCCESS;
 done:
-	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc); free(maskbuf);
+	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc);
 	for (e = 0; e < MD_MAX_ECHO; e++) { if (ph[e]) nifti_image_free(ph[e]); if (mg[e]) nifti_image_free(mg[e]); }
 	return rc;
 }
