@@ -505,6 +505,39 @@ function main()
                       n, len, si[1], si[2], si[end], len * len))
     end
 
+    # --- primitive parity tables. MUST stay in sync with RM_PRIM_* in src/romeo.c: the C side
+    #     evaluates the identical inputs under -romeo-dump and the two raw outputs are compared
+    #     byte-for-byte. This is the only coverage of the Payne-Hanek branch of rem2pi.
+    prim_d = Float64[
+        0.0, 1.0, -1.0, 3.141592653589793, -3.141592653589793,
+        1.5707963267948966, -1.5707963267948966, 4.71238898038469, 6.283185307179586, -6.283185307179586,
+        2.5, -2.5, 3.5, -3.5, 5.0, -5.0, 7.0, -7.0,
+        100.0, -100.0, 1000.0, 100000.0, 1000000.0, 1600000.0,
+        1650000.0, -1650000.0, 1.0e7, -1.0e7, 1.0e10, -1.0e10, 1.0e15, 1.0e20, 1.0e30, 1.0e100,
+        0.5, -0.5, 1.5, 2.5000000000000004]
+    prim_f = Float32[
+        0.0, 1.0, -1.0, 3.1415925f0, 3.1415927f0, -3.1415925f0, -3.1415927f0,
+        3.2f0, -3.2f0, 6.2831855f0, -6.2831855f0, 9.42477f0, 12.566371f0,
+        1.0f-30, -1.0f-30, 100.0f0, 1.0f5, 1.0f7, 1.0f10, -1.0f10, 1.0f20, 4.0f0, -4.0f0]
+    prim_w = Float64[
+        0.0, 1.0, 0.5, 0.5 / 255, 1.5 / 255, 2.5 / 255,
+        1 - 0.5 / 255, 1 - 1.5 / 255, 1.0000000000000002, -1.0e-17,
+        0.9980392156862745, 0.99607843137254903, 0.25, 0.75]
+    prim_uv = Tuple{Float32,Float32}[
+        (1.0f0, 1.0f0), (3.0f0, -3.0f0), (0.0f0, 3.1415927f0), (0.0f0, -3.1415927f0),
+        (1.0f0, 7.2831855f0), (-1.0f0, 100.0f0), (0.0f0, 1.0f10), (3.1415927f0, -3.1415927f0),
+        (2.0f0, 2.0f0 + 3.1415927f0), (-2.0f0, -2.0f0 - 3.1415927f0)]
+
+    dumpraw("prim_rem2pi64.f64", [rem2pi(x, RoundNearest) for x in prim_d])
+    dumpraw("prim_rem2pi32_gamma.f32",
+            vcat(Float32[rem2pi(x, RoundNearest) for x in prim_f], Float32[R.γ(x) for x in prim_f]))
+    dumpraw("prim_rescale.u8", UInt8[R.rescale(w) for w in prim_w])
+    # unwrapvoxel with a Float32 `old` (the pass-through branch of unwrapedge!) and with a
+    # Float64 `old` (the threshold branches / the temporal path) -- DIFFERENT subtraction widths.
+    dumpraw("prim_unwrapvoxel.f32",
+            vcat(Float32[R.unwrapvoxel(n, o) for (n, o) in prim_uv],
+                 Float32[R.unwrapvoxel(n, Float64(o)) for (n, o) in prim_uv]))
+
     open(joinpath(OUTDIR, "manifest.txt"), "w") do io
         for l in MANIFEST
             println(io, l)

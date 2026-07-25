@@ -256,7 +256,7 @@ reface.o: reface.c reface.h core32.h nifti_io.h .al_obj_flags
 qwarp.o: qwarp.c qwarp.h core32.h nifti_io.h .al_obj_flags
 	$(CNAME) $(CFLAGS) -MMD -MP -c qwarp.c -o qwarp.o
 
-# NOTE: the non-default targets above (debug/verbose/ubsan/sanitize/static/native-noomp) each
+# NOTE: the non-default targets below (debug/verbose/ubsan/sanitize/static/native-noomp) each
 # build their OWN romeo_*.o rather than romeo.o. Writing to romeo.o would clobber the release
 # object with e.g. UBSan-instrumented code, and `make all` would then find it NEWER than romeo.c
 # with an unchanged flag stamp, skip the rebuild, and fail to link on __ubsan_handle_*.

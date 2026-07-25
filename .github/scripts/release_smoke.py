@@ -418,7 +418,9 @@ def exercise_romeo(exe: str, tmp: Path, help_text: str) -> None:
     ground truth is known, and require `unwrapped - ground_truth` to be ONE constant multiple
     of 2*pi over the whole volume.  Any mis-assigned wrap shows up as a second constant.
     """
-    if "NOT in this build" in help_text and "-romeo <mag|none>" in help_text:
+    # Match the FULL distinguishing line: "NOT in this build" alone would silently disable this
+    # whole test the moment any other feature adopts the same phrasing.
+    if "ROMEO phase unwrapping — NOT in this build" in help_text:
         print("  -romeo: not built (ROMEO=0) - skipping")
         return
 

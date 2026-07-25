@@ -28,27 +28,37 @@
  * change the spanning tree, and shift an entire connected region by exactly 2*pi.  The rest of
  * niimath is built whole-program -ffast-math; this translation unit must not be.
  *
- * That is not a theoretical worry — it was MEASURED on the 76x76x46 validation volume
- * (phase0/mag0, -t 16.8), building this same source three ways and comparing against the pinned
- * Julia oracle:
+ * That is not a theoretical worry - it was MEASURED, building this same source three ways and
+ * comparing against the pinned Julia oracle. The middle column is the 76x76x46 validation volume
+ * (phase0/mag0, -t 16.8); the right column is the FULL parity suite (test/romeo_compare.py
+ * --weights-all: 4 real + 11 synthetic cases, 10 weight selections):
  *
- *   FP policy for romeo.o                          weight bytes differing   unwrapped
- *   ---------------------------------------------  ----------------------   -------------------
- *   -fno-fast-math -ffp-contract=off  (SHIPPED)          0 / 797088         bit-identical
- *   -fno-fast-math -ffp-contract=fast (FMA only)         0 / 797088         bit-identical
- *   -ffast-math -fno-finite-math-only (repo default)   360 / 797088         66 voxels off by
- *                                                                           >=1 full 2*pi wrap,
- *                                                                           max|diff| 12.57 rad
+ *   FP policy for romeo.o              e0 weight bytes differing   FULL parity suite
+ *   ---------------------------------  -------------------------   ---------------------------
+ *   -fno-fast-math -ffp-contract=off         0 / 797088            422/422 pass   (SHIPPED)
+ *   -fno-fast-math -ffp-contract=fast        0 / 797088            9 FAIL: the readphase rescale
+ *     (FMA contraction only)                                       on the line_x/plane_xy
+ *                                                                  fixtures differs by 1 float
+ *                                                                  ULP, and the pre-rescale
+ *                                                                  weights drift past the 4 ULP
+ *                                                                  limit (me: 5 ULP)
+ *   -ffast-math -fno-finite-math-only      360 / 797088            66 voxels off by >=1 FULL
+ *     (the repository-wide default)                                2*pi wrap, max|diff| 12.57 rad
  *
- * The failure mode is NOT float32 rounding: reassociation pushes a weight just past 1.0, the
- * `0 <= w <= 1` guard in rescale() then returns bin 0, and the edge DISAPPEARS from the graph
- * (largest observed bin deviation: 252).  Multi-echo output stops matching even at --compare
- * 1e-4.  Contraction alone measured clean, but it is left off because (a) it buys nothing —
- * median runtime is 0.07 s either way, the op is I/O-bound — and (b) it would silently break the
- * Dekker/Cody-Waite double-double arithmetic in the 2*pi range reduction below, where Julia
- * fuses ONLY at its explicit muladd sites (mirrored here as explicit fma() calls).  -fno-fast-math
- * does not inhibit SIMD auto-vectorisation of the non-reduction loops, so no vectorisation is
- * given up; only reassociation is.  Change ROMEO_STRICT_FP in src/Makefile to revisit.
+ * The -ffast-math failure mode is NOT float32 rounding: reassociation pushes a weight just past
+ * 1.0, the `0 <= w <= 1` guard in rescale() then returns bin 0, and the edge DISAPPEARS from the
+ * graph (largest observed bin deviation: 252). Multi-echo output stops matching even at
+ * --compare 1e-4.
+ *
+ * FMA contraction is bit-identical on the validation volume but NOT on the full corpus (row 2) -
+ * an earlier version of this comment claimed otherwise on the strength of the single-volume
+ * measurement alone. It is also unsafe in principle: it would silently break the Dekker/
+ * Cody-Waite double-double arithmetic in the 2*pi range reduction below, where Julia fuses ONLY
+ * at its explicit muladd sites (mirrored here as explicit fma() calls). And it buys nothing
+ * measurable - the unwrap is 0.02 s on the validation volume (0.07 s wall including gzip
+ * output). -fno-fast-math does not inhibit SIMD auto-vectorisation of the non-reduction loops,
+ * so no vectorisation is given up; only reassociation is. Change ROMEO_STRICT_FP in
+ * src/Makefile to revisit - and re-run the FULL suite, not one volume.
  *
  * ---------------------------------------------------------------------------------------------
  * NUMERIC TYPE AUDIT (romeo_plan.md §3.1).  Julia's promotion rules are NOT uniform across the
@@ -106,7 +116,6 @@
 #include <stdint.h>
 #include <limits.h>
 #include <math.h>
-#include <float.h>
 #include "romeo.h"
 #ifdef _OPENMP
 #include <omp.h>
@@ -117,6 +126,13 @@
 #define RM_2PI_F32 6.28318548202514648f   /* Float32(2pi) = 0x1.921fb6p+2 */
 #define RM_PI_F64 3.14159265358979323846  /* Float64(pi) */
 #define RM_2PI_F64 6.28318530717958647692 /* Float64(2pi) */
+
+/* MSVC has no strtok_r; its strtok_s takes the identical 3 arguments. romeo.c IS compiled on
+   Windows (src/CMakeLists.txt adds it to ADDITIONAL_SRCS, and both AppVeyor and
+   release-binaries.yml build with MSVC), so this is a hard build break without the alias. */
+#if defined(_MSC_VER) && !defined(strtok_r)
+#define strtok_r strtok_s
+#endif
 
 #define RM_ERR(...) do { fprintf(stderr, "** -romeo: "); fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -322,7 +338,10 @@ static int rm_paynehanek(double x, rm_dd *y) {
 	raw_exponent = (int)((u >> 52) & 0x7ff);
 	k = raw_exponent - 1023 - 52;
 	idx = k >> 6;                 /* arithmetic shift, matches Julia's k >> 6 */
-	shift = k - (idx << 6);
+	/* Julia writes `k - (idx << 6)`, but idx is NEGATIVE here for every |x| just above the
+	   Payne-Hanek threshold (k ~ -32 -> idx == -1), and left-shifting a negative int is UB in C
+	   (caught by UBSan). idx * 64 is the same value and well defined; idx stays in [-1, 15]. */
+	shift = k - idx * 64;
 	if (shift == 0) {
 		a1 = (idx + 0 < 0) ? 0 : RM_INV_2PI[idx + 0];
 		a2 = RM_INV_2PI[idx + 1];
@@ -898,10 +917,12 @@ typedef struct {           /* observable robustmask intermediates, for the parit
 	int64_t sample_len;
 } rm_mask_stages;
 
+/* Frees EVERY stage including s4. The two callers that keep the final mask detach it first
+   (`mask = stages.s4; stages.s4 = NULL;`), so this stays symmetric and every error path is a
+   single call rather than a free-plus-free-s4 pair. */
 static void rm_mask_stages_free(rm_mask_stages *s) {
-	free(s->s1); free(s->s2); free(s->s3); free(s->sm1); free(s->sm2);
-	s->s1 = s->s2 = s->s3 = NULL; s->sm1 = s->sm2 = NULL;
-	/* s4 is handed to the caller */
+	free(s->s1); free(s->s2); free(s->s3); free(s->sm1); free(s->sm2); free(s->s4);
+	s->s1 = s->s2 = s->s3 = s->s4 = NULL; s->sm1 = s->sm2 = NULL;
 }
 
 /* robustmask(weight; factor=1, threshold=nothing).  Returns 0 and fills stages->s4 (owned by
@@ -958,21 +979,21 @@ static int rm_robustmask(const float *weight, int nx, int ny, int nz,
 	st->sm2 = (float *)malloc((size_t)n * sizeof(float));
 	st->s4 = (uint8_t *)malloc((size_t)n);
 	if (!st->s1 || !st->sm1 || !st->s2 || !st->s3 || !st->sm2 || !st->s4) {
-		rm_mask_stages_free(st); free(st->s4); st->s4 = NULL; return 1;
+		rm_mask_stages_free(st); return 1;
 	}
 	for (i = 0; i < n; i++) st->s1[i] = (weight[i] > threshold) ? 1 : 0;
 	for (i = 0; i < n; i++) st->sm1[i] = (float)st->s1[i];
 	{
 		int boxes1[1] = { 5 };
-		if (rm_boxsmooth3d(st->sm1, nx, ny, nz, 1, boxes1)) { rm_mask_stages_free(st); free(st->s4); st->s4 = NULL; return 1; }
+		if (rm_boxsmooth3d(st->sm1, nx, ny, nz, 1, boxes1)) { rm_mask_stages_free(st); return 1; }
 	}
 	for (i = 0; i < n; i++) st->s2[i] = ((double)st->sm1[i] > 0.4) ? 1 : 0;
 	memcpy(st->s3, st->s2, (size_t)n);
-	if (rm_fill_holes(st->s3, nx, ny, nz)) { rm_mask_stages_free(st); free(st->s4); st->s4 = NULL; return 1; }
+	if (rm_fill_holes(st->s3, nx, ny, nz)) { rm_mask_stages_free(st); return 1; }
 	for (i = 0; i < n; i++) st->sm2[i] = (float)st->s3[i];
 	{
 		int boxes2[2] = { 3, 3 };
-		if (rm_boxsmooth3d(st->sm2, nx, ny, nz, 2, boxes2)) { rm_mask_stages_free(st); free(st->s4); st->s4 = NULL; return 1; }
+		if (rm_boxsmooth3d(st->sm2, nx, ny, nz, 2, boxes2)) { rm_mask_stages_free(st); return 1; }
 	}
 	for (i = 0; i < n; i++) st->s4[i] = ((double)st->sm2[i] > 0.6) ? 1 : 0;
 	return 0;
@@ -992,11 +1013,14 @@ typedef struct {
 	int64_t *len, *cap;
 	int nbins;
 	int min;   /* 1-based bin index; nbins+1 == empty */
+	int oom;   /* sticky: a failed enqueue would silently drop an edge from the spanning tree,
+	              leaving a whole region unwrapped WRONG with a zero exit status. Fail closed. */
 } rm_pq;
 
 static int rm_pq_init(rm_pq *q, int nbins) {
 	q->nbins = nbins;
 	q->min = nbins + 1;
+	q->oom = 0;
 	q->bin = (int64_t **)calloc((size_t)nbins + 1, sizeof(int64_t *));
 	q->len = (int64_t *)calloc((size_t)nbins + 1, sizeof(int64_t));
 	q->cap = (int64_t *)calloc((size_t)nbins + 1, sizeof(int64_t));
@@ -1011,11 +1035,11 @@ static void rm_pq_free(rm_pq *q) {
 }
 static int rm_pq_isempty(const rm_pq *q) { return q->min > q->nbins; }
 static int rm_pq_enqueue(rm_pq *q, int64_t item, int w) {
-	if (w < 1 || w > q->nbins) return 1;
+	if (w < 1 || w > q->nbins) { q->oom = 1; return 1; }
 	if (q->len[w] == q->cap[w]) {
 		int64_t nc = q->cap[w] ? q->cap[w] * 2 : 64;
 		int64_t *nb = (int64_t *)realloc(q->bin[w], (size_t)nc * sizeof(int64_t));
-		if (!nb) return 1;
+		if (!nb) { q->oom = 1; return 1; }
 		q->bin[w] = nb; q->cap[w] = nc;
 	}
 	q->bin[w][q->len[w]++] = item;
@@ -1028,7 +1052,9 @@ static int64_t rm_pq_dequeue(rm_pq *q) {
 	return e;
 }
 
-/* The seed queue is built once from sum(weights; dims=1) in ascending linear index and only
+/* The seed queue is built once from sum(weights; dims=1) — with every ZERO weight first
+   substituted by 255, so a voxel with non-existent edges sorts as WORST rather than best — in
+   ascending linear index and only
    ever dequeued, so a counting sort reproduces the bucket layout exactly: within a bin the
    entries are ascending and pop-from-the-end yields the HIGHEST linear index first. */
 typedef struct {
@@ -1156,6 +1182,14 @@ static void rm_unwrapedge(rm_grow *g, int64_t oldvox, int64_t newvox) {
 		g->wrapped[newvox - 1] = rm_unwrapvoxel_ff(g->wrapped[newvox - 1], g->wrapped[oldvox - 1] + df);
 }
 
+/* new_seed_thresh = NBINS - div(NBINS - sum(seed_weights)/3, 2).  sum/3 is Float64 and
+   div(::Float64, 2) truncates toward zero.  ONE definition: the -romeo-dump manifest reports
+   the same value, and two copies of this expression would drift. */
+static double rm_seed_thresh(int w1, int w2, int w3) {
+	double t = (double)RM_NBINS - (double)(w1 + w2 + w3) / 3.0;
+	return (double)RM_NBINS - trunc(t / 2.0);
+}
+
 /* Returns the new seed threshold, or 255 when no unvisited voxel remains. */
 static double rm_addseed(rm_grow *g, rm_seedq *sq, rm_pq *pq, int64_t *seeds, int *nseeds) {
 	int64_t seed = 0;
@@ -1173,20 +1207,15 @@ static double rm_addseed(rm_grow *g, rm_seedq *sq, rm_pq *pq, int64_t *seeds, in
 	seeds[*nseeds] = seed;
 	(*nseeds)++;
 	g->visited[seed - 1] = (uint8_t)(*nseeds);
-	{
-		int sum = (int)g->weights[rm_getedgeindex(seed, 1) - 1]
-			+ (int)g->weights[rm_getedgeindex(seed, 2) - 1]
-			+ (int)g->weights[rm_getedgeindex(seed, 3) - 1];
-		/* NBINS - div(NBINS - sum/3, 2): sum/3 is Float64, div(::Float64,2) truncates toward 0 */
-		double t = (double)RM_NBINS - (double)sum / 3.0;
-		return (double)RM_NBINS - trunc(t / 2.0);
-	}
+	return rm_seed_thresh((int)g->weights[rm_getedgeindex(seed, 1) - 1],
+		(int)g->weights[rm_getedgeindex(seed, 2) - 1],
+		(int)g->weights[rm_getedgeindex(seed, 3) - 1]);
 }
 
 /* grow_region_unwrap!.  maxseeds is capped at 255 upstream; only 1 is supported here (the
    experimental multi-seed/region-merging path is not ported). `pq` may already hold seed edges
    (the temporal-uncertain re-entry), in which case no seed is created. */
-static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds, uint8_t *out_visited) {
+static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds) {
 	int64_t seeds[256];
 	int nseeds = 0;
 	double new_seed_thresh = 256.0;
@@ -1195,6 +1224,7 @@ static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds, uin
 		if (!sq) return 1;
 		new_seed_thresh = rm_addseed(g, sq, pq, seeds, &nseeds);
 		seeded = 1;
+		if (pq->oom) return 1;
 	}
 	while (!rm_pq_isempty(pq)) {
 		int64_t edge, oldvox, newvox, vox, neighbor;
@@ -1214,10 +1244,10 @@ static int rm_grow_region(rm_grow *g, rm_pq *pq, rm_seedq *sq, int maxseeds, uin
 				int64_t e = rm_getnewedge(g, newvox, i);
 				if (e != 0 && g->weights[e - 1] > 0) rm_pq_enqueue(pq, e, g->weights[e - 1]);
 			}
+			if (pq->oom) return 1;
 		}
 	}
-	if (out_visited && out_visited != g->visited) memcpy(out_visited, g->visited, (size_t)g->n);
-	return 0;
+	return pq->oom ? 1 : 0;   /* fail closed on a dropped edge */
 }
 
 /* ============================================================================================
@@ -1262,7 +1292,7 @@ static int rm_unwrap3d(float *wrapped, const uint8_t *weights, int nx, int ny, i
 	g.phase2 = phase2; g.TE1 = TE1; g.TE2 = TE2; g.have_p2 = have_p2;
 	if (rm_pq_init(&pq, RM_NBINS)) { free(visited); return 1; }
 	if (rm_seedq_build(&sq, weights, n)) { rm_pq_free(&pq); free(visited); return 1; }
-	rc = rm_grow_region(&g, &pq, &sq, maxseeds, NULL);
+	rc = rm_grow_region(&g, &pq, &sq, maxseeds);
 	rm_pq_free(&pq);
 	rm_seedq_free(&sq);
 	if (visited_out) memcpy(visited_out, visited, (size_t)n);
@@ -1284,6 +1314,65 @@ static int rm_dump(const char *dir, const char *name, const void *p, size_t elem
 	if (n > 0 && fwrite(p, elem, (size_t)n, f) != (size_t)n) { fclose(f); RM_ERR("short write to '%s'\n", path); return 1; }
 	fclose(f);
 	return 0;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Primitive self-dump (test hook).  The 2*pi range reduction, gamma, rescale and unwrapvoxel are
+ * exercised on a FIXED input table that is duplicated verbatim in test/romeo_oracle.jl, so the
+ * two sides can be byte-compared.  This is the ONLY coverage of the Payne-Hanek branch: real
+ * phase data never reaches |x| >= 2^20*pi/2, but -no-phase-rescale lets a caller feed already
+ * unwrapped phase, and phaselinearity would then take arbitrarily large arguments.
+ * KEEP THE TABLES IN SYNC WITH test/romeo_oracle.jl.
+ * ----------------------------------------------------------------------------------------*/
+
+static const double RM_PRIM_D[] = {
+	0.0, 1.0, -1.0, 3.141592653589793, -3.141592653589793,
+	1.5707963267948966, -1.5707963267948966, 4.71238898038469, 6.283185307179586, -6.283185307179586,
+	2.5, -2.5, 3.5, -3.5, 5.0, -5.0, 7.0, -7.0,
+	100.0, -100.0, 1000.0, 100000.0, 1000000.0, 1600000.0,
+	/* >= 2^20*pi/2 == the Payne-Hanek branch */
+	1650000.0, -1650000.0, 1.0e7, -1.0e7, 1.0e10, -1.0e10, 1.0e15, 1.0e20, 1.0e30, 1.0e100,
+	0.5, -0.5, 1.5, 2.5000000000000004
+};
+static const float RM_PRIM_F[] = {
+	0.0f, 1.0f, -1.0f, 3.1415925f, 3.1415927f, -3.1415925f, -3.1415927f,
+	3.2f, -3.2f, 6.2831855f, -6.2831855f, 9.42477f, 12.566371f,
+	1.0e-30f, -1.0e-30f, 100.0f, 1.0e5f, 1.0e7f, 1.0e10f, -1.0e10f, 1.0e20f, 4.0f, -4.0f
+};
+static const double RM_PRIM_W[] = { /* rescale() inputs, incl. exact bin boundaries */
+	0.0, 1.0, 0.5, 0.5 / 255.0, 1.5 / 255.0, 2.5 / 255.0,
+	1.0 - 0.5 / 255.0, 1.0 - 1.5 / 255.0, 1.0000000000000002, -1.0e-17,
+	0.9980392156862745, 0.99607843137254903, 0.25, 0.75
+};
+static const float RM_PRIM_UV[][2] = { /* (new, old) pairs for unwrapvoxel */
+	{ 1.0f, 1.0f }, { 3.0f, -3.0f }, { 0.0f, 3.1415927f }, { 0.0f, -3.1415927f },
+	{ 1.0f, 7.2831855f }, { -1.0f, 100.0f }, { 0.0f, 1.0e10f }, { 3.1415927f, -3.1415927f },
+	{ 2.0f, 2.0f + 3.1415927f }, { -2.0f, -2.0f - 3.1415927f }
+};
+
+static void rm_dump_primitives(const char *dir) {
+	size_t i;
+	size_t nd = sizeof RM_PRIM_D / sizeof RM_PRIM_D[0];
+	size_t nf = sizeof RM_PRIM_F / sizeof RM_PRIM_F[0];
+	size_t nw = sizeof RM_PRIM_W / sizeof RM_PRIM_W[0];
+	size_t nu = sizeof RM_PRIM_UV / sizeof RM_PRIM_UV[0];
+	double *od = (double *)malloc(nd * sizeof(double));
+	float *of = (float *)malloc(nf * sizeof(float) * 2);
+	uint8_t *ow = (uint8_t *)malloc(nw);
+	float *ou = (float *)malloc(nu * sizeof(float) * 2);
+	if (!od || !of || !ow || !ou) { free(od); free(of); free(ow); free(ou); return; }
+	for (i = 0; i < nd; i++) od[i] = rm_rem2pi_d(RM_PRIM_D[i]);
+	for (i = 0; i < nf; i++) { of[i] = rm_rem2pi_f(RM_PRIM_F[i]); of[nf + i] = rm_gamma_f(RM_PRIM_F[i]); }
+	for (i = 0; i < nw; i++) ow[i] = rm_rescale(RM_PRIM_W[i]);
+	for (i = 0; i < nu; i++) {
+		ou[i] = rm_unwrapvoxel_ff(RM_PRIM_UV[i][0], RM_PRIM_UV[i][1]);
+		ou[nu + i] = rm_unwrapvoxel_fd(RM_PRIM_UV[i][0], (double)RM_PRIM_UV[i][1]);
+	}
+	rm_dump(dir, "c_prim_rem2pi64.f64", od, sizeof(double), (int64_t)nd);
+	rm_dump(dir, "c_prim_rem2pi32_gamma.f32", of, sizeof(float), (int64_t)(2 * nf));
+	rm_dump(dir, "c_prim_rescale.u8", ow, 1, (int64_t)nw);
+	rm_dump(dir, "c_prim_unwrapvoxel.f32", ou, sizeof(float), (int64_t)(2 * nu));
+	free(od); free(of); free(ow); free(ou);
 }
 
 romeo_opts romeo_opts_default(void) {
@@ -1372,7 +1461,7 @@ static int rm_parse_weights(const char *s, romeo_opts *o) {
 
 int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const char *cmd) {
 	int ac = *pac;
-	(void)cmd;
+	(void)cmd;  /* reserved: disambiguates the RM_ERR prefix if a second caller is ever added */
 	while (ac < argc) {
 		const char *a = argv[ac];
 		if (!strcmp(a, "-t")) {
@@ -1402,7 +1491,7 @@ int romeo_parse_subopts(int *pac, int argc, char *argv[], romeo_opts *o, const c
 				o->mask_sel = RM_MASK_QUALITY;
 				if (ac < argc) {
 					double v;
-					if (!rm_parse_double(argv[ac], &v)) { o->qmask_thresh = v; o->qmask_thresh_set = 1; ac++; }
+					if (!rm_parse_double(argv[ac], &v)) { o->qmask_thresh = v; ac++; }
 				}
 			} else {
 				/* set_mask! treats any token that names an existing file as a mask and errors
@@ -1661,6 +1750,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		}
 	}
 	if (dump) { if (rm_dump(dump, "c_phase_rescaled.f32", phase, sizeof(float), (int64_t)nim->nvox)) goto done; }
+	if (o->verbose) fprintf(stderr, " + -romeo: %dx%dx%d, %d echo(es); phase loaded\n", nx, ny, nz, neco);
 
 	/* ---- echo times ---------------------------------------------------------------------- */
 	TEs = (double *)malloc((size_t)(neco > 1 ? neco : 1) * sizeof(double));
@@ -1755,6 +1845,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			char path[2048];
 			snprintf(path, sizeof path, "%s/c_manifest.txt", dump);
 			manifest = fopen(path, "w");
+			rm_dump_primitives(dump);
 			if (rm_dump(dump, "c_weights.u8", weights, 1, 3 * n3)) goto done;
 			{
 				double *wd = (double *)malloc((size_t)3 * (size_t)n3 * sizeof(double));
@@ -1777,8 +1868,7 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 						int w2 = weights[rm_getedgeindex(sd, 2) - 1];
 						int w3 = weights[rm_getedgeindex(sd, 3) - 1];
 						fprintf(manifest, "seed_w1 %d\nseed_w2 %d\nseed_w3 %d\n", w1, w2, w3);
-						fprintf(manifest, "new_seed_thresh %.17g\n",
-							(double)RM_NBINS - trunc(((double)RM_NBINS - (double)(w1 + w2 + w3) / 3.0) / 2.0));
+						fprintf(manifest, "new_seed_thresh %.17g\n", rm_seed_thresh(w1, w2, w3));
 					}
 					rm_seedq_free(&sq);
 				}
@@ -1803,6 +1893,12 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 			if (mask) rm_dump(dump, "c_mask_s4_final.u8", mask, 1, n3);
 		}
 	}
+
+	if (o->verbose)
+		fprintf(stderr, " + -romeo: weights %d%d%d%d%d%d, mask=%s, template echo %d\n",
+			flags[0], flags[1], flags[2], flags[3], flags[4], flags[5],
+			mask ? (o->mask_sel == RM_MASK_FILE ? "file" : (o->mask_sel == RM_MASK_QUALITY ? "qualitymask" : "robustmask")) : "none",
+			template_echo);
 
 	/* ---- unwrap ----------------------------------------------------------------------------- */
 	visited = (uint8_t *)calloc((size_t)n3, 1);
@@ -1931,7 +2027,12 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 							}
 						}
 					}
-					rm_grow_region(&g, &pq, NULL, o->maxseeds, NULL);
+					if (rm_grow_region(&g, &pq, NULL, o->maxseeds)) {
+						rm_pq_free(&pq);
+						free(qual); free(halfw); free(halfr); free(vis); free(refvalue);
+						RM_ERR("out of memory during temporal-uncertain re-unwrapping\n");
+						goto done;
+					}
 					rm_pq_free(&pq);
 				}
 				free(qual); free(halfw); free(halfr); free(vis);
@@ -1993,13 +2094,13 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 		rm_dump(dump, "c_unwrapped.f32", phase, sizeof(float), (int64_t)nim->nvox);
 	}
 
+	if (o->verbose) fprintf(stderr, " + -romeo: unwrapping finished\n");
 	memcpy(nim->data, phase, (size_t)nim->nvox * sizeof(float));
 	ret = 0;
 
 done:
 	if (manifest) fclose(manifest);
 	rm_mask_stages_free(&stages);
-	free(stages.s4);
 	free(phase); free(mag); free(mask); free(weights); free(magmasked); free(visited); free(TEs);
 	(void)ihdr;
 	return ret;

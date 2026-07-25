@@ -48,7 +48,6 @@ typedef struct {
 	int mask_sel;            // RM_MASK_*
 	const char *mask_file;   // RM_MASK_FILE
 	double qmask_thresh;     // -k qualitymask <thr>
-	int qmask_thresh_set;
 	int template_echo;       // 1-based, default 1
 	int correctglobal;       // -g
 	int individual;          // -i

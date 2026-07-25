@@ -103,9 +103,9 @@ def cmp_float(res: Result, label: str, ref: str, got: str, tol: float, wrap_chec
         if not fx or not fy:
             # a non-finite difference has no magnitude; count it separately so an all-NaN pair
             # can never read as "equal" (the --compare gotcha, see AGENTS.md)
-            if fx != fy or (fx and fy and x != y):
+            if fx != fy:
                 nonfinite += 1
-            elif not fx and not fy and not (math.isnan(x) and math.isnan(y)) and x != y:
+            elif not (math.isnan(x) and math.isnan(y)) and x != y:
                 nonfinite += 1
             continue
         d = abs(x - y)
@@ -152,6 +152,37 @@ def cmp_seed_scalars(res: Result, tag: str, ref: str, cmanifest: str) -> None:
         res.add(label, False, "mismatch: " + ", ".join("%s oracle=%g c=%s" % (k, want[k], got.get(k)) for k in bad))
     else:
         res.add(label, True, "seed=%d new_seed_thresh=%g exact" % (int(want["seed_index"]), want.get("new_seed_thresh", 0)))
+
+
+def cmp_ulp(res: Result, label: str, ref: str, got: str, max_ulp: int) -> None:
+    """Compare two Float64 arrays in ULPs (plan M2: the pre-rescale weights must agree to <=4 ULP).
+    Bit patterns are mapped to a monotone signed ordering so the distance is exact."""
+    if not os.path.exists(ref) or not os.path.exists(got):
+        res.add(label, False, "missing " + os.path.basename(ref if not os.path.exists(ref) else got))
+        return
+    a = read_raw(ref, "d")
+    b = read_raw(got, "d")
+    if len(a) != len(b):
+        res.add(label, False, f"length {len(b)} != oracle {len(a)}")
+        return
+
+    def ordered(x: float) -> int:
+        (bits,) = struct.unpack("<q", struct.pack("<d", x))
+        return bits if bits >= 0 else -(bits & 0x7FFFFFFFFFFFFFFF) - (1 << 63)
+
+    worst = 0
+    argworst = -1
+    nonfinite = 0
+    for i, (x, y) in enumerate(zip(a, b)):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            if not (math.isnan(x) and math.isnan(y)) and x != y:
+                nonfinite += 1
+            continue
+        d = abs(ordered(x) - ordered(y))
+        if d > worst:
+            worst, argworst = d, i
+    ok = worst <= max_ulp and nonfinite == 0
+    res.add(label, ok, f"max {worst} ULP at {argworst} (limit {max_ulp}), nonfinite-mismatch={nonfinite}")
 
 
 def run_niimath(binary: str, args: list[str], cwd: str) -> tuple[int, str]:
@@ -205,6 +236,8 @@ def check_case(binary: str, ref: str, tag: str, datadir: str, phase: str, mag: s
         cmp_float(res, f"{tag}: qmap", R("qmap.f32"), C("qmap.f32"), 1e-6)
         for qi in range(1, 7):
             cmp_float(res, f"{tag}: qmap_{qi}", R(f"qmap_{qi}.f32"), C(f"qmap_{qi}.f32"), 1e-6)
+        cmp_ulp(res, f"{tag}: weights pre-rescale", R("weights_prerescale.f64"),
+                C("weights_prerescale.f64"), 4)
         cmp_float(res, f"{tag}: unwrapped", R("unwrapped.f32"), C("unwrapped.f32"), 1e-4, wrap_check=True)
 
         # Variant runs. The oracle dumps these arrays (M5/M6 exit criteria); each needs its own
@@ -272,6 +305,34 @@ def write_f32_nifti(path: str, dims: tuple[int, int, int], data: list[float]) ->
         f.write(bytes(hdr) + b"\0\0\0\0" + struct.pack("<%df" % len(data), *data))
 
 
+def check_primitives(binary: str, ref: str, res: Result) -> None:
+    """Byte-compare the low-level numeric primitives (rem2pi Float64/Float32, gamma, rescale,
+    both unwrapvoxel widths) against the oracle on a fixed input table shared by both sides.
+    The table deliberately includes |x| >= 2^20*pi/2 so the Payne-Hanek branch is covered — no
+    real phase image reaches it, but -no-phase-rescale lets a caller supply values that do."""
+    if not os.path.exists(os.path.join(ref, "prim_rem2pi64.f64")):
+        res.add("primitives", False, "oracle has no primitive tables (regenerate with romeo_oracle.sh)")
+        return
+    tmp = tempfile.mkdtemp(prefix="romeo_prim_")
+    try:
+        fix = os.path.join(ref, "fixtures")
+        phase = os.path.join(fix, "small_a_phase.nii")
+        if not os.path.exists(phase):
+            res.add("primitives", False, "missing synthetic fixture")
+            return
+        rc, log = run_niimath(binary, [phase, "-romeo", os.path.join(fix, "small_a_mag.nii"),
+                                       "-t", "16.8", "-romeo-dump", tmp,
+                                       os.path.join(tmp, "o")], tmp)
+        if rc != 0:
+            res.add("primitives", False, f"exit {rc}: {log.strip()[:150]}")
+            return
+        for name in ("rem2pi64.f64", "rem2pi32_gamma.f32", "rescale.u8", "unwrapvoxel.f32"):
+            cmp_exact(res, "primitive %s" % name.split(".")[0],
+                      os.path.join(ref, "prim_" + name), os.path.join(tmp, "c_prim_" + name))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_features_property(binary: str, res: Result) -> None:
     """ROMEO.jl test/features.jl, reimplemented against the C port (plan M5 exit criterion).
 
@@ -309,7 +370,6 @@ def check_features_property(binary: str, res: Result) -> None:
                     if rc != 0:
                         res.add(label, False, "exit %d: %s" % (rc, log.strip()[:120]))
                         continue
-                    got = read_raw(out, "f")[352 // 4:] if False else None
                     with open(out, "rb") as f:
                         blob = f.read()
                     off = int(struct.unpack_from("<f", blob, 108)[0])
@@ -321,15 +381,16 @@ def check_features_property(binary: str, res: Result) -> None:
                         npass += 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    res.add("features.jl property (%d cases)" % npass, True,
-            "unwrap(...; correctglobal) == ground truth for l in 7:5:20 x 5 offsets x 3 magnitudes")
+    expected = 3 * 5 * 3  # l in 7:5:20 x 5 offsets x 3 magnitude variants
+    res.add("features.jl property (%d/%d cases)" % (npass, expected), npass == expected,
+            "unwrap(...; correctglobal) == ground truth")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--ref", default=os.path.join(HERE, "romeo_ref"))
-    ap.add_argument("--data", default="/Users/chris/src/ROMEO.jl/romeo")
+    ap.add_argument("--data", default=os.environ.get("ROMEO_JL_DATA", "/Users/chris/src/ROMEO.jl/romeo"))
     ap.add_argument("--case", action="append", default=None)
     ap.add_argument("--weights-all", action="store_true", help="also check every -w selection")
     args = ap.parse_args()
@@ -363,6 +424,7 @@ def main() -> int:
             check_case(binary, ref, "me_a", fixdir, "me_a_phase.nii", "me_a_mag.nii",
                        ["-t", "[16.8,38.56]"], res, args.weights_all)
 
+    check_primitives(binary, ref, res)
     check_features_property(binary, res)
 
     failed = res.report()
