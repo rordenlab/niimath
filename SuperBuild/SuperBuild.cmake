@@ -51,6 +51,13 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
 option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -unwarp)" ON)
+# -moco and -stc are ON for every target; their former Apple-Silicon-only gate was lifted once
+# release_smoke.py (Windows/Ubuntu/macOS via AppVeyor) and js/tests/temporal.test.ts (Emscripten)
+# began checking both numerically on every build. These are forwarded to the inner project as
+# explicit -D cache entries, which its own option() default can never override, so any future
+# per-target rule must be applied HERE as well as in src/CMakeLists.txt.
+option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -119,6 +126,8 @@ ExternalProject_Add(src
         -DUSE_OPENMP:BOOL=${USE_OPENMP}
         -DENABLE_QC:BOOL=${ENABLE_QC}
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
+        -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
+        -DENABLE_STC:BOOL=${ENABLE_STC}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}

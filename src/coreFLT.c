@@ -96,6 +96,12 @@
 #ifdef HAVE_MEDIC
 #include "medic.h" // MEDIC multi-echo distortion correction (--medic, -unwarp)
 #endif
+#ifdef HAVE_MOCO
+#include "moco.h" // rigid-body motion correction (-moco)
+#endif
+#ifdef HAVE_STC
+#include "stc.h" // slice-time correction (-stc)
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -6997,6 +7003,253 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+#ifdef HAVE_MOCO
+/* -moco [-1Dfile <path>]: rigid-body motion correction of a 4D series onto sub-brick 0.
+   The optional "-1Dfile <path>" pair is consumed here; the trailing positional output name is
+   left to niimath's normal output handling. */
+staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *par = NULL;
+	if (ac < argc && !strcmp(argv[ac], "-1Dfile")) {
+		if (ac + 1 >= argc) {
+			printfx("-moco -1Dfile requires a filename\n");
+			return 1;
+		}
+		par = argv[ac + 1];
+		size_t n = strlen(par);
+		/* Supported NIfTI outputs never end in .1D. Keeping the namespaces disjoint is clearer
+		   than guessing the writer's eventual extension, compression, or paired member here. */
+		if (n < 3 || strcmp(par + n - 3, ".1D")) {
+			printfx("-moco -1Dfile requires a filename ending in '.1D'\n");
+			return 1;
+		}
+		ac += 2;
+	}
+	*pac = ac;
+	return nii_moco(nim, par);
+#else
+	(void)nim;
+	if (*pac + 1 < argc && !strcmp(argv[*pac], "-1Dfile")) *pac += 2;
+	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_MOCO
+
+#ifdef HAVE_STC
+/* -stc --slicetiming <list|@file> [-tzero <seconds>]: slice-time correction.
+
+   The option group is frozen: it MUST start with "--slicetiming" (case-sensitive) and may be
+   followed by at most one "-tzero". Anything else ends the group and returns to niimath's
+   normal chain parsing, so a mistyped option fails before any computation rather than being
+   silently ignored. */
+#ifdef DT32
+/* Bounds. A slice-timing list longer than this is a malformed argument, not a real slice count,
+   and a bigger "@file" is almost always a NIfTI handed over by mistake. */
+#define STC_MAX_TIMES 65536
+#define STC_MAX_FILE (4u << 20)
+
+staticx int stc_is_space(int c) {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
+}
+
+/* Scan a NUL-terminated buffer of slice times.  ONE scanner for both accepted forms, because two
+   loops for one job drift: the earlier pair had already grown two different finiteness checks.
+   `strict` selects the command-line form -- comma-separated, exactly one number per field, ASCII
+   whitespace allowed around it, no empty fields and no trailing junk.  Otherwise the AFNI "@file"
+   form is accepted: whitespace or commas separate, and '#' comments run to end of line.
+   With `out == NULL` this only counts, which is how the caller sizes one exact allocation. */
+staticx int stc_scan(const char *text, int strict, const char *who, double *out, int *nout) {
+	int n = 0;
+	const char *p = text;
+	for (;;) {
+		if (strict) {
+			while (stc_is_space((unsigned char)*p)) p++;
+		} else {
+			while (*p) {
+				if (*p == '#') { while (*p && *p != '\n') p++; }
+				else if (stc_is_space((unsigned char)*p) || *p == ',') p++;
+				else break;
+			}
+			if (!*p) break;
+		}
+		char *endp = NULL;
+		double d = strtod(p, &endp);
+		if (endp == p) {
+			printfx("-stc --slicetiming: %s has an empty or unparsable value at '%.24s'\n", who, p);
+			return 1;
+		}
+		if (!(d >= -DBL_MAX && d <= DBL_MAX)) {
+			printfx("-stc --slicetiming: %s has a value that is not finite ('%.24s')\n", who, p);
+			return 1;
+		}
+		if (n >= STC_MAX_TIMES) {
+			printfx("-stc --slicetiming: %s has more than %d values\n", who, STC_MAX_TIMES);
+			return 1;
+		}
+		if (out) out[n] = d;
+		n++;
+		p = endp;
+		if (strict) {
+			while (stc_is_space((unsigned char)*p)) p++;
+			if (*p == '\0') break;
+			if (*p != ',') {
+				printfx("-stc --slicetiming: unexpected text at '%.24s'\n", p);
+				return 1;
+			}
+			p++;
+		} else if (*p && *p != '#' && !stc_is_space((unsigned char)*p) && *p != ',') {
+			printfx("-stc --slicetiming: unexpected text at '%.24s'\n", p);
+			return 1;
+		}
+	}
+	if (n == 0) {
+		printfx("-stc --slicetiming: %s holds no values\n", who);
+		return 1;
+	}
+	*nout = n;
+	return 0;
+}
+
+/* Count, allocate exactly, then fill. */
+staticx int stc_parse_text(const char *text, int strict, const char *who,
+                           double **out, int *nout) {
+	int n = 0;
+	if (stc_scan(text, strict, who, NULL, &n)) return 1;
+	double *v = (double *)malloc((size_t)n * sizeof(double));
+	if (!v) {
+		printfx("-stc: out of memory\n");
+		return 1;
+	}
+	int n2 = 0;
+	if (stc_scan(text, strict, who, v, &n2) || n2 != n) {   /* n2 != n cannot happen; fail closed */
+		free(v);
+		return 1;
+	}
+	*out = v;
+	*nout = n;
+	return 0;
+}
+
+/* AFNI-style "@file". Sized from the file itself rather than always allocating the 4 MiB cap,
+   mirroring al_read_affine_json() earlier in this file. */
+staticx int stc_parse_file(const char *path, double **out, int *nout) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		printfx("-stc --slicetiming: cannot open '%s'\n", path);
+		return 1;
+	}
+	/* Size the read from the file when we can, but NEVER require it: seeking fails on a FIFO,
+	   /dev/stdin and shell process substitution ("@<(stc_slicetiming.py ...)"), which are all
+	   reasonable ways to hand over a timing list. So the length is only a starting hint and the
+	   buffer grows to whatever actually arrives, capped at STC_MAX_FILE. */
+	size_t cap = 8192;
+	if (fseek(f, 0, SEEK_END) == 0) {
+		long len = ftell(f);
+		if (len > 0 && (unsigned long)len <= (unsigned long)STC_MAX_FILE) cap = (size_t)len;
+		if (fseek(f, 0, SEEK_SET) != 0) {
+			fclose(f);
+			printfx("-stc --slicetiming: cannot rewind '%s'\n", path);
+			return 1;
+		}
+	}
+	char *buf = (char *)malloc(cap + 1);
+	if (!buf) {
+		fclose(f);
+		printfx("-stc: out of memory\n");
+		return 1;
+	}
+	size_t got = 0;
+	int bad = 0, over = 0;
+	for (;;) {
+		got += fread(buf + got, 1, cap - got, f);
+		if (got < cap || feof(f)) break;
+		if (cap >= STC_MAX_FILE) { over = 1; break; }
+		size_t ncap = (cap > STC_MAX_FILE / 2) ? (size_t)STC_MAX_FILE : cap * 2;
+		char *nb = (char *)realloc(buf, ncap + 1);
+		if (!nb) {
+			free(buf);
+			fclose(f);
+			printfx("-stc: out of memory\n");
+			return 1;
+		}
+		buf = nb;
+		cap = ncap;
+	}
+	bad = ferror(f);
+	fclose(f);
+	if (over) {
+		printfx("-stc --slicetiming: '%s' is larger than %u bytes\n", path, (unsigned)STC_MAX_FILE);
+		free(buf);
+		return 1;
+	}
+	buf[got] = '\0';
+	/* An embedded NUL means this is not the text file the user meant to name. */
+	if (bad || strlen(buf) != got) {
+		printfx("-stc --slicetiming: cannot read '%s'%s\n", path,
+		        bad ? "" : " (not a text file)");
+		free(buf);
+		return 1;
+	}
+	int rc = stc_parse_text(buf, 0, path, out, nout);
+	free(buf);
+	return rc;
+}
+#endif // DT32
+
+staticx int nifti_stc_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	if (ac >= argc || strcmp(argv[ac], "--slicetiming")) {
+		printfx("-stc requires '--slicetiming <t0,t1,...|@file>'\n");
+		return 1;
+	}
+	if (ac + 1 >= argc) {
+		printfx("-stc --slicetiming requires a comma-separated list of seconds or '@file'\n");
+		return 1;
+	}
+	const char *spec = argv[ac + 1];
+	ac += 2;
+	double *times = NULL;
+	int ntimes = 0;
+	int rc = (spec[0] == '@') ? stc_parse_file(spec + 1, &times, &ntimes)
+	                          : stc_parse_text(spec, 1, "--slicetiming", &times, &ntimes);
+	if (rc) return 1;
+	int have_tzero = 0;
+	double tzero = 0.0;
+	if (ac < argc && !strcmp(argv[ac], "-tzero")) {
+		if (ac + 1 >= argc) {
+			printfx("-stc -tzero requires a time in seconds\n");
+			free(times);
+			return 1;
+		}
+		char *end = NULL;
+		tzero = strtod(argv[ac + 1], &end);
+		if (end == argv[ac + 1] || *end != '\0' || !(tzero >= -DBL_MAX && tzero <= DBL_MAX)) {
+			printfx("-stc -tzero: '%s' is not a finite number of seconds\n", argv[ac + 1]);
+			free(times);
+			return 1;
+		}
+		have_tzero = 1;
+		ac += 2;
+	}
+	*pac = ac;
+	rc = nii_stc(nim, times, ntimes, have_tzero, tzero);
+	free(times);
+	return rc;
+#else
+	(void)nim;
+	int ac = *pac;
+	if (ac + 1 < argc && !strcmp(argv[ac], "--slicetiming")) ac += 2;
+	if (ac + 1 < argc && !strcmp(argv[ac], "-tzero")) ac += 2;
+	*pac = ac;
+	printfx("'-dt double' does not support -stc (slice-time correction is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_STC
+
 /* Huge-image (> INT_MAX voxel) support, issue #67. The core calculator ops below are
    nvox_t-clean (see core.h). Any op NOT in this EXACT list keeps int-sized indexing, so a
    huge image is rejected before that op runs rather than silently corrupted (fail-closed,
@@ -7943,6 +8196,24 @@ int main64(int argc, char *argv[]) {
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past the map and axis
+		}
+#endif
+#ifdef HAVE_MOCO
+		else if (!strcmp(argv[ac], "-moco")) {
+			ac++;
+			ok = nifti_moco_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past any -1Dfile pair
+		}
+#endif
+#ifdef HAVE_STC
+		else if (!strcmp(argv[ac], "-stc")) {
+			ac++;
+			ok = nifti_stc_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past --slicetiming and any -tzero pair
 		}
 #endif
 #ifdef HAVE_ROMEO

@@ -92,6 +92,30 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         ADD_DEFINITIONS(-DHAVE_MEDIC)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} medic.c)
     endif()
+
+    # MOCO rigid-body motion correction (-moco) and STC slice-time correction (-stc). Clean-room
+    # implementations of Cox & Jesmanowicz 1999 (MRM 42:1014-1018) and of AFNI 3dTshift's default
+    # Fourier method; 3dvolreg and 3dTshift are GPL-2 and were used only as black-box oracles.
+    # Ordinary FP, so both ride the normal source line (unlike the strict-FP romeo object).
+    #
+    # Both defaulted ON only for an Apple Silicon target while their numerical behaviour was
+    # unproven elsewhere. That gate is now LIFTED: release_smoke.py checks the -stc contract in
+    # closed form and -moco against a known whole-voxel shift, AppVeyor runs it on Windows/MSVC,
+    # Ubuntu and macOS, and js/tests/temporal.test.ts runs the same checks against the Emscripten
+    # bundle -- so every shipped target is validated numerically on every build rather than by
+    # assertion.
+    option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+    if(ENABLE_MOCO)
+        ADD_DEFINITIONS(-DHAVE_MOCO)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c)
+    endif()
+
+    # -stc: measured contract in moco_bench's test/stc_reference_manifest.md. See the MOCO note above.
+    option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
+    if(ENABLE_STC)
+        ADD_DEFINITIONS(-DHAVE_STC)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} stc.c)
+    endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)

@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260725"
+#define kMTHdate "v1.0.20260726"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -398,6 +398,22 @@ int show_help( void ) {
 	printf("                            <map> is 3D (broadcast over frames) or 4D matching the input frame count, on the input grid\n");
 	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
 	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
+#endif
+#ifdef HAVE_MOCO
+	printf(" -moco [-1Dfile <p.1D>]   : rigid-body motion correction of a 4D series onto volume 0\n");
+	printf("                            optional -1Dfile writes six columns per volume: roll pitch yaw dS dL dP\n");
+	printf("                            the parameter filename must end in '.1D'\n");
+	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
+#else
+	printf(" -moco [-1Dfile <path>]   : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
+#endif
+#ifdef HAVE_STC
+	printf(" -stc --slicetiming <t>   : slice-time correction of a 4D series (Fourier, detrend/interpolate/retrend)\n");
+	printf("                            <t> is one comma-separated list of seconds, or '@file'; one value per k slice\n");
+	printf("                            optional '-tzero <sec>' sets the common time point (default: mean of the times)\n");
+#else
+	/* Paired with the #ifdef so a build without it still says how to get the feature back. */
+	printf(" -stc --slicetiming <t>   : slice-time correction — NOT in this build (rebuild with STC=1 or -DENABLE_STC=ON)\n");
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");

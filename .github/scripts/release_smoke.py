@@ -65,6 +65,8 @@ def nifti_header(
     scale: float = 1.0,  # voxel size in xyz_units (pixdim + sform diagonal)
     scl_slope: float = 1.0,  # intensity scaling: stored -> scaled value is slope*v + inter
     scl_inter: float = 0.0,
+    tr: float = 0.0,  # pixdim[4], expressed in time_units
+    time_units: int = 0,  # 0 = none (historic default), 8 = sec, 16 = msec, 24 = usec
 ) -> bytes:
     # Defaults (xyz_units=2 mm, scale=1.0) reproduce the historic mm/unit-voxel
     # header exactly; scale/xyz_units let a fixture describe the SAME physical grid
@@ -74,11 +76,11 @@ def nifti_header(
     struct.pack_into("<8h", hdr, 40, 3, dims[0], dims[1], dims[2], 1, 1, 1, 1)
     struct.pack_into("<h", hdr, 70, datatype)
     struct.pack_into("<h", hdr, 72, bitpix)
-    struct.pack_into("<8f", hdr, 76, 1.0, scale, scale, scale, 0.0, 0.0, 0.0, 0.0)
+    struct.pack_into("<8f", hdr, 76, 1.0, scale, scale, scale, tr, 0.0, 0.0, 0.0)
     struct.pack_into("<f", hdr, 108, 352.0)
     struct.pack_into("<f", hdr, 112, scl_slope)
     struct.pack_into("<f", hdr, 116, scl_inter)
-    hdr[123] = xyz_units
+    hdr[123] = xyz_units | time_units
     struct.pack_into("<h", hdr, 252, 3)
     struct.pack_into("<h", hdr, 254, 3)
     struct.pack_into("<3f", hdr, 268, *offset)
@@ -107,13 +109,16 @@ def write_float32_nifti(
     nt: int = 1,
     scl_slope: float = 1.0,
     scl_inter: float = 0.0,
+    tr: float = 0.0,
+    time_units: int = 0,
 ) -> None:
     nvox = dims[0] * dims[1] * dims[2] * nt
     if len(data) != nvox:
         raise AssertionError(f"{path}: expected {nvox} values, got {len(data)}")
     payload = struct.pack(f"<{nvox}f", *data)
     header = bytearray(
-        nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope, scl_inter=scl_inter)
+        nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope,
+                     scl_inter=scl_inter, tr=tr, time_units=time_units)
     )
     if nt > 1:
         struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
@@ -2103,6 +2108,527 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
         raise AssertionError("-unifize -GM output identical to plain -unifize (GM scaling not applied)")
 
 
+def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
+    """-moco: analytic property check on a synthetic series with a KNOWN integer shift.
+
+    Volume 1 is volume 0 displaced by an exact whole number of voxels along k, so the answer is
+    known in closed form rather than by comparing against a stored golden.  The checks pin the
+    conventions that were established by measurement (moco_bench's test/moco_reference_manifest.md):
+
+      * the parameter file records the CORRECTION, so a +N voxel displacement is reported as a
+        NEGATIVE dS of N mm -- this catches a sign flip, which no residual-based check would;
+      * only dS moves; the other five parameters stay at zero, catching an axis mix-up;
+      * row 0 is all zeros (the base registers to itself);
+      * the file is six %8.4f columns joined by single spaces, one row per volume;
+      * the corrected volume actually lands on the base far better than the input did.
+    """
+    if "-moco" not in help_text or "NOT in this build" in _help_line(help_text, "-moco"):
+        print("  -moco: not built (MOCO=0) - skipping")
+        return
+
+    nx, ny, nz, nt = 24, 24, 20, 3
+    shift = 2  # whole voxels along k, so the displaced volume is an exact copy
+
+    def cell(x: int, y: int, z: int) -> float:
+        # A compact object on a ZERO background, well inside the 5% edging border.  A ramp that
+        # reaches the FOV edge would make the shifted volume differ from the base by a boundary
+        # discontinuity no rigid motion can explain, and the fit would (correctly) refuse it.
+        return (
+            140.0 * math.exp(-((x - 10) ** 2 + (y - 11) ** 2 + (z - 9) ** 2) / 18.0)
+            + 90.0 * math.exp(-((x - 15) ** 2 + (y - 8) ** 2 + (z - 12) ** 2) / 9.7)
+            + 70.0 * math.exp(-((x - 9) ** 2 + (y - 15) ** 2 + (z - 11) ** 2) / 8.0)
+        )
+
+    vol0 = [0.0] * (nx * ny * nz)
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                vol0[x + y * nx + z * nx * ny] = cell(x, y, z)
+
+    data = list(vol0)
+    for t in range(1, nt):
+        sh = shift if t == 1 else 0
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    src = z - sh
+                    v = vol0[x + y * nx + src * nx * ny] if 0 <= src < nz else 0.0
+                    data.append(v)
+
+    src_path = tmp / "moco_in.nii"
+    write_float32_nifti(src_path, (nx, ny, nz), data, nt=nt)
+    par_path = tmp / "moco.1D"
+    out_path = tmp / "moco_out.nii"
+    require_success(
+        run_niimath(exe, [str(src_path), "-moco", "-1Dfile", str(par_path), str(out_path)]),
+        "-moco with -1Dfile",
+    )
+    if not par_path.exists():
+        raise AssertionError("-moco -1Dfile did not write a parameter file")
+
+    lines = par_path.read_text().splitlines()
+    if len(lines) != nt:
+        raise AssertionError("-moco -1Dfile: expected %d rows, got %d" % (nt, len(lines)))
+    for row in lines:
+        # exactly six %8.4f fields joined by single spaces: 6*8 + 5 = 53 chars, no trailing space
+        if len(row) != 53:
+            raise AssertionError("-moco -1Dfile: row is not 53 chars: %r" % row)
+        for f in range(6):
+            field = row[f * 9 : f * 9 + 8]
+            if len(field) != 8 or field != field.rstrip():
+                raise AssertionError("-moco -1Dfile: field %d is not width 8: %r" % (f, row))
+            body = field.strip()
+            if "." not in body or len(body.split(".")[1]) != 4:
+                raise AssertionError("-moco -1Dfile: field %d lacks 4 decimals: %r" % (f, row))
+            float(body)  # must parse in the C locale
+            if f < 5 and row[f * 9 + 8] != " ":
+                raise AssertionError("-moco -1Dfile: fields not single-space separated: %r" % row)
+    if not par_path.read_text().endswith("\n"):
+        raise AssertionError("-moco -1Dfile: missing final newline")
+    rows = [[float(v) for v in row.split()] for row in lines]
+    for k, v in enumerate(rows[0]):
+        if abs(v) > 1e-4:
+            raise AssertionError("-moco: base row must be zeros, column %d is %g" % (k, v))
+
+    roll, pitch, yaw, dS, dL, dP = rows[1]
+    # +shift voxels along k is +shift mm Superior; the file records the correction, so dS < 0.
+    if abs(dS + float(shift)) > 0.20:
+        raise AssertionError("-moco: expected dS near %.1f, got %.4f" % (-float(shift), dS))
+    for name, v in (("roll", roll), ("pitch", pitch), ("yaw", yaw), ("dL", dL), ("dP", dP)):
+        if abs(v) > 0.10:
+            raise AssertionError("-moco: %s should be ~0 for a pure k shift, got %.4f" % (name, v))
+
+    written = out_path if out_path.exists() else Path(str(out_path) + ".gz")
+    if not written.exists():
+        raise AssertionError("-moco did not write an output image")
+    if written.suffix == ".gz":
+        plain = tmp / "moco_out_plain.nii"
+        require_success(
+            run_niimath(exe, [str(written), "-gz", "0", str(plain)]), "-moco decompress"
+        )
+        written = plain
+    vals = read_float32_nifti(written)
+    n3 = nx * ny * nz
+
+    def interior_rms(a_off: int, b_off: int) -> float:
+        tot = 0.0
+        cnt = 0
+        for z in range(4, nz - 4):
+            for y in range(4, ny - 4):
+                for x in range(4, nx - 4):
+                    i = x + y * nx + z * nx * ny
+                    d = vals[a_off + i] - vals[b_off + i]
+                    tot += d * d
+                    cnt += 1
+        return math.sqrt(tot / cnt) if cnt else 0.0
+
+    before = 0.0
+    cnt = 0
+    for z in range(4, nz - 4):
+        for y in range(4, ny - 4):
+            for x in range(4, nx - 4):
+                i = x + y * nx + z * nx * ny
+                d = data[i] - data[n3 + i]
+                before += d * d
+                cnt += 1
+    before = math.sqrt(before / cnt)
+    after = interior_rms(0, n3)
+    if not (after < before * 0.10):
+        raise AssertionError(
+            "-moco: correction did not align volume 1 (interior rms %.4f before, %.4f after)"
+            % (before, after)
+        )
+    if abs(vals[0] - data[0]) > 1e-6:
+        raise AssertionError("-moco: volume 0 must be copied through unchanged")
+
+    # without -1Dfile no parameter file is produced
+    out2 = tmp / "moco_out2.nii"
+    require_success(run_niimath(exe, [str(src_path), "-moco", str(out2)]), "-moco without -1Dfile")
+
+    # a 3D input must be refused rather than silently treated as a single volume
+    mean_path = tmp / "moco_3d.nii"
+    require_success(run_niimath(exe, [str(src_path), "-Tmean", str(mean_path)]), "-moco 3D fixture")
+    mean_written = mean_path if mean_path.exists() else Path(str(mean_path) + ".gz")
+    rejected = run_niimath(exe, [str(mean_written), "-moco", str(tmp / "moco_bad.nii")])
+    if rejected.returncode == 0:
+        raise AssertionError("-moco accepted a 3D image; it must reject one")
+
+    # the base volume must be copied through in full, not merely its first voxel.  Compare against
+    # the file as written (float32), not the float64 source list.
+    src_vals = read_float32_nifti(src_path)
+    for i in range(n3):
+        if vals[i] != src_vals[i]:
+            raise AssertionError(
+                "-moco: volume 0 must be copied through unchanged (voxel %d: %r vs %r)"
+                % (i, vals[i], src_vals[i])
+            )
+
+    # The .1D suffix keeps parameter and supported NIfTI output namespaces disjoint.
+    bad_par = tmp / "moco_params.nii.gz"
+    if run_niimath(
+        exe, [str(src_path), "-moco", "-1Dfile", str(bad_par), str(tmp / "moco_bad_suffix.nii")]
+    ).returncode == 0:
+        raise AssertionError("-moco accepted a -1Dfile path without the required .1D suffix")
+
+    # a failing run must leave an existing parameter file untouched and drop no temporary
+    keep = tmp / "moco_keep.1D"
+    keep.write_text("PRESERVE ME\n")
+    run_niimath(exe, [str(mean_written), "-moco", "-1Dfile", str(keep), str(tmp / "moco_bad2.nii")])
+    if keep.read_text() != "PRESERVE ME\n":
+        raise AssertionError("-moco clobbered an existing parameter file on a failing run")
+    leftovers = list(tmp.glob("*.mocotmp*"))
+    if leftovers:
+        raise AssertionError("-moco left a temporary parameter file behind: %s" % leftovers)
+
+    # structurally 4D but single-volume must be rejected too
+    one = tmp / "moco_one.nii"
+    require_success(run_niimath(exe, [str(src_path), "-crop", "0", "1", str(one)]), "-moco 1-volume fixture")
+    one_written = one if one.exists() else Path(str(one) + ".gz")
+    if run_niimath(exe, [str(one_written), "-moco", str(tmp / "moco_bad3.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted a single-volume 4D image")
+
+    # ---- rotation + fractional interpolation ------------------------------------------------
+    # Rotating the object about the k axis by a few degrees exercises the four-shear
+    # factorization, fractional heptic interpolation and the clip-to-input-range rule, none of
+    # which an integral translation touches.  Checks: the recovered roll has the right magnitude
+    # and sign, the other five parameters stay small, the corrected volume lands on the base, and
+    # clipping holds the output inside the moving volume's own range.
+    ang = math.radians(4.0)
+    cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
+    rot = [0.0] * n3
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                # sample the analytic object at the back-rotated location: exact, no resampler
+                dx0, dy0 = x - cx, y - cy
+                sx = cx + dx0 * math.cos(ang) + dy0 * math.sin(ang)
+                sy = cy - dx0 * math.sin(ang) + dy0 * math.cos(ang)
+                rot[x + y * nx + z * nx * ny] = cell(sx, sy, z)
+    rdata = list(vol0) + rot + list(vol0)
+    rot_src = tmp / "moco_rot.nii"
+    write_float32_nifti(rot_src, (nx, ny, nz), rdata, nt=3)
+    rot_par = tmp / "moco_rot.1D"
+    rot_out = tmp / "moco_rot_out.nii"
+    require_success(
+        run_niimath(exe, [str(rot_src), "-moco", "-1Dfile", str(rot_par), str(rot_out)]),
+        "-moco rotation",
+    )
+    rrows = [[float(v) for v in r.split()] for r in rot_par.read_text().splitlines()]
+    rroll, rpitch, ryaw = rrows[1][0], rrows[1][1], rrows[1][2]
+    # index k is +Superior for this RAS 1 mm header, so a rotation in the (i,j) plane is roll.
+    if abs(rroll + 4.0) > 0.35:
+        raise AssertionError("-moco: expected correction roll near -4 deg, got %.4f" % rroll)
+    for name, v in (("pitch", rpitch), ("yaw", ryaw)):
+        if abs(v) > 0.35:
+            raise AssertionError("-moco: %s should be ~0 for an in-plane rotation, got %.4f" % (name, v))
+    rwritten = rot_out if rot_out.exists() else Path(str(rot_out) + ".gz")
+    if rwritten.suffix == ".gz":
+        rplain = tmp / "moco_rot_plain.nii"
+        require_success(run_niimath(exe, [str(rwritten), "-gz", "0", str(rplain)]), "-moco rot decompress")
+        rwritten = rplain
+    rvals = read_float32_nifti(rwritten)
+    lo_in, hi_in = min(rot), max(rot)
+    for i in range(n3):
+        v = rvals[n3 + i]
+        if v < lo_in - 1e-3 or v > hi_in + 1e-3:
+            raise AssertionError(
+                "-moco: -clipit violated at voxel %d: %g outside input range [%g, %g]"
+                % (i, v, lo_in, hi_in)
+            )
+    num = den = 0.0
+    for z in range(5, nz - 5):
+        for y in range(5, ny - 5):
+            for x in range(5, nx - 5):
+                i = x + y * nx + z * nx * ny
+                num += (rvals[n3 + i] - rvals[i]) ** 2
+                den += (rot[i] - vol0[i]) ** 2
+    if not (num < den * 0.10):
+        raise AssertionError(
+            "-moco: rotation not corrected (interior sse %.4g after vs %.4g before)" % (num, den)
+        )
+
+    print("  -moco: parameter sign/axis/format, base passthrough, alignment, rotation+clipping,")
+    print("         output separation, existing-file preservation and 3D/singleton rejection OK")
+
+
+def _stc_reference(x: list[float], shift: int, nt: int) -> list[float]:
+    """Closed-form -stc output for an INTEGER sample shift, from the measured contract.
+
+    An integer shift makes the Fourier stage exactly a circular shift of the zero-padded
+    residual, so the whole pipeline -- least-squares detrend, shift, clip to the residual range,
+    retrend, clip to the original range -- has a closed form and needs no FFT here.  That is what
+    lets this test pin the SHIFT DIRECTION, which no residual-magnitude check could.
+    """
+    half = 0.5 * (nt - 1)
+    mean = sum(x) / nt
+    sdd = nt * (nt * nt - 1) / 12.0
+    slope = sum((i - half) * x[i] for i in range(nt)) / sdd
+    trend = [mean + slope * (i - half) for i in range(nt)]
+    xd = [x[i] - trend[i] for i in range(nt)]
+    lo, hi = min(xd), max(xd)
+    xlo, xhi = min(x), max(x)
+    out = []
+    for i in range(nt):
+        j = i - shift
+        y = xd[j] if 0 <= j < nt else 0.0  # outside [0, nt) the padded array is zero
+        y = min(max(y, lo), hi)
+        r = y + trend[i]
+        out.append(min(max(r, xlo), xhi))
+    return out
+
+
+def exercise_stc(exe: str, tmp: Path, help_text: str) -> None:
+    """-stc: closed-form check of the measured contract, with no AFNI dependency.
+
+    The fixture uses two slices with times [0, TR] so that -tzero pins one slice to an EXACT
+    one-sample shift and the other to zero.  Everything the manifest records as load-bearing is
+    checked here: shift direction, the least-squares detrend/retrend, both clips, the
+    small-shift skip, toffset = tzero, the non-finite policy, and the parser's rejections.
+    """
+    if "-stc" not in help_text or "NOT in this build" in _help_line(help_text, "-stc"):
+        print("  -stc: not built (STC=0) - skipping")
+        return
+
+    nx, ny, nz, nt = 3, 3, 2, 16
+    tr = 2.0
+    n3 = nx * ny * nz
+    # A spiky series with a strong trend, so BOTH clips have a chance to engage; 9 voxels per
+    # slice also leaves the last batch partly filled (STC processes 8 series at a time).
+    def series(v: int) -> list[float]:
+        return [100.0 + 6.0 * i + 30.0 * math.sin(2.7 * i + v) + (25.0 if i == 5 + (v % 3) else 0.0)
+                for i in range(nt)]
+
+    data = [0.0] * (n3 * nt)
+    for t in range(nt):
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    v = x + y * nx + z * nx * ny
+                    data[t * n3 + v] = series(v)[t]
+    src = tmp / "stc_in.nii"
+    write_float32_nifti(src, (nx, ny, nz), data, nt=nt, tr=tr, time_units=8)
+    times = "0,%g" % tr
+
+    def corrected(args: list[str], label: str) -> list[float]:
+        out = tmp / ("stc_%s.nii" % label)
+        require_success(run_niimath(exe, [str(src), *args, "-gz", "0", str(out)]), "-stc " + label)
+        return read_float32_nifti(out)
+
+    # -tzero 0: slice 0 has shift 0 (skipped verbatim), slice 1 has shift exactly +1 sample.
+    vals = corrected(["-stc", "--slicetiming", times, "-tzero", "0"], "fwd")
+    src_vals = read_float32_nifti(src)
+    clipped_seen = False
+    for z, shift in ((0, 0), (1, 1)):
+        for y in range(ny):
+            for x in range(nx):
+                v = x + y * nx + z * nx * ny
+                got = [vals[t * n3 + v] for t in range(nt)]
+                have = [src_vals[t * n3 + v] for t in range(nt)]
+                if shift == 0:
+                    if got != have:
+                        raise AssertionError("-stc: zero-shift slice must be copied verbatim")
+                    continue
+                want = _stc_reference(have, shift, nt)
+                for t in range(nt):
+                    if abs(got[t] - want[t]) > 2e-3 * max(1.0, abs(want[t])):
+                        raise AssertionError(
+                            "-stc: voxel %d sample %d is %.6g, closed form says %.6g"
+                            % (v, t, got[t], want[t])
+                        )
+                if min(want) <= min(have) or max(want) >= max(have):
+                    clipped_seen = True
+    if not clipped_seen:
+        raise AssertionError("-stc fixture never exercised the output clip; strengthen it")
+
+    # -tzero TR reverses the roles AND the sign: slice 0 now shifts by exactly -1 sample.
+    rev = corrected(["-stc", "--slicetiming", times, "-tzero", "%g" % tr], "rev")
+    for y in range(ny):
+        for x in range(nx):
+            v = x + y * nx
+            have = [src_vals[t * n3 + v] for t in range(nt)]
+            want = _stc_reference(have, -1, nt)
+            for t in range(nt):
+                if abs(rev[t * n3 + v] - want[t]) > 2e-3 * max(1.0, abs(want[t])):
+                    raise AssertionError("-stc: negative shift disagrees with the closed form")
+
+    # A pure line in time is annihilated by the detrend and restored by the retrend, so it must
+    # come back unchanged for ANY shift.  This catches a retrend applied at the shifted index.
+    ramp = [0.0] * (n3 * nt)
+    for t in range(nt):
+        for v in range(n3):
+            ramp[t * n3 + v] = 5.0 + 3.0 * t + 0.25 * v
+    ramp_src = tmp / "stc_ramp.nii"
+    write_float32_nifti(ramp_src, (nx, ny, nz), ramp, nt=nt, tr=tr, time_units=8)
+    ramp_out = tmp / "stc_ramp_out.nii"
+    require_success(
+        run_niimath(exe, [str(ramp_src), "-stc", "--slicetiming", "0,1.3", "-gz", "0", str(ramp_out)]),
+        "-stc linear ramp",
+    )
+    got = read_float32_nifti(ramp_out)
+    for i, (a, b) in enumerate(zip(got, ramp)):
+        if abs(a - b) > 1e-3:
+            raise AssertionError("-stc: a linear time trend must survive unchanged (%d: %g vs %g)"
+                                 % (i, a, b))
+
+    # All-equal slice times leave every shift at zero: the output must be bit-identical.
+    eq = tmp / "stc_eq.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-stc", "--slicetiming", "0.8,0.8", "-gz", "0", str(eq)]),
+        "-stc all-equal timings",
+    )
+    if read_float32_nifti(eq) != src_vals:
+        raise AssertionError("-stc: all-equal slice times must leave the data untouched")
+
+    # Measured skip threshold: |fractional shift| < 0.001 copies the slice verbatim.  With
+    # TR = 2 and tzero = 0 a slice time of 0.0018 s is a shift of 0.0009.
+    skip = tmp / "stc_skip.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-stc", "--slicetiming", "0,0.0018", "-tzero", "0",
+                          "-gz", "0", str(skip)]),
+        "-stc sub-threshold shift",
+    )
+    if read_float32_nifti(skip) != src_vals:
+        raise AssertionError("-stc: a shift below 0.001 samples must be copied verbatim")
+
+    # toffset takes the common time point, in the header's own time units; TR and the spatial
+    # transform are untouched.
+    out_hdr = (tmp / "stc_fwd.nii").read_bytes()
+    src_hdr = src.read_bytes()
+    toffset = struct.unpack_from("<f", out_hdr, 136)[0]  # NIfTI-1 toffset
+    if abs(toffset - 0.0) > 1e-6:
+        raise AssertionError("-stc: toffset must be tzero (0), got %g" % toffset)
+    dflt = tmp / "stc_default_tzero.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-stc", "--slicetiming", times, "-gz", "0", str(dflt)]),
+        "-stc default tzero",
+    )
+    toffset = struct.unpack_from("<f", dflt.read_bytes(), 136)[0]
+    if abs(toffset - tr / 2.0) > 1e-5:
+        raise AssertionError("-stc: default tzero must be the mean slice time, got %g" % toffset)
+    for name, off, size in (("pixdim", 76, 32), ("srow", 280, 48), ("dim", 40, 16)):
+        if out_hdr[off:off + size] != src_hdr[off:off + size]:
+            raise AssertionError("-stc changed the %s header block" % name)
+
+    # niimath policy: a series holding any non-finite sample is written out as all-NaN, and its
+    # neighbours are unaffected (nothing leaks between voxels).
+    nf = list(data)
+    nf_vox = 4 + nx * ny          # a voxel in slice 1, the slice that actually gets shifted
+    nf[3 * n3 + nf_vox] = float("nan")
+    nf_src = tmp / "stc_nf.nii"
+    write_float32_nifti(nf_src, (nx, ny, nz), nf, nt=nt, tr=tr, time_units=8)
+    nf_out = tmp / "stc_nf_out.nii"
+    require_success(
+        run_niimath(exe, [str(nf_src), "-stc", "--slicetiming", times, "-tzero", "0",
+                          "-gz", "0", str(nf_out)]),
+        "-stc non-finite input",
+    )
+    nfv = read_float32_nifti(nf_out)
+    for t in range(nt):
+        if nfv[t * n3 + nf_vox] == nfv[t * n3 + nf_vox]:
+            raise AssertionError("-stc: a non-finite series must be written out as all-NaN")
+    for v in range(n3):
+        if v == nf_vox:
+            continue
+        for t in range(nt):
+            if nfv[t * n3 + v] != nfv[t * n3 + v]:
+                raise AssertionError("-stc: a non-finite series contaminated voxel %d" % v)
+
+    # The all-NaN rule stops at the skip threshold: a slice that is copied verbatim keeps its
+    # non-finite samples exactly as they were.  Pin it, because it is the one place where the
+    # verbatim-copy guarantee and the non-finite policy meet and the documented wording has to
+    # match which one wins.
+    nfs = list(data)
+    nfs[3 * n3 + 4] = float("nan")          # voxel 4 is in slice 0, which -tzero 0 leaves alone
+    nfs_src = tmp / "stc_nf_skip.nii"
+    write_float32_nifti(nfs_src, (nx, ny, nz), nfs, nt=nt, tr=tr, time_units=8)
+    nfs_out = tmp / "stc_nf_skip_out.nii"
+    require_success(
+        run_niimath(exe, [str(nfs_src), "-stc", "--slicetiming", times, "-tzero", "0",
+                          "-gz", "0", str(nfs_out)]),
+        "-stc non-finite in a skipped slice",
+    )
+    skipped = read_float32_nifti(nfs_out)
+    src_nfs = read_float32_nifti(nfs_src)
+    for t in range(nt):
+        for v in range(nx * ny):        # slice 0 only
+            a, b = skipped[t * n3 + v], src_nfs[t * n3 + v]
+            if a != b and not (a != a and b != b):
+                raise AssertionError(
+                    "-stc: a skipped slice must be copied verbatim, NaN included (voxel %d, t %d)"
+                    % (v, t))
+
+    # Parser and validation: every rejection must fail before any output appears.
+    bad = tmp / "stc_bad.nii"
+    adjacent = tmp / "stc_adjacent.1D"
+    adjacent.write_text("0+%g\n" % tr)
+    rejects = [
+        (["-stc", str(bad)], "missing --slicetiming"),
+        (["-stc", "--SliceTiming", times, str(bad)], "wrong case"),
+        (["-stc", "-tzero", "0", "--slicetiming", times, str(bad)], "-tzero before --slicetiming"),
+        (["-stc", "--slicetiming", "0", str(bad)], "too few values"),
+        (["-stc", "--slicetiming", "0,1,2", str(bad)], "too many values"),
+        (["-stc", "--slicetiming", "0,,2", str(bad)], "empty field"),
+        (["-stc", "--slicetiming", "0,%g," % tr, str(bad)], "trailing comma"),
+        (["-stc", "--slicetiming", "0,nan", str(bad)], "non-finite value"),
+        (["-stc", "--slicetiming", "0,2.5", str(bad)], "slice time above TR"),
+        (["-stc", "--slicetiming", "-0.1,1.0", str(bad)], "negative slice time"),
+        (["-stc", "--slicetiming", times, "-tzero", "2.5", str(bad)], "tzero above max"),
+        (["-stc", "--slicetiming", times, "-tzero", "x", str(bad)], "unparsable tzero"),
+        (["-stc", "--slicetiming", "@%s" % (tmp / "stc_absent.1D"), str(bad)], "missing @file"),
+        (["-stc", "--slicetiming", "@%s" % adjacent, str(bad)], "missing @file separator"),
+    ]
+    for argv, label in rejects:
+        res = run_niimath(exe, [str(src), *argv])
+        if res.returncode == 0 or bad.exists() or Path(str(bad) + ".gz").exists():
+            raise AssertionError("-stc accepted %s" % label)
+
+    # 3D and short series are refused rather than silently mishandled.
+    short = tmp / "stc_short.nii"
+    write_float32_nifti(short, (nx, ny, nz), [1.0] * (n3 * 4), nt=4, tr=tr, time_units=8)
+    if run_niimath(exe, [str(short), "-stc", "--slicetiming", times, str(bad)]).returncode == 0:
+        raise AssertionError("-stc accepted nt = 4")
+    vol3d = tmp / "stc_3d.nii"
+    write_float32_nifti(vol3d, (nx, ny, nz), [1.0] * n3, tr=tr, time_units=8)
+    if run_niimath(exe, [str(vol3d), "-stc", "--slicetiming", times, str(bad)]).returncode == 0:
+        raise AssertionError("-stc accepted a 3D image")
+    # A header without a temporal unit must be refused, not assumed to be seconds.
+    nounit = tmp / "stc_nounit.nii"
+    write_float32_nifti(nounit, (nx, ny, nz), data, nt=nt, tr=tr, time_units=0)
+    if run_niimath(exe, [str(nounit), "-stc", "--slicetiming", times, str(bad)]).returncode == 0:
+        raise AssertionError("-stc accepted a header with no temporal unit")
+
+    # The AFNI-style @file form (whitespace separated, '#' comments) matches the inline list, and
+    # -stc chains like any other operation.
+    tfile = tmp / "stc_times.1D"
+    tfile.write_text("# slice times, seconds\n0\n%g\n" % tr)
+    at = corrected(["-stc", "--slicetiming", "@%s" % tfile, "-tzero", "0"], "atfile")
+    if at != vals:
+        raise AssertionError("-stc: '@file' and the inline list disagree")
+    chained = tmp / "stc_chain.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-stc", "--slicetiming", times, "-tzero", "0", "-add", "1",
+                          "-gz", "0", str(chained)]),
+        "-stc chained with -add",
+    )
+    ch = read_float32_nifti(chained)
+    for i in range(len(vals)):
+        if abs(ch[i] - (vals[i] + 1.0)) > 1e-3:
+            raise AssertionError("-stc did not chain into the following operation")
+
+    print("  -stc: shift direction/closed form, detrend+retrend, clips, skip threshold,")
+    print("        toffset, non-finite policy, parser rejections, @file and chaining OK")
+
+
+def _help_line(help_text: str, tag: str) -> str:
+    """The help line for one operation, so a caller can tell "absent" from "present but
+    disabled" -- a platform-gated feature prints a '... NOT in this build' line rather than
+    vanishing, and the two cases need different test behaviour."""
+    for line in help_text.splitlines():
+        if line.strip().startswith(tag):
+            return line
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("exe", nargs="?", default=shutil.which("niimath") or "niimath")
@@ -2332,6 +2858,8 @@ def main() -> int:
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
         exercise_medic(exe, tmp, help_text)
+        exercise_moco(exe, tmp, help_text)
+        exercise_stc(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
 
         if args.expect_bsd:

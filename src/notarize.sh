@@ -29,14 +29,17 @@ AL_SRCS="allineate.c powell_newuoa.c coreg_fast.c reface.c"
 
 build_arch() {
     local target="$1" minver="$2" output="$3"
+    # -moco and -stc build for BOTH slices: their Apple-Silicon-only gate was lifted once CI began
+    # checking both numerically (release_smoke.py) on every shipped target.
+    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC" arch_srcs="${SRCS} moco.c stc.c"
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
     # (allineate no longer needs a separate scoped compile — everything is fast-math now.)
     # ROMEO is compiled SEPARATELY, strict-FP, for this architecture and linked as an object:
     # it must not join the whole-program fast-math source line (see src/romeo.c for the measured
     # consequence -- weight bins move and regions shift by 2*pi).
-    gcc -O3 -fno-fast-math -ffp-contract=off ${DFLAGS} -c romeo.c -target "$target" -mmacosx-version-min="$minver" -o "romeo_$target.o"
-    gcc -sectcreate TEXT info_plist Info.plist -O3 -ffast-math -fno-finite-math-only ${DFLAGS} ${SRCS} ${AL_SRCS} "romeo_$target.o" -lm -lz -target "$target" -mmacosx-version-min="$minver" -o "$output"
+    gcc -O3 -fno-fast-math -ffp-contract=off ${arch_dflags} -c romeo.c -target "$target" -mmacosx-version-min="$minver" -o "romeo_$target.o"
+    gcc -sectcreate TEXT info_plist Info.plist -O3 -ffast-math -fno-finite-math-only ${arch_dflags} ${arch_srcs} ${AL_SRCS} "romeo_$target.o" -lm -lz -target "$target" -mmacosx-version-min="$minver" -o "$output"
     rm -f "romeo_$target.o"
     strip "./$output"
 }
