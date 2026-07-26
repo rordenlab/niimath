@@ -16,6 +16,7 @@
 // Conventions below marked "measured" were established against the pinned oracle; see the
 // manifest for the experiment behind each one.
 
+#define _USE_MATH_DEFINES // microsoft compiler: gates M_PI in <math.h>, must precede it
 #include <math.h>
 #include <stddef.h>   /* ptrdiff_t: do NOT rely on <omp.h> to drag this in */
 #include <stdint.h>
@@ -29,6 +30,9 @@
 	#define getpid _getpid
 #else
 	#include <unistd.h>
+#endif
+#ifndef M_PI
+	#define M_PI 3.14159265358979323846
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -924,7 +928,13 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 		int fd = -1;
 		for (int attempt = 0; attempt < 8 && fd < 0; attempt++) {
 			snprintf(tmpname, plen + 32, "%s.mocotmp%ld_%d", par_path, (long)getpid(), attempt);
+			/* O_BINARY (Windows only) keeps the .1D byte-identical across platforms: without it
+			   the CRT translates every '\n' this file writes into "\r\n". */
+#ifdef _WIN32
+			fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0600);
+#else
 			fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
 		}
 		FILE *f = (fd < 0) ? NULL : fdopen(fd, "wb");
 		if (!f) {
