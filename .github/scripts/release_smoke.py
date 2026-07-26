@@ -2103,6 +2103,256 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
         raise AssertionError("-unifize -GM output identical to plain -unifize (GM scaling not applied)")
 
 
+def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
+    """-moco: analytic property check on a synthetic series with a KNOWN integer shift.
+
+    Volume 1 is volume 0 displaced by an exact whole number of voxels along k, so the answer is
+    known in closed form rather than by comparing against a stored golden.  The checks pin the
+    conventions that were established by measurement (moco_bench's test/moco_reference_manifest.md):
+
+      * the parameter file records the CORRECTION, so a +N voxel displacement is reported as a
+        NEGATIVE dS of N mm -- this catches a sign flip, which no residual-based check would;
+      * only dS moves; the other five parameters stay at zero, catching an axis mix-up;
+      * row 0 is all zeros (the base registers to itself);
+      * the file is six %8.4f columns joined by single spaces, one row per volume;
+      * the corrected volume actually lands on the base far better than the input did.
+    """
+    if "-moco" not in help_text or "NOT in this build" in _moco_help_line(help_text):
+        print("  -moco: not built (MOCO=0) - skipping")
+        return
+
+    nx, ny, nz, nt = 24, 24, 20, 3
+    shift = 2  # whole voxels along k, so the displaced volume is an exact copy
+
+    def cell(x: int, y: int, z: int) -> float:
+        # A compact object on a ZERO background, well inside the 5% edging border.  A ramp that
+        # reaches the FOV edge would make the shifted volume differ from the base by a boundary
+        # discontinuity no rigid motion can explain, and the fit would (correctly) refuse it.
+        return (
+            140.0 * math.exp(-((x - 10) ** 2 + (y - 11) ** 2 + (z - 9) ** 2) / 18.0)
+            + 90.0 * math.exp(-((x - 15) ** 2 + (y - 8) ** 2 + (z - 12) ** 2) / 9.7)
+            + 70.0 * math.exp(-((x - 9) ** 2 + (y - 15) ** 2 + (z - 11) ** 2) / 8.0)
+        )
+
+    vol0 = [0.0] * (nx * ny * nz)
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                vol0[x + y * nx + z * nx * ny] = cell(x, y, z)
+
+    data = list(vol0)
+    for t in range(1, nt):
+        sh = shift if t == 1 else 0
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    src = z - sh
+                    v = vol0[x + y * nx + src * nx * ny] if 0 <= src < nz else 0.0
+                    data.append(v)
+
+    src_path = tmp / "moco_in.nii"
+    write_float32_nifti(src_path, (nx, ny, nz), data, nt=nt)
+    par_path = tmp / "moco.1D"
+    out_path = tmp / "moco_out.nii"
+    require_success(
+        run_niimath(exe, [str(src_path), "-moco", "-1Dfile", str(par_path), str(out_path)]),
+        "-moco with -1Dfile",
+    )
+    if not par_path.exists():
+        raise AssertionError("-moco -1Dfile did not write a parameter file")
+
+    lines = par_path.read_text().splitlines()
+    if len(lines) != nt:
+        raise AssertionError("-moco -1Dfile: expected %d rows, got %d" % (nt, len(lines)))
+    for row in lines:
+        # exactly six %8.4f fields joined by single spaces: 6*8 + 5 = 53 chars, no trailing space
+        if len(row) != 53:
+            raise AssertionError("-moco -1Dfile: row is not 53 chars: %r" % row)
+        for f in range(6):
+            field = row[f * 9 : f * 9 + 8]
+            if len(field) != 8 or field != field.rstrip():
+                raise AssertionError("-moco -1Dfile: field %d is not width 8: %r" % (f, row))
+            body = field.strip()
+            if "." not in body or len(body.split(".")[1]) != 4:
+                raise AssertionError("-moco -1Dfile: field %d lacks 4 decimals: %r" % (f, row))
+            float(body)  # must parse in the C locale
+            if f < 5 and row[f * 9 + 8] != " ":
+                raise AssertionError("-moco -1Dfile: fields not single-space separated: %r" % row)
+    if not par_path.read_text().endswith("\n"):
+        raise AssertionError("-moco -1Dfile: missing final newline")
+    rows = [[float(v) for v in row.split()] for row in lines]
+    for k, v in enumerate(rows[0]):
+        if abs(v) > 1e-4:
+            raise AssertionError("-moco: base row must be zeros, column %d is %g" % (k, v))
+
+    roll, pitch, yaw, dS, dL, dP = rows[1]
+    # +shift voxels along k is +shift mm Superior; the file records the correction, so dS < 0.
+    if abs(dS + float(shift)) > 0.20:
+        raise AssertionError("-moco: expected dS near %.1f, got %.4f" % (-float(shift), dS))
+    for name, v in (("roll", roll), ("pitch", pitch), ("yaw", yaw), ("dL", dL), ("dP", dP)):
+        if abs(v) > 0.10:
+            raise AssertionError("-moco: %s should be ~0 for a pure k shift, got %.4f" % (name, v))
+
+    written = out_path if out_path.exists() else Path(str(out_path) + ".gz")
+    if not written.exists():
+        raise AssertionError("-moco did not write an output image")
+    if written.suffix == ".gz":
+        plain = tmp / "moco_out_plain.nii"
+        require_success(
+            run_niimath(exe, [str(written), "-gz", "0", str(plain)]), "-moco decompress"
+        )
+        written = plain
+    vals = read_float32_nifti(written)
+    n3 = nx * ny * nz
+
+    def interior_rms(a_off: int, b_off: int) -> float:
+        tot = 0.0
+        cnt = 0
+        for z in range(4, nz - 4):
+            for y in range(4, ny - 4):
+                for x in range(4, nx - 4):
+                    i = x + y * nx + z * nx * ny
+                    d = vals[a_off + i] - vals[b_off + i]
+                    tot += d * d
+                    cnt += 1
+        return math.sqrt(tot / cnt) if cnt else 0.0
+
+    before = 0.0
+    cnt = 0
+    for z in range(4, nz - 4):
+        for y in range(4, ny - 4):
+            for x in range(4, nx - 4):
+                i = x + y * nx + z * nx * ny
+                d = data[i] - data[n3 + i]
+                before += d * d
+                cnt += 1
+    before = math.sqrt(before / cnt)
+    after = interior_rms(0, n3)
+    if not (after < before * 0.10):
+        raise AssertionError(
+            "-moco: correction did not align volume 1 (interior rms %.4f before, %.4f after)"
+            % (before, after)
+        )
+    if abs(vals[0] - data[0]) > 1e-6:
+        raise AssertionError("-moco: volume 0 must be copied through unchanged")
+
+    # without -1Dfile no parameter file is produced
+    out2 = tmp / "moco_out2.nii"
+    require_success(run_niimath(exe, [str(src_path), "-moco", str(out2)]), "-moco without -1Dfile")
+
+    # a 3D input must be refused rather than silently treated as a single volume
+    mean_path = tmp / "moco_3d.nii"
+    require_success(run_niimath(exe, [str(src_path), "-Tmean", str(mean_path)]), "-moco 3D fixture")
+    mean_written = mean_path if mean_path.exists() else Path(str(mean_path) + ".gz")
+    rejected = run_niimath(exe, [str(mean_written), "-moco", str(tmp / "moco_bad.nii")])
+    if rejected.returncode == 0:
+        raise AssertionError("-moco accepted a 3D image; it must reject one")
+
+    # the base volume must be copied through in full, not merely its first voxel.  Compare against
+    # the file as written (float32), not the float64 source list.
+    src_vals = read_float32_nifti(src_path)
+    for i in range(n3):
+        if vals[i] != src_vals[i]:
+            raise AssertionError(
+                "-moco: volume 0 must be copied through unchanged (voxel %d: %r vs %r)"
+                % (i, vals[i], src_vals[i])
+            )
+
+    # The .1D suffix keeps parameter and supported NIfTI output namespaces disjoint.
+    bad_par = tmp / "moco_params.nii.gz"
+    if run_niimath(
+        exe, [str(src_path), "-moco", "-1Dfile", str(bad_par), str(tmp / "moco_bad_suffix.nii")]
+    ).returncode == 0:
+        raise AssertionError("-moco accepted a -1Dfile path without the required .1D suffix")
+
+    # a failing run must leave an existing parameter file untouched and drop no temporary
+    keep = tmp / "moco_keep.1D"
+    keep.write_text("PRESERVE ME\n")
+    run_niimath(exe, [str(mean_written), "-moco", "-1Dfile", str(keep), str(tmp / "moco_bad2.nii")])
+    if keep.read_text() != "PRESERVE ME\n":
+        raise AssertionError("-moco clobbered an existing parameter file on a failing run")
+    leftovers = list(tmp.glob("*.mocotmp*"))
+    if leftovers:
+        raise AssertionError("-moco left a temporary parameter file behind: %s" % leftovers)
+
+    # structurally 4D but single-volume must be rejected too
+    one = tmp / "moco_one.nii"
+    require_success(run_niimath(exe, [str(src_path), "-crop", "0", "1", str(one)]), "-moco 1-volume fixture")
+    one_written = one if one.exists() else Path(str(one) + ".gz")
+    if run_niimath(exe, [str(one_written), "-moco", str(tmp / "moco_bad3.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted a single-volume 4D image")
+
+    # ---- rotation + fractional interpolation ------------------------------------------------
+    # Rotating the object about the k axis by a few degrees exercises the four-shear
+    # factorization, fractional heptic interpolation and the clip-to-input-range rule, none of
+    # which an integral translation touches.  Checks: the recovered roll has the right magnitude
+    # and sign, the other five parameters stay small, the corrected volume lands on the base, and
+    # clipping holds the output inside the moving volume's own range.
+    ang = math.radians(4.0)
+    cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
+    rot = [0.0] * n3
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                # sample the analytic object at the back-rotated location: exact, no resampler
+                dx0, dy0 = x - cx, y - cy
+                sx = cx + dx0 * math.cos(ang) + dy0 * math.sin(ang)
+                sy = cy - dx0 * math.sin(ang) + dy0 * math.cos(ang)
+                rot[x + y * nx + z * nx * ny] = cell(sx, sy, z)
+    rdata = list(vol0) + rot + list(vol0)
+    rot_src = tmp / "moco_rot.nii"
+    write_float32_nifti(rot_src, (nx, ny, nz), rdata, nt=3)
+    rot_par = tmp / "moco_rot.1D"
+    rot_out = tmp / "moco_rot_out.nii"
+    require_success(
+        run_niimath(exe, [str(rot_src), "-moco", "-1Dfile", str(rot_par), str(rot_out)]),
+        "-moco rotation",
+    )
+    rrows = [[float(v) for v in r.split()] for r in rot_par.read_text().splitlines()]
+    rroll, rpitch, ryaw = rrows[1][0], rrows[1][1], rrows[1][2]
+    # index k is +Superior for this RAS 1 mm header, so a rotation in the (i,j) plane is roll.
+    if abs(rroll + 4.0) > 0.35:
+        raise AssertionError("-moco: expected correction roll near -4 deg, got %.4f" % rroll)
+    for name, v in (("pitch", rpitch), ("yaw", ryaw)):
+        if abs(v) > 0.35:
+            raise AssertionError("-moco: %s should be ~0 for an in-plane rotation, got %.4f" % (name, v))
+    rwritten = rot_out if rot_out.exists() else Path(str(rot_out) + ".gz")
+    if rwritten.suffix == ".gz":
+        rplain = tmp / "moco_rot_plain.nii"
+        require_success(run_niimath(exe, [str(rwritten), "-gz", "0", str(rplain)]), "-moco rot decompress")
+        rwritten = rplain
+    rvals = read_float32_nifti(rwritten)
+    lo_in, hi_in = min(rot), max(rot)
+    for i in range(n3):
+        v = rvals[n3 + i]
+        if v < lo_in - 1e-3 or v > hi_in + 1e-3:
+            raise AssertionError(
+                "-moco: -clipit violated at voxel %d: %g outside input range [%g, %g]"
+                % (i, v, lo_in, hi_in)
+            )
+    num = den = 0.0
+    for z in range(5, nz - 5):
+        for y in range(5, ny - 5):
+            for x in range(5, nx - 5):
+                i = x + y * nx + z * nx * ny
+                num += (rvals[n3 + i] - rvals[i]) ** 2
+                den += (rot[i] - vol0[i]) ** 2
+    if not (num < den * 0.10):
+        raise AssertionError(
+            "-moco: rotation not corrected (interior sse %.4g after vs %.4g before)" % (num, den)
+        )
+
+    print("  -moco: parameter sign/axis/format, base passthrough, alignment, rotation+clipping,")
+    print("         output separation, existing-file preservation and 3D/singleton rejection OK")
+
+
+def _moco_help_line(help_text: str) -> str:
+    for line in help_text.splitlines():
+        if line.strip().startswith("-moco"):
+            return line
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("exe", nargs="?", default=shutil.which("niimath") or "niimath")
@@ -2332,6 +2582,7 @@ def main() -> int:
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
         exercise_medic(exe, tmp, help_text)
+        exercise_moco(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
 
         if args.expect_bsd:

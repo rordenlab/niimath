@@ -399,6 +399,16 @@ int show_help( void ) {
 	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
 	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
 #endif
+#ifdef HAVE_MOCO
+	printf(" -moco [-1Dfile <p.1D>]   : rigid-body motion correction of a 4D series onto volume 0\n");
+	printf("                            optional -1Dfile writes six columns per volume: roll pitch yaw dS dL dP\n");
+	printf("                            the parameter filename must end in '.1D'\n");
+	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
+#elif !defined(EMSCRIPTEN)
+	/* Only offer the "rebuild to enable" hint where -moco is actually supported.  WASM is a later
+	   milestone (moco_plan.md M6), so that build does not advertise the command at all. */
+	printf(" -moco [-1Dfile <path>]   : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
+#endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");
 	printf("                            opts: -cost XX (nmi,mi,ecc,ncc,ls) -sep 4 2 -fwhm 7 7 -dither 0|1\n");

@@ -51,6 +51,11 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
 option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -unwarp)" ON)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+  option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+else()
+  option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" OFF)
+endif()
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -119,6 +124,7 @@ ExternalProject_Add(src
         -DUSE_OPENMP:BOOL=${USE_OPENMP}
         -DENABLE_QC:BOOL=${ENABLE_QC}
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
+        -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}

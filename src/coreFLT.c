@@ -96,6 +96,9 @@
 #ifdef HAVE_MEDIC
 #include "medic.h" // MEDIC multi-echo distortion correction (--medic, -unwarp)
 #endif
+#ifdef HAVE_MOCO
+#include "moco.h" // rigid-body motion correction (-moco)
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -6997,6 +7000,40 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+#ifdef HAVE_MOCO
+/* -moco [-1Dfile <path>]: rigid-body motion correction of a 4D series onto sub-brick 0.
+   The optional "-1Dfile <path>" pair is consumed here; the trailing positional output name is
+   left to niimath's normal output handling. */
+staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *par = NULL;
+	if (ac < argc && !strcmp(argv[ac], "-1Dfile")) {
+		if (ac + 1 >= argc) {
+			printfx("-moco -1Dfile requires a filename\n");
+			return 1;
+		}
+		par = argv[ac + 1];
+		size_t n = strlen(par);
+		/* Supported NIfTI outputs never end in .1D. Keeping the namespaces disjoint is clearer
+		   than guessing the writer's eventual extension, compression, or paired member here. */
+		if (n < 3 || strcmp(par + n - 3, ".1D")) {
+			printfx("-moco -1Dfile requires a filename ending in '.1D'\n");
+			return 1;
+		}
+		ac += 2;
+	}
+	*pac = ac;
+	return nii_moco(nim, par);
+#else
+	(void)nim;
+	if (*pac + 1 < argc && !strcmp(argv[*pac], "-1Dfile")) *pac += 2;
+	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_MOCO
+
 /* Huge-image (> INT_MAX voxel) support, issue #67. The core calculator ops below are
    nvox_t-clean (see core.h). Any op NOT in this EXACT list keeps int-sized indexing, so a
    huge image is rejected before that op runs rather than silently corrupted (fail-closed,
@@ -7943,6 +7980,15 @@ int main64(int argc, char *argv[]) {
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past the map and axis
+		}
+#endif
+#ifdef HAVE_MOCO
+		else if (!strcmp(argv[ac], "-moco")) {
+			ac++;
+			ok = nifti_moco_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past any -1Dfile pair
 		}
 #endif
 #ifdef HAVE_ROMEO

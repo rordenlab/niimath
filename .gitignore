@@ -42,7 +42,7 @@ _skbuild/niimath/_dist_ver.py
 /dwi/
 /qc/
 audit_temp.md
-audit_response.md
+audit_response*.md
 coreg_plan.md
 
 # allineate object-flag signature stamp (Makefile flag-change detection)

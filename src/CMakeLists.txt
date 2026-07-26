@@ -92,6 +92,28 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         ADD_DEFINITIONS(-DHAVE_MEDIC)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} medic.c)
     endif()
+
+    # MOCO rigid-body motion correction (-moco). Clean-room implementation of Cox & Jesmanowicz
+    # 1999 (MRM 42:1014-1018); AFNI's 3dvolreg is GPL-2 and was used only as a black-box oracle.
+    # Ordinary FP, so it rides the normal source line (unlike the strict-FP romeo object).
+    # Defaults ON only on Apple Silicon macOS. Portable code, but other native targets remain
+    # opt-in until their numerical validation is recorded.
+    # CMAKE_OSX_ARCHITECTURES names the TARGET slice and does NOT change CMAKE_SYSTEM_PROCESSOR,
+    # so a universal build driven from an Apple Silicon runner would otherwise enable -moco in the
+    # x86_64 slice too.  Prefer the target when it is set; fall back to the host processor.
+    set(_moco_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(_moco_arch "${CMAKE_OSX_ARCHITECTURES}")
+    endif()
+    if(APPLE AND _moco_arch MATCHES "^(arm64|aarch64)$")
+        option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+    else()
+        option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" OFF)
+    endif()
+    if(ENABLE_MOCO)
+        ADD_DEFINITIONS(-DHAVE_MOCO)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c)
+    endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
     option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
