@@ -30,6 +30,16 @@ const fileOperandOps = new Set<string>([
   'mas', 'restart'
 ]);
 
+// Operators that exist in the NATIVE binary but are deliberately absent from every wasm build,
+// so a generated browser method could only ever fail. This manifest is produced by running
+// ../src/niimath (native), which is why they have to be excluded explicitly rather than simply
+// not appearing in the help text.
+const nativeOnlyOps = new Set<string>([
+  // -mindgrab: needs ~2.5 GB of working memory, which does not fit wasm32's 4 GB address space
+  // alongside the runtime; BRAINCHOP is never enabled for wasm/tiny/nano.
+  'mindgrab'
+]);
+
 // Function to parse the niimath help text
 function parseHelpText(helpText: string): MethodDefinitions {
   const lines = helpText.split('\n');
@@ -121,7 +131,7 @@ function parseHelpText(helpText: string): MethodDefinitions {
           args: args.map(arg => arg.replace(/[<>]/g, '')),
           help: helpText
         };
-      } else if (isTopLevel && !fileOperandOps.has(key)) {
+      } else if (isTopLevel && !fileOperandOps.has(key) && !nativeOnlyOps.has(key)) {
         // General case for non-kernel, non-mesh, and non-bitmap top-level operations.
         // File-operand operators are skipped (the browser worker cannot stage their files).
         methodDefinitions[key] = {

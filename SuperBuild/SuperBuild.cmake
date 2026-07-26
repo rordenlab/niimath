@@ -58,6 +58,19 @@ option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -un
 # per-target rule must be applied HERE as well as in src/CMakeLists.txt.
 option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
 option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
+# MindGrab skull stripping (-mindgrab). ON by default, matching src/CMakeLists.txt and the
+# Makefile. BOTH halves of src/'s support rule -- pointer size AND build flavor -- MUST be
+# duplicated here, per the note above: this value is forwarded as an explicit -D cache entry, so
+# src/'s own default can never override it, and src/ then hard-errors on an unsupported explicit
+# request. Mirroring only the pointer-size half made `cmake -DBUILD_FLAVOR=tiny ..` configure
+# cleanly at this level and then FAIL inside the inner project (caught in audit). BUILD_FLAVOR is
+# set at line 23, well above this test.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all")
+  set(BRAINCHOP_DEFAULT OFF)
+else()
+  set(BRAINCHOP_DEFAULT ON)
+endif()
+option(ENABLE_BRAINCHOP "Enable MindGrab skull stripping (-mindgrab)" ${BRAINCHOP_DEFAULT})
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -128,6 +141,7 @@ ExternalProject_Add(src
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
         -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
         -DENABLE_STC:BOOL=${ENABLE_STC}
+        -DENABLE_BRAINCHOP:BOOL=${ENABLE_BRAINCHOP}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}
@@ -140,3 +154,11 @@ ExternalProject_Add(src
 
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION ${SKBUILD_PROJECT_NAME}/bin
         USE_SOURCE_PERMISSIONS)
+
+# A BrainChop-enabled binary embeds the MIT-licensed MindGrab weights, and MIT requires its notice
+# to accompany the copy. The inner project installs it under its own prefix, but this SuperBuild
+# only forwards bin/, so the notice has to be installed here too or the wheel ships without it.
+if(ENABLE_BRAINCHOP)
+    install(FILES ${CMAKE_SOURCE_DIR}/src/mindgrab.LICENSE
+            DESTINATION ${SKBUILD_PROJECT_NAME}/bin)
+endif()

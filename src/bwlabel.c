@@ -14,6 +14,19 @@
 
 #define printfx(...) fprintf(stderr, __VA_ARGS__)
 
+// Keep allocation failure handling in one place, with the same fail-closed process policy as
+// niimath's core allocators. It cannot just call nii_calloc: the Makefile's mindgrab-test target
+// links bwlabel.c WITHOUT core.c, so core.h's allocators are not available in that binary.
+// Including core.h here to remove the duplication would break `make test`.
+static void *bwl_malloc(size_t bytes) {
+  void *p = malloc(bytes);
+  if (!p && bytes != 0) {
+    printfx("bwlabel: out of memory\n");
+    exit(EXIT_FAILURE);
+  }
+  return p;
+}
+
 //Jesper Andersson has acknowledged that this port of spm_bwlabel.c may be released using the BSD 2-Clause license
 
 //Copyright 2021 Jesper Andersson
@@ -137,7 +150,7 @@ static void * mxRealloc(void *oldArray, size_t oldBytes, size_t newBytes) {
       free(oldArray);
       return NULL;
    }
-   void *newArray = (void *)malloc(newBytes);
+   void *newArray = bwl_malloc(newBytes);
    memset(newArray, 0, newBytes);
    if (oldBytes > 0) {
      //void * memcpy ( void * destination, const void * source, size_t num );
@@ -166,7 +179,7 @@ static uint32_t do_initial_labelling(uint8_t        *bw,   /* Binary map */
    int32_t       sl, r, c;
    uint32_t  ttn = kGrowSize;
    uint32_t nabo9[9];
-   *tt = (uint32_t *)malloc(ttn * sizeof(uint32_t));
+   *tt = (uint32_t *)bwl_malloc(ttn * sizeof(uint32_t));
    memset(*tt, 0, ttn * sizeof(uint32_t));
    for (sl=0; sl<dim[2]; sl++)
    {
@@ -258,7 +271,8 @@ static int translate_labels(uint32_t  *il,     /* Map of initial labels. */
    int         cl = 0;
    n = dim[0]*dim[1]*dim[2];
    for (i=0; i<ttn; i++) {ml = MAX(ml,tt[i]);}
-   uint32_t *fl = (uint32_t *)malloc(ml * sizeof(uint32_t));
+   if (ml == 0) return 0;
+   uint32_t *fl = (uint32_t *)bwl_malloc((size_t)ml * sizeof(uint32_t));
    memset(fl, 0, ml * sizeof(uint32_t));
    for (i=0; i<n; i++)
    {
@@ -299,7 +313,7 @@ static void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
   int numk = 6;
   if (is26)
     numk = 26;
-  int32_t *k = (int32_t *)malloc(numk * sizeof(int32_t)); //queue with untested seed
+  int32_t *k = (int32_t *)bwl_malloc((size_t)numk * sizeof(int32_t)); //queue with untested seed
   if (is26) {
     int j = 0;
     for (int z = -1; z <= 1; z++)
@@ -318,8 +332,8 @@ static void fillh(uint32_t* imgBin, size_t dim[3], int is26, int nLabels) {
     k[5] = -1;
   }
   //https://en.wikipedia.org/wiki/Flood_fill
-  int32_t *q = (int32_t *)malloc(nvox * sizeof(int32_t)); //queue with untested seed
-  uint8_t *vxs = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  int32_t *q = (int32_t *)bwl_malloc((size_t)nvox * sizeof(int32_t)); //queue with untested seed
+  uint8_t *vxs = (uint8_t *)bwl_malloc((size_t)nvox * sizeof(uint8_t));
   for (int label = 1; label <= nLabels; label++) {
     for (size_t i = 0; i < nvox; i++)
       vxs[i] = (imgBin[i] == label);
@@ -382,11 +396,11 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
     return 0;
   }
   size_t nvox = dim[0] * dim[1] * dim[2];
-  uint32_t *l = (uint32_t *)malloc(nvox * sizeof(uint32_t)); //output image
+  uint32_t *l = (uint32_t *)bwl_malloc(nvox * sizeof(uint32_t)); //output image
   memset(l, 0, nvox * sizeof(uint32_t));
-  uint32_t *il = (uint32_t *)malloc(nvox * sizeof(uint32_t));
+  uint32_t *il = (uint32_t *)bwl_malloc(nvox * sizeof(uint32_t));
   memset(il, 0, nvox * sizeof(uint32_t));
-  uint8_t *bw = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  uint8_t *bw = (uint8_t *)bwl_malloc(nvox * sizeof(uint8_t));
   memset(bw, 0, nvox * sizeof(uint8_t));
   for (size_t i = 0; i < nvox; i++)
     if (img[i] != 0.0) bw[i] = 1;
@@ -397,7 +411,7 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
   free(il);
   free(tt);
   if ((nl > 0) && (onlyLargest)){
-    uint32_t *nls = (uint32_t *)malloc((nl+1) * sizeof(uint32_t));
+    uint32_t *nls = (uint32_t *)bwl_malloc((size_t)(nl + 1) * sizeof(uint32_t));
     for (int j = 0; j <= nl; j++)
         nls[j] = 0;
     for (int i = 0; i < nvox; i++) {
@@ -436,11 +450,11 @@ int bwlabelCore(float *img, int conn, size_t dim[3], bool onlyLargest) {
     return 0;
   }
   size_t nvox = dim[0] * dim[1] * dim[2];
-  uint32_t *l = (uint32_t *)malloc(nvox * sizeof(uint32_t)); //output image
+  uint32_t *l = (uint32_t *)bwl_malloc(nvox * sizeof(uint32_t)); //output image
   memset(l, 0, nvox * sizeof(uint32_t));
-  uint32_t *il = (uint32_t *)malloc(nvox * sizeof(uint32_t));
+  uint32_t *il = (uint32_t *)bwl_malloc(nvox * sizeof(uint32_t));
   memset(il, 0, nvox * sizeof(uint32_t));
-  uint8_t *bw = (uint8_t *)malloc(nvox * sizeof(uint8_t));
+  uint8_t *bw = (uint8_t *)bwl_malloc(nvox * sizeof(uint8_t));
   memset(bw, 0, nvox * sizeof(uint8_t));
   for (size_t i = 0; i < nvox; i++)
     if (img[i] != 0.0) bw[i] = 1;
@@ -451,7 +465,7 @@ int bwlabelCore(float *img, int conn, size_t dim[3], bool onlyLargest) {
   free(il);
   free(tt);
   if ((nl > 0) && (onlyLargest)){
-    uint32_t *nls = (uint32_t *)malloc((nl+1) * sizeof(uint32_t));
+    uint32_t *nls = (uint32_t *)bwl_malloc((size_t)(nl + 1) * sizeof(uint32_t));
     for (int j = 0; j <= nl; j++)
         nls[j] = 0;
     for (int i = 0; i < nvox; i++) {
@@ -468,6 +482,7 @@ int bwlabelCore(float *img, int conn, size_t dim[3], bool onlyLargest) {
     for (int i = 0; i < nvox; i++)
       l[i] = (l[i] == mxL);
     nl = 1;
+    free(nls);
   } //if labels found
   for (size_t i = 0; i < nvox; i++)
     img[i] = l[i];
@@ -480,7 +495,7 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
     return bwlabelCore(img, conn, dim, onlyLargest);
   }
   size_t nvox = dim[0] * dim[1] * dim[2];
-  float *invertMaskF = (float *)malloc(nvox * sizeof(float));
+  float *invertMaskF = (float *)bwl_malloc(nvox * sizeof(float));
   memset(invertMaskF, 0, nvox * sizeof(float));
   for (size_t i = 0; i < nvox; i++)
     if (img[i] == 0.0) invertMaskF[i] = 1.0;
@@ -490,12 +505,12 @@ int bwlabel(float *img, int conn, size_t dim[3], bool onlyLargest, bool fillBubb
     return bwlabelCore(img, conn, dim, onlyLargest);
   }
   //bubbles exist - identify external labels that are on the boundary of the volume
-  uint32_t *invertMask = (uint32_t *)malloc(nvox * sizeof(uint32_t));
+  uint32_t *invertMask = (uint32_t *)bwl_malloc(nvox * sizeof(uint32_t));
   for (size_t i = 0; i < nvox; i++) {
     invertMask[i] = round(invertMaskF[i]);
   }
   free(invertMaskF);
-  uint32_t *isEdgeLabel = (uint32_t *)malloc((nInvert + 1) * sizeof(uint32_t));
+  uint32_t *isEdgeLabel = (uint32_t *)bwl_malloc((size_t)(nInvert + 1) * sizeof(uint32_t));
   memset(isEdgeLabel, 0, (nInvert + 1)  * sizeof(uint32_t));
   size_t x = dim[0];
   size_t y = dim[1];

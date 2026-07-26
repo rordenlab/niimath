@@ -39,6 +39,25 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR BUILD_FLAVOR STREQUAL "tiny")
     ADD_DEFINITIONS(-DFORCE_INT32_MAX)
 endif()
 
+# MindGrab needs over 2 GB of activation memory and is implemented only in the full native
+# inventory. Reject unsupported EXPLICIT requests instead of silently ignoring the option in
+# tiny/nano or admitting it to a 32-bit/wasm address space. This test runs BEFORE the option()
+# below, so on a FRESH configure it only ever sees a value the caller passed and the default can
+# never trip it. (On a re-configure of an existing build directory the cache entry already
+# exists, so flipping BUILD_FLAVOR in place can trip it without the caller asking for BrainChop;
+# configure into a clean directory.) SuperBuild.cmake must mirror BOTH halves of this rule --
+# see the note there.
+if(ENABLE_BRAINCHOP AND (CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all"))
+    message(FATAL_ERROR "ENABLE_BRAINCHOP=ON requires a 64-bit native BUILD_FLAVOR=all build.")
+endif()
+# ...and the DEFAULT is ON only where the feature can actually run: a 32-bit "all" build would
+# otherwise pull in mindgrab.c on an address space that cannot hold its 2.15 GB of activations.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(BRAINCHOP_DEFAULT OFF)
+else()
+    set(BRAINCHOP_DEFAULT ON)
+endif()
+
 # ENABLE_QWARP is only meaningful for the full "all" flavor (tiny/nano omit the allineate engine
 # qwarp depends on). Reject the explicit unsupported combination rather than silently dropping the
 # feature — the tiny branch never declares the option, so -DENABLE_QWARP=ON would otherwise be an
@@ -115,6 +134,18 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     if(ENABLE_STC)
         ADD_DEFINITIONS(-DHAVE_STC)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} stc.c)
+    endif()
+    # MindGrab skull stripping (-mindgrab). Clean-room C implementation of the MeshNet inference
+    # brainchop-cli runs under tinygrad; only the trained weights are upstream (MIT, see
+    # src/mindgrab.LICENSE) and no third-party runtime is linked. ON by default on 64-bit hosts
+    # (see BRAINCHOP_DEFAULT above), matching the Makefile, so every shipped artifact carries
+    # -mindgrab; it costs ~595 KB of binary and nothing at runtime unless the op is used. Native
+    # only: inference needs ~2.5 GB of working memory, which does not fit wasm32's 4 GB address
+    # space alongside the runtime. Requires HAVE_CONFORM (always on here) and bwlabel.c (below).
+    option(ENABLE_BRAINCHOP "Enable MindGrab skull stripping (-mindgrab)" ${BRAINCHOP_DEFAULT})
+    if(ENABLE_BRAINCHOP)
+        ADD_DEFINITIONS(-DHAVE_BRAINCHOP)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} mindgrab.c mindgrab_weights.c)
     endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
@@ -384,4 +415,15 @@ if(SKBUILD)
     install(TARGETS ${PROGRAMS} DESTINATION niimath)
 else()
     install(TARGETS ${PROGRAMS} DESTINATION bin)
+endif()
+
+# A BrainChop-enabled binary embeds the MIT-licensed MindGrab weights, and MIT requires its notice
+# to travel with the copy. The top-level LICENSE summarises this and points here; ship the full
+# notice too. ENABLE_BRAINCHOP is only declared for BUILD_FLAVOR=all, so this is a no-op elsewhere.
+if(ENABLE_BRAINCHOP)
+    if(SKBUILD)
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mindgrab.LICENSE DESTINATION niimath)
+    else()
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mindgrab.LICENSE DESTINATION share/niimath)
+    endif()
 endif()

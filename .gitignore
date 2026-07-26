@@ -7,6 +7,7 @@
 /src/niimath-noomp
 # left behind only when `make test`'s stc-test step fails before its cleanup
 /src/stc_fft_selftest
+/src/mindgrab_selftest
 /library/borg.nii.gz
 /library/blurred.nii.gz
 dist

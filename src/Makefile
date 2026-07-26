@@ -194,6 +194,29 @@ ifeq "$(MESH)" "0"
 	MFLAGS=
 endif
 
+# MindGrab skull stripping (-mindgrab). Clean-room C implementation of the MeshNet inference
+# brainchop-cli runs under tinygrad; only the trained weights are upstream (MIT, see
+# src/mindgrab.LICENSE). No third-party runtime is linked. ON by default for the native
+# Makefile targets; run "BRAINCHOP=0 make" to omit it. It costs ~595 KB of binary (the model
+# constants) and nothing at runtime unless -mindgrab is used. Requires HAVE_CONFORM (always
+# on) and bwlabel.c, which normally rides the nii2mesh source line -- a MESH=0 brainchop
+# build has to compile it explicitly, and adding it twice would be a duplicate symbol.
+BCFLAGS= -DHAVE_BRAINCHOP mindgrab.c mindgrab_weights.c
+ifeq "$(MFLAGS)" ""
+	BCFLAGS+= bwlabel.c
+endif
+ifeq "$(BRAINCHOP)" "0"
+	BCFLAGS=
+endif
+# wasm/tiny/nano never reference $(BCFLAGS), so -mindgrab is simply absent from those targets
+# and the default above cannot leak into them. Reject only an EXPLICIT BRAINCHOP=1 there, so
+# that a plain `make wasm` keeps working: it would otherwise be a silent no-op.
+ifeq "$(BRAINCHOP)" "1"
+ifneq "$(filter wasm wasm-wasi wasm-emcc-core tiny nano,$(MAKECMDGOALS))" ""
+$(error BRAINCHOP=1 is native-only: 2.5 GB of working memory does not fit wasm32's 4 GB address space alongside the runtime, and single-threaded inference takes about a minute)
+endif
+endif
+
 #run "AL=0 make" for compile without allineate registration
 ifeq "$(AL)" "0"
 	AFLAGS=
@@ -274,7 +297,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 all: $(ALOBJS) $(ROMEOOBJS)
-	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(ROMEOFLAGS) $(ROMEOOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
+	$(CNAME) $(CFLAGS) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALOBJS) $(ROMEOFLAGS) $(ROMEOOBJS) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -flto -o niimath
 
 # Canonical local regression: build, then run the stdlib-only release smoke test
 # (`.github/scripts/release_smoke.py`) against the freshly built binary. It synthesizes small
@@ -282,8 +305,8 @@ all: $(ALOBJS) $(ROMEOOBJS)
 # -odt char, feature dispatch, optional zstd — with no external test data. Deeper coverage lives
 # elsewhere: the corner-case/conformance suite in the separate `niimath_tests` repo, and the WASI
 # feature-parity suite via `bun run test:wasi` in ../js (needs Zig).
-.PHONY: test stc-test
-test: all stc-test
+.PHONY: test stc-test mindgrab-test
+test: all stc-test mindgrab-test
 	python3 ../.github/scripts/release_smoke.py ./niimath
 
 # The -stc FFT primitive is validated against a naive long-double DFT at every transform length
@@ -293,6 +316,17 @@ test: all stc-test
 stc-test:
 ifneq ($(STCFLAGS),)
 	@$(CNAME) -O2 -std=gnu99 -I. -o stc_fft_selftest ../test/stc_fft_selftest.c -lm && ./stc_fft_selftest && rm -f stc_fft_selftest
+endif
+
+# -mindgrab's numerics in closed form: tanh/GELU against libm and the pinned tinygrad values,
+# numpy's quantile rule, the weight table's checksum and padding, the convolution's impulse
+# response at every dilation and at the volume faces, GroupNorm and the argmax tie rule. It
+# #includes mindgrab.c to reach the static kernels and overrides MG_DIM to 32 so the real
+# convolution runs in 2 MB, which is the only reason it is a separate compile rather than part
+# of release_smoke.py. Skipped when BRAINCHOP=0.
+mindgrab-test:
+ifneq ($(BCFLAGS),)
+	@$(CNAME) -O2 -std=gnu99 -I. $(OMPFLAGS) -o mindgrab_selftest ../test/mindgrab_selftest.c mindgrab_weights.c bwlabel.c $(OMPLINK) -lm && ./mindgrab_selftest && rm -f mindgrab_selftest
 endif
 
 # The prebuilt registration objects are compiled with flags that depend on command-line
@@ -366,12 +400,12 @@ endif
 .PHONY: native-noomp
 native-noomp:
 	$(if $(ROMEOOBJS),$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_noomp.o)
-	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_noomp.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
+	$(CNAME) $(filter-out $(OMPFLAGS),$(CFLAGS)) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_noomp.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(AFLAGS) $(ALSRC) $(MFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(filter-out $(OMPLINK),$(LDFLAGS)) $(BMPFLAGS) -flto -o niimath-noomp
 
 #issue30: static build
 static:
 	$(if $(ROMEOOBJS),gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEO_STRICT_FP) $(OMPFLAGS) -c romeo.c -o romeo_static.o)
-	gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_static.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
+	gcc -O3 -static -std=gnu99 $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_static.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(AFASTMATH) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -flto -o niimath
 
 # tiny: terminal executable to emulate WASM (no OpenMP)
 tiny:
@@ -384,17 +418,17 @@ nano:
 debug: CFLAGS   = -O0 -ffunction-sections -fdata-sections
 debug:
 	$(if $(ROMEOOBJS),$(CNAME) $(CFLAGS) $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_dbg.o)
-	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_dbg.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
+	$(CNAME) $(CFLAGS) $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_dbg.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(BMPFLAGS) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) -o niimath
 
 verbose:
 	$(if $(ROMEOOBJS),$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_verb.o)
-	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_verb.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O0 -Wall -Wextra -Wno-sign-compare $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_verb.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # Lightweight undefined-behavior diagnostics. Unlike the Apple-Clang ASan target below,
 # UBSan is safe with Homebrew libomp on Apple Silicon and retains the normal OpenMP paths.
 ubsan:
 	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(OMPFLAGS) $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_ubsan.o)
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_ubsan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_ubsan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(OMPFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(OMPLINK) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # sanitize checks memory errors - similar to tiny/wasm
 # on MacOS consider: export MallocNanoZone=0
@@ -412,7 +446,7 @@ ubsan:
 # Run with: MallocNanoZone=0 make sanitize
 sanitize:
 	$(if $(ROMEOOBJS),$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEO_STRICT_FP) -c romeo.c -o romeo_asan.o)
-	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_asan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
+	$(CNAME) -O1 -g -Wno-deprecated -fsanitize=address -fno-omit-frame-pointer $(ROMEOFLAGS) $(ROMEOOBJS:romeo.o=romeo_asan.o) $(BFLAGS) $(TFILES) $(DTFLAGS) $(QCFLAGS) $(MEDICFLAGS) $(MOCOFLAGS) $(STCFLAGS) $(BCFLAGS) $(GPL_SRCS) $(GFILES) $(MFLAGS) $(AFLAGS) $(ALSRC) $(UFLAGS) $(UFLAGS64) $(ZFLAGS) $(ZSTDFLAGS) $(ZSTDLIB) $(LDFLAGS) $(BMPFLAGS) -o niimath
 
 # WASM build. The default (BSD) target is minimal. With GPL=1 it additionally links
 # allineate (-deface/-allineate) and the spm_coreg module (-spm_coreg/-spm_deface,

@@ -102,6 +102,13 @@
 #ifdef HAVE_STC
 #include "stc.h" // slice-time correction (-stc)
 #endif
+#ifdef HAVE_BRAINCHOP
+#ifndef HAVE_CONFORM
+#error "HAVE_BRAINCHOP requires HAVE_CONFORM: -mindgrab conforms its input and reslices the mask back"
+#endif
+#include "mindgrab.h" // MindGrab skull stripping (-mindgrab)
+#include "mindgrab_weights.h"
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -6056,6 +6063,32 @@ staticx int nifti_reslice(nifti_image *nim, char *fin, int isLinear) {
 #endif
 }
 
+#ifdef DT32
+// Reslice a float32 mask (any grid, any orientation) onto nim with nearest neighbor and
+// set every voxel the mask does not cover to nim's minimum intensity. nimMsk is CONSUMED
+// (resliced in place); the caller still owns and frees it. Shared by -reslice_mask, which
+// reads the mask from a file, and -mindgrab, which computes it in memory.
+staticx int nii_apply_reslice_mask(nifti_image *nim, nifti_image *nimMsk) {
+	flt *img = (flt *)nim->data;
+	flt mn = INFINITY;
+	for (size_t i = 0; i < nim->nvox; i++)
+		mn = MIN(mn, img[i]);
+	int isLinear = 0;
+	int ok = reslice(nimMsk, nim, isLinear);
+	if (ok != 0)
+		// reslice failed (e.g. a 4D working image — reslice is 3D-only): nimMsk was NOT resampled
+		// onto nim's grid, so it still holds only its own (smaller) 3D buffer. Bail before the
+		// mask-application loop, which would otherwise read nim->nvox elements past that buffer.
+		return ok;
+	flt *imgMsk = (flt *)nimMsk->data;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (imgMsk[i] <= 0)
+			img[i] = mn;
+	}
+	return ok;
+}
+#endif // DT32
+
 staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 #ifdef DT32
 	if (nim->datatype != DT_FLOAT32) {
@@ -6080,24 +6113,7 @@ staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 		nifti_image_free(nimMsk); // was a leak on conversion failure
 		return 1;
 	}
-	flt *img = (flt *)nim->data;
-	flt mn = INFINITY;
-	for (size_t i = 0; i < nim->nvox; i++)
-		mn = MIN(mn, img[i]);
-	int isLinear = 0;
-	int ok = reslice(nimMsk, nim, isLinear);
-	if (ok != 0) {
-		// reslice failed (e.g. a 4D working image — reslice is 3D-only): nimMsk was NOT resampled
-		// onto nim's grid, so it still holds only its own (smaller) 3D buffer. Bail before the
-		// mask-application loop, which would otherwise read nim->nvox elements past that buffer.
-		nifti_image_free(nimMsk);
-		return ok;
-	}
-	flt *imgMsk = (flt *)nimMsk->data;
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (imgMsk[i] <= 0)
-			img[i] = mn;
-	}
+	int ok = nii_apply_reslice_mask(nim, nimMsk);
 	nifti_image_free(nimMsk);
 	return ok;
 #else
@@ -6105,6 +6121,94 @@ staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 	return 1;
 #endif
 }
+
+#ifdef HAVE_BRAINCHOP
+// -mindgrab [-border <mm>]: MindGrab skull stripping. Conform a COPY of the working image
+// to the 256^3 uint8 grid the network was trained on, run the network (mindgrab.c), then
+// reslice the brain mask back onto the original grid and blank everything outside it,
+// exactly as the brainchop-cli reference does with `niimath <in> -reslice_mask -`.
+//
+// -border <mm> reproduces brainchop's `-b N`: it grows the mask by N mm BEFORE the reslice,
+// with the same `-close 1 N 0` the reference shells out to. It has to be an option rather
+// than a chained op, because by the time -mindgrab returns the mask no longer exists --
+// the border restores voxels the strip has already blanked, and nothing downstream can
+// tell those from genuinely dark brain voxels.
+//
+// Fail-atomic: nim is only touched by the final nii_apply_reslice_mask(), after every
+// fallible step has succeeded.
+staticx int nifti_mindgrab(nifti_image *nim, double border) {
+#ifdef DT32
+	if (nim->datatype != DT_FLOAT32) {
+		printfx("mindgrab: Unsupported datatype %d\n", nim->datatype);
+		return 1;
+	}
+	int nvox3D = 0;
+	if (nii_nvox3d_int(nim, &nvox3D) || nim->nvox != (size_t)nvox3D) {
+		printfx("mindgrab: requires a scalar 3D image (not 4D, not oversized)\n");
+		return 1;
+	}
+	// Shallow copy plus a private voxel buffer: nifti_image owns exactly four pointers
+	// (fname, iname, data, ext_list) and nifti_image_free() tolerates NULLs, so this is a
+	// complete, independently freeable image.
+	nifti_image *cnim = (nifti_image *)calloc(1, sizeof(nifti_image));
+	if (!cnim) {
+		printfx("mindgrab: out of memory\n");
+		return 1;
+	}
+	*cnim = *nim;
+	cnim->fname = NULL;
+	cnim->iname = NULL;
+	cnim->ext_list = NULL;
+	cnim->num_ext = 0;
+	cnim->data = nii_malloc(nim->nvox, sizeof(float)); // fully overwritten by the memcpy
+	size_t nbytes = (size_t)nim->nvox * sizeof(float);
+	memcpy(cnim->data, nim->data, nbytes);
+	if (conform(cnim) != EXIT_SUCCESS) {
+		printfx("mindgrab: could not conform the input to 256^3 1mm\n");
+		nifti_image_free(cnim);
+		return 1;
+	}
+	// The reference pipes the conformed volume through `-odt char`, so the network sees
+	// rounded uint8 values, not the float32 reslice output. Same conversion, same rounding.
+	in_hdr chdr = set_input_hdr(cnim);
+	if (nifti_image_change_datatype(cnim, DT_UINT8, &chdr) != 0) {
+		printfx("mindgrab: could not convert the conformed volume to uint8\n");
+		nifti_image_free(cnim);
+		return 1;
+	}
+	if (cnim->nvox != (size_t)MINDGRAB_DIM * MINDGRAB_DIM * MINDGRAB_DIM) {
+		printfx("mindgrab: conform produced %zu voxels, expected 256^3\n", (size_t)cnim->nvox);
+		nifti_image_free(cnim);
+		return 1;
+	}
+	// The mask lives on the conformed grid, so reuse cnim rather than cloning a second detached
+	// nifti_image: the "owns exactly four pointers" invariant above is then relied on once, not
+	// twice. Swap the uint8 payload for the float32 mask in place -- both are resident during
+	// mindgrab_segment either way, so this costs no extra peak memory.
+	float *maskbuf = (float *)nii_malloc(cnim->nvox, sizeof(float)); // fully overwritten below
+	if (mindgrab_segment((const unsigned char *)cnim->data, maskbuf) != 0) {
+		free(maskbuf);
+		nifti_image_free(cnim);
+		return 1;
+	}
+	free(cnim->data);
+	cnim->data = maskbuf;
+	cnim->datatype = DT_FLOAT32;
+	cnim->nbyper = 4;
+	if (border > 0.0 && nifti_close(cnim, 1, (flt)border, 0) != EXIT_SUCCESS) {
+		printfx("mindgrab: could not grow the mask border by %g mm\n", border);
+		nifti_image_free(cnim);
+		return 1;
+	}
+	int ok = nii_apply_reslice_mask(nim, cnim);
+	nifti_image_free(cnim);
+	return ok;
+#else
+	printfx("'-dt double' does not support mindgrab\n");
+	return 1;
+#endif
+}
+#endif // HAVE_BRAINCHOP
 #endif // HAVE_CONFORM
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
@@ -8056,6 +8160,32 @@ int main64(int argc, char *argv[]) {
 		} else if ((!strcmp(argv[ac], "-reslice_mask")) || (!strcmp(argv[ac], "--reslice_mask"))) {
 			ac++;
 			ok = nifti_reslice_mask(nim, argv[ac]);
+		} else if ((!strcmp(argv[ac], "-mindgrab")) || (!strcmp(argv[ac], "--mindgrab"))) {
+#ifdef HAVE_BRAINCHOP
+			double mgBorder = 0.0;
+			// `argc` was decremented above so argv[argc] is the OUTPUT filename, still a valid
+			// pointer. Look one past it (ac + 1 <= argc, not < argc) on purpose: otherwise a
+			// trailing `-mindgrab -border` makes "-border" the output name, silently runs the
+			// full 8 s inference and writes -border.nii.gz instead of reporting the missing
+			// value. Anyone whose output really is named "-border" can spell it "./-border".
+			if ((ac + 1 <= argc) && (!strcmp(argv[ac + 1], "-border"))) {
+				if (ac + 2 >= argc) { // the value must sit strictly before the output name
+					printfx("mindgrab: -border requires a distance in mm\n");
+					goto fail;
+				}
+				mgBorder = strtod(argv[ac + 2], &end);
+				if ((end == argv[ac + 2]) || (*end != '\0') ||
+					!(mgBorder > 0.0) || !(mgBorder < 1e4)) {
+					printfx("mindgrab: -border expects a positive distance in mm\n");
+					goto fail;
+				}
+				ac += 2;
+			}
+			ok = nifti_mindgrab(nim, mgBorder);
+#else
+			printfx("'-mindgrab' requires a build with BRAINCHOP=1 (or -DENABLE_BRAINCHOP=ON)\n");
+			ok = 1;
+#endif
 		} else if ((!strcmp(argv[ac], "-conform")) || (!strcmp(argv[ac], "--conform"))) {
 			ok = nifti_conform(nim);
 		} else if ((!strcmp(argv[ac], "-comply")) || (!strcmp(argv[ac], "--comply"))) {

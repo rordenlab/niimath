@@ -26,12 +26,22 @@ mkdir ${APP_DIR}
 DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE -DHAVE_ROMEO -DHAVE_MEDIC"
 SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c dtifit.c qc.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c medic.c"
 AL_SRCS="allineate.c powell_newuoa.c coreg_fast.c reface.c"
+# MindGrab skull stripping (-mindgrab) ships in the universal binary, matching the Makefile
+# and CMake defaults: mindgrab_weights.c embeds 571 KiB of model constants (MIT, see
+# src/mindgrab.LICENSE) and inference needs ~2.5 GB of working memory, but costs nothing
+# unless -mindgrab is used. Run "BRAINCHOP=0 ./notarize.sh" to omit it.
+BC_DFLAGS=""
+BC_SRCS=""
+if [ "${BRAINCHOP:-1}" = "1" ]; then
+    BC_DFLAGS="-DHAVE_BRAINCHOP"
+    BC_SRCS="mindgrab.c mindgrab_weights.c"
+fi
 
 build_arch() {
     local target="$1" minver="$2" output="$3"
     # -moco and -stc build for BOTH slices: their Apple-Silicon-only gate was lifted once CI began
     # checking both numerically (release_smoke.py) on every shipped target.
-    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC" arch_srcs="${SRCS} moco.c stc.c"
+    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC ${BC_DFLAGS}" arch_srcs="${SRCS} moco.c stc.c ${BC_SRCS}"
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
     # (allineate no longer needs a separate scoped compile — everything is fast-math now.)

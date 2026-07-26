@@ -81,9 +81,17 @@
 #else
 	#define kLicense " BSD"
 #endif
+#if defined(HAVE_BRAINCHOP)
+	#define kChop " (MIT for mindgrab)"
+#else
+	#define kChop ""
+#endif
 
 #define kMTHdate "v1.0.20260726"
-#define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
+/* kChop precedes kLicense on purpose: README and AGENTS.md both document that the version
+   string ENDS in " BSD" or " GPL", so the overall-binary licence must stay the last word;
+   a bundled third-party model is a qualifier in front of it. */
+#define kMTHvers kMTHdate kOMPsuf kCCsuf kChop kLicense
 
 #ifdef NII2MESH
 
@@ -338,6 +346,12 @@ int show_help( void ) {
 	printf(" -reslice_nn <target>     : reslice to match image 'target' using nearest neighbor interpolation\n");
 	printf(" -reslice_mask <mask>     : reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity\n");
 
+#endif
+#ifdef HAVE_BRAINCHOP
+	printf(" -mindgrab [-border <mm>] : skull strip with the MindGrab network (3D input; ~2.5GB RAM)\n");
+	printf("                            -border grows the brain mask before it is applied\n");
+#else
+	printf(" -mindgrab                : MindGrab skull stripping — NOT in this build (64-bit native only; BRAINCHOP=1 or -DENABLE_BRAINCHOP=ON)\n");
 #endif
 #ifdef HAVE_ALLINEATE
 	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");

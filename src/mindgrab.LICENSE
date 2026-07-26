@@ -1,0 +1,69 @@
+MindGrab model weights — provenance and licence
+===============================================
+
+`src/mindgrab_weights.c` is generated from the upstream MindGrab checkpoint. The C code that
+consumes it (`src/mindgrab.c`, `scripts/export_mindgrab.py`) is niimath's own, BSD-2-Clause
+like the rest of the repository; only the 146,237 trained parameters come from upstream.
+
+Artifact
+--------
+    URL      https://huggingface.co/neuroneural/mindgrab/resolve/main/model.pth
+    SHA-256  31f1bda17b8d3eee17a54cf3f199899763a6615a049f05ab2a05f18eb98ec23a
+    Config   https://huggingface.co/neuroneural/mindgrab/resolve/main/model.json
+    SHA-256  e321f27014eb05f187667873d5301be57f9aac4c5be427e68e9f484748d643fd
+
+Reference implementation: brainchop-cli (https://github.com/neuroneural/brainchop-cli),
+MIT, Copyright (c) 2024 spikedoanz (Mike Doan). Validated against brainchop-cli 0.1.24 with tinygrad
+(the version installed at validation time; 0.2.x renames the short CLI options but not the model).
+
+Licence
+-------
+The exact model release above declares `license: mit` in its Hugging Face model-card metadata.
+That metadata is the ONLY licence statement that covers these weights, and the whole MIT basis
+rests on it. Two things it is worth being precise about:
+
+  * The same bytes are also served from `github.com/neuroneural/brainchop-models`
+    (`meshnet/mindgrab/model.pth`), which brainchop-cli still downloads from -- verified
+    byte-identical at the SHA-256 above. That repository has NO LICENSE file at all.
+  * `neuroneural/brainchop` and `neuroneural/brainchop-cli` are MIT-licensed SOFTWARE
+    repositories. They distribute the weights but do not themselves license them, so they are
+    not independent confirmation.
+
+The MindGrab paper (arXiv:2506.11860) does not state a licence for the model; the paper itself
+is CC BY 4.0. Do not cite it as the licence basis. If upstream ever adds a LICENSE beside the
+weights, record it here and this note can be simplified.
+
+Upstream MIT notice (brainchop-cli)
+-----------------------------------
+MIT License
+
+Copyright (c) 2024 spikedoanz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Citation
+--------
+    Fani, A., Doan, M., Le, I., Fedorov, A., Hoffmann, M., Rorden, C., Plis, S. MindGrab for
+    BrainChop: Fast and Accurate Skull Stripping for Command Line and Browser.
+    arXiv:2506.11860 (2025). https://arxiv.org/abs/2506.11860
+
+    Fedorov, A., et al. End-to-end learning of brain tissue segmentation from imperfect
+    labeling. IJCNN 2017 (the MeshNet architecture).
+
+Intended use
+------------
+`-mindgrab` is automated research segmentation. It is not a medical device and carries no
+diagnostic guarantee. Inspect its output before relying on it.

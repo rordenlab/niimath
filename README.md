@@ -73,6 +73,7 @@ make debug             # Debug build (-g, no optimization)
 make ubsan             # Lightweight undefined-behavior checks (OpenMP-safe on macOS)
 make sanitize          # AddressSanitizer build
 AL=0 make              # Disable allineate registration
+BRAINCHOP=0 make       # Omit MindGrab skull stripping (-mindgrab); ON by default
 ZSTD=0 make            # Disable zstd compression support
 make wasm              # Emscripten/WebAssembly target
 make wasm-wasi         # Experimental zlib-free WASI compute backend (needs Zig)
@@ -210,9 +211,43 @@ niimath has a few features not provided by fslmaths:
    - an optional stdlib-only BIDS wrapper (`medic.py`, in the `medic_bench` repository) discovers multi-echo runs, reads the parameters from their JSON sidecars, and drives `--medic` and `-unwarp` for you
    - a clean-room emulation developed from the published method and black-box measurement of the reference tool; every convention it implements is recorded in the `medic_bench` repository, which also holds the benchmarks and the patent analysis. **No equivalence with the reference tool is claimed.** `-unwarp` does reproduce it closely — fed the reference's own displacement map it matches the reference's corrected images to nrmse 3.5e-5 — but `--medic` does **not** match end to end: given the same mask its native field map agrees to 0.0027 Hz at the 99th percentile, while the reference's brain-mask construction, its iteration-limited field inversion and a residual in its low-rank filtering are deliberately not reproduced. Supply the same mask to both with `--mask` when you want a like-for-like comparison
    - please cite Van et al. 2026, *Imaging Neuroscience* 4, [doi:10.1162/IMAG.a.1262](https://doi.org/10.1162/IMAG.a.1262), and the ROMEO reference above for the unwrapping
+ - `-mindgrab [-border <mm>]` : **MindGrab** skull stripping — replaces every voxel outside the brain with the image minimum, on the input grid, at the input intensities. Built in by default; omit it with `BRAINCHOP=0 make` or `cmake -DENABLE_BRAINCHOP=OFF`
+   - 3D scalar input only. Internally it conforms a copy of the image to 256³ 1 mm (as `-conform`), evaluates a 25-layer dilated MeshNet, keeps the largest 26-connected component of the 2-class argmax, and reslices that mask back with nearest neighbour. Peak RSS is about **2.5 GB** (2.15 GB of that is the two activation buffers). On an idle Apple M4 Pro it takes roughly **8 s at 10 threads** and about 70 s single-threaded; expect more on a loaded machine. Output is bit-identical for any thread count
+   - `-border <mm>` grows the mask before it is applied, reproducing brainchop's `-b`. It must be an option rather than a chained `-close`, because once `-mindgrab` returns, the border would have to restore voxels the strip has already blanked
+   - the network is a clean-room C implementation — no ONNX Runtime, no TFLite, no tinygrad, nothing to install. Only the trained weights are upstream and MIT-licensed: 146,237 float32 parameters, 571 KiB of constants, which grow the binary by about 595 KB. See `src/mindgrab.LICENSE` for provenance, both SHA-256s and the citation
+   - this is automated research segmentation, **not a diagnostic guarantee**. Inspect the output
  - `--compare <ref>`       : report if images are identical, terminates without saving new image
  - `--bitmap -a name.png`  : mimic fsl slicer (see [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap))
  - `filename.nii`          : mimic fslhd (can also export to a txt file: 'niimath T1.nii 2> T1.txt') report header and terminate without saving new image
+
+## Skull stripping: replacing brainchop with niimath
+
+[brainchop-cli](https://github.com/neuroneural/brainchop-cli) already calls niimath for most of its MindGrab pipeline — it shells out to `niimath -conform`, `-bwlabel 26`, `-close` and `-reslice_mask`, and only the neural network itself runs in Python under tinygrad. `-mindgrab` folds that last step in, so a default build does the whole job in one process with no Python, no model download and no inference runtime.
+
+Commands below are for brainchop-cli **0.1.24**, the version this port was validated against. 0.2.x renamed the short options (`-i` → `--inverse-conform`, `-ss` → `--skull-strip`, `-b` → `--border`, `-a` → `--mask`); the long forms work in both.
+
+| brainchop-cli 0.1.24 | niimath | agreement |
+| --- | --- | --- |
+| `brainchop -m mindgrab -i -o brain.nii.gz t1.nii.gz` | `niimath t1.nii.gz -mindgrab brain.nii.gz` | voxel-identical; append `-odt input_force` AFTER the output name to match the wrapper's datatype |
+| `brainchop -ss -i -o brain.nii.gz t1.nii.gz` (`-ss` is an alias for `-m mindgrab`) | `niimath t1.nii.gz -mindgrab brain.nii.gz` | voxel-identical; append `-odt input_force` AFTER the output name to match the wrapper's datatype |
+| `brainchop -m mindgrab -i -b 4 -o brain.nii.gz t1.nii.gz` | `niimath t1.nii.gz -mindgrab -border 4 brain.nii.gz` | voxel-identical; append `-odt input_force` AFTER the output name to match the wrapper's datatype |
+| `brainchop -m mindgrab -i -a mask.nii.gz -o brain.nii.gz t1.nii.gz` | `niimath t1.nii.gz -mindgrab -bin mask.nii.gz -odt char` | **conditional — read the mask caveat below** |
+
+"Voxel-identical" means `niimath out.nii.gz --compare ref.nii.gz` reports the images as identical, on a real T1. That holds for the tinygrad METAL backend and its CPU backend alike: both agree with this port on all 16,777,216 conformed voxels of the 2-class argmax.
+
+The margins are genuinely narrow, though, so treat `-mindgrab` output as reproducible rather than bit-stable. Output is identical for any thread count, but not necessarily across compilers: brainchop's own METAL and CPU backends differ by up to 3.1e-5 in the logits while the smallest decision margin on that volume is 3.0e-5. Measured on brainchop-cli's own `t1.nii.gz`, a niimath binary built by CMake (which adds `-march=armv8-a+crc`) differed from the Makefile build on one voxel in 12,582,912; on other volumes the two builds agreed exactly. Compare skull strips by voxel count or Dice, not by checksum.
+
+**The `-bin` mask recipe only works when the image minimum is 0.** `-mindgrab` writes an image, not a mask, and it blanks voxels to the image *minimum* — the same convention `-reslice_mask` uses. `-bin` binarizes at "not zero", so the two only line up on a zero-background image. For a typical MRI T1 that is the case, and `-bin` then recovers the mask everywhere except the handful of in-brain voxels that sit at zero themselves (**36 of 12,582,912**, 0.0003 %, on the sample T1). For **CT/HU data, or any image with a nonzero background, it silently returns an all-ones mask** — measured: adding 1000 to that same T1 makes `-mindgrab -bin` return 12,582,912 of 12,582,912. When the background is not zero, threshold the stripped image against the original instead of binarizing it, or take the mask from brainchop's `-a`.
+
+Because `-mindgrab` is an ordinary chained operation, anything else may follow it:
+
+```bash
+niimath t1.nii.gz -mindgrab brain.nii.gz                  # skull-stripped image
+niimath t1.nii.gz -mindgrab -border 4 brain.nii.gz        # ... with a 4 mm margin
+niimath t1.nii.gz -mindgrab -bin mask.nii.gz -odt char    # brain mask (see caveat above)
+niimath t1.nii.gz -mindgrab -bin -dilF -ero mask.nii.gz   # mask, smoothed by a kernel pass
+niimath t1.nii.gz -mindgrab -s 2 -gz 0 smooth_brain.nii   # strip, then blur, uncompressed
+```
 
 ## Identical Versus Equivalent Results
 
@@ -305,6 +340,8 @@ The `-romeo` phase-unwrapping command (`src/romeo.c`) is a C port of [ROMEO.jl](
 The `--medic` and `-unwarp` commands (`src/medic.c`) are original BSD-2-Clause code by the niimath authors: a clean-room emulation of the MEDIC method published by Van et al. (*Imaging Neuroscience* 4, 2026, [doi:10.1162/IMAG.a.1262](https://doi.org/10.1162/IMAG.a.1262)), developed from the paper and from black-box measurement of the reference tool's public executables. No reference implementation, test, build product or debug symbol was read, and no code from it is included; the measurements that fix each convention are recorded in the `medic_bench` repository. Phase unwrapping is performed by the MIT-licensed `-romeo` port described above, so `--medic` requires it (`ROMEO=0` implies `MEDIC=0`); `MEDIC=0 make` or `-DENABLE_MEDIC=OFF` omits MEDIC alone.
 
 The `-moco` and `-stc` commands (`src/moco.c`, `src/stc.c`) are original BSD-2-Clause code by the niimath authors. Both emulate a published AFNI method whose reference implementation is **GPL-2** — `3dvolreg`, `mri_3dalign`, `thd_rot3d` and `thd_shear3d` for `-moco`; `3dTshift` and its FFT for `-stc`. Those sources were **not** read, translated or paraphrased; they served only as black-box oracles. The clean-room specification is the published method (Cox & Jesmanowicz 1999 for `-moco`; AFNI's published `3dTshift -help` and `-verbose` output for `-stc`) together with measured inputs and outputs, recorded in the `moco_bench` repository (`test/moco_reference_manifest.md` and `test/stc_reference_manifest.md`). The FFT in `stc.c` is original niimath code — a batched Stockham autosort kernel; no FFT implementation was read or adapted. A binary containing these commands remains BSD-2-Clause.
+
+The optional `-mindgrab` command (`src/mindgrab.c`) is original BSD-2-Clause code by the niimath authors — a clean-room C implementation of the MeshNet inference that [brainchop-cli](https://github.com/neuroneural/brainchop-cli) (MIT) performs under tinygrad, developed from the published architecture and from black-box, layer-by-layer measurement of the reference. No inference runtime is linked. What *is* upstream is the trained MindGrab model: 146,237 float32 parameters, released through BrainChop under the MIT license, embedded as `src/mindgrab_weights.c` by `scripts/export_mindgrab.py`. `src/mindgrab.LICENSE` records the artifact URL, its SHA-256, the licence basis and the citation. The command is **on by default** in every 64-bit build path — Makefile, CMake, SuperBuild and the notarized macOS binary — so a standard niimath carries those 571 KiB of weights; `BRAINCHOP=0 make`, `cmake -DENABLE_BRAINCHOP=OFF` or `BRAINCHOP=0 ./notarize.sh` omit them, and 32-bit/wasm/tiny/nano builds never include them. MIT is permissive and compatible with the 2-Clause BSD License, so the combined binary may be distributed under BSD-2-Clause terms provided the MIT notice in `src/mindgrab.LICENSE` ships with it.
 
 The optional `-spm_coreg` and `-spm_deface` commands link the separate GPL-2 `spm_coreg` module (the [niimath_gpl](https://github.com/rordenlab/niimath_gpl) submodule), enabled only when built with `make GPL=1` (`-DHAVE_GPL`). A binary built that way is a combined work licensed under the GNU GPL-2; the default build (without the module) remains BSD-2-Clause. The version string reported by `niimath` ends in ` GPL` or ` BSD` to indicate which applies.
 

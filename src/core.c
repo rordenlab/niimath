@@ -121,6 +121,10 @@ void *nii_malloc(size_t count, size_t size) {
 	return ptr;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
+#endif
 int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
@@ -236,6 +240,9 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	free(S);
 	return thresh;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */

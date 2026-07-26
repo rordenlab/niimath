@@ -2619,6 +2619,66 @@ def exercise_stc(exe: str, tmp: Path, help_text: str) -> None:
     print("        toffset, non-finite policy, parser rejections, @file and chaining OK")
 
 
+def exercise_mindgrab(exe: str, tmp: Path, help_text: str) -> None:
+    """-mindgrab: CLI contract only.
+
+    Every -mindgrab run conforms to 256^3 and evaluates the whole network, so there is no cheap
+    end-to-end case to assert on here -- it costs ~8 s and ~2.5 GB whatever the input size.  The
+    numerics are covered in closed form by test/mindgrab_selftest.c (`make test`) and against the
+    brainchop-cli oracle by test/mindgrab_parity.c.  What IS cheap, and what this checks, is that
+    every rejection happens BEFORE the expensive path and writes no output.
+    """
+    line = _help_line(help_text, "-mindgrab")
+    if not line:
+        raise AssertionError("-mindgrab help line missing entirely (it must be #ifdef-paired)")
+    if "NOT in this build" in line:
+        # A disabled build must still say how to enable it, and must refuse the op rather than
+        # silently doing nothing.
+        if "BRAINCHOP=1" not in line:
+            raise AssertionError("disabled -mindgrab help must name BRAINCHOP=1")
+        out = tmp / "mg_disabled.nii"
+        src = tmp / "mg_in.nii"
+        write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
+        result = run_niimath(exe, [str(src), "-mindgrab", str(out)])
+        if result.returncode == 0 or out.exists():
+            raise AssertionError("-mindgrab must fail in a build without BRAINCHOP")
+        print("  -mindgrab: not built (BRAINCHOP=0) - contract checked")
+        return
+
+    if "-border" not in line:
+        raise AssertionError("-mindgrab help must document -border")
+
+    # 4D input: rejected before any conform/inference work, no output file.
+    src4d = tmp / "mg_4d.nii"
+    write_float32_nifti(src4d, (5, 5, 4), [float(i % 5) for i in range(500)], nt=5)
+    out4d = tmp / "mg_4d_out.nii"
+    result = run_niimath(exe, [str(src4d), "-mindgrab", str(out4d)])
+    if result.returncode == 0 or out4d.exists():
+        raise AssertionError("-mindgrab must reject 4D input and write nothing")
+
+    # Malformed -border: rejected at parse time, again with no output.
+    src = tmp / "mg_in3d.nii"
+    write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
+    for bad in ("abc", "4junk", "0", "-3"):
+        out = tmp / f"mg_border_{bad}.nii"
+        result = run_niimath(exe, [str(src), "-mindgrab", "-border", bad, str(out)])
+        if result.returncode == 0 or out.exists():
+            raise AssertionError(f"-mindgrab -border {bad} must be rejected with no output")
+    # -border swallowed by the output-filename slot. niimath takes the LAST argv as the output,
+    # so the dispatch deliberately peeks one past the op range: without that, `-mindgrab -border`
+    # ran a full 8 s inference and wrote a file literally named "-border.nii.gz" at exit 0.
+    # Nothing may be created by any of these, so compare the directory listing before and after.
+    for tail in (["-border"], ["-border", "4"], ["-border", str(tmp / "mg_border_val.nii")]):
+        before = sorted(p.name for p in tmp.iterdir())
+        result = run_niimath(exe, [str(src), "-mindgrab"] + tail)
+        after = sorted(p.name for p in tmp.iterdir())
+        if result.returncode == 0:
+            raise AssertionError(f"-mindgrab {' '.join(tail)} must be rejected")
+        if before != after:
+            raise AssertionError(f"-mindgrab {' '.join(tail)} wrote {set(after) - set(before)}")
+    print("  -mindgrab: CLI contract OK (4D and -border rejections write nothing)")
+
+
 def _help_line(help_text: str, tag: str) -> str:
     """The help line for one operation, so a caller can tell "absent" from "present but
     disabled" -- a platform-gated feature prints a '... NOT in this build' line rather than
@@ -2861,6 +2921,7 @@ def main() -> int:
         exercise_moco(exe, tmp, help_text)
         exercise_stc(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
+        exercise_mindgrab(exe, tmp, help_text)
 
         if args.expect_bsd:
             spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
