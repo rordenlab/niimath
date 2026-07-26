@@ -842,11 +842,20 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 		   oracle.  Rbest/sbest are a DIVERGENCE BACKSTOP, not a minimum-cost selector: they are
 		   restored only when the cost rises by more than MOCO_COST_RISE. */
 		if (!fitted) {
+			/* Both updates are shared state written from every worker.  The counter is a plain
+			   increment, but `first_failed` is a read-compare-write that `omp atomic` cannot
+			   express, so it needs a critical section -- an unguarded minimum here is a data
+			   race that can report the wrong volume number in the diagnostic below. */
 #ifdef _OPENMP
 			#pragma omp atomic update
 #endif
 			nfit_failed++;
-			if (first_failed < 0 || t < first_failed) first_failed = t;
+#ifdef _OPENMP
+			#pragma omp critical(moco_first_failed)
+#endif
+			{
+				if (first_failed < 0 || t < first_failed) first_failed = t;
+			}
 		}
 		{
 			mo33 Rinv;

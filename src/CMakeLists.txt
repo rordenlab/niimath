@@ -101,11 +101,11 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     # CMAKE_OSX_ARCHITECTURES names the TARGET slice and does NOT change CMAKE_SYSTEM_PROCESSOR,
     # so a universal build driven from an Apple Silicon runner would otherwise enable -moco in the
     # x86_64 slice too.  Prefer the target when it is set; fall back to the host processor.
-    set(_moco_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    set(_niimath_arch "${CMAKE_SYSTEM_PROCESSOR}")
     if(CMAKE_OSX_ARCHITECTURES)
-        set(_moco_arch "${CMAKE_OSX_ARCHITECTURES}")
+        set(_niimath_arch "${CMAKE_OSX_ARCHITECTURES}")
     endif()
-    if(APPLE AND _moco_arch MATCHES "^(arm64|aarch64)$")
+    if(APPLE AND _niimath_arch MATCHES "^(arm64|aarch64)$")
         option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
     else()
         option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" OFF)
@@ -113,6 +113,24 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     if(ENABLE_MOCO)
         ADD_DEFINITIONS(-DHAVE_MOCO)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c)
+    endif()
+
+    # STC slice-time correction (-stc). Clean-room implementation of AFNI 3dTshift's default
+    # Fourier method; 3dTshift.c and its FFT are MCW GPL-2 and were used only as a black-box
+    # oracle (moco_bench's test/stc_reference_manifest.md). Ordinary FP, so it rides the normal source line.
+    # Same Apple-Silicon-first validation gate as MOCO above, sharing the _niimath_arch computed
+    # there (the target slice, not the host processor, decides). The variable is deliberately NOT
+    # named after either feature: a MOCO-owned name read from here would evaluate to empty if the
+    # MOCO block were ever moved or removed, and -stc would then silently default OFF on the one
+    # platform it is validated for.
+    if(APPLE AND _niimath_arch MATCHES "^(arm64|aarch64)$")
+        option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
+    else()
+        option(ENABLE_STC "Enable slice-time correction (-stc)" OFF)
+    endif()
+    if(ENABLE_STC)
+        ADD_DEFINITIONS(-DHAVE_STC)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} stc.c)
     endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)

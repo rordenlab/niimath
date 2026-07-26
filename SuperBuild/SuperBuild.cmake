@@ -51,10 +51,22 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
 option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -unwarp)" ON)
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+# -moco and -stc default ON only for an Apple Silicon TARGET.  These defaults are forwarded to the
+# inner project as explicit -D cache entries, which means the inner project's own option() default
+# can never override them -- so the target-architecture rule has to be applied HERE too, exactly
+# as src/CMakeLists.txt applies it.  CMAKE_OSX_ARCHITECTURES names the target slice and does NOT
+# change CMAKE_SYSTEM_PROCESSOR, so without this an arm64 host cross-building for x86_64 (or a
+# universal "arm64;x86_64" build) would cache ON and ship the features in an unvalidated slice.
+set(_niimath_arch "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_OSX_ARCHITECTURES)
+  set(_niimath_arch "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+if(APPLE AND _niimath_arch MATCHES "^(arm64|aarch64)$")
   option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+  option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
 else()
   option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" OFF)
+  option(ENABLE_STC "Enable slice-time correction (-stc)" OFF)
 endif()
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
@@ -125,6 +137,7 @@ ExternalProject_Add(src
         -DENABLE_QC:BOOL=${ENABLE_QC}
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
         -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
+        -DENABLE_STC:BOOL=${ENABLE_STC}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}

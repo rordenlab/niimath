@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260725"
+#define kMTHdate "v1.0.20260726"
 #define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
@@ -408,6 +408,15 @@ int show_help( void ) {
 	/* Only offer the "rebuild to enable" hint where -moco is actually supported.  WASM is a later
 	   milestone (moco_plan.md M6), so that build does not advertise the command at all. */
 	printf(" -moco [-1Dfile <path>]   : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
+#endif
+#ifdef HAVE_STC
+	printf(" -stc --slicetiming <t>   : slice-time correction of a 4D series (Fourier, detrend/interpolate/retrend)\n");
+	printf("                            <t> is one comma-separated list of seconds, or '@file'; one value per k slice\n");
+	printf("                            optional '-tzero <sec>' sets the common time point (default: mean of the times)\n");
+#elif !defined(EMSCRIPTEN)
+	/* Paired with the #ifdef so a STC=0 build still says how to get the feature back. WASM is
+	   deliberately silent: that target has not passed a numerical gate for -stc. */
+	printf(" -stc --slicetiming <t>   : slice-time correction — NOT in this build (rebuild with STC=1 or -DENABLE_STC=ON)\n");
 #endif
 #ifdef HAVE_GPL
 	printf(" -spm_coreg <ref> [opts]  : SPM rigid-body coregistration to 'ref' (GPL spm_coreg)\n");

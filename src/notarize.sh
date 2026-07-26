@@ -31,8 +31,8 @@ build_arch() {
     local target="$1" minver="$2" output="$3"
     local arch_dflags="${DFLAGS}" arch_srcs="${SRCS}"
     if [[ "$target" == arm64-* ]]; then
-        arch_dflags="${arch_dflags} -DHAVE_MOCO"
-        arch_srcs="${arch_srcs} moco.c"
+        arch_dflags="${arch_dflags} -DHAVE_MOCO -DHAVE_STC"
+        arch_srcs="${arch_srcs} moco.c stc.c"
     fi
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.

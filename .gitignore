@@ -5,6 +5,8 @@
 /bin/
 /src/niimath
 /src/niimath-noomp
+# left behind only when `make test`'s stc-test step fails before its cleanup
+/src/stc_fft_selftest
 /library/borg.nii.gz
 /library/blurred.nii.gz
 dist
@@ -41,9 +43,8 @@ _skbuild/niimath/_dist_ver.py
 /validate/
 /dwi/
 /qc/
-audit_temp.md
-audit_response*.md
-coreg_plan.md
+audit_*.md
+
 
 # allineate object-flag signature stamp (Makefile flag-change detection)
 .al_obj_flags
