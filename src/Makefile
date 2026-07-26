@@ -88,34 +88,22 @@ QCFLAGS= -DHAVE_QC qc.c
 #romeo.c, nothing here is reassociation-sensitive, so medic.c rides the normal source line.
 MEDICFLAGS= -DHAVE_MEDIC medic.c
 
-# One platform probe, shared by every feature carrying the Apple-Silicon VALIDATION gate below.
-# A second verbatim copy would be a second gate to keep in sync (and a second subprocess).
-APPLE_ARM64 := $(shell test "$$(uname -s)" = Darwin -a "$$(uname -m)" = arm64 && echo 1 || echo 0)
-
 #MOCO rigid-body motion correction (-moco). Clean-room implementation of Cox & Jesmanowicz
 #1999 (MRM 42:1014-1018); AFNI's 3dvolreg is GPL-2 and was used only as a black-box oracle.
 #Ordinary FP, so it rides the normal source line (unlike romeo.o).
-# Platform gate: moco_plan.md's owner decision is Apple Silicon macOS first; Linux and Windows
-# must not advertise -moco until their validation is recorded (WASM is M6, see MOCO_WASM below).
-# moco.c itself is portable -- this gate is about VALIDATION, not portability, so lifting it is a
-# one-line change once those platforms have run the numerical gates.
-ifeq ($(APPLE_ARM64),1)
-	MOCOFLAGS= -DHAVE_MOCO moco.c
-else
-	MOCOFLAGS=
-endif
+MOCOFLAGS= -DHAVE_MOCO moco.c
 #STC slice-time correction (-stc). Clean-room implementation of AFNI 3dTshift's default Fourier
 #method; 3dTshift.c and its FFT are MCW GPL-2 and were used only as a black-box oracle. Every
 #measured convention is recorded in moco_bench's test/stc_reference_manifest.md. Ordinary FP, so it rides the
 #normal source line (unlike romeo.o).
-# Platform gate, same reasoning as MOCO above: the numerical gates were run on Apple Silicon
-# macOS, so no other target advertises -stc until its own validation is recorded. stc.c itself is
-# portable -- this is a VALIDATION gate, not a portability one.
-ifeq ($(APPLE_ARM64),1)
-	STCFLAGS= -DHAVE_STC stc.c
-else
-	STCFLAGS=
-endif
+STCFLAGS= -DHAVE_STC stc.c
+# Both were Apple-Silicon-only while their numerical behaviour was unproven elsewhere. That gate
+# is now LIFTED, because the validation is automated rather than anecdotal: release_smoke.py
+# checks the whole -stc contract in CLOSED FORM (an exact integer sample shift makes the pipeline
+# analytic, so it needs neither an FFT nor AFNI) plus -moco against a known whole-voxel shift, and
+# AppVeyor runs it on Windows/MSVC, Ubuntu and macOS; js/tests/temporal.test.ts runs the same
+# checks against the Emscripten bundle. Neither source has platform-specific code, and MSVC leaves
+# _OPENMP undefined, so the int64_t parallel-loop index never reaches its OpenMP 2.0 parser.
 #dtifit's dependencies for the WASM target (which otherwise ships no tensor support);
 #grouped so "DTIFIT=0 make wasm" restores the original tensor-free WASM build
 DT_WASM= $(TFILES) $(DTFLAGS)
@@ -130,13 +118,15 @@ QC_WASM= $(QCFLAGS)
 # wasm. Omitted from tiny/nano (like every other optional feature) and from the WASI reactor,
 # which is a lean zlib-free compute backend.
 MEDIC_WASM= $(MEDICFLAGS)
-# -moco is deliberately ABSENT from the wasm inventory: moco_plan.md's owner decision is native
-# first, WASM as a later milestone (M6). Leaving this empty keeps the Emscripten build from
-# advertising a command that has not passed a WASM numerical gate.
-MOCO_WASM=
-# -stc is deliberately ABSENT from the wasm inventory for the same reason as -moco: its
-# numerical and memory behaviour has not been measured under wasm32/-DFORCE_INT32_MAX.
-STC_WASM=
+# -moco and -stc in the Emscripten build. Both are pure computation on a 4D series with no
+# platform-specific code, and both are validated in the browser bundle by js/tests. DELIBERATE
+# LIMIT, not an oversight: wasm32 is a 4 GiB address space and every wasm target sets
+# -DFORCE_INT32_MAX, and BOTH commands hold the input and the corrected output resident at once
+# (-moco adds per-volume scratch, -stc a per-worker FFT buffer), so a long series will not fit in
+# the browser -- size the run on a native binary first. Emscripten has no OpenMP, so both run
+# single-threaded there; -stc is unaffected numerically because no reduction crosses voxels.
+MOCO_WASM= $(MOCOFLAGS)
+STC_WASM= $(STCFLAGS)
 #Optional GPL spm_coreg module (GNU GPL-2): "GPL=1 make" enables -spm_coreg. OFF by
 #default so the repository builds remain BSD-2. The GPL sources live in src/GPL,
 #provided by the niimath_gpl submodule (a binary built with GPL=1 is a GPL-2 work).

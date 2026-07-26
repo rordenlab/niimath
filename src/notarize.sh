@@ -29,11 +29,9 @@ AL_SRCS="allineate.c powell_newuoa.c coreg_fast.c reface.c"
 
 build_arch() {
     local target="$1" minver="$2" output="$3"
-    local arch_dflags="${DFLAGS}" arch_srcs="${SRCS}"
-    if [[ "$target" == arm64-* ]]; then
-        arch_dflags="${arch_dflags} -DHAVE_MOCO -DHAVE_STC"
-        arch_srcs="${arch_srcs} moco.c stc.c"
-    fi
+    # -moco and -stc build for BOTH slices: their Apple-Silicon-only gate was lifted once CI began
+    # checking both numerically (release_smoke.py) on every shipped target.
+    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC" arch_srcs="${SRCS} moco.c stc.c"
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
     # (allineate no longer needs a separate scoped compile — everything is fast-math now.)

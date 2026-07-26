@@ -51,23 +51,13 @@ option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface)
 option(USE_OPENMP "Build with OpenMP support" ON)
 option(ENABLE_QC "Enable anatomical QC metrics (--qc)" ON)
 option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -unwarp)" ON)
-# -moco and -stc default ON only for an Apple Silicon TARGET.  These defaults are forwarded to the
-# inner project as explicit -D cache entries, which means the inner project's own option() default
-# can never override them -- so the target-architecture rule has to be applied HERE too, exactly
-# as src/CMakeLists.txt applies it.  CMAKE_OSX_ARCHITECTURES names the target slice and does NOT
-# change CMAKE_SYSTEM_PROCESSOR, so without this an arm64 host cross-building for x86_64 (or a
-# universal "arm64;x86_64" build) would cache ON and ship the features in an unvalidated slice.
-set(_niimath_arch "${CMAKE_SYSTEM_PROCESSOR}")
-if(CMAKE_OSX_ARCHITECTURES)
-  set(_niimath_arch "${CMAKE_OSX_ARCHITECTURES}")
-endif()
-if(APPLE AND _niimath_arch MATCHES "^(arm64|aarch64)$")
-  option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
-  option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
-else()
-  option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" OFF)
-  option(ENABLE_STC "Enable slice-time correction (-stc)" OFF)
-endif()
+# -moco and -stc are ON for every target; their former Apple-Silicon-only gate was lifted once
+# release_smoke.py (Windows/Ubuntu/macOS via AppVeyor) and js/tests/temporal.test.ts (Emscripten)
+# began checking both numerically on every build. These are forwarded to the inner project as
+# explicit -D cache entries, which its own option() default can never override, so any future
+# per-target rule must be applied HERE as well as in src/CMakeLists.txt.
+option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
+option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
