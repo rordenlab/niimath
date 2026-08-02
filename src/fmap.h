@@ -9,8 +9,9 @@
 // published: Jezzard & Balaban, Magn Reson Med 34:65-73 (1995), plus FSL's own documentation at
 // https://fsl.fmrib.ox.ac.uk/fsl/docs/registration/fugue.html
 //
-// Every measured convention, the experiment behind it, and the two deliberate divergences are
-// recorded in the fmap_bench repository's test/fmap_reference_manifest.md.  Read that before
+// Every measured convention, the experiment behind it, and the three deliberate divergences are
+// recorded in the fmap_bench repository's test/fmap_reference_manifest.md (which currently has no
+// git remote -- treat its figures as internal measurements until it is published).  Read that before
 // changing any constant here.
 //
 // Guarded by HAVE_FMAP.
@@ -49,9 +50,15 @@ extern "C" {
 // one shift volume rather than two copies of the input.  Byte-identical across thread counts:
 // every line is independent and no reduction is used.
 //
-// Fails closed, leaving `nim` untouched, on: a non-float32 or >4D working image; a fieldmap that
-// is missing, unreadable, not 3D, oversized, or off-grid; a non-finite fieldmap voxel; a
-// non-finite or non-positive dwell; or an unrecognised unwarpdir.  Returns 0 on success.
+// Fails closed on: a non-float32 or >4D working image; a fieldmap that is missing, unreadable,
+// not 3D, oversized, or off-grid; a non-finite fieldmap voxel; a non-finite or non-positive
+// dwell; or an unrecognised unwarpdir.  Returns 0 on success.
+//
+// "Fails closed" means NO OUTPUT IS WRITTEN, not that `nim` is restored.  Every rejection above
+// is detected before any voxel is touched, but the resampling itself is IN PLACE, so an
+// allocation failure once it has begun leaves `nim->data` partially rewritten.  That is safe
+// only because the op-loop caller frees `nim` without saving on a non-zero return; a caller
+// outside the op loop must not reuse `nim` after a failure.
 int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char *unwarpdir);
 
 #ifdef HAVE_ROMEO
@@ -80,10 +87,14 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 // Unwrapping is ROMEO, not a reimplementation of the reference's PRELUDE, so the two disagree at
 // poorly conditioned voxels.  That is why the acceptance gate is on the final unwarped EPI.
 //
-// Fails closed, leaving `nim` untouched, on: a non-float32, non-3D or oversized working image; a
-// missing, unreadable, non-3D, oversized or off-grid magnitude; an empty mask; a non-finite or
-// constant phase image; a non-finite or non-positive delta_te_ms; or an unwrapping failure.
-// Returns 0 on success.
+// Fails closed on: a non-float32, non-3D or oversized working image; a missing, unreadable,
+// non-3D, oversized or off-grid magnitude; an empty mask; a non-finite or constant phase image;
+// a non-finite or non-positive delta_te_ms; or an unwrapping failure.  Returns 0 on success.
+//
+// As with fmap_unwarp, "fails closed" means no output is written -- NOT that `nim` survives.
+// The phase is rescaled to radians IN PLACE before ROMEO is called, so a failure at or after
+// the unwrap leaves `nim->data` overwritten.  Safe only under the op loop's free-without-saving
+// contract; do not reuse `nim` after a failure outside it.
 // `debranch` enables the 2*pi branch-outlier correction described in fmap.c (default on; the CLI
 // spells the opt-out `-no-debranch`).  It is applied in fmap.c AFTER romeo_unwrap_frame() returns,
 // so romeo.c is untouched and neither --medic nor -romeo is affected by it -- MEDIC keeps a

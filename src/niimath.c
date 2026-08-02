@@ -412,6 +412,12 @@ int show_help( void ) {
 	printf("                            no regularisation is applied (matching the reference); output is 0 outside the mask\n");
 	printf("                            isolated 2*pi branch outliers ROMEO leaves behind ARE corrected; -no-debranch disables that\n");
 	printf("                            (that correction lives in -fmapprep only — romeo.c is untouched, so -romeo and --medic are unaffected)\n");
+#elif defined(HAVE_FMAP)
+	printf(" -fmapprep <mag> <dTE_ms> : build a rad/s B0 fieldmap from a wrapped phase difference — NOT in this build\n");
+	printf("                            it needs ROMEO phase unwrapping (rebuild without ROMEO=0 / with -DENABLE_ROMEO=ON)\n");
+#else
+	printf(" -fmapprep <mag> <dTE_ms> : build a rad/s B0 fieldmap from a wrapped phase difference — NOT in this build\n");
+	printf("                            (rebuild without FMAP=0 / with -DENABLE_FMAP=ON, and with ROMEO enabled)\n");
 #endif
 #ifdef HAVE_FMAP
 	printf(" -fugue <fmap> <dwell> <dir> : correct EPI susceptibility distortion with a B0 fieldmap (emulates FSL fugue)\n");

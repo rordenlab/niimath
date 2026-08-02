@@ -1,5 +1,15 @@
 # fmap_plan.md — B0 fieldmap preparation and EPI unwarping in niimath
 
+> **HISTORICAL — superseded by `fmap_bench/test/fmap_reference_manifest.md`.**
+>
+> This is the plan the work was executed against, kept because the manifest cites it by name and because two of its predictions were overturned *by measurement*, which is worth being able to read. It is **not** a contract and must not be updated: a second document that can drift from the manifest is exactly the failure AGENTS.md already records for `skullstrip_plan.md`.
+>
+> Two decisions here were deliberately reversed during implementation:
+> * **Decision 4** said the apply stage would reuse `medic_unwarp`'s `md_pull`. It does not — `md_pull` is a 3D Lanczos-5 pull over a millimetre map writing to a second buffer, while `-fugue` is a 1D linear pull over a voxel shift that rewrites in place. See the note at the foot of `src/fmap.c`.
+> * **M4** said `ROMEO=0` must imply `FMAP=0`. It does not — only `-fmapprep` needs ROMEO, so a `ROMEO=0` build keeps a working `-fugue`, and CMake emits a `message(STATUS)` rather than erroring.
+>
+> Its M3 prediction that the regularisation chain would be the schedule risk was also wrong in an interesting way: there is no regularisation chain at all.
+
 **Goal.** Give niimath a BSD-2 replacement for the two FSL tools that carry the fieldmap half of a FUGUE-style susceptibility-distortion pipeline: `fsl_prepare_fieldmap` (Siemens phase-difference → rad/s fieldmap) and `fugue` (fieldmap + dwell + phase-encoding direction → unwarped EPI). `bet` is explicitly out of scope. Two new chain ops, `-fmapprep` and `-fugue`, validated end to end against the FSL binaries on `/Users/chris/src/fmap_bench/generic`, with the evidence published in the `fmap_bench` repository the way `moco_bench` and `medic_bench` already do for `-moco`, `-stc` and `--medic`.
 
 **Why this is worth doing.** On the benchmark dataset FSL spends 12.7 s and 650 MB peak, of which `fugue` alone is 11.3 s and all 650 MB. The apply stage is a separable 1D resample along one axis over a 76×76×45×254 series (66 M voxels, 264 MB as float32) — memory-bandwidth-bound work that niimath should do several times faster in roughly half the RAM. `fsl_prepare_fieldmap` (819 ms) is small, but folding it in removes the last non-niimath step apart from brain extraction.

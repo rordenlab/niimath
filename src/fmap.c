@@ -15,7 +15,7 @@
 //   1. The interpolation is 1D LINEAR along the unwarp axis, not cubic, spline or Lanczos.  An
 //      impulse displaced by half a voxel comes back as exactly two taps of 0.5; by a quarter, as
 //      0.75/0.25.  No wider kernel can do that.  (This is why -fugue does not reuse -unwarp's
-//      md_pull, which is a 3D Lanczos-3 pull -- see the note at the bottom of this file.)
+//      md_pull, which is a 3D Lanczos-5 pull -- see the note at the bottom of this file.)
 //   2. The shift is sampled at the OUTPUT voxel.  This is a pure pull with no inversion, so mass
 //      is NOT conserved under compression: an impulse through a ramp field comes back summing to
 //      893.33, not 1000, and the reference agrees with the pull model on that deficit to six
@@ -37,9 +37,7 @@
 #ifndef M_PI
 	#define M_PI 3.14159265358979323846
 #endif
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+/* No <omp.h>: this file uses only #pragma omp, which needs no header. */
 
 #include "fmap.h"
 #include "print.h"
@@ -48,11 +46,12 @@
 #endif
 
 #define FM_ERR(...) do { printfx("-fugue: " __VA_ARGS__); } while (0)
+#define FP_ERR(...) do { printfx("-fmapprep: " __VA_ARGS__); } while (0)
 
 // A voxel whose |fieldmap| falls below this carries no data.  Measured bound on the reference's
 // own threshold: (3.278e-07, 0.6237] rad/s -- six orders of magnitude of daylight between the
 // largest value it discards and the smallest it keeps.  At 1e-6 rad/s the implied shift is
-// 6.5e-12 voxels, so nothing physical is discarded by sitting in the middle of that gap.
+// 6.5e-9 voxels, so nothing physical is discarded by sitting in the middle of that gap.
 #define FMAP_EPS 1e-6
 
 /* ============================== argument parsing ============================== */
@@ -82,31 +81,36 @@ static int fm_parse_dir(const char *dir, int *axis, double *sigma) {
 
 // Read a NIfTI as float32.  Header-only preflight first, so a malformed or oversized image is
 // rejected before its payload is decompressed and allocated.
-static nifti_image *fm_read_f32(const char *fn) {
+/* `op` and `what` are threaded through because this reader is shared: -fugue passes
+   ("-fugue", "fieldmap") and -fmapprep passes ("-fmapprep", "magnitude").  Routing its
+   messages through FM_ERR instead told a -fmapprep user that "-fugue" could not read their
+   "fieldmap", naming an operation absent from their command line and the wrong file role. */
+static nifti_image *fm_read_f32(const char *fn, const char *op, const char *what) {
 	nifti_image *n;
 	in_hdr ihdr;
 	{
 		nifti_image *h = nifti_image_read(fn, 0);
 		int bad = 0;
-		if (!h) { FM_ERR("failed to read the header of fieldmap '%s'\n", fn); return NULL; }
+		if (!h) { printfx("%s: failed to read the header of %s '%s'\n", op, what, fn); return NULL; }
 		if (h->nvox < 1 || h->nx < 1 || h->ny < 1 || h->nz < 1) {
-			FM_ERR("fieldmap '%s' has invalid dimensions\n", fn); bad = 1;
+			printfx("%s: %s '%s' has invalid dimensions\n", op, what, fn); bad = 1;
 		} else if (h->nt > 1 || h->nu > 1 || h->nv > 1 || h->nw > 1) {
-			FM_ERR("fieldmap '%s' must be a single 3D volume\n", fn); bad = 1;
+			printfx("%s: %s '%s' must be a single 3D volume\n", op, what, fn); bad = 1;
 		} else if ((int64_t)h->nvox > INT_MAX) {
-			FM_ERR("fieldmap '%s' exceeds INT_MAX voxels; -fugue is not a huge-image-safe operation\n", fn);
+			printfx("%s: %s '%s' exceeds INT_MAX voxels; %s is not a huge-image-safe operation\n",
+				op, what, fn, op);
 			bad = 1;
 		}
 		nifti_image_free(h);
 		if (bad) return NULL;
 	}
 	n = nifti_image_read(fn, 1);
-	if (!n) { FM_ERR("failed to read fieldmap '%s'\n", fn); return NULL; }
+	if (!n) { printfx("%s: failed to read %s '%s'\n", op, what, fn); return NULL; }
 	/* Re-check after the load as well as before it: the preflight is what stops us decompressing
 	   a huge payload, this is the fail-closed guarantee, and it costs nothing. */
 	if (n->nvox < 1 || n->nx < 1 || n->ny < 1 || n->nz < 1 ||
 		n->nt > 1 || n->nu > 1 || n->nv > 1 || n->nw > 1 || (int64_t)n->nvox > INT_MAX) {
-		FM_ERR("fieldmap '%s' changed on disk or has unusable dimensions\n", fn);
+		printfx("%s: %s '%s' changed on disk or has unusable dimensions\n", op, what, fn);
 		nifti_image_free(n); return NULL;
 	}
 	ihdr = set_input_hdr(n);
@@ -116,7 +120,7 @@ static nifti_image *fm_read_f32(const char *fn) {
 	if (n->datatype != DT_FLOAT32 ||
 		(n->scl_slope != 0.0f && n->scl_slope != 1.0f) || n->scl_inter != 0.0f) {
 		if (nifti_image_change_datatype(n, DT_FLOAT32, &ihdr) != 0) {
-			FM_ERR("failed to convert fieldmap '%s' to float32\n", fn);
+			printfx("%s: failed to convert %s '%s' to float32\n", op, what, fn);
 			nifti_image_free(n); return NULL;
 		}
 	}
@@ -165,7 +169,7 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 	const float *fdat;
 	double sigma = 1.0, scale;
 	int axis = 1, rc = 1;
-	int64_t nx, ny, nz, n3, nt, t, i;
+	int64_t nx, ny, nz, n3, nt, i;
 	int64_t dim[3], str[3], step, nline, nax, bstep, cstep, nb, nc;
 	int oom = 0;
 
@@ -192,7 +196,7 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 	if (n3 < 1 || (int64_t)nim->nvox % n3 != 0) { FM_ERR("invalid image geometry\n"); return 1; }
 	nt = (int64_t)nim->nvox / n3;
 
-	fm = fm_read_f32(fmapfile);
+	fm = fm_read_f32(fmapfile, "-fugue", "fieldmap");
 	if (!fm) return 1;
 	if (fm->nx != nx || fm->ny != ny || fm->nz != nz || max_displacement_mm(nim, fm) > 0.001f) {
 		FM_ERR("fieldmap '%s' does not share the input's grid (dimensions and world transform must match)\n",
@@ -267,12 +271,25 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 		double stackbuf[512];
 		double *heap = NULL;
 		double *buf = stackbuf;
-		int local_oom = 0;
 		if (nax > (int64_t)(sizeof(stackbuf) / sizeof(stackbuf[0]))) {
 			heap = (double *)malloc((size_t)nax * sizeof(double));
-			if (!heap) local_oom = 1; else buf = heap;
+			if (!heap) {
+#ifdef _OPENMP
+				#pragma omp atomic write
+#endif
+				oom = 1;
+			} else
+				buf = heap;
 		}
-		if (!local_oom) {
+		/* EVERY thread must reach the same decision about the worksharing loop below.  Branching
+		   on a THREAD-LOCAL allocation result would let one thread skip an `omp for` that the
+		   others enter -- the team then encounters different worksharing regions, which is
+		   undefined behaviour and in practice hangs at the implicit barrier.  The barrier
+		   publishes `oom` (it implies a flush) so the test that follows is team-wide. */
+#ifdef _OPENMP
+		#pragma omp barrier
+#endif
+		if (!oom) {
 			float *img = (float *)nim->data;
 			int64_t tt;
 			for (tt = 0; tt < nt; tt++) {
@@ -303,11 +320,6 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 					}
 				}
 			}
-		} else {
-#ifdef _OPENMP
-			#pragma omp atomic write
-#endif
-			oom = 1;
 		}
 		free(heap);
 	}
@@ -445,7 +457,7 @@ int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int 
 	n3 = nx * ny * nz;
 	if (n3 < 1 || (int64_t)nim->nvox != n3) { printfx("-fmapprep: invalid image geometry\n"); return 1; }
 
-	mg = fm_read_f32(magfile);
+	mg = fm_read_f32(magfile, "-fmapprep", "magnitude");
 	if (!mg) return 1;
 	if (mg->nx != nx || mg->ny != ny || mg->nz != nz || max_displacement_mm(nim, mg) > 0.001f) {
 		printfx("-fmapprep: magnitude '%s' does not share the phase image's grid (dimensions and world transform must match)\n",
@@ -540,7 +552,7 @@ done:
 #endif // HAVE_ROMEO
 
 /* Why this does not reuse medic_unwarp's md_pull, despite the plan's preference for sharing:
-   md_pull is a 3D Lanczos-3 pull driven by a displacement map in MILLIMETRES with an arbitrary
+   md_pull is a 3D Lanczos-5 pull driven by a displacement map in MILLIMETRES with an arbitrary
    world-space direction.  -fugue is a 1D LINEAR pull driven by a shift in VOXELS along a single
    storage axis, with a support-aware extrapolation step md_pull has no notion of.  The two share
    a loop shape and nothing else; unifying them would mean threading a mode flag that changes the
