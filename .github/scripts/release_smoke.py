@@ -2653,6 +2653,193 @@ def _skullstrip_geometry(path: Path) -> tuple:
     )
 
 
+def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
+    """-fugue / -fmapprep: closed-form checks of the measured contract, with no FSL dependency.
+
+    Everything asserted here is derivable analytically, which is the point: the reference is a
+    non-redistributable binary, so the smoke test must stand on the arithmetic rather than on a
+    golden file.  See fmap_bench's test/fmap_reference_manifest.md for the experiment behind each
+    convention.
+    """
+    if "-fugue" not in help_text or "NOT in this build" in _help_line(help_text, "-fugue"):
+        print("  -fugue/-fmapprep: not built (FMAP=0) - skipping")
+        return
+
+    # A cube, so a 2-voxel shift of a centrally placed impulse stays inside the FOV along EVERY
+    # axis -- with a short z the "z-" case silently walks off the end and the test measures
+    # out-of-FOV fill instead of the sign convention.
+    nx, ny, nz = 8, 8, 8
+    n3 = nx * ny * nz
+    dwell = 0.001
+    two_pi = 2.0 * math.pi
+
+    # An impulse makes the output literally the interpolation kernel.
+    impulse = [0.0] * n3
+    impulse[3 + 3 * nx + 3 * nx * ny] = 1000.0
+    src = tmp / "fugue_impulse.nii"
+    write_float32_nifti(src, (nx, ny, nz), impulse)
+
+    def constant_field(shift_vox: float, axis_n: int) -> Path:
+        """A uniform field whose implied shift is exactly `shift_vox` voxels."""
+        val = shift_vox * two_pi / (dwell * axis_n)
+        p = tmp / ("fugue_f_%g_%d.nii" % (shift_vox, axis_n))
+        write_float32_nifti(p, (nx, ny, nz), [val] * n3)
+        return p
+
+    def unwarp(field: Path, direction: str, inp: Path = src) -> list[float]:
+        out = tmp / "fugue_out.nii"
+        require_success(run_niimath(exe, [str(inp), "-fugue", str(field), repr(dwell),
+                                          direction, "-gz", "0", str(out)]), "-fugue")
+        return read_float32_nifti(out)
+
+    # Whole-voxel shift, and the sign convention: a POSITIVE field moves signal toward -axis for
+    # "y" and toward +axis for "y-".  N is the dimension along the UNWARP axis, so the same
+    # displacement along z needs a field scaled by nz, not ny.
+    for direction, di, dj, dk, axis_n in (("y", 0, -2, 0, ny), ("y-", 0, 2, 0, ny),
+                                          ("x", -2, 0, 0, nx), ("x-", 2, 0, 0, nx),
+                                          ("z", 0, 0, -2, nz), ("z-", 0, 0, 2, nz)):
+        vals = unwarp(constant_field(2.0, axis_n), direction)
+        want = (3 + di) + (3 + dj) * nx + (3 + dk) * nx * ny
+        hot = [i for i, v in enumerate(vals) if abs(v) > 1e-3]
+        if hot != [want] or abs(vals[want] - 1000.0) > 1e-2:
+            raise SystemExit("-fugue: --unwarpdir %s put the impulse at %s (expected [%d], value %g)"
+                             % (direction, hot, want, vals[want] if hot else float("nan")))
+
+    # Half-voxel shift must split EXACTLY 500/500.  This is the check that pins the kernel to
+    # linear: no cubic, spline or windowed-sinc kernel can produce two taps.
+    vals = unwarp(constant_field(1.5, ny), "y")
+    hot = sorted(i for i, v in enumerate(vals) if abs(v) > 1e-3)
+    # out(v) = in(v + 1.5), so the impulse at y=3 lands half in y=1 and half in y=2.
+    want = sorted([3 + 1 * nx + 3 * nx * ny, 3 + 2 * nx + 3 * nx * ny])
+    if hot != want or any(abs(vals[i] - 500.0) > 1e-2 for i in hot):
+        raise SystemExit("-fugue: a 1.5-voxel shift did not split 500/500; got %s at %s"
+                         % ([vals[i] for i in hot], hot))
+
+    # A zero fieldmap is an exact identity -- the cheapest possible check that the extrapolation
+    # path cannot introduce a shift where there is no field.
+    zero = tmp / "fugue_zero.nii"
+    write_float32_nifti(zero, (nx, ny, nz), [0.0] * n3)
+    if unwarp(zero, "y") != impulse:
+        raise SystemExit("-fugue: an all-zero fieldmap was not an exact identity")
+
+    # Out-of-FOV samples contribute 0, and no Jacobian modulation is applied.
+    vals = unwarp(constant_field(float(ny), ny), "y")
+    if any(abs(v) > 1e-6 for v in vals):
+        raise SystemExit("-fugue: a whole-FOV shift should have emptied the image")
+
+    # -p 1 vs -p 8 byte-equality: every line is independent, so this must hold exactly.
+    outs = []
+    for threads in ("1", "8"):
+        o = tmp / ("fugue_p%s.nii" % threads)
+        require_success(run_niimath(exe, [str(src), "-p", threads, "-fugue",
+                                          str(constant_field(1.5, ny)), repr(dwell), "y",
+                                          "-gz", "0", str(o)]), "-fugue -p " + threads)
+        outs.append(o.read_bytes())
+    if outs[0] != outs[1]:
+        raise SystemExit("-fugue: -p 1 and -p 8 outputs differ")
+
+    # Rejections, all of which must fail closed rather than write a wrong image.
+    field = constant_field(1.0, ny)
+    bad = tmp / "fugue_bad.nii"
+    for args, label in (
+        (["-fugue", str(field)], "missing dwell and direction"),
+        (["-fugue", str(field), "y", "0.001"], "transposed dwell/direction"),
+        (["-fugue", str(field), repr(dwell), "q"], "unknown unwarpdir"),
+        (["-fugue", str(field), "0", "y"], "zero dwell"),
+        (["-fugue", str(field), "-0.001", "y"], "negative dwell"),
+    ):
+        if run_niimath(exe, [str(src), *args, "-gz", "0", str(bad)]).returncode == 0:
+            raise SystemExit("-fugue: accepted %s" % label)
+
+    # A 4D fieldmap and an off-grid fieldmap must both be refused.
+    fmap4d = tmp / "fugue_f4d.nii"
+    write_float32_nifti(fmap4d, (nx, ny, nz), [1.0] * (n3 * 2), nt=2)
+    offgrid = tmp / "fugue_off.nii"
+    write_float32_nifti(offgrid, (nx, ny, nz), [1.0] * n3, offset=(25.0, 0.0, 0.0))
+    for f, label in ((fmap4d, "4D fieldmap"), (offgrid, "off-grid fieldmap")):
+        if run_niimath(exe, [str(src), "-fugue", str(f), repr(dwell), "y",
+                             "-gz", "0", str(bad)]).returncode == 0:
+            raise SystemExit("-fugue: accepted a %s" % label)
+    if run_niimath(exe, ["-dt", "double", str(src), "-fugue", str(field), repr(dwell), "y",
+                         "-gz", "0", str(bad)]).returncode == 0:
+        raise SystemExit("-fugue: accepted -dt double")
+
+    print("  -fugue: shift constant, all six directions, linear kernel, zero-field identity,")
+    print("        out-of-FOV fill, -p 1 vs -p 8 byte-equality and parser rejections OK")
+
+    if "-fmapprep" not in help_text:
+        print("  -fmapprep: not built (needs ROMEO) - skipping")
+        return
+
+    # -fmapprep on a smooth, non-wrapping phase ramp: unwrapping is then the identity, so the
+    # whole op reduces to closed form -- scale by 2*pi/span, divide by deltaTE, subtract the
+    # median over the mask, zero outside it.
+    delta_te_ms = 2.5
+    mag = [0.0] * n3
+    phase = [0.0] * n3
+    inside = []
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                v = x + y * nx + z * nx * ny
+                phase[v] = float(y)  # a gentle ramp: no wraps for the unwrapper to resolve
+                if 1 <= x < nx - 1 and 1 <= y < ny - 1:
+                    mag[v] = 100.0
+                    inside.append(v)
+    pha = tmp / "fmapprep_phase.nii"
+    mgn = tmp / "fmapprep_mag.nii"
+    write_float32_nifti(pha, (nx, ny, nz), phase)
+    write_float32_nifti(mgn, (nx, ny, nz), mag)
+    out = tmp / "fmapprep_out.nii"
+    require_success(run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                                      "-gz", "0", str(out)]), "-fmapprep")
+    got = read_float32_nifti(out)
+
+    span = max(phase) - min(phase)
+    rad = [(p - min(phase)) / span * two_pi - math.pi for p in phase]
+    field = [r * 1000.0 / delta_te_ms for r in rad]
+    ordered = sorted(field[v] for v in inside)
+    median = ordered[len(ordered) // 2]  # UPPER central value, not the average
+    for v in range(n3):
+        want = (field[v] - median) if mag[v] != 0.0 else 0.0
+        if abs(got[v] - want) > 1e-2:
+            raise SystemExit("-fmapprep: voxel %d is %g, expected %g" % (v, got[v], want))
+
+    # The mask is the magnitude's nonzero support, verbatim -- no erosion, no dilation.
+    if [v for v in range(n3) if got[v] != 0.0 and mag[v] == 0.0]:
+        raise SystemExit("-fmapprep: wrote nonzero values outside the magnitude mask")
+
+    # -no-debranch is accepted before the output name and REJECTED in it, so a truncated command
+    # line cannot silently produce a file called "-no-debranch".
+    require_success(run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                                      "-no-debranch", "-gz", "0", str(out)]), "-fmapprep -no-debranch")
+    if run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                         "-no-debranch"]).returncode == 0:
+        raise SystemExit("-fmapprep: accepted '-no-debranch' as the output filename")
+    stray = tmp / "-no-debranch"
+    if stray.exists():
+        raise SystemExit("-fmapprep: wrote a file named after its own flag")
+
+    for args, label in (
+        ([str(pha), "-fmapprep", str(mgn)], "missing deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "0"], "zero deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "-2.5"], "negative deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "abc"], "non-numeric deltaTE"),
+    ):
+        if run_niimath(exe, [*args, "-gz", "0", str(tmp / "fmapprep_bad.nii")]).returncode == 0:
+            raise SystemExit("-fmapprep: accepted %s" % label)
+
+    # An empty mask has no median to subtract, so it must be refused rather than divided by.
+    empty = tmp / "fmapprep_empty.nii"
+    write_float32_nifti(empty, (nx, ny, nz), [0.0] * n3)
+    if run_niimath(exe, [str(pha), "-fmapprep", str(empty), repr(delta_te_ms),
+                         "-gz", "0", str(tmp / "fmapprep_bad.nii")]).returncode == 0:
+        raise SystemExit("-fmapprep: accepted an all-zero magnitude (empty mask)")
+
+    print("  -fmapprep: closed-form scale/median/mask contract, verbatim mask, -no-debranch")
+    print("        parsing and deltaTE/empty-mask rejections OK")
+
+
 def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
     """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
     hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
@@ -3254,6 +3441,7 @@ def main() -> int:
         exercise_medic(exe, tmp, help_text)
         exercise_moco(exe, tmp, help_text)
         exercise_stc(exe, tmp, help_text)
+        exercise_fmap(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
         exercise_skullstrip(exe, tmp, help_text)
         exercise_openmp_scratch_ops(exe, tmp)

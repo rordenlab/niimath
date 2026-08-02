@@ -58,6 +58,7 @@ option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -un
 # per-target rule must be applied HERE as well as in src/CMakeLists.txt.
 option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
 option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
+option(ENABLE_FMAP "Enable B0 fieldmap distortion correction (-fugue, -fmapprep)" ON)
 # Forwarded as an explicit -D below: src/ own option() default can never override a
 # SuperBuild cache entry, so a platform rule must be mirrored in BOTH files.
 option(ENABLE_SKULLSTRIP "Enable AFNI-style surface skull stripping (-skullstrip)" OFF)
@@ -144,6 +145,7 @@ ExternalProject_Add(src
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
         -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
         -DENABLE_STC:BOOL=${ENABLE_STC}
+        -DENABLE_FMAP:BOOL=${ENABLE_FMAP}
         -DENABLE_SKULLSTRIP:BOOL=${ENABLE_SKULLSTRIP}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}

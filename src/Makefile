@@ -550,7 +550,7 @@ wasm_al_objs:
 WASM_OUT= ../js/src/niimath.js
 
 wasm: $(WASM_AL_PREREQ) $(WASM_ROMEO_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(FMAP_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 

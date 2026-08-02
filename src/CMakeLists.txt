@@ -124,6 +124,24 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} stc.c)
     endif()
 
+    # FMAP B0 fieldmap distortion correction (-fugue, -fmapprep). Clean-room emulation of FSL
+    # fugue and fsl_prepare_fieldmap; FSL's sources (Oxford non-commercial licence, incompatible
+    # with BSD-2) were NOT read -- the executables served only as a black-box oracle. Every
+    # measured convention is in fmap_bench's test/fmap_reference_manifest.md. Ordinary FP, so it
+    # rides the normal source line (unlike the strict-FP romeo object).
+    #
+    # -fmapprep additionally needs ROMEO for phase unwrapping and is #ifdef'd out without it;
+    # -fugue does NOT, so an ENABLE_ROMEO=OFF build still gets the apply stage. That is why this
+    # does not hard-error on the combination the way ENABLE_MEDIC does.
+    option(ENABLE_FMAP "Enable B0 fieldmap distortion correction (-fugue, -fmapprep)" ON)
+    if(ENABLE_FMAP)
+        ADD_DEFINITIONS(-DHAVE_FMAP)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} fmap.c)
+        if(NOT ENABLE_ROMEO)
+            message(STATUS "ENABLE_FMAP without ENABLE_ROMEO: -fugue is built, -fmapprep is not")
+        endif()
+    endif()
+
     # SKULLSTRIP AFNI-style surface skull stripping (-skullstrip). Normalisation, intensity prep,
     # deformation and touchup are ALL adapted from public-domain AFNI (thd_brainormalize.c,
     # thd_automask.c, SUMA_BrainWrap.c -- the last carries no copyright notice, so it is a
