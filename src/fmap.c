@@ -226,7 +226,14 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 	}
 	nline = nb * nc;
 
-	shift = (float *)malloc((size_t)n3 * sizeof(float));
+	{	/* nii_mul_size, not a bare multiply: fmap.c is in the Emscripten target, where size_t is
+		   32-bit and a large n3 would wrap the byte count to a small number or 0. */
+		size_t bytes;
+		if (nii_mul_size((size_t)n3, sizeof(float), &bytes)) {
+			FM_ERR("image is too large for the shift field allocation\n"); goto done;
+		}
+		shift = (float *)malloc(bytes);
+	}
 	if (!shift) { FM_ERR("out of memory allocating the shift field\n"); goto done; }
 
 	/* Voxels, not millimetres, and N is the dimension along the unwarp axis (measured). */
@@ -324,10 +331,10 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 		free(heap);
 	}
 	if (oom) {
-		/* The image is now partially rewritten, so it cannot be handed back.  The op-loop caller
-		   frees `nim` without saving when a non-zero status is returned, so reporting the failure
-		   is sufficient; there is no snapshot to restore. */
-		FM_ERR("out of memory resampling; the working image is no longer valid\n");
+		/* Nothing was written: the barrier above makes the decision team-wide, so either every
+		   thread ran the worksharing loop or none did.  This path is therefore all-or-nothing
+		   and `nim` is exactly as it arrived. */
+		FM_ERR("out of memory allocating the resampling buffers; the image is unchanged\n");
 		goto done;
 	}
 	rc = 0;
@@ -384,8 +391,11 @@ static float fm_select_kth(float *a, int64_t n, int64_t k) {
 // It cannot corrupt a genuine field value: the correction is always an INTEGER multiple of
 // 2*pi/deltaTE, i.e. a projection onto the set of unwrappings consistent with the same wrapped
 // phase.  A voxel only moves when it sits more than half a wrap from the median of its in-mask
-// 6-neighbours, and a true field gradient that steep is beyond what a phase DIFFERENCE can
-// represent anyway -- it would already be aliased.
+// 6-neighbours.  The usual argument is that a true field gradient that steep is beyond what a
+// phase DIFFERENCE can represent and would already be aliased; that is a strong heuristic rather
+// than a proof, and it weakens for strongly anisotropic voxels where one neighbour is much
+// further away in millimetres than another.  What IS guaranteed is the projection property: a
+// moved voxel still explains the same wrapped phase.
 //
 // Jacobi, not Gauss-Seidel: every pass reads a snapshot, so the result does not depend on
 // traversal order and is byte-identical across thread counts.
@@ -394,7 +404,10 @@ static int fm_debranch(float *f, const unsigned char *mask, int64_t nx, int64_t 
 	float *snap = NULL;
 	int64_t n3 = nx * ny * nz, x, y, z, pass;
 	if (!(wrap > 0.0) || !(wrap <= DBL_MAX)) return 0;   /* nothing sane to project onto */
-	snap = (float *)malloc((size_t)n3 * sizeof(float));
+	{	size_t bytes;
+		if (nii_mul_size((size_t)n3, sizeof(float), &bytes)) return 1;
+		snap = (float *)malloc(bytes);
+	}
 	if (!snap) return 1;
 	for (pass = 0; pass < FMAP_DEBRANCH_PASSES; pass++) {
 		int64_t moved = 0;
@@ -420,7 +433,12 @@ static int fm_debranch(float *f, const unsigned char *mask, int64_t nx, int64_t 
 			}
 			nm = v[n / 2];   /* upper central value, matching the demedian convention */
 			k = floor(((double)snap[o] - nm) / wrap + 0.5);
-			if (k != 0.0) { f[o] = (float)((double)snap[o] - k * wrap); moved++; }
+			/* `k > 0 || k < 0` rather than `k != 0`: both are false for NaN, whereas `!=` is
+			   TRUE for it.  A NaN k reaches here when the field itself has overflowed to +/-Inf
+			   (Inf - Inf), and taking the branch then wrote NaN over every masked voxel and
+			   exited 0 -- the one fail-open path in this file.  Now such a voxel is left alone
+			   and the finiteness check after this call rejects the image. */
+			if (k > 0.0 || k < 0.0) { f[o] = (float)((double)snap[o] - k * wrap); moved++; }
 		}
 		if (moved == 0) break;
 	}
@@ -529,10 +547,27 @@ int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int 
 		goto done;
 	}
 
+	/* The rad/s scaling can overflow float32 for an absurdly small deltaTE (below ~3e-35 ms),
+	   which used to publish an Inf -- or, via the NaN branch above, an all-NaN -- fieldmap at
+	   exit 0.  -fugue would reject it downstream, but this file's own rule is that a corrupted
+	   image is never written, so check here rather than relying on the next op. */
+	for (i = 0; i < n3; i++) {
+		if (!(ph[i] >= -FLT_MAX && ph[i] <= FLT_MAX)) {
+			printfx("-fmapprep: the fieldmap overflowed to a non-finite value; deltaTE (%g ms) is implausibly small\n",
+				delta_te_ms);
+			goto done;
+		}
+	}
+
 	/* Measured: subtract the median over the mask, taking the UPPER of the two central values for
 	   an even population.  Averaging the two central values is wrong, and not subtly so -- on a
 	   field whose mask splits into two equal populations it errs by half the field's range. */
-	sel = (float *)malloc((size_t)nmask * sizeof(float));
+	{	size_t bytes;
+		if (nii_mul_size((size_t)nmask, sizeof(float), &bytes)) {
+			printfx("-fmapprep: mask is too large for the median buffer\n"); goto done;
+		}
+		sel = (float *)malloc(bytes);
+	}
 	if (!sel) { printfx("-fmapprep: out of memory computing the median\n"); goto done; }
 	{
 		int64_t j = 0;

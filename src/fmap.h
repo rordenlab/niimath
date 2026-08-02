@@ -54,11 +54,15 @@ extern "C" {
 // not 3D, oversized, or off-grid; a non-finite fieldmap voxel; a non-finite or non-positive
 // dwell; or an unrecognised unwarpdir.  Returns 0 on success.
 //
-// "Fails closed" means NO OUTPUT IS WRITTEN, not that `nim` is restored.  Every rejection above
-// is detected before any voxel is touched, but the resampling itself is IN PLACE, so an
-// allocation failure once it has begun leaves `nim->data` partially rewritten.  That is safe
-// only because the op-loop caller frees `nim` without saving on a non-zero return; a caller
-// outside the op loop must not reuse `nim` after a failure.
+// Every failure path is all-or-nothing: rejections are detected before any voxel is touched, and
+// the resampling loop is entered by the whole thread team or by none of it, so an allocation
+// failure there leaves `nim` exactly as it arrived.  (That team-wide decision is load-bearing --
+// branching on a per-thread allocation result would put the team on different worksharing
+// regions, which hangs.  See the barrier in fmap.c.)
+//
+// Byte-identical across thread counts, and byte-stable run to run WITHIN a build.  NOT bit-stable
+// ACROSS builds: the interior-gap fill is FMA-contracted under the tree's -ffast-math, so a
+// different compiler can move roughly 1 voxel in 2400 by ~1 ULP of the shift.
 int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char *unwarpdir);
 
 #ifdef HAVE_ROMEO
@@ -91,10 +95,10 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 // non-3D, oversized or off-grid magnitude; an empty mask; a non-finite or constant phase image;
 // a non-finite or non-positive delta_te_ms; or an unwrapping failure.  Returns 0 on success.
 //
-// As with fmap_unwarp, "fails closed" means no output is written -- NOT that `nim` survives.
-// The phase is rescaled to radians IN PLACE before ROMEO is called, so a failure at or after
-// the unwrap leaves `nim->data` overwritten.  Safe only under the op loop's free-without-saving
-// contract; do not reuse `nim` after a failure outside it.
+// Unlike fmap_unwarp this is NOT all-or-nothing: the phase is rescaled to radians IN PLACE
+// before ROMEO is called, so a failure at or after the unwrap leaves `nim->data` overwritten.
+// No output is written either way, which is safe under the op loop's free-without-saving
+// contract -- but a caller outside that loop must not reuse `nim` after a failure.
 // `debranch` enables the 2*pi branch-outlier correction described in fmap.c (default on; the CLI
 // spells the opt-out `-no-debranch`).  It is applied in fmap.c AFTER romeo_unwrap_frame() returns,
 // so romeo.c is untouched and neither --medic nor -romeo is affected by it -- MEDIC keeps a

@@ -2715,6 +2715,52 @@ def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
         raise SystemExit("-fugue: a 1.5-voxel shift did not split 500/500; got %s at %s"
                          % ([vals[i] for i in hot], hot))
 
+    # EXTRAPOLATION.  A zero fieldmap is unsupported, and the reference does NOT read that as
+    # zero shift -- it extrapolates the shift field along each line before resampling.  Without
+    # this case every fieldmap in this test is either uniform or all-zero, so three of
+    # fm_fill_line's four branches never run, and the naive model would pass.
+    #
+    # Field is 0 for y < 2 and a 1-voxel shift elsewhere; input is a ramp in y.  Linear
+    # interpolation of a linear function is exact, so out - (1000 + y) == -1.0 at EVERY y
+    # including y = 0 and 1 IFF the leading run replicated the first supported value.
+    ramp = [0.0] * n3
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                ramp[x + y * nx + z * nx * ny] = 1000.0 + y
+    ramp_src = tmp / "fugue_ramp.nii"
+    write_float32_nifti(ramp_src, (nx, ny, nz), ramp)
+    partial = [0.0] * n3
+    val = 1.0 * two_pi / (dwell * ny)
+    for z in range(nz):
+        for y in range(2, ny):
+            for x in range(nx):
+                partial[x + y * nx + z * nx * ny] = val
+    pf = tmp / "fugue_partial.nii"
+    write_float32_nifti(pf, (nx, ny, nz), partial)
+    vals = unwarp(pf, "y", inp=ramp_src)
+    for y in range(ny - 1):          # last row pulls out of FOV, so skip it
+        v = vals[3 + y * nx + 3 * nx * ny]
+        if abs(v - (1000.0 + y + 1.0)) > 1e-2:
+            raise SystemExit("-fugue: shift field was not extrapolated over unsupported voxels; "
+                             "row y=%d is %g, expected %g (a naive model gives %g at y<2)"
+                             % (y, v, 1000.0 + y + 1.0, 1000.0 + y))
+
+    # 4D: one 3D fieldmap must be applied identically to every volume.
+    vol4 = [0.0] * (n3 * 3)
+    for t in range(3):
+        vol4[t * n3 + (3 + (3 + t) * nx + 3 * nx * ny)] = 1000.0
+    src4 = tmp / "fugue_4d.nii"
+    write_float32_nifti(src4, (nx, ny, nz), vol4, nt=3)
+    vals = unwarp(constant_field(2.0, ny), "y", inp=src4)
+    for t in range(3):
+        want = 3 + (1 + t) * nx + 3 * nx * ny
+        hot = [i - t * n3 for i, v in enumerate(vals[t * n3:(t + 1) * n3], start=t * n3)
+               if abs(v) > 1e-3]
+        if hot != [want]:
+            raise SystemExit("-fugue: 4D volume %d put the impulse at %s, expected [%d]"
+                             % (t, hot, want))
+
     # A zero fieldmap is an exact identity -- the cheapest possible check that the extrapolation
     # path cannot introduce a shift where there is no field.
     zero = tmp / "fugue_zero.nii"
@@ -2722,7 +2768,21 @@ def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
     if unwarp(zero, "y") != impulse:
         raise SystemExit("-fugue: an all-zero fieldmap was not an exact identity")
 
-    # Out-of-FOV samples contribute 0, and no Jacobian modulation is applied.
+    # Out-of-FOV samples contribute 0, and no Jacobian modulation is applied.  Use a UNIFORM
+    # input, not the impulse: with an impulse an all-zero output is also what ANY bug that
+    # simply blanks the image produces, so the assertion would not distinguish them.  Here the
+    # rows that still pull from inside the FOV must keep their value exactly.
+    uniform = tmp / "fugue_uniform.nii"
+    write_float32_nifti(uniform, (nx, ny, nz), [1000.0] * n3)
+    vals = unwarp(constant_field(2.0, ny), "y", inp=uniform)
+    for y in range(ny):
+        v = vals[3 + y * nx + 3 * nx * ny]
+        want = 1000.0 if y + 2 < ny else 0.0
+        if abs(v - want) > 1e-3:
+            raise SystemExit("-fugue: out-of-FOV fill wrong at y=%d: %g, expected %g" % (y, v, want))
+
+    # -no-debranch must reach fmap_prepare, not merely parse: on a smooth phase the correction
+    # is inert, so the two outputs have to be byte-identical.
     vals = unwarp(constant_field(float(ny), ny), "y")
     if any(abs(v) > 1e-6 for v in vals):
         raise SystemExit("-fugue: a whole-FOV shift should have emptied the image")
