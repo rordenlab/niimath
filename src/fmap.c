@@ -43,6 +43,9 @@
 
 #include "fmap.h"
 #include "print.h"
+#ifdef HAVE_ROMEO
+#include "romeo.h" // in-memory phase unwrapping for -fmapprep
+#endif
 
 #define FM_ERR(...) do { printfx("-fugue: " __VA_ARGS__); } while (0)
 
@@ -321,6 +324,220 @@ done:
 	nifti_image_free(fm);
 	return rc;
 }
+
+/* ============================== -fmapprep ============================== */
+
+#ifdef HAVE_ROMEO
+
+// Comparator-free selection of the k-th smallest, in place.  Deliberately not qsort: emscripten's
+// qsort dispatches the comparator through call_indirect once per comparison, which is ~100x slower
+// than native and is a standing rule in this tree for anything touching a per-voxel array.
+static float fm_select_kth(float *a, int64_t n, int64_t k) {
+	int64_t lo = 0, hi = n - 1;
+	while (lo < hi) {
+		/* Median-of-three pivot: keeps the already-sorted and reverse-sorted cases -- both of
+		   which a masked, spatially coherent fieldmap can approximate -- off the O(n^2) path. */
+		int64_t mid = lo + (hi - lo) / 2, i = lo, j = hi;
+		float p;
+		if (a[mid] < a[lo]) { float t = a[mid]; a[mid] = a[lo]; a[lo] = t; }
+		if (a[hi] < a[lo])  { float t = a[hi];  a[hi]  = a[lo]; a[lo] = t; }
+		if (a[hi] < a[mid]) { float t = a[hi];  a[hi]  = a[mid]; a[mid] = t; }
+		p = a[mid];
+		while (i <= j) {
+			while (a[i] < p) i++;
+			while (a[j] > p) j--;
+			if (i <= j) { float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+		}
+		if (k <= j) hi = j;
+		else if (k >= i) lo = i;
+		else return a[k];
+	}
+	return a[lo];
+}
+
+// Maximum branch-correction passes.  Measured on the benchmark: 4 passes reach a fixed point
+// (30, 6, 5, 3 voxels moved, then 0).  The cap only bounds a pathological input; convergence is
+// the normal exit.
+#define FMAP_DEBRANCH_PASSES 10
+
+// Move voxels that ROMEO left on the wrong 2*pi branch onto the branch their neighbours agree on.
+//
+// This is a DELIBERATE DIVERGENCE from the reference, which applies no post-processing at all
+// (measured -- a single-voxel spike passes through fsl_prepare_fieldmap intact).  It exists
+// because niimath unwraps with ROMEO rather than PRELUDE, and on this data ROMEO leaves ~30
+// isolated voxels a full 2*pi out: measured by their distance from their own 6-neighbour median,
+// ROMEO produced 30 such outliers where PRELUDE produced 2.  Each one becomes a ~17-voxel shift
+// error in the corrected EPI, so they are visible artefacts, not rounding.
+//
+// It cannot corrupt a genuine field value: the correction is always an INTEGER multiple of
+// 2*pi/deltaTE, i.e. a projection onto the set of unwrappings consistent with the same wrapped
+// phase.  A voxel only moves when it sits more than half a wrap from the median of its in-mask
+// 6-neighbours, and a true field gradient that steep is beyond what a phase DIFFERENCE can
+// represent anyway -- it would already be aliased.
+//
+// Jacobi, not Gauss-Seidel: every pass reads a snapshot, so the result does not depend on
+// traversal order and is byte-identical across thread counts.
+static int fm_debranch(float *f, const unsigned char *mask, int64_t nx, int64_t ny, int64_t nz,
+	double wrap) {
+	float *snap = NULL;
+	int64_t n3 = nx * ny * nz, x, y, z, pass;
+	if (!(wrap > 0.0) || !(wrap <= DBL_MAX)) return 0;   /* nothing sane to project onto */
+	snap = (float *)malloc((size_t)n3 * sizeof(float));
+	if (!snap) return 1;
+	for (pass = 0; pass < FMAP_DEBRANCH_PASSES; pass++) {
+		int64_t moved = 0;
+		memcpy(snap, f, (size_t)n3 * sizeof(float));
+		for (z = 0; z < nz; z++) for (y = 0; y < ny; y++) for (x = 0; x < nx; x++) {
+			const int64_t o = x + y * nx + z * nx * ny;
+			double v[6], nm, k;
+			int n = 0, a, b;
+			if (!mask[o]) continue;
+			if (x > 0      && mask[o - 1])          v[n++] = snap[o - 1];
+			if (x < nx - 1 && mask[o + 1])          v[n++] = snap[o + 1];
+			if (y > 0      && mask[o - nx])         v[n++] = snap[o - nx];
+			if (y < ny - 1 && mask[o + nx])         v[n++] = snap[o + nx];
+			if (z > 0      && mask[o - nx * ny])    v[n++] = snap[o - nx * ny];
+			if (z < nz - 1 && mask[o + nx * ny])    v[n++] = snap[o + nx * ny];
+			if (n < 3) continue;   /* too few neighbours to out-vote the voxel itself */
+			/* Insertion sort of at most 6 values: small fixed N, so no comparator indirection
+			   (emscripten's qsort would dispatch through call_indirect per comparison). */
+			for (a = 1; a < n; a++) {
+				double t = v[a];
+				for (b = a - 1; b >= 0 && v[b] > t; b--) v[b + 1] = v[b];
+				v[b + 1] = t;
+			}
+			nm = v[n / 2];   /* upper central value, matching the demedian convention */
+			k = floor(((double)snap[o] - nm) / wrap + 0.5);
+			if (k != 0.0) { f[o] = (float)((double)snap[o] - k * wrap); moved++; }
+		}
+		if (moved == 0) break;
+	}
+	free(snap);
+	return 0;
+}
+
+int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int debranch) {
+	nifti_image *mg = NULL;
+	unsigned char *mask = NULL;
+	float *sel = NULL;
+	float *ph;
+	const float *mag;
+	double lo = 0.0, hi = 0.0, scale, offset, inv_te, median;
+	int64_t nx, ny, nz, n3, i, nmask = 0;
+	int rc = 1;
+	romeo_opts o;
+
+	if (!nim || nim->datatype != DT_FLOAT32) {
+		printfx("-fmapprep: internal error: expected a float32 working image\n"); return 1;
+	}
+	if (nim->nt > 1 || nim->nu > 1 || nim->nv > 1 || nim->nw > 1) {
+		printfx("-fmapprep: the phase-difference input must be a single 3D volume\n"); return 1;
+	}
+	if ((int64_t)nim->nvox > INT_MAX) {
+		printfx("-fmapprep: input exceeds INT_MAX voxels; -fmapprep is not a huge-image-safe operation\n"); return 1;
+	}
+	if (!(delta_te_ms > 0.0) || !(delta_te_ms <= DBL_MAX)) {
+		printfx("-fmapprep: deltaTE must be a positive, finite echo time difference in milliseconds; got %g\n",
+			delta_te_ms);
+		return 1;
+	}
+	nx = nim->nx; ny = nim->ny; nz = (nim->nz < 1 ? 1 : nim->nz);
+	n3 = nx * ny * nz;
+	if (n3 < 1 || (int64_t)nim->nvox != n3) { printfx("-fmapprep: invalid image geometry\n"); return 1; }
+
+	mg = fm_read_f32(magfile);
+	if (!mg) return 1;
+	if (mg->nx != nx || mg->ny != ny || mg->nz != nz || max_displacement_mm(nim, mg) > 0.001f) {
+		printfx("-fmapprep: magnitude '%s' does not share the phase image's grid (dimensions and world transform must match)\n",
+			magfile);
+		goto done;
+	}
+	mag = (const float *)mg->data;
+	ph = (float *)nim->data;
+
+	mask = (unsigned char *)malloc((size_t)n3);
+	if (!mask) { printfx("-fmapprep: out of memory allocating the mask\n"); goto done; }
+	for (i = 0; i < n3; i++) {
+		/* Measured: the mask is the magnitude's nonzero support, used verbatim.  Magnitude-guard
+		   rather than isfinite(): the program is built -ffast-math. */
+		mask[i] = (unsigned char)(mag[i] >= -FLT_MAX && mag[i] <= FLT_MAX && mag[i] != 0.0f);
+		nmask += mask[i];
+	}
+	if (nmask < 1) {
+		printfx("-fmapprep: magnitude '%s' has no nonzero voxels, so there is no brain to build a fieldmap over\n",
+			magfile);
+		goto done;
+	}
+
+	/* Rescale the stored phase so its observed range spans exactly one 2*pi period, which is what
+	   a wrapped phase difference is.  The reference instead demands its input pre-scaled onto a
+	   fixed 0..4096 and multiplies by 2*pi/4096; doing it from the observed range is equivalent on
+	   such an image and additionally accepts the other encodings a converter may emit (0..4095,
+	   -4096..4094, and radians already).  The absolute offset is irrelevant -- the demedian at the
+	   end removes any constant -- so only the SPAN has to be right. */
+	for (i = 0; i < n3; i++) {
+		if (!(ph[i] >= -FLT_MAX && ph[i] <= FLT_MAX)) {
+			printfx("-fmapprep: the phase image contains a non-finite value\n");
+			goto done;
+		}
+		if (i == 0 || ph[i] < lo) lo = ph[i];
+		if (i == 0 || ph[i] > hi) hi = ph[i];
+	}
+	if (!(hi > lo)) {
+		printfx("-fmapprep: the phase image is constant (%g everywhere); it carries no field information\n", lo);
+		goto done;
+	}
+	scale = (2.0 * M_PI) / (hi - lo);
+	offset = -M_PI - lo * scale;
+	for (i = 0; i < n3; i++) ph[i] = (float)((double)ph[i] * scale + offset);
+
+	o = romeo_opts_default();
+	o.nTE = 1;
+	o.TEs[0] = delta_te_ms;
+	o.te_epi = 0;
+	o.template_echo = 1;
+	o.individual = 0;
+	o.correctglobal = 0;
+	o.no_phase_rescale = 1;   /* already in radians, above */
+	/* mask_in is supplied, so ROMEO's own robustmask is bypassed entirely and the mask stays
+	   byte-identical to the caller's brain extraction -- the point of taking a magnitude at all. */
+	if (romeo_unwrap_frame(ph, mag, 1, (int)nx, (int)ny, (int)nz, 1, o.TEs, &o, mask, NULL)) {
+		printfx("-fmapprep: ROMEO failed to unwrap the phase difference\n");
+		goto done;
+	}
+
+	inv_te = 1000.0 / delta_te_ms;   /* deltaTE arrives in milliseconds; the field is rad/s */
+	for (i = 0; i < n3; i++) ph[i] = (float)((double)ph[i] * inv_te);
+
+	/* Applied HERE, in fmap.c, strictly AFTER romeo_unwrap_frame() has returned -- romeo.c is not
+	   touched and neither --medic nor -romeo can see this.  `-no-debranch` turns it off so the raw
+	   ROMEO field can be obtained for parity tracing against a reference MEDIC implementation. */
+	if (debranch && fm_debranch(ph, mask, nx, ny, nz, 2.0 * M_PI * inv_te)) {
+		printfx("-fmapprep: out of memory correcting 2*pi branch outliers\n");
+		goto done;
+	}
+
+	/* Measured: subtract the median over the mask, taking the UPPER of the two central values for
+	   an even population.  Averaging the two central values is wrong, and not subtly so -- on a
+	   field whose mask splits into two equal populations it errs by half the field's range. */
+	sel = (float *)malloc((size_t)nmask * sizeof(float));
+	if (!sel) { printfx("-fmapprep: out of memory computing the median\n"); goto done; }
+	{
+		int64_t j = 0;
+		for (i = 0; i < n3; i++) if (mask[i]) sel[j++] = ph[i];
+		median = (double)fm_select_kth(sel, nmask, nmask / 2);
+	}
+	for (i = 0; i < n3; i++) ph[i] = mask[i] ? (float)((double)ph[i] - median) : 0.0f;
+
+	rc = 0;
+done:
+	free(sel);
+	free(mask);
+	nifti_image_free(mg);
+	return rc;
+}
+
+#endif // HAVE_ROMEO
 
 /* Why this does not reuse medic_unwarp's md_pull, despite the plan's preference for sharing:
    md_pull is a 3D Lanczos-3 pull driven by a displacement map in MILLIMETRES with an arbitrary

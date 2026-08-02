@@ -405,6 +405,14 @@ int show_help( void ) {
 	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
 	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
 #endif
+#if defined(HAVE_FMAP) && defined(HAVE_ROMEO)
+	printf(" -fmapprep <mag> <dTE_ms> [-no-debranch] : build a rad/s B0 fieldmap from a wrapped phase difference (emulates fsl_prepare_fieldmap SIEMENS)\n");
+	printf("                            input is the phase difference; <mag> is the BRAIN-EXTRACTED magnitude (supplies the mask)\n");
+	printf("                            <dTE_ms> is EchoTime2-EchoTime1 in milliseconds; unwrapping is ROMEO, not PRELUDE\n");
+	printf("                            no regularisation is applied (matching the reference); output is 0 outside the mask\n");
+	printf("                            isolated 2*pi branch outliers ROMEO leaves behind ARE corrected; -no-debranch disables that\n");
+	printf("                            (that correction lives in -fmapprep only — romeo.c is untouched, so -romeo and --medic are unaffected)\n");
+#endif
 #ifdef HAVE_FMAP
 	printf(" -fugue <fmap> <dwell> <dir> : correct EPI susceptibility distortion with a B0 fieldmap (emulates FSL fugue)\n");
 	printf("                            <fmap> is a 3D fieldmap in rad/s on the input grid (e.g. from fsl_prepare_fieldmap)\n");

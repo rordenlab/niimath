@@ -54,6 +54,44 @@ extern "C" {
 // non-finite or non-positive dwell; or an unrecognised unwarpdir.  Returns 0 on success.
 int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char *unwarpdir);
 
+#ifdef HAVE_ROMEO
+// -fmapprep <brain_magnitude> <deltaTE_ms>: ordinary chain operation, DT32 only.
+//
+// Turns a two-echo phase-difference image into a B0 fieldmap in rad/s, the units `-fugue` and
+// FSL's fugue consume.  The working image is the wrapped phase difference; `magfile` is the
+// BRAIN-EXTRACTED magnitude belonging to it (bet output, or any image whose nonzero voxels are
+// the region to keep), which supplies both the mask and the anatomical weighting for unwrapping.
+// `delta_te_ms` is the echo time difference in MILLISECONDS.
+//
+//   mask      = (magnitude != 0)                       used verbatim; no erosion, no dilation
+//   phase_rad = the working image rescaled so its observed range spans exactly 2*pi
+//   unwrapped = ROMEO 3D spatial unwrapping over the mask, magnitude-weighted
+//   out(v)    = unwrapped(v)/deltaTE_s - median_mask(...)   inside the mask, 0 outside
+//
+// There is deliberately NO regularisation: no median filter, no despiking, no smoothing and no
+// erosion.  That is measured reference behaviour, not an omission -- a single-voxel spike passes
+// through the reference intact.  The ONE post-processing step, 2*pi branch-outlier correction, is
+// a divergence forced by using ROMEO rather than PRELUDE and is described in fmap.c.
+//
+// The median is the UPPER of the two central values for an even population (`sorted[n/2]`), not
+// their average.  The distinction is not cosmetic: on a field whose mask splits into two equal
+// populations the averaging median is wrong by half the field's range.
+//
+// Unwrapping is ROMEO, not a reimplementation of the reference's PRELUDE, so the two disagree at
+// poorly conditioned voxels.  That is why the acceptance gate is on the final unwarped EPI.
+//
+// Fails closed, leaving `nim` untouched, on: a non-float32, non-3D or oversized working image; a
+// missing, unreadable, non-3D, oversized or off-grid magnitude; an empty mask; a non-finite or
+// constant phase image; a non-finite or non-positive delta_te_ms; or an unwrapping failure.
+// Returns 0 on success.
+// `debranch` enables the 2*pi branch-outlier correction described in fmap.c (default on; the CLI
+// spells the opt-out `-no-debranch`).  It is applied in fmap.c AFTER romeo_unwrap_frame() returns,
+// so romeo.c is untouched and neither --medic nor -romeo is affected by it -- MEDIC keeps a
+// faithful ROMEO.  The opt-out exists so the raw ROMEO field can be recovered when tracing a
+// divergence against a reference MEDIC implementation.
+int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int debranch);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

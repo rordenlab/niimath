@@ -7190,6 +7190,56 @@ staticx int nifti_fugue_wrap(nifti_image *nim, int *pac, int argc, char *argv[])
 	return 1;
 #endif
 }
+
+#ifdef HAVE_ROMEO
+/* -fmapprep <brain_magnitude> <deltaTE_ms>: build a rad/s B0 fieldmap from a wrapped two-echo
+   phase difference.  Both arguments are positional, so `ac + 1 >= argc` is the right guard. */
+staticx int nifti_fmapprep_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *magfile, *testr;
+	char *end = NULL;
+	double te;
+	int debranch = 1;
+	if (ac + 1 >= argc) {
+		printfx("-fmapprep requires a brain-extracted magnitude and an echo time difference (-fmapprep <magnitude> <deltaTE_ms>)\n");
+		return 1;
+	}
+	magfile = argv[ac];
+	testr = argv[ac + 1];
+	ac += 2;
+	te = strtod(testr, &end);
+	if (!end || end == testr || *end != '\0') {
+		*pac = ac;
+		printfx("-fmapprep deltaTE must be a number (the echo time difference in milliseconds); got '%s'\n", testr);
+		return 1;
+	}
+	/* Optional trailing sub-option, so this peeks ONE PAST the last operand, per the op-loop gotcha
+	   in AGENTS.md: argc was decremented so argv[argc] is the output filename, and a lone
+	   `-no-debranch` can legally sit either immediately before it (ac < argc, consume it) or IN it
+	   (ac == argc, which means the user forgot the output name).  Stopping the scan at `ac < argc`
+	   would silently adopt the flag as the output filename and write a file called
+	   "-no-debranch" at exit 0. */
+	if (ac <= argc && !strcmp(argv[ac], "-no-debranch")) {
+		if (ac == argc) {
+			*pac = ac;
+			printfx("-fmapprep: '-no-debranch' is in the output-filename slot; put it before the output name\n");
+			return 1;
+		}
+		debranch = 0;
+		ac++;
+	}
+	*pac = ac;
+	if (nii_reject_oversize_aux(magfile, "fmapprep magnitude")) return 1;
+	return fmap_prepare(nim, magfile, te, debranch);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 1 < argc) *pac += 2;
+	printfx("'-dt double' does not support -fmapprep (fieldmap preparation is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_ROMEO
 #endif // HAVE_FMAP
 
 #ifdef HAVE_MOCO
@@ -8388,6 +8438,15 @@ int main64(int argc, char *argv[]) {
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past the map and axis
+		}
+#endif
+#if defined(HAVE_FMAP) && defined(HAVE_ROMEO)
+		else if (!strcmp(argv[ac], "-fmapprep")) {
+			ac++;
+			ok = nifti_fmapprep_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the magnitude and deltaTE
 		}
 #endif
 #ifdef HAVE_FMAP
