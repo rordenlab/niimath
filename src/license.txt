@@ -13,10 +13,6 @@ zlib is optional and includes a simple license
 The project can optionally be compiled with the accelerated CloudFlare zlib. This is fully compatible with the BSD license.
  https://github.com/cloudflare/zlib
 
-The project can optionally be compiled to support the Butterworth filter (bw.c). The Recursive digital filter functions are provided under LGPL from Exstrom Laboratories.
- http://www.exstrom.com/journal/sigproc/
- https://www.gnu.org/licenses/lgpl-3.0.en.html
-
 The bwlabel.c file is Jesper Andersson's connected component labeling, which he has provided under the BSD 2-Clause license.
 
 On January 7, 2020 Matthew Webster said that direct copies of the fslmaths text and error messages were permitted and are not copyrighted. This allows users to have a common interface and error detection routines.
@@ -29,6 +25,35 @@ The project can optionally be compiled with tensor decomposition code by Daniel 
 The project includes unifize.c for bias field correction, adapted from AFNI's 3dUnifize.
 This code is public domain and was developed at the US National Institutes of Health.
   https://github.com/afni/afni
+
+Several optional commands emulate published AFNI methods. AFNI is primarily a United States
+Government Work (public domain); separately, on 12 May 2026 the Medical College of Wisconsin
+relicensed the AFNI code under its copyright -- the 1994-2000 "major portions" by Robert W. Cox
+and colleagues -- from GPL-2 to the Creative Commons Attribution License (CC BY 4.0).
+  https://github.com/afni/afni/blob/master/LICENSE.txt
+  https://creativecommons.org/licenses/by/4.0/
+
+niimath contains NO code from those MCW files. -moco (moco.c), -stc (stc.c, including its FFT)
+and -skullstrip's coordinate conversion are original clean-room implementations written from
+published descriptions and measured input/output behaviour; the AFNI programs served only as
+black-box oracles. -qwarp likewise substitutes niimath's own routines for the three MCW
+utilities on its path rather than porting them. niimath therefore carries no CC BY attribution
+obligation, and these commands are BSD-2-Clause.
+
+Where niimath DOES adapt AFNI code -- unifize.c above, allineate.c (3dAllineate), qwarp.c
+(3dQwarp) and skullstrip.c's normalisation and surface stages -- the source files are
+public-domain US Government Work, not the MCW-copyrighted portions.
+
+AFNI's src/3DEdge/ (Gregoire Malandain) is GPL-3.0 and was NOT relicensed. It is deliberately
+excluded, which is why -skullstrip implements only AFNI's -no_use_edge behaviour.
+
+The optional copyleft payload is NOT part of a default build. Building with GPL=1 (make) or
+-DENABLE_GPL=ON (CMake) adds -spm_coreg/-spm_deface, which link SPM's spm_coreg module from the
+niimath_gpl submodule (src/GPL). That module is GNU GPL-2 or later, so a binary built that way
+is a combined copyleft work: distribute it under the GPL-2-or-later terms in src/GPL/LICENSE.
+Its version string ends in " GPL" rather than " BSD". The default binary contains none of that
+code. (A third command, -bandpass, briefly rode the same switch on Exstrom Laboratories' LGPL-3
+bw.c; it was retired and that file deleted, so niimath contains no LGPL code.)
 
 The rest of the code was written by Chris Rorden (2020) and is distributed using the 2-Clause BSD license. 
 

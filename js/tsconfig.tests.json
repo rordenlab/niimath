@@ -1,0 +1,17 @@
+{
+  // Type-checks the test sources, which tsconfig.json deliberately EXCLUDES so they cannot
+  // emit .d.ts into dist/. That exclusion left a real hole: `js/src/wasi/featureParity.test.ts`
+  // once shipped with an unbalanced brace, so the whole WASI parity suite (~40 assertions)
+  // failed to LOAD, and nothing caught it -- js.yml runs `bun test ./tests`, which does not
+  // include src/wasi, and `tsc --noEmit` skipped the file by this exclusion. Verified: a
+  // deliberate type error in that file produced zero tsc errors before this config existed.
+  // noEmit is what makes this safe to point at the tests: no declaration output is produced.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true, "declaration": false, "declarationMap": false, "rootDir": "./src" },
+  // tests/ is NOT included: two of its files carry PRE-EXISTING type errors (they pass a
+  // `worker` property that ImageProcessorConfig does not declare and the constructor drops).
+  // Those are unrelated to this config's purpose and would make it red on arrival. Add tests/
+  // here once they are resolved -- the runtime suite already covers them (bun test ./tests).
+  "include": ["src/**/*.test.ts", "src/**/*.test.mts"],
+  "exclude": ["node_modules", "dist"]
+}

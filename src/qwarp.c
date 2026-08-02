@@ -7,13 +7,17 @@
  * rev 506e48403 (AFNI_26.1.00-6). Optimizer: Powell NEWUOA (powell_newuoa.c).
  *
  * LICENSING BOUNDARY: AFNI's LICENSE.txt is a NIH Public Domain Notice with EXCEPTIONS
- * for bundled third-party code. Three utilities on this path are GPL-v2 / Medical College
- * of Wisconsin exceptions, NOT public domain — edt_blur.c (FIR Gaussian blur),
+ * for bundled third-party code. Three utilities on this path are Medical College of
+ * Wisconsin exceptions, NOT public domain — edt_blur.c (FIR Gaussian blur),
  * edt_buildmask.c (sphere mask), cs_qmed.c (median). These are NOT ported; instead their
  * function is provided by niimath's own BSD/public-domain coreFLT.c (Gaussian blur via
  * nifti_smooth_gauss_f32) or by small clean-room routines here. Only genuinely public-
  * domain AFNI files are ported. Never copied from any GPL AFNI file or from
  * niimath/src/GPL/. See qwarp.h and AGENTS.md.
+ *
+ * (Those three were GPL-2 when this was written; MCW relicensed its 1994-2000 AFNI code to
+ * CC BY 4.0 on 2026-05-12, so porting them is now permitted if attribution is carried.
+ * They remain unported: substituting niimath's own code keeps the tree attribution-free.)
  *
  * Ports the single operation:
  *     3dQwarp -blur 0 3 -source <moving> -base <stationary> -prefix <output>
@@ -235,8 +239,9 @@ static float qw_cliplevel(const float *far, int64_t nvox, float mfrac) {
 }
 
 /* Gaussian blur — the SOURCE `-blur 0 3` step (and the sigma=4.5 vox step in weightize).
- * AFNI's blur (edt_blur.c, FIR_blur_volume_3d) is GPL-v2 / Medical College of Wisconsin —
- * a bundled EXCEPTION to AFNI's public-domain core — so we do NOT port it. Instead we call
+ * AFNI's blur (edt_blur.c, FIR_blur_volume_3d) is Medical College of Wisconsin — a bundled
+ * EXCEPTION to AFNI's public-domain core (GPL-2 originally, CC BY 4.0 since 2026-05-12) — so
+ * we still do NOT port it, to stay attribution-free. Instead we call
  * niimath's own BSD/public-domain separable Gaussian (coreFLT.c via core32.h), the same
  * backend coreg_fast uses. Voxel units (dx=dy=dz=1) to match AFNI's dx=1 blur convention;
  * the kernel differs from AFNI's, so the result is EQUIVALENT, not bit-identical (allowed). */
@@ -502,7 +507,8 @@ static void qw_compute_pad(const float *base, int nx, int ny, int nz,
 }
 
 /* ---- clean-room spherical median (replaces the GPL mri_medianfilter chain) ----
- * mri_medianfilter.c is public domain but calls the GPL MCW_build_mask (sphere offsets)
+ * mri_medianfilter.c is public domain but calls MCW_build_mask (sphere offsets; MCW, GPL-2
+ * when this was written and CC BY 4.0 since the relicense -- reimplemented here either way)
  * and qmed_float (median). Both are standard algorithms reimplemented here independently:
  * the sphere is the geometric set {d : |d|^2 <= r^2, d != 0} plus the center; the median is
  * a plain sort of the in-grid, in-mask neighborhood (even count -> mean of the two middle,

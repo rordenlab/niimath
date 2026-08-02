@@ -34,11 +34,11 @@ const fileOperandOps = new Set<string>([
 // so a generated browser method could only ever fail. This manifest is produced by running
 // ../src/niimath (native), which is why they have to be excluded explicitly rather than simply
 // not appearing in the help text.
-const nativeOnlyOps = new Set<string>([
-  // -mindgrab: needs ~2.5 GB of working memory, which does not fit wasm32's 4 GB address space
-  // alongside the runtime; BRAINCHOP is never enabled for wasm/tiny/nano.
-  'mindgrab'
-]);
+// Empty at present: -mindgrab was the only entry and that feature has been removed from the
+// project. Kept (rather than deleted) because the exclusion mechanism is still needed -- any
+// op that the native binary advertises but the wasm build cannot run belongs here, or the
+// generated browser method would exist and could only ever fail.
+const nativeOnlyOps = new Set<string>([]);
 
 // Function to parse the niimath help text
 function parseHelpText(helpText: string): MethodDefinitions {

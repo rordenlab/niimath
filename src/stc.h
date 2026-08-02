@@ -3,7 +3,8 @@
 // Clean-room implementation of the slice-time correction published in AFNI's 3dTshift
 // documentation: the default "detrend -> interpolate -> retrend" Fourier method.  AFNI's
 // 3dTshift.c, its shifting engine and its FFT are Medical College of Wisconsin copyrighted and
-// GPL-2; they were NOT read, translated or paraphrased.  They served only as a black-box oracle.
+// (MCW; GPL-2 when this was written, CC BY 4.0 since the 2026-05-12 relicense); they were NOT
+// read, translated or paraphrased.  They served only as a black-box oracle.
 // Every convention the published help does not fix was measured through the 3dTshift executable
 // and is recorded in the moco_bench repository's test/stc_reference_manifest.md.
 //

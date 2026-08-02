@@ -1,8 +1,11 @@
 // moco.c - rigid-body motion correction for 4D datasets (-moco)
 //
 // Clean-room implementation of Cox RW & Jesmanowicz A, "Real-Time 3D Image Registration for
-// Functional MRI", Magn Reson Med 42:1014-1018 (1999).  AFNI's GPL-2 3dvolreg/3drotate sources
-// were not read; they served only as black-box oracles.  See moco.h and
+// Functional MRI", Magn Reson Med 42:1014-1018 (1999).  AFNI's 3dvolreg/3drotate sources were
+// not read; they served only as black-box oracles.  (Those files were MCW GPL-2 when this was
+// written; MCW relicensed its 1994-2000 AFNI code to CC BY 4.0 on 2026-05-12.  That removes the
+// copyleft bar, not the clean-room standing: CC BY still requires attribution and a statement
+// of changes, which original code does not.)  See moco.h and
 // the moco_bench repository's test/moco_reference_manifest.md.
 //
 // Structure, following the paper:
@@ -703,6 +706,28 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 			}
 			NE[p][q] = NE[q][p] = s;
 		}
+	/* NE does NOT depend on t: it is built once, above, from the base geometry alone. So if it
+	   cannot be factored, EVERY volume's fit fails on iteration 0 -- and the per-frame
+	   "no step for N of N volumes" warning below is the wrong response, because that path is
+	   designed for per-frame data problems (a non-finite voxel, an empty frame) and it FAILS
+	   OPEN: it publishes the input unchanged with an all-zero .1D at exit 0, so a pipeline
+	   regressing those six columns as nuisance silently gets six zero regressors.
+	   The reachable degenerate case is a singleton spatial dimension. With nz==1 (or nx/ny==1)
+	   one translation derivative is IDENTICALLY zero -- shift_row's +/-MOCO_DELTA warps land on
+	   mirror-image Lagrange taps whose weights are bit-identical, so the central difference is
+	   exactly 0.0 -- and NE gets an exact zero pivot. MEASURED on a 40x40x1x8 phantom with a
+	   known 1.47-voxel shift: output bit-identical to input, .1D all zeros, exit 0; the SAME
+	   phantom at nz==2 recovers it. Probe once here and fail closed instead. */
+	{
+		double probe_b[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}, probe_x[6];
+		if (chol6(NE, probe_b, probe_x)) {
+			printfx("-moco: the registration problem is degenerate for every volume (a singleton "
+					"spatial dimension leaves one translation unidentifiable); no volume can be fit\n");
+			rc = 1;
+			goto done;
+		}
+	}
+
 	memcpy(out + (size_t)base_idx * nvol, base, nvol * sizeof(float));  // base copied unchanged
 
 	/* A worker that cannot allocate MUST NOT leave its output volume unwritten: `out` would

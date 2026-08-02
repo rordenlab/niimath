@@ -15,7 +15,7 @@
 #define printfx(...) fprintf(stderr, __VA_ARGS__)
 
 // Keep allocation failure handling in one place, with the same fail-closed process policy as
-// niimath's core allocators. It cannot just call nii_calloc: the Makefile's mindgrab-test target
+// niimath's core allocators. It cannot just call nii_calloc: a standalone selftest target
 // links bwlabel.c WITHOUT core.c, so core.h's allocators are not available in that binary.
 // Including core.h here to remove the duplication would break `make test`.
 static void *bwl_malloc(size_t bytes) {

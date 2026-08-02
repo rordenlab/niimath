@@ -44,7 +44,7 @@ endif()
 
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
 option(BUILD_BMP "Build bitmap (PNG) output support" ON)
-option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
+option(ENABLE_GPL "Enable optional copyleft module (-spm_coreg/-spm_deface); GPL-2-or-later binary" OFF)
 # These mirror src/CMakeLists.txt options; declare and forward them here so the
 # documented top-level build (cmake .. on the repo root) actually honours them
 # instead of silently reporting an unused variable.
@@ -58,19 +58,22 @@ option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -un
 # per-target rule must be applied HERE as well as in src/CMakeLists.txt.
 option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
 option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
-# MindGrab skull stripping (-mindgrab). ON by default, matching src/CMakeLists.txt and the
-# Makefile. BOTH halves of src/'s support rule -- pointer size AND build flavor -- MUST be
-# duplicated here, per the note above: this value is forwarded as an explicit -D cache entry, so
-# src/'s own default can never override it, and src/ then hard-errors on an unsupported explicit
-# request. Mirroring only the pointer-size half made `cmake -DBUILD_FLAVOR=tiny ..` configure
-# cleanly at this level and then FAIL inside the inner project (caught in audit). BUILD_FLAVOR is
-# set at line 23, well above this test.
-if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all")
-  set(BRAINCHOP_DEFAULT OFF)
-else()
-  set(BRAINCHOP_DEFAULT ON)
+# Forwarded as an explicit -D below: src/ own option() default can never override a
+# SuperBuild cache entry, so a platform rule must be mirrored in BOTH files.
+option(ENABLE_SKULLSTRIP "Enable AFNI-style surface skull stripping (-skullstrip)" OFF)
+# Mirrored from src/CMakeLists.txt, per the rule in AGENTS.md known-issue 2: this value is
+# forwarded as an explicit -D cache entry that src/'s own option() default can never override,
+# so a platform rule enforced only there would let the top level configure cleanly and then
+# hard-fail inside the inner project. Reject the unsupported request here too.
+if(ENABLE_SKULLSTRIP AND (CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all"))
+  message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON requires a 64-bit native BUILD_FLAVOR=all build.")
 endif()
-option(ENABLE_BRAINCHOP "Enable MindGrab skull stripping (-mindgrab)" ${BRAINCHOP_DEFAULT})
+# Mirror the Emscripten guard too, not only the pointer-size/flavor one: wasm64 reports 8-byte
+# pointers and would pass the test above, so an outer configure could succeed and the inner
+# project then hard-fail.
+if(ENABLE_SKULLSTRIP AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
+  message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON is not supported for WebAssembly targets.")
+endif()
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -141,7 +144,7 @@ ExternalProject_Add(src
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
         -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
         -DENABLE_STC:BOOL=${ENABLE_STC}
-        -DENABLE_BRAINCHOP:BOOL=${ENABLE_BRAINCHOP}
+        -DENABLE_SKULLSTRIP:BOOL=${ENABLE_SKULLSTRIP}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}
@@ -155,10 +158,3 @@ ExternalProject_Add(src
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION ${SKBUILD_PROJECT_NAME}/bin
         USE_SOURCE_PERMISSIONS)
 
-# A BrainChop-enabled binary embeds the MIT-licensed MindGrab weights, and MIT requires its notice
-# to accompany the copy. The inner project installs it under its own prefix, but this SuperBuild
-# only forwards bin/, so the notice has to be installed here too or the wheel ships without it.
-if(ENABLE_BRAINCHOP)
-    install(FILES ${CMAKE_SOURCE_DIR}/src/mindgrab.LICENSE
-            DESTINATION ${SKBUILD_PROJECT_NAME}/bin)
-endif()

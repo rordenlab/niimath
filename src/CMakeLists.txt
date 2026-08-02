@@ -39,24 +39,14 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 OR BUILD_FLAVOR STREQUAL "tiny")
     ADD_DEFINITIONS(-DFORCE_INT32_MAX)
 endif()
 
-# MindGrab needs over 2 GB of activation memory and is implemented only in the full native
-# inventory. Reject unsupported EXPLICIT requests instead of silently ignoring the option in
-# tiny/nano or admitting it to a 32-bit/wasm address space. This test runs BEFORE the option()
-# below, so on a FRESH configure it only ever sees a value the caller passed and the default can
-# never trip it. (On a re-configure of an existing build directory the cache entry already
-# exists, so flipping BUILD_FLAVOR in place can trip it without the caller asking for BrainChop;
-# configure into a clean directory.) SuperBuild.cmake must mirror BOTH halves of this rule --
-# see the note there.
-if(ENABLE_BRAINCHOP AND (CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all"))
-    message(FATAL_ERROR "ENABLE_BRAINCHOP=ON requires a 64-bit native BUILD_FLAVOR=all build.")
+# Reject the explicit unsupported request instead of silently ignoring the option.
+if(ENABLE_SKULLSTRIP AND (CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all"))
+    message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON requires a 64-bit native BUILD_FLAVOR=all build.")
+endif()
+if(ENABLE_SKULLSTRIP AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
+    message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON is not supported for WebAssembly targets.")
 endif()
 # ...and the DEFAULT is ON only where the feature can actually run: a 32-bit "all" build would
-# otherwise pull in mindgrab.c on an address space that cannot hold its 2.15 GB of activations.
-if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-    set(BRAINCHOP_DEFAULT OFF)
-else()
-    set(BRAINCHOP_DEFAULT ON)
-endif()
 
 # ENABLE_QWARP is only meaningful for the full "all" flavor (tiny/nano omit the allineate engine
 # qwarp depends on). Reject the explicit unsupported combination rather than silently dropping the
@@ -69,8 +59,6 @@ endif()
 if(${BUILD_FLAVOR} STREQUAL "all")
     ADD_DEFINITIONS(-DHAVE_64BITS)
     set(ADDITIONAL_SRCS core64.c)
-    ADD_DEFINITIONS(-DHAVE_BUTTERWORTH)
-    set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bw.c)
     ADD_DEFINITIONS(-DHAVE_FORMATS)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} base64.c)
     ADD_DEFINITIONS(-DHAVE_TENSOR)
@@ -114,7 +102,7 @@ if(${BUILD_FLAVOR} STREQUAL "all")
 
     # MOCO rigid-body motion correction (-moco) and STC slice-time correction (-stc). Clean-room
     # implementations of Cox & Jesmanowicz 1999 (MRM 42:1014-1018) and of AFNI 3dTshift's default
-    # Fourier method; 3dvolreg and 3dTshift are GPL-2 and were used only as black-box oracles.
+    # Fourier method; 3dvolreg and 3dTshift (MCW; GPL-2 when this was written, CC BY 4.0 since the 2026-05-12 relicense) were used only as black-box oracles.
     # Ordinary FP, so both ride the normal source line (unlike the strict-FP romeo object).
     #
     # Both defaulted ON only for an Apple Silicon target while their numerical behaviour was
@@ -135,17 +123,19 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         ADD_DEFINITIONS(-DHAVE_STC)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} stc.c)
     endif()
-    # MindGrab skull stripping (-mindgrab). Clean-room C implementation of the MeshNet inference
-    # brainchop-cli runs under tinygrad; only the trained weights are upstream (MIT, see
-    # src/mindgrab.LICENSE) and no third-party runtime is linked. ON by default on 64-bit hosts
-    # (see BRAINCHOP_DEFAULT above), matching the Makefile, so every shipped artifact carries
-    # -mindgrab; it costs ~595 KB of binary and nothing at runtime unless the op is used. Native
-    # only: inference needs ~2.5 GB of working memory, which does not fit wasm32's 4 GB address
-    # space alongside the runtime. Requires HAVE_CONFORM (always on here) and bwlabel.c (below).
-    option(ENABLE_BRAINCHOP "Enable MindGrab skull stripping (-mindgrab)" ${BRAINCHOP_DEFAULT})
-    if(ENABLE_BRAINCHOP)
-        ADD_DEFINITIONS(-DHAVE_BRAINCHOP)
-        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} mindgrab.c mindgrab_weights.c)
+
+    # SKULLSTRIP AFNI-style surface skull stripping (-skullstrip). Normalisation, intensity prep,
+    # deformation and touchup are ALL adapted from public-domain AFNI (thd_brainormalize.c,
+    # thd_automask.c, SUMA_BrainWrap.c -- the last carries no copyright notice, so it is a
+    # non-copyrightable US Government work). The one carve-out is SUMA_3dedge3 (Malandain,
+    # GPL-3.0), never reached by our -no_use_edge contract; surface primitives are clean-room.
+    # OFF by default pending the native-release gate in skullstrip_plan.md, NOT because of
+    # accuracy -- the two weakest images now sit inside the agreement band. NOTE the
+    # semantic reuse of the name -- it previously aliased -deface.
+    option(ENABLE_SKULLSTRIP "Enable AFNI-style surface skull stripping (-skullstrip)" OFF)
+    if(ENABLE_SKULLSTRIP)
+        ADD_DEFINITIONS(-DHAVE_SKULLSTRIP)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} skullstrip.c)
     endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)
@@ -172,9 +162,11 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         endif()
     endif()
 
-    # Optional GPL spm_coreg module (-spm_coreg/-spm_deface). OFF so default builds stay
-    # BSD-2; ON produces a GPL-2 combined-work binary. Sources from the niimath_gpl submodule.
-    option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
+    # Optional copyleft payload: -spm_coreg/-spm_deface (SPM's spm_coreg, GPL-2-or-later).
+    # OFF so default builds stay BSD-2. Sources from the niimath_gpl submodule. Distribute an
+    # ENABLE_GPL binary under SPM's own terms, GPL-2 or later. (It was briefly GPL-3, when the
+    # payload also carried Exstrom's LGPL-3 bw.c for -bandpass; that op was retired.)
+    option(ENABLE_GPL "Enable optional copyleft module (-spm_coreg/-spm_deface); GPL-2-or-later binary" OFF)
     if(ENABLE_GPL)
         if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/GPL/spm_coreg.c")
             message(FATAL_ERROR "ENABLE_GPL set but src/GPL is empty — run: git submodule update --init")
@@ -417,13 +409,31 @@ else()
     install(TARGETS ${PROGRAMS} DESTINATION bin)
 endif()
 
-# A BrainChop-enabled binary embeds the MIT-licensed MindGrab weights, and MIT requires its notice
-# to travel with the copy. The top-level LICENSE summarises this and points here; ship the full
-# notice too. ENABLE_BRAINCHOP is only declared for BUILD_FLAVOR=all, so this is a no-op elsewhere.
-if(ENABLE_BRAINCHOP)
-    if(SKBUILD)
-        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mindgrab.LICENSE DESTINATION niimath)
+# Numerical self-tests, so the CMake/MSVC/wheel toolchains are not the only paths that ship
+# compiler-sensitive kernels without ever running a kernel check (release_smoke.py covers
+# dispatch and rejection, not arithmetic). These are registered ONLY when their feature is on,
+# so they cannot drift out of sync with the build inventory the way a separate list would.
+# Nothing in CI invokes ctest yet -- run it by hand with `ctest --output-on-failure`.
+if(ENABLE_SKULLSTRIP)
+    enable_testing()
+    # MSVC has no separate libm; everywhere else the self-tests need it just as niimath does.
+    if(MSVC)
+        set(SELFTEST_MATH_LIB "")
     else()
-        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/mindgrab.LICENSE DESTINATION share/niimath)
+        set(SELFTEST_MATH_LIB m)
     endif()
+endif()
+if(ENABLE_SKULLSTRIP)
+    add_executable(skullstrip_selftest
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_skullstrip_mesh.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/skullstrip.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/nifti_io.c)
+    # nifti_io.c picks up the directory-wide -DHAVE_ZLIB/-DHAVE_ZSTD, so the test needs the same
+    # include paths and libraries niimath got; inherit them rather than restating them here,
+    # which would be one more list to keep in sync.
+    target_include_directories(skullstrip_selftest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} $<TARGET_PROPERTY:niimath,INCLUDE_DIRECTORIES>)
+    target_link_libraries(skullstrip_selftest PRIVATE
+        $<TARGET_PROPERTY:niimath,LINK_LIBRARIES> ${SELFTEST_MATH_LIB})
+    add_test(NAME skullstrip_selftest COMMAND skullstrip_selftest)
 endif()

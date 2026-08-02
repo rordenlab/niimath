@@ -81,17 +81,12 @@
 #else
 	#define kLicense " BSD"
 #endif
-#if defined(HAVE_BRAINCHOP)
-	#define kChop " (MIT for mindgrab)"
-#else
-	#define kChop ""
-#endif
 
 #define kMTHdate "v1.0.20260726"
-/* kChop precedes kLicense on purpose: README and AGENTS.md both document that the version
-   string ENDS in " BSD" or " GPL", so the overall-binary licence must stay the last word;
-   a bundled third-party model is a qualifier in front of it. */
-#define kMTHvers kMTHdate kOMPsuf kCCsuf kChop kLicense
+/* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
+   release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
+   the overall-binary licence stays the last word. */
+#define kMTHvers kMTHdate kOMPsuf kCCsuf kLicense
 
 #ifdef NII2MESH
 
@@ -280,7 +275,13 @@ int show_help( void ) {
     //printf("Chris Rorden's niimath version %s (%llu-bit %s)\n", kMATHvers, (unsigned long long) sizeof(size_t)*8, kOS);
     printf("    Math for NIfTI images inspired by fslmaths without encumbrance problems\n\n");
 #ifdef HAVE_GPL
-	printf("    Built with the optional GPL spm_coreg module: this executable is licensed GPL-2.\n\n");
+	// GPL-2-or-later: the optional payload is SPM's spm_coreg and nothing else. It briefly
+	// also carried Exstrom's LGPL-3 bw.c (-bandpass), which pushed the combined work up to
+	// GPL-3; that op was retired, so the resolution is back to SPM's own terms. This is the
+	// only licence statement the binary itself prints -- keep it in step with license.txt,
+	// README.md and AGENTS.md, it is the most legally visible string in the build.
+	printf("    Built with the optional GPL module (-spm_coreg/-spm_deface):\n");
+	printf("    this executable is licensed GPL-2 or later.\n\n");
 #else
 	printf("    License: BSD-2-Clause.\n\n");
 #endif
@@ -294,9 +295,6 @@ int show_help( void ) {
 	printf(" ""input"" will set the datatype to that of the original image\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
-#ifdef HAVE_BUTTERWORTH
-	printf(" -bandpass <hp> <lp> <tr> : Butterworth filter, highpass and lowpass in Hz,TR in seconds (zero-phase 2*2nd order filtfilt)\n");
-#endif
 #ifdef HAVE_BMP
 	printf("\n");
 	printf(" The bitmap option creates PNG images from NIfTI volumes:\n");
@@ -346,12 +344,6 @@ int show_help( void ) {
 	printf(" -reslice_nn <target>     : reslice to match image 'target' using nearest neighbor interpolation\n");
 	printf(" -reslice_mask <mask>     : reslice mask to current image using nearest neighbor; set voxels ≤ 0 in mask to minimum intensity\n");
 
-#endif
-#ifdef HAVE_BRAINCHOP
-	printf(" -mindgrab [-border <mm>] : skull strip with the MindGrab network (3D input; ~2.5GB RAM)\n");
-	printf("                            -border grows the brain mask before it is applied\n");
-#else
-	printf(" -mindgrab                : MindGrab skull stripping — NOT in this build (64-bit native only; BRAINCHOP=1 or -DENABLE_BRAINCHOP=ON)\n");
 #endif
 #ifdef HAVE_ALLINEATE
 	printf(" -allineate <base> [opts] : affine registration to match 'base' (from AFNI 3dAllineate)\n");
@@ -412,6 +404,16 @@ int show_help( void ) {
 	printf("                            <map> is 3D (broadcast over frames) or 4D matching the input frame count, on the input grid\n");
 	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
 	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
+#endif
+#ifdef HAVE_SKULLSTRIP
+	printf(" -skullstrip [-faithful]  : AFNI-style surface skull stripping (no template, no mask)\n");
+	printf("                            returns the ORIGINAL intensities inside the brain; outside becomes the image minimum\n");
+	printf("                            -faithful runs the slower reference kernel, bit-identical to the pre-optimisation\n");
+	printf("                            release; the default is ~1.8x quicker at the same quality (use it for regression diffs)\n");
+	printf("                            NOTE: this name previously aliased -deface; that operation is still -deface\n");
+#else
+	printf(" -skullstrip              : surface skull stripping — NOT in this build (rebuild a 64-bit native target with SKULLSTRIP=1 or -DENABLE_SKULLSTRIP=ON; wasm/tiny/nano cannot enable it)\n");
+	printf("                            NOTE: this name previously aliased -deface; that operation is still -deface\n");
 #endif
 #ifdef HAVE_MOCO
 	printf(" -moco [-1Dfile <p.1D>]   : rigid-body motion correction of a 4D series onto volume 0\n");

@@ -111,6 +111,7 @@ def write_float32_nifti(
     scl_inter: float = 0.0,
     tr: float = 0.0,
     time_units: int = 0,
+    scale: float = 1.0,  # voxel size, for fixtures whose PHYSICAL size matters
 ) -> None:
     nvox = dims[0] * dims[1] * dims[2] * nt
     if len(data) != nvox:
@@ -118,7 +119,7 @@ def write_float32_nifti(
     payload = struct.pack(f"<{nvox}f", *data)
     header = bytearray(
         nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope,
-                     scl_inter=scl_inter, tr=tr, time_units=time_units)
+                     scl_inter=scl_inter, tr=tr, time_units=time_units, scale=scale)
     )
     if nt > 1:
         struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
@@ -131,6 +132,25 @@ def read_float32_nifti(path: Path) -> list[float]:
     nvox = _prod(dim[1 : dim[0] + 1])
     offset = int(struct.unpack_from("<f", blob, 108)[0])
     return list(struct.unpack_from(f"<{nvox}f", blob, offset))
+
+
+def exercise_fillh(exe: str, tmp: Path) -> None:
+    """Exercise independent 3D scratch on a multi-volume flood fill."""
+    dims = (5, 5, 5)
+    n3 = _prod(dims)
+    first = [1.0] * n3
+    first[2 + 5 * (2 + 5 * 2)] = 0.0
+    second = [0.0] * n3
+    src = tmp / "fillh_4d.nii"
+    out = tmp / "fillh_4d_out.nii"
+    write_float32_nifti(src, dims, first + second, nt=2)
+    require_success(
+        run_niimath(exe, [str(src), "-fillh", "-gz", "0", str(out)]),
+        "multi-volume -fillh",
+    )
+    result = read_float32_nifti(out)
+    if result[:n3] != [1.0] * n3 or result[n3:] != second:
+        raise AssertionError("-fillh did not process 4D volumes independently")
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -2619,64 +2639,359 @@ def exercise_stc(exe: str, tmp: Path, help_text: str) -> None:
     print("        toffset, non-finite policy, parser rejections, @file and chaining OK")
 
 
-def exercise_mindgrab(exe: str, tmp: Path, help_text: str) -> None:
-    """-mindgrab: CLI contract only.
+def _skullstrip_geometry(path: Path) -> tuple:
+    """Everything that locates the voxels in world space. -skullstrip works on a fixed internal
+    grid and pulls the mask back, so a regression there shows up as a changed header, not as a
+    changed value."""
+    blob = read_nifti_bytes(path)
+    return (
+        struct.unpack_from("<8h", blob, 40),    # dim
+        struct.unpack_from("<8f", blob, 76),    # pixdim
+        struct.unpack_from("<2h", blob, 252),   # qform_code, sform_code
+        struct.unpack_from("<6f", blob, 256),   # quatern b/c/d, qoffset x/y/z
+        struct.unpack_from("<12f", blob, 280),  # srow_x/y/z
+    )
 
-    Every -mindgrab run conforms to 256^3 and evaluates the whole network, so there is no cheap
-    end-to-end case to assert on here -- it costs ~8 s and ~2.5 GB whatever the input size.  The
-    numerics are covered in closed form by test/mindgrab_selftest.c (`make test`) and against the
-    brainchop-cli oracle by test/mindgrab_parity.c.  What IS cheap, and what this checks, is that
-    every rejection happens BEFORE the expensive path and writes no output.
+
+def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
+    """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
+    hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
+
+    These ops had NO in-repo coverage at all before this, which is how eight unchecked
+    allocations survived a hardening sweep that fixed six siblings in the same file.  The
+    checks below are chosen for what they can actually catch:
+
+    * -detrend on an exactly-linear time series must return all-zero.  Catches a wrong scratch
+      size (nvol vs nvox3D) and any cross-voxel bleed from the hoisted buffer.
+    * -bptf at -p 1 vs -p 8 must be BYTE-IDENTICAL.  This is the check that catches a botched
+      hoist: a scratch buffer that is not fully overwritten before each read produces
+      thread-count-dependent output, and nothing else here would notice.
+    * -sobel_binary must be two-valued, and plain -sobel must be unaffected by imgdir now
+      being allocated only in the binary branch.
     """
-    line = _help_line(help_text, "-mindgrab")
+    nx, ny, nz, nt = 6, 6, 4, 12
+    nvox3d = nx * ny * nz
+    # voxel v has series a_v + b_v * t -- exactly linear, so a linear detrend must null it.
+    linear = []
+    for t in range(nt):
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    v = i + j * nx + k * nx * ny
+                    linear.append(float(v % 5) + 0.25 * (v % 3 + 1) * t)
+    src = tmp / "omp_linear.nii"
+    write_float32_nifti(src, (nx, ny, nz), linear, nt=nt)  # dims is 3-tuple; nt is separate
+
+    det = tmp / "omp_detrend.nii"
+    require_success(run_niimath(exe, [str(src), "-detrend", "-gz", "0", str(det)]), "-detrend")
+    for idx, value in enumerate(read_float32_nifti(det)):
+        if abs(value) > 1e-3:
+            raise AssertionError(f"-detrend left {value} at voxel {idx}; a linear series must null out")
+
+    # Thread-count byte-equality: the real regression detector for the hoisted scratch.
+    for op in (["-bptf", "4", "2"], ["-bptf", "3", "-1"], ["-bptfm", "4", "2"], ["-detrend"]):
+        outs = []
+        for threads in ("1", "8"):
+            dst = tmp / ("omp_%s_p%s.nii" % (op[0].lstrip("-"), threads))
+            require_success(
+                run_niimath(exe, [str(src)] + op + ["-p", threads, "-gz", "0", str(dst)]),
+                " ".join(op) + " -p " + threads,
+            )
+            outs.append(dst.read_bytes())
+        if outs[0] != outs[1]:
+            raise AssertionError(
+                " ".join(op) + " is not byte-identical at -p 1 vs -p 8; worker scratch is "
+                "carrying state between voxels")
+
+    # -tfce and -tfceS must run and stay finite; -tfceS is 3D-only.
+    blob = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                inside = (i - 3) ** 2 + (j - 3) ** 2 + (k - 2) ** 2 <= 4
+                blob.append(100.0 if inside else 1.0)
+    src3 = tmp / "omp_blob.nii"
+    write_float32_nifti(src3, (nx, ny, nz), blob)
+    for name, args in (("-tfce", ["-tfce", "2", "0.5", "6"]),
+                       ("-tfceS", ["-tfceS", "2", "0.5", "6", "3", "3", "2", "0.5"])):
+        dst = tmp / ("omp_%s.nii" % name.lstrip("-"))
+        require_success(run_niimath(exe, [str(src3)] + args + ["-gz", "0", str(dst)]), name)
+        values = read_float32_nifti(dst)
+        if len(values) != nvox3d:
+            raise AssertionError(f"{name} changed the voxel count")
+        for value in values:
+            if value != value or value in (float("inf"), float("-inf")):
+                raise AssertionError(f"{name} produced a non-finite value")
+
+    # -sobel_binary is two-valued; plain -sobel must not have been perturbed by imgdir now
+    # being allocated only in the binary branch (it is never read when isBinary == 0).
+    edge = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                edge.append(200.0 if i >= nx // 2 else 10.0)
+    src_edge = tmp / "omp_edge.nii"
+    write_float32_nifti(src_edge, (nx, ny, nz), edge)
+    sb = tmp / "omp_sobelb.nii"
+    require_success(run_niimath(exe, [str(src_edge), "-sobel_binary", "-gz", "0", str(sb)]), "-sobel_binary")
+    if not set(read_float32_nifti(sb)) <= {0.0, 1.0}:
+        raise AssertionError("-sobel_binary must emit only 0 and 1")
+    so = tmp / "omp_sobel.nii"
+    require_success(run_niimath(exe, [str(src_edge), "-sobel", "-gz", "0", str(so)]), "-sobel")
+    svals = read_float32_nifti(so)
+    if len(svals) != nvox3d or max(svals) <= min(svals):
+        raise AssertionError("-sobel produced no gradient on a step edge")
+
+    # Degenerate TFCE input, matching the reference implementation. fslmaths derives its step
+    # size as max/100 and REJECTS a run where that is not positive -- exit 1, no output written,
+    # and for 4D a SINGLE degenerate volume fails the whole operation. An all-NaN volume is
+    # NOT rejected (NaN <= 0 is false), and both tools emit an all-zero image for it.
+    # Before this contract existed niimath accepted all of these and evaluated (int)NaN.
+    flat = [0.0] * nvox3d
+    zero_src = tmp / "omp_tfce_zero.nii"
+    write_float32_nifti(zero_src, (nx, ny, nz), flat)
+    zero_out = tmp / "omp_tfce_zero_out.nii"
+    rej = run_niimath(exe, [str(zero_src), "-tfce", "2", "0.5", "6", "-gz", "0", str(zero_out)])
+    if rej.returncode == 0:
+        raise AssertionError("-tfce must reject a volume whose maximum is not positive")
+    if zero_out.exists():
+        raise AssertionError("-tfce wrote an output for a rejected degenerate volume")
+    if "deltaT" not in (rej.stdout + rej.stderr):
+        raise AssertionError("-tfce rejection must name the positive-deltaT requirement")
+    # 4D: one degenerate volume fails the whole run.
+    mixed = [(100.0 if v % 7 == 0 else 1.0) for v in range(nvox3d)] + flat
+    mixed_src = tmp / "omp_tfce_mixed.nii"
+    write_float32_nifti(mixed_src, (nx, ny, nz), mixed, nt=2)
+    mixed_out = tmp / "omp_tfce_mixed_out.nii"
+    if run_niimath(exe, [str(mixed_src), "-tfce", "2", "0.5", "6", "-gz", "0", str(mixed_out)]).returncode == 0:
+        raise AssertionError("-tfce must fail the whole run when any volume is degenerate")
+    if mixed_out.exists():
+        raise AssertionError("-tfce wrote an output despite a degenerate volume")
+
+    # -tfceS coordinate validation. The range check used to print a diagnostic and then FALL
+    # THROUGH, computing seed from the rejected coordinate and reading inimg[seed] out of
+    # bounds -- on a 16^3 image, -100000 in each axis reads ~109 MB before the buffer, and it
+    # did not crash, which is why a diagnostic without a return is worse than no check at all.
+    seed_src = tmp / "omp_tfces.nii"
+    write_float32_nifti(seed_src, (nx, ny, nz), [100.0 if v % 5 == 0 else 1.0 for v in range(nvox3d)])
+    for bad in (["-100000", "-100000", "-100000"], ["999", "999", "999"], ["-1", "0", "0"],
+                [str(nx), "0", "0"], ["0", str(ny), "0"], ["0", "0", str(nz)]):
+        dst = tmp / ("omp_tfces_bad_%s.nii" % "_".join(bad).replace("-", "m"))
+        res = run_niimath(exe, [str(seed_src), "-tfceS", "2", "0.5", "6"] + bad + ["0.5", "-gz", "0", str(dst)])
+        if res.returncode == 0:
+            raise AssertionError("-tfceS accepted out-of-range coordinate " + " ".join(bad))
+        if dst.exists():
+            raise AssertionError("-tfceS wrote an output for out-of-range coordinate " + " ".join(bad))
+    # ...and an in-range coordinate must still work, so the check is not simply rejecting all.
+    ok_dst = tmp / "omp_tfces_ok.nii"
+    require_success(
+        run_niimath(exe, [str(seed_src), "-tfceS", "2", "0.5", "6", "0", "0", "0", "0.5",
+                          "-gz", "0", str(ok_dst)]),
+        "-tfceS with an in-range coordinate",
+    )
+
+    print("  -tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: linear-detrend nulling, -p 1 vs -p 8")
+    print("        byte-equality, finiteness, sobel two-valuedness and the fslmaths")
+    print("        positive-deltaT rejection (3D and 4D) and -tfceS bounds rejection OK")
+
+
+def exercise_skullstrip(exe: str, tmp: Path, help_text: str) -> None:
+    """-skullstrip: end-to-end CLI contract on a synthetic head.
+
+    test_skullstrip_mesh.c checks the surface primitives analytically and nothing checked the
+    OPERATION -- which is how both repositioning stages once sat inside the SSV() diagnostic macro
+    and ran only when SKULLSTRIP_VERBOSE was set, with the whole suite green.  The verbose-equality
+    case below is the regression test for exactly that: a diagnostic must never move a voxel.
+
+    The working grid is a fixed 167x212x175 whatever the input, so a 48^3 fixture costs the same
+    ~2 s as a real head.  The numerics stay in skullstrip_bench; this is dispatch and contract.
+    """
+    line = _help_line(help_text, "-skullstrip")
     if not line:
-        raise AssertionError("-mindgrab help line missing entirely (it must be #ifdef-paired)")
+        raise AssertionError("-skullstrip help line missing entirely (it must be #ifdef-paired)")
+
     if "NOT in this build" in line:
-        # A disabled build must still say how to enable it, and must refuse the op rather than
-        # silently doing nothing.
-        if "BRAINCHOP=1" not in line:
-            raise AssertionError("disabled -mindgrab help must name BRAINCHOP=1")
-        out = tmp / "mg_disabled.nii"
-        src = tmp / "mg_in.nii"
+        # OFF by default, so a disabled build must still say how to enable it and must refuse the
+        # op rather than passing the image through unstripped.
+        if "SKULLSTRIP=1" not in line:
+            raise AssertionError("disabled -skullstrip help must name SKULLSTRIP=1")
+        src = tmp / "ss_disabled_in.nii"
+        out = tmp / "ss_disabled.nii"
         write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
-        result = run_niimath(exe, [str(src), "-mindgrab", str(out)])
+        result = run_niimath(exe, [str(src), "-skullstrip", str(out)])
         if result.returncode == 0 or out.exists():
-            raise AssertionError("-mindgrab must fail in a build without BRAINCHOP")
-        print("  -mindgrab: not built (BRAINCHOP=0) - contract checked")
+            raise AssertionError("-skullstrip must fail in a build without SKULLSTRIP")
+        if "SKULLSTRIP=1" not in (result.stdout + result.stderr):
+            raise AssertionError("disabled -skullstrip must say how to enable it")
+        print("  -skullstrip: not built (SKULLSTRIP=0) - contract checked")
         return
 
-    if "-border" not in line:
-        raise AssertionError("-mindgrab help must document -border")
+    # 4D input: rejected before any surface work, and nothing at all is created.
+    src4d = tmp / "ss_4d.nii"
+    write_float32_nifti(src4d, (8, 8, 8), [float(i % 7) for i in range(8 * 8 * 8 * 3)], nt=3)
+    before = sorted(p.name for p in tmp.iterdir())
+    result = run_niimath(exe, [str(src4d), "-skullstrip", str(tmp / "ss_4d_out.nii")])
+    after = sorted(p.name for p in tmp.iterdir())
+    if result.returncode == 0:
+        raise AssertionError("-skullstrip must reject 4D input")
+    if before != after:
+        raise AssertionError(f"-skullstrip on 4D input wrote {set(after) - set(before)}")
 
-    # 4D input: rejected before any conform/inference work, no output file.
-    src4d = tmp / "mg_4d.nii"
-    write_float32_nifti(src4d, (5, 5, 4), [float(i % 5) for i in range(500)], nt=5)
-    out4d = tmp / "mg_4d_out.nii"
-    result = run_niimath(exe, [str(src4d), "-mindgrab", str(out4d)])
-    if result.returncode == 0 or out4d.exists():
-        raise AssertionError("-mindgrab must reject 4D input and write nothing")
+    # A ~190 mm ellipsoid on a 4 mm grid: normalisation measures from the top of the head, so a
+    # fixture that is small in MILLIMETRES (rather than in voxels) has degenerate contrast and is
+    # rejected -- the physical size is what matters here, not the voxel count.
+    dims = (48, 48, 48)
+    values: list[float] = []
+    for k in range(dims[2]):
+        for j in range(dims[1]):
+            for i in range(dims[0]):
+                r = ((i - 23.5) / 13.0) ** 2 + ((j - 23.5) / 15.0) ** 2 + ((k - 23.5) / 12.0) ** 2
+                values.append(400.0 if r <= 1.0 else (120.0 if r <= 1.6 else 5.0))
+    src = tmp / "ss_head.nii"
+    write_float32_nifti(src, dims, values, scale=4.0)
 
-    # Malformed -border: rejected at parse time, again with no output.
-    src = tmp / "mg_in3d.nii"
-    write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
-    for bad in ("abc", "4junk", "0", "-3"):
-        out = tmp / f"mg_border_{bad}.nii"
-        result = run_niimath(exe, [str(src), "-mindgrab", "-border", bad, str(out)])
-        if result.returncode == 0 or out.exists():
-            raise AssertionError(f"-mindgrab -border {bad} must be rejected with no output")
-    # -border swallowed by the output-filename slot. niimath takes the LAST argv as the output,
-    # so the dispatch deliberately peeks one past the op range: without that, `-mindgrab -border`
-    # ran a full 8 s inference and wrote a file literally named "-border.nii.gz" at exit 0.
-    # Nothing may be created by any of these, so compare the directory listing before and after.
-    for tail in (["-border"], ["-border", "4"], ["-border", str(tmp / "mg_border_val.nii")]):
-        before = sorted(p.name for p in tmp.iterdir())
-        result = run_niimath(exe, [str(src), "-mindgrab"] + tail)
-        after = sorted(p.name for p in tmp.iterdir())
-        if result.returncode == 0:
-            raise AssertionError(f"-mindgrab {' '.join(tail)} must be rejected")
-        if before != after:
-            raise AssertionError(f"-mindgrab {' '.join(tail)} wrote {set(after) - set(before)}")
-    print("  -mindgrab: CLI contract OK (4D and -border rejections write nothing)")
+    # DT32 only: -dt double must say so, not quietly emit a float64 result.
+    dbl_out = tmp / "ss_double.nii"
+    dbl = run_niimath(exe, ["-dt", "double", str(src), "-skullstrip", str(dbl_out)])
+    if dbl.returncode == 0 or dbl_out.exists():
+        raise AssertionError("-skullstrip must reject -dt double")
+    if "double" not in (dbl.stdout + dbl.stderr):
+        raise AssertionError("-skullstrip -dt double rejection must name the datatype")
+
+    out = tmp / "ss_out.nii"
+    require_success(run_niimath(exe, [str(src), "-skullstrip", "-gz", "0", str(out)]), "-skullstrip")
+    if not out.exists():
+        raise AssertionError("-skullstrip wrote no output")
+    if _skullstrip_geometry(src) != _skullstrip_geometry(out):
+        raise AssertionError("-skullstrip changed the header geometry (dims/pixdim/qform/sform)")
+
+    # Output contract (skullstrip.h): in-mask voxels keep their ORIGINAL value, out-of-mask voxels
+    # become the image MINIMUM. So the result is a strict subset of the input -- no value may
+    # appear that the input did not contain, and every changed voxel must hold the minimum.
+    vmin = min(values)
+
+    def check_subset(result, label):
+        """The output contract, stated ONCE. Both kernels are held to the same rule -- writing it
+        twice is how two rules for one contract quietly drift apart. Returns the removed count."""
+        if len(result) != len(values):
+            raise AssertionError(f"{label} changed the voxel count")
+        if min(result) != vmin:
+            raise AssertionError(f"{label} background is {min(result)}, expected the input minimum {vmin}")
+        if not set(result) <= set(values):
+            raise AssertionError(f"{label} invented values {sorted(set(result) - set(values))}")
+        n_removed = 0
+        for i in range(len(values)):
+            if result[i] != values[i]:
+                if result[i] != vmin:
+                    raise AssertionError(f"{label} voxel {i} became {result[i]}, not the minimum {vmin}")
+                n_removed += 1
+        if sum(1 for value in result if value == 400.0) == 0:
+            raise AssertionError(f"{label} removed the whole brain")
+        # KNOW WHAT THIS FIXTURE CAN AND CANNOT SEE. It is a concentric ellipsoid whose
+        # background value (5.0) IS vmin, so blanking a background voxel is a no-op that no
+        # assertion can detect: 90,784 of its 110,592 voxels are invisible to this check and only
+        # the 19,808 bright ones (9,800 at 400.0 + 10,008 at 120.0) can ever register as removed.
+        # Measured, ~330 do -- about 3% of the shell -- so this is a DISPATCH AND CONTRACT test,
+        # not a segmentation-quality test, and it would still pass against a nearly-identity mask.
+        # Mask quality lives in strip_bench (Dice against external reference masks); do not add a
+        # quality claim here. The floor below is only strong enough to catch the mask never being
+        # applied at all. (An earlier draft asserted the far-corner voxel was removed -- vacuous,
+        # because that voxel already holds vmin in the input.)
+        if n_removed < 100:
+            raise AssertionError(f"{label} removed only {n_removed} voxels; the fixture no longer exercises the mask")
+        return n_removed
+
+    stripped = read_float32_nifti(out)
+    removed = check_subset(stripped, "-skullstrip")
+
+    # -restart adopts a new dataset, including its STORED datatype. Start from an integer image,
+    # restart from the float fixture, and require the same result as processing that float fixture
+    # directly. Passing the original input's datatype through restart selects the wrong AFNI
+    # normalization branch.
+    restart_seed = tmp / "ss_restart_seed.nii"
+    write_uint8_nifti(restart_seed)
+    restart_out = tmp / "ss_restart_out.nii"
+    require_success(
+        run_niimath(
+            exe,
+            [str(restart_seed), "-restart", str(src), "-skullstrip", "-gz", "0", str(restart_out)],
+        ),
+        "-restart float dataset followed by -skullstrip",
+    )
+    if read_float32_nifti(restart_out) != stripped:
+        raise AssertionError("-restart left -skullstrip using the original input's stored datatype")
+
+    # THE REGRESSION TEST: a diagnostic environment variable must not change the segmentation.
+    verbose_env = os.environ.copy()
+    verbose_env["SKULLSTRIP_VERBOSE"] = "1"
+    vout = tmp / "ss_out_verbose.nii"
+    verbose_result = run_niimath(
+        exe, [str(src), "-skullstrip", "-gz", "0", str(vout)], env=verbose_env
+    )
+    require_success(
+        verbose_result,
+        "-skullstrip with SKULLSTRIP_VERBOSE=1",
+    )
+    if "skullstrip: deformation kernel fast" not in verbose_result.stderr:
+        raise AssertionError("default -skullstrip did not select the fast deformation kernel")
+    if vout.read_bytes() != out.read_bytes():
+        raise AssertionError("SKULLSTRIP_VERBOSE=1 changed the -skullstrip output")
+
+    # -faithful selects the reference deformation kernel.  Two things are worth pinning: it must
+    # be ACCEPTED and produce a real strip (a silently-ignored sub-option would look identical to
+    # a working one on a pass/fail check), and it must not be swallowed as the output name -- the
+    # op-loop peek gotcha: a sub-option in the output-name slot must not become the output name.
+    fout = tmp / "ss_faithful.nii"
+    faithful_result = run_niimath(
+        exe,
+        [str(src), "-skullstrip", "-faithful", "-gz", "0", str(fout)],
+        env=verbose_env,
+    )
+    require_success(
+        faithful_result,
+        "-skullstrip -faithful",
+    )
+    if "skullstrip: deformation kernel faithful" not in faithful_result.stderr:
+        raise AssertionError("-skullstrip -faithful did not select the faithful deformation kernel")
+    faithful = read_float32_nifti(fout)
+    check_subset(faithful, "-skullstrip -faithful")
+    # The faithful kernel needs its OWN verbose byte-equality check. The one above covers the
+    # default kernel only, and -faithful is otherwise run exclusively WITH SKULLSTRIP_VERBOSE=1
+    # (to read the dispatch line) -- yet verbose does gate work on this path too, via
+    # `ss_verbose() ? &xs : NULL` in skullstrip.c. A diagnostic must never move a voxel in
+    # EITHER kernel.
+    fquiet = tmp / "ss_faithful_quiet.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-skullstrip", "-faithful", "-gz", "0", str(fquiet)]),
+        "-skullstrip -faithful without SKULLSTRIP_VERBOSE",
+    )
+    if fquiet.read_bytes() != fout.read_bytes():
+        raise AssertionError("SKULLSTRIP_VERBOSE=1 changed the -skullstrip -faithful output")
+
+    # Rejected AND writes nothing -- both halves matter, because an op
+    # that errors after creating the file is a different bug from one that errors cleanly.
+    before = set(os.listdir(tmp))
+    trailing = run_niimath(exe, [str(src), "-skullstrip", "-faithful"])
+    if trailing.returncode == 0:
+        raise AssertionError("trailing -skullstrip -faithful must fail, not become the output name")
+    if set(os.listdir(tmp)) != before:
+        raise AssertionError("trailing -skullstrip -faithful wrote a file; it must write nothing")
+
+    # -skullstrip is an ordinary chain op, not a terminal subcommand.
+    chained = tmp / "ss_chain.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-skullstrip", "-mul", "2", "-gz", "0", str(chained)]),
+        "-skullstrip chained with -mul",
+    )
+    doubled = read_float32_nifti(chained)
+    for i in range(len(stripped)):
+        if abs(doubled[i] - 2.0 * stripped[i]) > 1e-3:
+            raise AssertionError("-skullstrip did not chain into the following operation")
+
+    print("  -skullstrip: 4D/-dt double rejections, geometry preserved, %d of %d voxels kept,"
+          % (len(values) - removed, len(values)))
+    print("        subset-of-input contract, restart datatype, SKULLSTRIP_VERBOSE equality,")
+    print("        -faithful kernel accepted and not swallowed as the output name, and chaining OK")
 
 
 def _help_line(help_text: str, tag: str) -> str:
@@ -2702,9 +3017,27 @@ def main() -> int:
         info = run_niimath(exe, [])
         require_success(info, "help/version")
         help_text = info.stdout + info.stderr
-        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-bandpass", "-mesh", "-romeo"):
+        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-mesh", "-romeo"):
             if token not in help_text:
                 raise AssertionError(f"packaged binary help is missing {token}")
+        # COPYLEFT SELF-CONSISTENCY -- and KNOW EXACTLY WHAT THIS DOES AND DOES NOT PROVE.
+        # -spm_coreg is the entire copyleft payload (SPM, GPL-2-or-later, in the src/GPL
+        # submodule). Both the " GPL " version brand (niimath.c's kLicense) and the -spm_coreg
+        # help line are emitted under the SAME `HAVE_GPL` macro, so the two checks below cannot
+        # disagree unless the build is HALF-wired -- GPL sources compiled with the brand or the
+        # help line out of step. That is a real failure mode and worth catching, but it is NOT
+        # a proof that a BSD-branded binary is free of GPL object code: a build that linked
+        # GPL/*.c WITHOUT -DHAVE_GPL would brand itself BSD, hide the op, and pass. Proving
+        # absence needs a symbol check (nm), which this stdlib-only cross-platform script
+        # cannot do. Do not describe this as a licence gate; the load-bearing check is the
+        # BEHAVIOURAL one below, which requires the op to actually refuse to run.
+        # (It used to key on -bandpass, retired along with Exstrom's LGPL-3 bw.c; with that
+        # gone the payload is SPM alone, so a GPL=1 binary is GPL-2-or-later, not GPL-3.)
+        is_gpl_build = " GPL " in help_text
+        if is_gpl_build and "-spm_coreg" not in help_text:
+            raise AssertionError("GPL build brands itself GPL but hides -spm_coreg (half-wired build)")
+        if not is_gpl_build and "-spm_coreg" in help_text:
+            raise AssertionError("BSD-branded build advertises -spm_coreg (half-wired build)")
         if args.expect_bsd and " BSD " not in help_text:
             raise AssertionError("expected a BSD build version string")
 
@@ -2914,6 +3247,7 @@ def main() -> int:
             raise AssertionError("binary operation failed to detect a y-axis spatial mismatch")
 
         exercise_qc(exe, tmp)
+        exercise_fillh(exe, tmp)
 
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
@@ -2921,12 +3255,29 @@ def main() -> int:
         exercise_moco(exe, tmp, help_text)
         exercise_stc(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
-        exercise_mindgrab(exe, tmp, help_text)
+        exercise_skullstrip(exe, tmp, help_text)
+        exercise_openmp_scratch_ops(exe, tmp)
 
-        if args.expect_bsd:
-            spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
-            if spm.returncode == 0 or "requires a build with the optional GPL module" not in (spm.stdout + spm.stderr):
-                raise AssertionError("BSD package should reject -spm_coreg with the GPL-module message")
+        # THE LOAD-BEARING COPYLEFT CHECK, and it runs for EVERY BSD-branded binary, not just
+        # a packaged one -- it used to be gated on --expect-bsd, which meant only the wheel
+        # build exercised it. Behavioural, not a help-string grep: the op must actually REFUSE
+        # to run. Still not a proof of absent object code (see the note further up), but it is
+        # the strongest thing available here.
+        spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
+        spm_out = spm.stdout + spm.stderr
+        stub_msg = "requires a build with the optional GPL module"
+        if not is_gpl_build:
+            if spm.returncode == 0 or stub_msg not in spm_out:
+                raise AssertionError("BSD-branded binary must reject -spm_coreg with the GPL-module message")
+        else:
+            # The other half of the same half-wiring test. A build where niimath.c received
+            # -DHAVE_GPL but core32/core64.c did not would brand itself GPL, print the help
+            # line, satisfy both greps above -- and still dispatch to the !HAVE_GPL stub. Only
+            # running the op catches that. Deliberately does NOT require success: -spm_coreg on
+            # a degenerate 8-bit fixture may legitimately fail to converge, and this is a
+            # wiring check, not a registration-quality check.
+            if stub_msg in spm_out:
+                raise AssertionError("GPL-branded binary dispatched -spm_coreg to the !HAVE_GPL stub (half-wired build)")
 
         if args.expect_zstd:
             env = os.environ.copy()

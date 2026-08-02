@@ -46,7 +46,7 @@ jobs:
           cmake -Wno-dev -B build -DENABLE_ZSTD=ON
           cmake --build build
           python3 .github/scripts/release_smoke.py ./build/bin/niimath --expect-zstd
-          7z a "${{ matrix.zip }}" ./build/bin/* LICENSE src/mindgrab.LICENSE >/dev/null
+          7z a "${{ matrix.zip }}" ./build/bin/* LICENSE >/dev/null
 
       # ---- Windows: static zstd via vcpkg (as release.yml), passed through ZSTD_ROOT. ----
       - name: Build (Windows)
@@ -59,7 +59,7 @@ jobs:
             -DCMAKE_PREFIX_PATH=C:/vcpkg/installed/x64-windows-static
           cmake --build build --config Release
           python .github\scripts\release_smoke.py .\build\bin\niimath.exe --expect-zstd
-          7z a ${{ matrix.zip }} .\build\bin\* LICENSE src\mindgrab.LICENSE > $null
+          7z a ${{ matrix.zip }} .\build\bin\* LICENSE > $null
 
       # ---- macOS: universal (x86_64 + arm64), static zstd from source (self-contained, no dylib),
       #      no OpenMP (single-arch libomp can't link into a universal binary). ----
@@ -82,7 +82,7 @@ jobs:
           lipo -info build/niimath   # expect: x86_64 arm64
           if otool -L build/niimath | grep -qi zstd; then echo "ERROR: zstd not statically linked"; exit 1; fi
           python3 .github/scripts/release_smoke.py ./build/niimath --expect-zstd
-          zip -j "${{ matrix.zip }}" ./build/niimath LICENSE src/mindgrab.LICENSE
+          zip -j "${{ matrix.zip }}" ./build/niimath LICENSE
 
       - name: Attach binary to the GitHub Release
         uses: softprops/action-gh-release@v2
