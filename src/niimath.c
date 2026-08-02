@@ -405,6 +405,15 @@ int show_help( void ) {
 	printf("                            <axis> is i|j|k (or x|y|z); a trailing '-' is accepted and IGNORED — the sign is already in the map\n");
 	printf("                            Lanczos-5 windowed-sinc interpolation, zero fill outside the FOV, no Jacobian modulation\n");
 #endif
+#ifdef HAVE_FMAP
+	printf(" -fugue <fmap> <dwell> <dir> : correct EPI susceptibility distortion with a B0 fieldmap (emulates FSL fugue)\n");
+	printf("                            <fmap> is a 3D fieldmap in rad/s on the input grid (e.g. from fsl_prepare_fieldmap)\n");
+	printf("                            <dwell> is the effective echo spacing in SECONDS (BIDS EffectiveEchoSpacing)\n");
+	printf("                            <dir> is the phase-encoding axis x|y|z (or i|j|k) with an optional trailing '-'\n");
+	printf("                            shift = fmap/(2*pi)*dwell*N; 1D linear interpolation, zero fill outside the FOV, no Jacobian modulation\n");
+#else
+	printf(" -fugue <fmap> <dwell> <dir> : EPI fieldmap unwarping — NOT in this build (rebuild without FMAP=0 / with -DENABLE_FMAP=ON)\n");
+#endif
 #ifdef HAVE_SKULLSTRIP
 	printf(" -skullstrip [-faithful]  : AFNI-style surface skull stripping (no template, no mask)\n");
 	printf("                            returns the ORIGINAL intensities inside the brain; outside becomes the image minimum\n");

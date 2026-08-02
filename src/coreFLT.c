@@ -99,6 +99,9 @@
 #ifdef HAVE_STC
 #include "stc.h" // slice-time correction (-stc)
 #endif
+#ifdef HAVE_FMAP
+#include "fmap.h" // B0 fieldmap EPI distortion correction (-fugue)
+#endif
 #ifdef HAVE_SKULLSTRIP
 // Guarded by HAVE_SKULLSTRIP ALONE. It once sat nested inside another feature's #ifdef, which
 // made the combination that disabled the outer feature fail to compile; keep this include and
@@ -7151,6 +7154,44 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+#ifdef HAVE_FMAP
+/* -fugue <fieldmap> <dwell> <unwarpdir>: correct susceptibility distortion in an EPI using a B0
+   fieldmap in rad/s.  An ordinary chain operation, DT32 only.  All three arguments are positional
+   and must therefore sit strictly before the output name, so `ac + 2 >= argc` is the right guard
+   here -- the `ac + 1 <= argc` peek documented in AGENTS.md is for OPTIONAL trailing sub-options,
+   which this op has none of. */
+staticx int nifti_fugue_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *fmapfile, *dir, *dwellstr;
+	char *end = NULL;
+	double dwell;
+	if (ac + 2 >= argc) {
+		printfx("-fugue requires a fieldmap, a dwell time and an unwarp direction (-fugue <fieldmap> <dwell_seconds> <x|y|z|x-|y-|z->)\n");
+		return 1;
+	}
+	fmapfile = argv[ac];
+	dwellstr = argv[ac + 1];
+	dir = argv[ac + 2];
+	*pac = ac + 3;
+	dwell = strtod(dwellstr, &end);
+	/* Reject trailing junk rather than silently accepting the prefix strtod could parse: a
+	   transposed command line puts the unwarp direction here, and "y" parses as 0.0. */
+	if (!end || end == dwellstr || *end != '\0') {
+		printfx("-fugue dwell must be a number (the effective echo spacing in seconds); got '%s'\n", dwellstr);
+		return 1;
+	}
+	if (nii_reject_oversize_aux(fmapfile, "fugue fieldmap")) return 1;
+	return fmap_unwarp(nim, fmapfile, dwell, dir);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 2 < argc) *pac += 3;
+	printfx("'-dt double' does not support -fugue (fieldmap unwarping is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_FMAP
+
 #ifdef HAVE_MOCO
 /* -moco [-1Dfile <path>]: rigid-body motion correction of a 4D series onto sub-brick 0.
    The optional "-1Dfile <path>" pair is consumed here; the trailing positional output name is
@@ -8347,6 +8388,15 @@ int main64(int argc, char *argv[]) {
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past the map and axis
+		}
+#endif
+#ifdef HAVE_FMAP
+		else if (!strcmp(argv[ac], "-fugue")) {
+			ac++;
+			ok = nifti_fugue_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the fieldmap, dwell and direction
 		}
 #endif
 #ifdef HAVE_MOCO
