@@ -2811,6 +2811,24 @@ def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
         if run_niimath(exe, [str(src), *args, "-gz", "0", str(bad)]).returncode == 0:
             raise SystemExit("-fugue: accepted %s" % label)
 
+    # A fieldmap whose world transform is NaN must be REFUSED, not accepted.  Under -ffast-math
+    # the natural spelling `max_displacement_mm(...) > tol` is FALSE for NaN, so it accepts a
+    # pair whose geometry could not be measured -- measured, that wrote a full output at exit 0.
+    nanx = tmp / "fugue_nanxform.nii"
+    write_float32_nifti(nanx, (nx, ny, nz), [1.0] * n3)
+    raw = bytearray(nanx.read_bytes())
+    struct.pack_into("<h", raw, 252, 0)          # qform_code = 0
+    struct.pack_into("<h", raw, 254, 1)          # sform_code = 1, so the sform is the one used
+    for off in (280, 296, 312):                  # srow_x, srow_y, srow_z
+        struct.pack_into("<4f", raw, off, *([float("nan")] * 4))
+    nanx.write_bytes(raw)
+    nan_out = tmp / "fugue_nanxform_out.nii"
+    if nan_out.exists():
+        nan_out.unlink()
+    if run_niimath(exe, [str(src), "-fugue", str(nanx), repr(dwell), "y",
+                         "-gz", "0", str(nan_out)]).returncode == 0 or nan_out.exists():
+        raise SystemExit("-fugue: accepted a fieldmap whose world transform is NaN")
+
     # A 4D fieldmap and an off-grid fieldmap must both be refused.
     fmap4d = tmp / "fugue_f4d.nii"
     write_float32_nifti(fmap4d, (nx, ny, nz), [1.0] * (n3 * 2), nt=2)
