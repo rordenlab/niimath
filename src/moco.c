@@ -658,8 +658,120 @@ static nifti_image *moco_read_ref(const char *fn, nifti_image *nim) {
 	return ref;
 }
 
-// ------------------------------------------------------------------ entry point
-int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file) {
+// ------------------------------------------------------------------ parameter file writers
+/* The historical -1Dfile layout: six %8.4f fields, single spaces, LF.  AFNI 3dvolreg writes this
+   and downstream tools parse it by column position, so it is frozen. */
+#define MOCO_PAR_FMT "%8.4f %8.4f %8.4f %8.4f %8.4f %8.4f\n"
+/* -relative is a new output with no such compatibility burden, so it keeps the precision the
+   estimator actually carries rather than rounding to 1e-4 deg / 1e-4 mm. */
+#define MOCO_REL_FMT "%12.8f %12.8f %12.8f %12.8f %12.8f %12.8f\n"
+
+/* Open an exclusive sibling temporary of `path`.  Returns the stream and stores the malloc'd
+   temporary name in *tmpname, or NULL.  O_EXCL never follows a pre-existing symlink and never
+   truncates another writer's file.  The name is exclusive rather than globally unique, so a
+   crashed run plus PID reuse can leave a stale sibling; try a few suffixes before giving up. */
+static FILE *moco_open_tmp(const char *path, char **tmpname) {
+	size_t plen = strlen(path);
+	if (plen > SIZE_MAX - 32) return NULL;
+	char *nm = (char *)malloc(plen + 32);        /* ".mocotmp" + pid digits + NUL */
+	if (!nm) return NULL;
+	int fd = -1;
+	for (int attempt = 0; attempt < 8 && fd < 0; attempt++) {
+		snprintf(nm, plen + 32, "%s.mocotmp%ld_%d", path, (long)getpid(), attempt);
+		/* O_BINARY (Windows only) keeps the output byte-identical across platforms: without it
+		   the CRT translates every '\n' the text file writes into "\r\n", and would corrupt the
+		   binary companion outright. */
+#ifdef _WIN32
+		fd = open(nm, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0600);
+#else
+		fd = open(nm, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+	}
+	FILE *f = (fd < 0) ? NULL : fdopen(fd, "wb");
+	if (!f) {
+		if (fd >= 0) close(fd);
+		remove(nm);
+		free(nm);
+		return NULL;
+	}
+	*tmpname = nm;
+	return f;
+}
+
+/* Rename a temporary over its final name.  Returns 0 on success. */
+static int moco_publish_tmp(const char *tmpname, const char *path) {
+#ifdef _WIN32
+	/* The Windows CRT's rename() fails when the destination exists, which would break every
+	   re-run that overwrites an existing output file. */
+	remove(path);
+#endif
+	return rename(tmpname, path) != 0;
+}
+
+/* Write `nt` rows of six parameters to `path` through an exclusive sibling temporary, renamed only
+   on success, so a failed run cannot truncate or delete a file the user already had there.  When
+   `also_binary` is set a float64 companion is written to "<path>.bin" as well: nt*6 raw
+   little-endian doubles, row-major, no header (np.fromfile(...).reshape(-1, 6)).  Both temporaries
+   are written and closed before either is renamed, so a failure while writing publishes neither;
+   only a failure BETWEEN the two renames can leave the text file without its companion.
+   Returns 0 on success, non-zero after printing a diagnostic. */
+static int moco_write_par(const char *path, const double *par, int nt, const char *fmt,
+                          int also_binary) {
+	char *tn = NULL, *bn = NULL, *btn = NULL;
+	FILE *f = moco_open_tmp(path, &tn), *bf = NULL;
+	int bad = 0;
+	if (!f) {
+		printfx("-moco: cannot write '%s'\n", path);
+		return 1;
+	}
+	if (also_binary) {
+		size_t plen = strlen(path);
+		if (plen > SIZE_MAX - 5 || !(bn = (char *)malloc(plen + 5))) {
+			printfx("-moco: out of memory\n");
+			bad = 1;
+		} else {
+			memcpy(bn, path, plen);
+			memcpy(bn + plen, ".bin", 5);
+			bf = moco_open_tmp(bn, &btn);
+			if (!bf) {
+				printfx("-moco: cannot write '%s'\n", bn);
+				bad = 1;
+			}
+		}
+	}
+	for (int t = 0; t < nt && !bad; t++) {
+		const double *p = par + (size_t)t * 6;
+		if (fprintf(f, fmt, p[0], p[1], p[2], p[3], p[4], p[5]) < 0) bad = 1;
+		if (bf) {
+			/* Serialize each double little-endian by hand rather than fwrite'ing the array, so
+			   the file has ONE documented byte order on every platform niimath builds for. */
+			unsigned char buf[48];
+			for (int k = 0; k < 6; k++) {
+				uint64_t bits;
+				memcpy(&bits, &p[k], sizeof(bits));
+				for (int b = 0; b < 8; b++) buf[k * 8 + b] = (unsigned char)((bits >> (8 * b)) & 0xFF);
+			}
+			if (fwrite(buf, 1, sizeof(buf), bf) != sizeof(buf)) bad = 1;
+		}
+	}
+	if (fclose(f) != 0) bad = 1;
+	if (bf && fclose(bf) != 0) bad = 1;
+	if (!bad && moco_publish_tmp(tn, path)) bad = 1;
+	if (!bad && btn && moco_publish_tmp(btn, bn)) bad = 1;
+	if (bad) {
+		remove(tn);
+		if (btn) remove(btn);
+		printfx("-moco: failed writing '%s'\n", path);
+	}
+	free(tn); free(bn); free(btn);
+	return bad;
+}
+
+// ------------------------------------------------------------------ shared setup
+/* Validation, geometry and the finite-difference step sizes -- identical for every entry point,
+   so they live here rather than being restated (and drifting) in each.  Returns 0 on success. */
+static int moco_prepare(const nifti_image *nim, moco_geom *g, size_t *nvol_out,
+                        double vmm[3], double step[6], int *nt_out) {
 	if (!nim || nim->datatype != DT_FLOAT32 || !nim->data) {
 		printfx("-moco: internal error (expected float32 image)\n");
 		return 1;
@@ -673,22 +785,222 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		printfx("-moco requires a 4D image with more than one volume (got nt = %lld)\n", (long long)nt);
 		return 1;
 	}
+	g->dim[0] = nim->nx; g->dim[1] = nim->ny; g->dim[2] = nim->nz;
+	if (g->dim[0] < 1 || g->dim[1] < 1 || g->dim[2] < 1) {
+		printfx("-moco: degenerate spatial dimensions\n");
+		return 1;
+	}
+	if (moco_geom_init(nim, g)) {
+		printfx("-moco: singular voxel-to-world transform\n");
+		return 1;
+	}
+	// Derivative images of the base: central differences at MOCO_DELTA voxels.  The rotation
+	// step is the angle whose displacement at the largest in-plane radius equals MOCO_DELTA
+	// voxels, so all six columns of the normal equations carry comparable magnitude.
+	for (int i = 0; i < 3; i++) {
+		double s = 0.0;
+		for (int r = 0; r < 3; r++) s += g->idx2mm[r][i] * g->idx2mm[r][i];
+		vmm[i] = sqrt(s);
+	}
+	double dmm = MOCO_DELTA * (vmm[0] + vmm[1] + vmm[2]) / 3.0;
+	double ext[3];
+	for (int i = 0; i < 3; i++) ext[i] = 0.5 * (double)g->dim[i] * vmm[i];
+	double lever[3];                       // radius seen by roll(z), pitch(x), yaw(y)
+	lever[0] = sqrt(ext[0] * ext[0] + ext[1] * ext[1]);
+	lever[1] = sqrt(ext[1] * ext[1] + ext[2] * ext[2]);
+	lever[2] = sqrt(ext[0] * ext[0] + ext[2] * ext[2]);
+	for (int p = 0; p < 3; p++)
+		step[p] = (lever[p] > 1e-9) ? (dmm / lever[p]) * (180.0 / M_PI) : 1.0;
+	/* MEASURED from -verbose: d/dx, d/dy, d/dz use delta = 0.7 * the voxel size of that DICOM
+	   axis (1.96184 = 0.7*2.80263 and 1.96 = 0.7*2.8 on bold1), not 0.7 * the mean. */
+	double dvox[3] = {0, 0, 0};
+	for (int i = 0; i < 3; i++)
+		for (int j = 0; j < 3; j++) dvox[i] += fabs(g->idx2mm[i][j]);
+	step[3] = MOCO_DELTA * dvox[2];   /* dS -> DICOM z */
+	step[4] = MOCO_DELTA * dvox[0];   /* dL -> DICOM x */
+	step[5] = MOCO_DELTA * dvox[1];   /* dP -> DICOM y */
+	*nvol_out = (size_t)g->dim[0] * g->dim[1] * g->dim[2];
+	*nt_out = nt;
+	return 0;
+}
+
+/* Everything the fit needs that depends only on the BASE volume: the registration weight, the six
+   derivative images and the (constant) normal equations.  In the ordinary mode this runs once; in
+   -relative mode it runs per volume, because there the base moves.
+   Returns 0 on success, 1 on allocation failure, 2 on a shear factorization failure. */
+static int moco_base_setup(const float *base, const moco_geom *g, const double vmm[3],
+                           const double step[6], size_t nvol, float *wt, float *deriv,
+                           double NE[6][6], float *pad, float *rowbuf, float *tmpA, float *tmpB) {
+	if (moco_weight(base, wt, g->dim, vmm)) return 1;
+	for (int p = 0; p < 6; p++) {
+		double pp[6] = {0, 0, 0, 0, 0, 0}, pm[6] = {0, 0, 0, 0, 0, 0};
+		pp[p] = step[p];
+		pm[p] = -step[p];
+		if (moco_warp(base, tmpA, g, pp, pad, rowbuf) ||
+		    moco_warp(base, tmpB, g, pm, pad, rowbuf)) return 2;
+		float *d = deriv + (size_t)p * nvol;
+		double inv = 1.0 / (2.0 * step[p]);
+		for (size_t i = 0; i < nvol; i++) d[i] = (float)(((double)tmpA[i] - (double)tmpB[i]) * inv);
+	}
+	// Normal equations are constant across iterations (derivatives are taken at identity).
+	for (int p = 0; p < 6; p++)
+		for (int q = p; q < 6; q++) {
+			const float *dp = deriv + (size_t)p * nvol, *dq = deriv + (size_t)q * nvol;
+			double s = 0.0;
+			for (size_t i = 0; i < nvol; i++) {
+				double w = (double)wt[i];
+				if (!(w > 0.0)) continue;
+				s += w * dp[i] * dq[i];
+			}
+			NE[p][q] = NE[q][p] = s;
+		}
+	return 0;
+}
+
+/* Fit one moving volume onto one base, given that base's weight/derivatives/normal equations.
+   Writes the fitted transform into Rtot/stot and returns 1 if at least one iteration produced a
+   usable step, 0 if none did (the caller reports those).  `lw`, `lpad` and `lrow` are caller-owned
+   scratch, so this is safe to call from several threads at once.  This is the measured estimator
+   -- both the ordinary and the -relative modes go through it, so they cannot drift apart. */
+static int moco_fit_one(const float *base, const float *mov, const moco_geom *g, const float *wt,
+                        const float *deriv, const double NE[6][6], size_t nvol,
+                        float *lw, float *lpad, float *lrow, mo33 Rtot, double stot[3]) {
+	/* Repeated linearization about IDENTITY: at every iteration the moving volume is
+	   resampled through the CURRENT total estimate and compared with the untouched base, so
+	   the derivative basis (taken once, at identity) is the correct basis at the point we
+	   linearize about, and the fixed point is the true optimum.  Warping the base forward
+	   instead leaves a stale basis and converges ~7% short on every parameter. */
+	mo33 Rbest;
+	double sbest[3] = {0, 0, 0};
+	m_ident(Rtot);
+	m_ident(Rbest);
+	stot[0] = stot[1] = stot[2] = 0.0;
+	/* Gauss-Newton with a fixed basis can take a step that makes things worse when the
+	   linear model is a poor fit (small or near-degenerate volumes).  Keep the best estimate
+	   seen and abandon the iteration the first time the weighted cost rises, rather than
+	   letting it run away -- an unguarded loop reached 806 mm of "translation" on a 40 mm
+	   deep synthetic volume while still exiting 0. */
+	int fitted = 0;            /* did any iteration produce a usable step? */
+	double best_cost = -1.0;   /* minimum cost seen, with Rbest/sbest its transform */
+	double prev_cost = -1.0;   /* previous iteration's cost, for the rise test */
+	for (int it = 0; it < MOCO_MAXITE; it++) {
+		mo33 Rinv;
+		double sinv[3];
+		moco_invert(Rtot, stot, Rinv, sinv);
+		if (moco_warp_rs(mov, lw, g, Rinv, sinv, lpad, lrow)) break;
+		/* MEASURED: the reference fits a seventh parameter, an intensity SCALE between the
+		   base and the moving volume (the leading number on its -verbose "First fit" lines:
+		   0.992952 where the measured brightness ratio is 0.9929, 0.862325 where it is
+		   0.8679).  Without it, a run whose volumes are dimmer than the base -- bold3 is 13%
+		   dimmer -- fits the brightness difference into the motion parameters.  The scale is
+		   linear given the transform, so profile it out in closed form (variable projection)
+		   rather than carrying a 7th column: for fixed `a` this IS the exact optimum. */
+		double sxy = 0.0, sxx = 0.0;
+		for (size_t i = 0; i < nvol; i++) {
+			/* Skip zero-weight voxels rather than multiplying by 0.0: 0.0 * NaN is NaN, so a
+			   single non-finite voxel anywhere -- including the >=21% that the edging border
+			   and MOCO_WCLIP have already excluded -- would poison the whole sum and silently
+			   abandon the fit for every volume. */
+			double w = (double)wt[i];
+			if (!(w > 0.0)) continue;
+			double m = (double)lw[i];
+			sxy += w * (double)base[i] * m;
+			sxx += w * m * m;
+		}
+		/* No information in the weighted region (an all-zero or dropped frame, or a transform
+		   that pushed the data out of the FOV): substituting gfac = 1 makes every iteration
+		   identical, so neither the divergence guard nor the convergence test can fire and 23
+		   identical steps compose into fabricated motion (measured: 16.6 deg of roll for a
+		   volume containing no data).  Also reject an absurd or non-positive scale, which is
+		   what a contrast-inverted or dropout frame produces. */
+		if (!(sxx > 1e-30 * (1.0 + fabs(sxy)))) break;
+		double gfac = sxy / sxx;
+		if (!(gfac > 0.125 && gfac < 8.0)) break;
+		double cost = 0.0;
+		for (size_t i = 0; i < nvol; i++) {
+			double w = (double)wt[i];
+			if (!(w > 0.0)) continue;
+			double r = (double)base[i] - gfac * (double)lw[i];
+			cost += w * r * r;
+		}
+		if (!(cost >= 0.0)) break;                       /* non-finite: keep the last good */
+		/* Only a CLEAR rise counts as divergence.  Near convergence the cost routinely
+		   ticks up slightly without the step being bad, and reverting there costs real
+		   accuracy (measured: a 1e-6 tolerance took max rotation error from 0.0086 to
+		   0.0703 deg on the reference run, while MOCO_COST_RISE bounds the pathological
+		   case just as well). */
+		if (prev_cost >= 0.0 && cost > prev_cost * (1.0 + MOCO_COST_RISE)) {
+			/* Diverging: fall back to the MINIMUM-cost transform seen, which is not
+			   necessarily the immediately preceding one -- several sub-threshold rises can
+			   accumulate before a rejection. */
+			memcpy(Rtot, Rbest, sizeof(mo33));
+			memcpy(stot, sbest, sizeof(sbest));
+			break;
+		}
+		prev_cost = cost;
+		if (best_cost < 0.0 || cost < best_cost) {
+			best_cost = cost;
+			memcpy(Rbest, Rtot, sizeof(mo33));
+			memcpy(sbest, stot, sizeof(sbest));
+		}
+		double b[6];
+		for (int p = 0; p < 6; p++) {
+			const float *dp = deriv + (size_t)p * nvol;
+			double sum = 0.0;
+			for (size_t i = 0; i < nvol; i++) {
+				double w = (double)wt[i];
+				if (!(w > 0.0)) continue;
+				sum += w * dp[i] * ((double)base[i] - gfac * (double)lw[i]);
+			}
+			b[p] = -sum;
+		}
+		double dx[6];
+		if (chol6(NE, b, dx)) break;
+		int wild = 0;
+		for (int p = 0; p < 6; p++)
+			if (!(fabs(dx[p]) < 1.0e6)) wild = 1;   /* non-finite or divergent */
+		if (wild) break;
+		fitted = 1;
+		mo33 Rd;
+		moco_rot(dx[0], dx[1], dx[2], Rd);
+		double sd[3] = {dx[4], dx[5], dx[3]};
+		moco_compose(Rd, sd, Rtot, stot, Rtot, stot);
+		double dr = fabs(dx[0]) > fabs(dx[1]) ? fabs(dx[0]) : fabs(dx[1]);
+		if (fabs(dx[2]) > dr) dr = fabs(dx[2]);
+		/* dx[3..5] are (dS, dL, dP) = DICOM (z, x, y); the storage axes may also be
+		   permuted, so convert the step to VOXELS through mm2idx rather than dividing by
+		   vmm[p-3], which silently pairs dS with the x voxel size. */
+		double dstep_mm[3] = {dx[4], dx[5], dx[3]};
+		double dstep_vox[3];
+		m_vec(g->mm2idx, dstep_mm, dstep_vox);
+		double dtv = 0.0;
+		for (int p = 0; p < 3; p++) {
+			double v = fabs(dstep_vox[p]);
+			if (v > dtv) dtv = v;
+		}
+		if (dtv < MOCO_XTHRESH && dr < MOCO_RTHRESH) break;
+	}
+	/* MEASURED: do NOT substitute the minimum-cost transform here.  Cost is evaluated at
+	   the START of each iteration, so best_cost lags one step behind, and at convergence the
+	   final (unscored) step is genuinely better -- selecting the minimum instead moved
+	   rotation p95 from 0.0067 to 0.0099 deg and max from 0.0086 to 0.0703 against the
+	   oracle.  Rbest/sbest are a DIVERGENCE BACKSTOP, not a minimum-cost selector: they are
+	   restored only when the cost rises by more than MOCO_COST_RISE. */
+	return fitted;
+}
+
+// ------------------------------------------------------------------ entry point
+int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file) {
+	moco_geom g;
+	size_t nvol;
+	double vmm[3], step[6];
+	int nt;
+	if (moco_prepare(nim, &g, &nvol, vmm, step, &nt)) return 1;
 	if (!ref_file && (ref_vol < 0 || ref_vol >= nt)) {
 		printfx("-moco -ref %d is outside the input series (it has %lld volumes, 0..%lld)\n",
 		        ref_vol, (long long)nt, (long long)(nt - 1));
 		return 1;
 	}
-	moco_geom g;
-	g.dim[0] = nim->nx; g.dim[1] = nim->ny; g.dim[2] = nim->nz;
-	if (g.dim[0] < 1 || g.dim[1] < 1 || g.dim[2] < 1) {
-		printfx("-moco: degenerate spatial dimensions\n");
-		return 1;
-	}
-	if (moco_geom_init(nim, &g)) {
-		printfx("-moco: singular voxel-to-world transform\n");
-		return 1;
-	}
-	size_t nvol = (size_t)g.dim[0] * g.dim[1] * g.dim[2];
 	/* wasm32 is a 32-bit size_t and the huge gate only bounds the VOXEL count, so these
 	   products must be checked before they reach malloc (AGENTS.md: callers pre-compute
 	   overflow-prone products with nii_mul_size). */
@@ -743,66 +1055,16 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		goto done;
 	}
 
-	// Derivative images of the base: central differences at MOCO_DELTA voxels.  The rotation
-	// step is the angle whose displacement at the largest in-plane radius equals MOCO_DELTA
-	// voxels, so all six columns of the normal equations carry comparable magnitude.
-	double vmm[3] = {0, 0, 0};
-	for (int i = 0; i < 3; i++) {
-		double s = 0.0;
-		for (int r = 0; r < 3; r++) s += g.idx2mm[r][i] * g.idx2mm[r][i];
-		vmm[i] = sqrt(s);
-	}
-	double dmm = MOCO_DELTA * (vmm[0] + vmm[1] + vmm[2]) / 3.0;
-	double ext[3];
-	for (int i = 0; i < 3; i++) ext[i] = 0.5 * (double)g.dim[i] * vmm[i];
-	double lever[3];                       // radius seen by roll(z), pitch(x), yaw(y)
-	lever[0] = sqrt(ext[0] * ext[0] + ext[1] * ext[1]);
-	lever[1] = sqrt(ext[1] * ext[1] + ext[2] * ext[2]);
-	lever[2] = sqrt(ext[0] * ext[0] + ext[2] * ext[2]);
-	double step[6];
-	for (int p = 0; p < 3; p++)
-		step[p] = (lever[p] > 1e-9) ? (dmm / lever[p]) * (180.0 / M_PI) : 1.0;
-	/* MEASURED from -verbose: d/dx, d/dy, d/dz use delta = 0.7 * the voxel size of that DICOM
-	   axis (1.96184 = 0.7*2.80263 and 1.96 = 0.7*2.8 on bold1), not 0.7 * the mean. */
-	double dvox[3] = {0, 0, 0};
-	for (int i = 0; i < 3; i++)
-		for (int j = 0; j < 3; j++) dvox[i] += fabs(g.idx2mm[i][j]);
-	step[3] = MOCO_DELTA * dvox[2];   /* dS -> DICOM z */
-	step[4] = MOCO_DELTA * dvox[0];   /* dL -> DICOM x */
-	step[5] = MOCO_DELTA * dvox[1];   /* dP -> DICOM y */
-
-	if (moco_weight(base, wt, g.dim, vmm)) {
-		printfx("-moco: out of memory building the registration weight\n");
-		rc = 1;
-		goto done;
-	}
-	for (int p = 0; p < 6 && !rc; p++) {
-		double pp[6] = {0, 0, 0, 0, 0, 0}, pm[6] = {0, 0, 0, 0, 0, 0};
-		pp[p] = step[p];
-		pm[p] = -step[p];
-		if (moco_warp(base, tmpA, &g, pp, pad, rowbuf) ||
-		    moco_warp(base, tmpB, &g, pm, pad, rowbuf)) { rc = 1; break; }
-		float *d = deriv + (size_t)p * nvol;
-		double inv = 1.0 / (2.0 * step[p]);
-		for (size_t i = 0; i < nvol; i++) d[i] = (float)(((double)tmpA[i] - (double)tmpB[i]) * inv);
-	}
-	if (rc) {
-		printfx("-moco: shear factorization failed while building derivatives\n");
-		goto done;
-	}
-	// Normal equations are constant across iterations (derivatives are taken at identity).
 	double NE[6][6];
-	for (int p = 0; p < 6; p++)
-		for (int q = p; q < 6; q++) {
-			const float *dp = deriv + (size_t)p * nvol, *dq = deriv + (size_t)q * nvol;
-			double s = 0.0;
-			for (size_t i = 0; i < nvol; i++) {
-				double w = (double)wt[i];
-				if (!(w > 0.0)) continue;
-				s += w * dp[i] * dq[i];
-			}
-			NE[p][q] = NE[q][p] = s;
+	{
+		int src = moco_base_setup(base, &g, vmm, step, nvol, wt, deriv, NE, pad, rowbuf, tmpA, tmpB);
+		if (src) {
+			printfx(src == 1 ? "-moco: out of memory building the registration weight\n"
+			                 : "-moco: shear factorization failed while building derivatives\n");
+			rc = 1;
+			goto done;
 		}
+	}
 	/* A base drawn from the series is copied through unchanged (and keeps its all-zero parameter
 	   row).  With an external reference there is no such sub-brick: the loop below writes every
 	   volume, so nothing is copied here. */
@@ -829,126 +1091,9 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 			continue;
 		}
 		const float *mov = img + (size_t)t * nvol;
-		/* Repeated linearization about IDENTITY: at every iteration the moving volume is
-		   resampled through the CURRENT total estimate and compared with the untouched base, so
-		   the derivative basis (taken once, at identity) is the correct basis at the point we
-		   linearize about, and the fixed point is the true optimum.  Warping the base forward
-		   instead leaves a stale basis and converges ~7% short on every parameter. */
-		mo33 Rtot, Rbest;
-		double stot[3] = {0, 0, 0}, sbest[3] = {0, 0, 0};
-		m_ident(Rtot);
-		m_ident(Rbest);
-		/* Gauss-Newton with a fixed basis can take a step that makes things worse when the
-		   linear model is a poor fit (small or near-degenerate volumes).  Keep the best estimate
-		   seen and abandon the iteration the first time the weighted cost rises, rather than
-		   letting it run away -- an unguarded loop reached 806 mm of "translation" on a 40 mm
-		   deep synthetic volume while still exiting 0. */
-		int fitted = 0;            /* did any iteration produce a usable step? */
-		double best_cost = -1.0;   /* minimum cost seen, with Rbest/sbest its transform */
-		double prev_cost = -1.0;   /* previous iteration's cost, for the rise test */
-		for (int it = 0; it < MOCO_MAXITE; it++) {
-			mo33 Rinv;
-			double sinv[3];
-			moco_invert(Rtot, stot, Rinv, sinv);
-			if (moco_warp_rs(mov, lw, &g, Rinv, sinv, lpad, lrow)) break;
-			/* MEASURED: the reference fits a seventh parameter, an intensity SCALE between the
-			   base and the moving volume (the leading number on its -verbose "First fit" lines:
-			   0.992952 where the measured brightness ratio is 0.9929, 0.862325 where it is
-			   0.8679).  Without it, a run whose volumes are dimmer than the base -- bold3 is 13%
-			   dimmer -- fits the brightness difference into the motion parameters.  The scale is
-			   linear given the transform, so profile it out in closed form (variable projection)
-			   rather than carrying a 7th column: for fixed `a` this IS the exact optimum. */
-			double sxy = 0.0, sxx = 0.0;
-			for (size_t i = 0; i < nvol; i++) {
-				/* Skip zero-weight voxels rather than multiplying by 0.0: 0.0 * NaN is NaN, so a
-				   single non-finite voxel anywhere -- including the >=21% that the edging border
-				   and MOCO_WCLIP have already excluded -- would poison the whole sum and silently
-				   abandon the fit for every volume. */
-				double w = (double)wt[i];
-				if (!(w > 0.0)) continue;
-				double m = (double)lw[i];
-				sxy += w * (double)base[i] * m;
-				sxx += w * m * m;
-			}
-			/* No information in the weighted region (an all-zero or dropped frame, or a transform
-			   that pushed the data out of the FOV): substituting gfac = 1 makes every iteration
-			   identical, so neither the divergence guard nor the convergence test can fire and 23
-			   identical steps compose into fabricated motion (measured: 16.6 deg of roll for a
-			   volume containing no data).  Also reject an absurd or non-positive scale, which is
-			   what a contrast-inverted or dropout frame produces. */
-			if (!(sxx > 1e-30 * (1.0 + fabs(sxy)))) break;
-			double gfac = sxy / sxx;
-			if (!(gfac > 0.125 && gfac < 8.0)) break;
-			double cost = 0.0;
-			for (size_t i = 0; i < nvol; i++) {
-				double w = (double)wt[i];
-				if (!(w > 0.0)) continue;
-				double r = (double)base[i] - gfac * (double)lw[i];
-				cost += w * r * r;
-			}
-			if (!(cost >= 0.0)) break;                       /* non-finite: keep the last good */
-			/* Only a CLEAR rise counts as divergence.  Near convergence the cost routinely
-			   ticks up slightly without the step being bad, and reverting there costs real
-			   accuracy (measured: a 1e-6 tolerance took max rotation error from 0.0086 to
-			   0.0703 deg on the reference run, while MOCO_COST_RISE bounds the pathological
-			   case just as well). */
-			if (prev_cost >= 0.0 && cost > prev_cost * (1.0 + MOCO_COST_RISE)) {
-				/* Diverging: fall back to the MINIMUM-cost transform seen, which is not
-				   necessarily the immediately preceding one -- several sub-threshold rises can
-				   accumulate before a rejection. */
-				memcpy(Rtot, Rbest, sizeof(mo33));
-				memcpy(stot, sbest, sizeof(stot));
-				break;
-			}
-			prev_cost = cost;
-			if (best_cost < 0.0 || cost < best_cost) {
-				best_cost = cost;
-				memcpy(Rbest, Rtot, sizeof(mo33));
-				memcpy(sbest, stot, sizeof(stot));
-			}
-			double b[6];
-			for (int p = 0; p < 6; p++) {
-				const float *dp = deriv + (size_t)p * nvol;
-				double sum = 0.0;
-				for (size_t i = 0; i < nvol; i++) {
-					double w = (double)wt[i];
-					if (!(w > 0.0)) continue;
-					sum += w * dp[i] * ((double)base[i] - gfac * (double)lw[i]);
-				}
-				b[p] = -sum;
-			}
-			double dx[6];
-			if (chol6(NE, b, dx)) break;
-			int wild = 0;
-			for (int p = 0; p < 6; p++)
-				if (!(fabs(dx[p]) < 1.0e6)) wild = 1;   /* non-finite or divergent */
-			if (wild) break;
-			fitted = 1;
-			mo33 Rd;
-			moco_rot(dx[0], dx[1], dx[2], Rd);
-			double sd[3] = {dx[4], dx[5], dx[3]};
-			moco_compose(Rd, sd, Rtot, stot, Rtot, stot);
-			double dr = fabs(dx[0]) > fabs(dx[1]) ? fabs(dx[0]) : fabs(dx[1]);
-			if (fabs(dx[2]) > dr) dr = fabs(dx[2]);
-			/* dx[3..5] are (dS, dL, dP) = DICOM (z, x, y); the storage axes may also be
-			   permuted, so convert the step to VOXELS through mm2idx rather than dividing by
-			   vmm[p-3], which silently pairs dS with the x voxel size. */
-			double dstep_mm[3] = {dx[4], dx[5], dx[3]};
-			double dstep_vox[3];
-			m_vec(g.mm2idx, dstep_mm, dstep_vox);
-			double dtv = 0.0;
-			for (int p = 0; p < 3; p++) {
-				double v = fabs(dstep_vox[p]);
-				if (v > dtv) dtv = v;
-			}
-			if (dtv < MOCO_XTHRESH && dr < MOCO_RTHRESH) break;
-		}
-		/* MEASURED: do NOT substitute the minimum-cost transform here.  Cost is evaluated at
-		   the START of each iteration, so best_cost lags one step behind, and at convergence the
-		   final (unscored) step is genuinely better -- selecting the minimum instead moved
-		   rotation p95 from 0.0067 to 0.0099 deg and max from 0.0086 to 0.0703 against the
-		   oracle.  Rbest/sbest are a DIVERGENCE BACKSTOP, not a minimum-cost selector: they are
-		   restored only when the cost rises by more than MOCO_COST_RISE. */
+		mo33 Rtot;
+		double stot[3];
+		int fitted = moco_fit_one(base, mov, &g, wt, deriv, NE, nvol, lw, lpad, lrow, Rtot, stot);
 		if (!fitted) {
 			/* Both updates are shared state written from every worker.  The counter is a plain
 			   increment, but `first_failed` is a read-compare-write that `omp atomic` cannot
@@ -1016,59 +1161,9 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		        "non-finite voxel or an empty frame is the usual cause.\n",
 		        nfit_failed, (long long)(nt - (base_idx >= 0 ? 1 : 0)), first_failed);
 	}
-	if (par_path) {
-		/* Write through a sibling temporary and rename, so a failed run cannot truncate or
-		   delete a parameter file the user already had at this path. */
-		size_t plen = strlen(par_path);
-		char *tmpname = (char *)malloc(plen + 32);   /* ".mocotmp" + pid digits + NUL */
-		if (!tmpname) {
-			printfx("-moco: out of memory\n");
-			rc = 1;
-			goto done;
-		}
-		/* O_EXCL never follows a pre-existing symlink and never truncates another writer's file.
-		   The name is exclusive rather than globally unique, so a crashed run plus PID reuse can
-		   leave a stale sibling; try a few suffixes before giving up. */
-		int fd = -1;
-		for (int attempt = 0; attempt < 8 && fd < 0; attempt++) {
-			snprintf(tmpname, plen + 32, "%s.mocotmp%ld_%d", par_path, (long)getpid(), attempt);
-			/* O_BINARY (Windows only) keeps the .1D byte-identical across platforms: without it
-			   the CRT translates every '\n' this file writes into "\r\n". */
-#ifdef _WIN32
-			fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0600);
-#else
-			fd = open(tmpname, O_WRONLY | O_CREAT | O_EXCL, 0600);
-#endif
-		}
-		FILE *f = (fd < 0) ? NULL : fdopen(fd, "wb");
-		if (!f) {
-			if (fd >= 0) { close(fd); remove(tmpname); }
-			printfx("-moco: cannot write '%s'\n", par_path);
-			free(tmpname);
-			rc = 1;
-			goto done;
-		}
-		int bad = 0;
-		for (int t = 0; t < nt; t++) {
-			const double *p = par + (size_t)t * 6;
-			if (fprintf(f, "%8.4f %8.4f %8.4f %8.4f %8.4f %8.4f\n",
-			            p[0], p[1], p[2], p[3], p[4], p[5]) < 0) { bad = 1; break; }
-		}
-		if (fclose(f) != 0) bad = 1;
-#ifdef _WIN32
-		/* The Windows CRT's rename() fails when the destination exists, which would break every
-		   re-run that overwrites an existing -1Dfile. */
-		if (!bad) remove(par_path);
-#endif
-		if (!bad && rename(tmpname, par_path) != 0) bad = 1;
-		if (bad) {
-			remove(tmpname);
-			printfx("-moco: failed writing '%s'\n", par_path);
-			free(tmpname);
-			rc = 1;
-			goto done;
-		}
-		free(tmpname);
+	if (par_path && moco_write_par(par_path, par, nt, MOCO_PAR_FMT, 0)) {
+		rc = 1;
+		goto done;
 	}
 	free(nim->data);
 	nim->data = out;
@@ -1078,5 +1173,133 @@ done:
 	free(deriv); free(pad); free(rowbuf); free(tmpA); free(tmpB);
 	free(wt); free(out); free(par);
 	nifti_image_free(ref);
+	return rc;
+}
+
+// ------------------------------------------------------------------ -relative (QC) entry point
+int nii_moco_relative(nifti_image *nim, const char *rel_path) {
+	moco_geom g;
+	size_t nvol;
+	double vmm[3], step[6];
+	int nt;
+	if (!rel_path) {
+		printfx("-moco: internal error (-relative without a path)\n");
+		return 1;
+	}
+	if (moco_prepare(nim, &g, &nvol, vmm, step, &nt)) return 1;
+	size_t nb_vol, nb_deriv, nb_pad, nb_row;
+	int mx = g.pdim[0] > g.pdim[1] ? g.pdim[0] : g.pdim[1];
+	if (g.pdim[2] > mx) mx = g.pdim[2];
+	if (nii_mul_size(nvol, sizeof(float), &nb_vol) ||
+	    nii_mul_size(nvol, 6 * sizeof(float), &nb_deriv) ||
+	    nii_mul_size(g.pn, sizeof(float), &nb_pad) ||
+	    nii_mul_size((size_t)mx, 2 * sizeof(float), &nb_row)) {
+		printfx("-moco: image too large for this build\n");
+		return 1;
+	}
+	double *par = (double *)calloc((size_t)nt * 6, sizeof(double));
+	if (!par) {
+		printfx("-moco: out of memory\n");
+		return 1;
+	}
+	const float *img = (const float *)nim->data;
+	/* Volume 0 has no predecessor: its row stays the all-zero row calloc gave it, matching how the
+	   ordinary mode reports its own base. */
+	int worker_oom = 0, worker_fail = 0, nfit_failed = 0, first_failed = -1;
+#ifdef _OPENMP
+	#pragma omp parallel for schedule(dynamic) if (nt > 3)
+#endif
+	for (int t = 1; t < nt; t++) {
+		/* Every buffer is per-worker here, not shared as in the ordinary mode: the base moves with
+		   t, so the weight, the six derivative images and the normal equations are rebuilt for each
+		   pair.  That is what makes this mode roughly an order of magnitude more work per volume --
+		   and what keeps the pairs independent, so the loop stays parallel and thread-count
+		   invariant.  `pad`/`rowbuf` are reused by the fit once the setup that filled them is
+		   done, which is safe because the two phases never overlap. */
+		float *wt = (float *)malloc(nb_vol);
+		float *deriv = (float *)malloc(nb_deriv);
+		float *pad = (float *)malloc(nb_pad);
+		float *rowbuf = (float *)malloc(nb_row);
+		float *tmpA = (float *)malloc(nb_vol);
+		float *tmpB = (float *)malloc(nb_vol);
+		float *lw = (float *)malloc(nb_vol);
+		if (!wt || !deriv || !pad || !rowbuf || !tmpA || !tmpB || !lw) {
+#ifdef _OPENMP
+			#pragma omp atomic write
+#endif
+			worker_oom = 1;
+		} else {
+			/* Fit against the ORIGINAL predecessor, never a corrected one: that keeps every pair
+			   independent (parallel, thread-count invariant) and makes the numbers raw
+			   frame-to-frame motion rather than residual drift after correction. */
+			const float *base = img + (size_t)(t - 1) * nvol;
+			const float *mov = img + (size_t)t * nvol;
+			double NE[6][6];
+			int src = moco_base_setup(base, &g, vmm, step, nvol, wt, deriv, NE, pad, rowbuf, tmpA, tmpB);
+			if (src == 1) {
+#ifdef _OPENMP
+				#pragma omp atomic write
+#endif
+				worker_oom = 1;
+			} else if (src) {
+#ifdef _OPENMP
+				#pragma omp atomic write
+#endif
+				worker_fail = 1;
+			} else {
+				mo33 Rtot;
+				double stot[3];
+				int fitted = moco_fit_one(base, mov, &g, wt, deriv, NE, nvol, lw, pad, rowbuf, Rtot, stot);
+				if (!fitted) {
+					/* `first_failed` is a read-compare-write that `omp atomic` cannot express, so
+					   it needs a critical section; an unguarded minimum is a data race that can
+					   name the wrong volume in the diagnostic below. */
+#ifdef _OPENMP
+					#pragma omp atomic update
+#endif
+					nfit_failed++;
+#ifdef _OPENMP
+					#pragma omp critical(moco_first_failed)
+#endif
+					{
+						if (first_failed < 0 || t < first_failed) first_failed = t;
+					}
+				}
+				/* Same convention as the ordinary mode (manifest 3.2): the row records the
+				   CORRECTION that maps this sub-brick back onto its base -- here the PREVIOUS
+				   volume -- i.e. the INVERSE of the fitted motion, extracted from the inverse
+				   transform rather than by negating the parameters, which would only agree to
+				   first order. */
+				mo33 Rinv;
+				double sinv[3], roll, pitch, yaw;
+				moco_invert(Rtot, stot, Rinv, sinv);
+				moco_unrot(Rinv, &roll, &pitch, &yaw);
+				double *pr = par + (size_t)t * 6;
+				pr[0] = roll; pr[1] = pitch; pr[2] = yaw;
+				pr[3] = sinv[2]; pr[4] = sinv[0]; pr[5] = sinv[1];   /* dS, dL, dP */
+			}
+		}
+		free(wt); free(deriv); free(pad); free(rowbuf); free(tmpA); free(tmpB); free(lw);
+	}
+	int rc = 0;
+	if (worker_oom) {
+		printfx("-moco -relative: out of memory measuring one or more volume pairs\n");
+		rc = 1;
+	} else if (worker_fail) {
+		printfx("-moco -relative: shear factorization failed while building derivatives\n");
+		rc = 1;
+	}
+	if (!rc && nfit_failed > 0) {
+		/* Name a frame: a bare count cannot be told apart from genuinely motionless pairs, and a
+		   pipeline thresholding these columns would treat a failed fit as "no motion". */
+		printfx("-moco -relative: warning - the fit produced no step for %d of %lld volume pairs "
+		        "(first: volume %d); they are reported as zero motion. A non-finite voxel or an "
+		        "empty frame is the usual cause.\n",
+		        nfit_failed, (long long)(nt - 1), first_failed);
+	}
+	/* The image is deliberately untouched: -relative is a measurement pass, so `nim` passes through
+	   to niimath's output stage exactly as it arrived. */
+	if (!rc && moco_write_par(rel_path, par, nt, MOCO_REL_FMT, 1)) rc = 1;
+	free(par);
 	return rc;
 }

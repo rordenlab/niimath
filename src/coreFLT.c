@@ -7028,12 +7028,24 @@ staticx int moco_volume_index(const char *s, int *out) {
 /* -moco [-ref <n|image>] [-1Dfile <path>]: rigid-body motion correction of a 4D series.
    The optional "-ref <arg>" and "-1Dfile <path>" pairs are consumed here in either order; the
    trailing positional output name is left to niimath's normal output handling. */
-staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
+                            const char *fout, int *no_image_out) {
 #ifdef DT32
 	int ac = *pac;
 	const char *par = NULL, *ref_file = NULL;
-	int ref_vol = 0, seen_par = 0, seen_ref = 0;
+	int ref_vol = 0, seen_par = 0, seen_ref = 0, rel = 0;
 	while (ac < argc) {
+		if (!strcmp(argv[ac], "-relative")) {
+			/* A FLAG, not a path: -relative produces no image, so the trailing positional that
+			   niimath would otherwise write the corrected series to is its parameter file. */
+			if (rel) {
+				printfx("-moco -relative given more than once\n");
+				return 1;
+			}
+			rel = 1;
+			ac += 1;
+			continue;
+		}
 		if (!strcmp(argv[ac], "-1Dfile")) {
 			if (seen_par) {
 				printfx("-moco -1Dfile given more than once\n");
@@ -7078,13 +7090,44 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) 
 		break;
 	}
 	*pac = ac;
+	/* -relative is a measurement-only mode that registers each volume onto its PREDECESSOR, so
+	   there is no base and no base-relative fit: rejecting the options that presuppose one is
+	   clearer than silently ignoring them (the project's parse-time rejection rule). */
+	if (rel) {
+		if (seen_ref) {
+			printfx("-moco -relative registers each volume onto the previous one, so -ref does not apply\n");
+			return 1;
+		}
+		if (par) {
+			printfx("-moco -relative does not perform the reference-based fit that -1Dfile reports; "
+			        "run them as two separate -moco commands if you want both\n");
+			return 1;
+		}
+		/* The measurement is the whole point of this run, so the trailing name is the parameter
+		   file and no image is written.  Requiring the .1D suffix keeps that unambiguous: it is
+		   the one extension niimath never writes an image to, so a user who typed an image name
+		   by mistake is told rather than handed a .1D called out.nii.gz. */
+		size_t n = fout ? strlen(fout) : 0;
+		if (n < 3 || strcmp(fout + n - 3, ".1D")) {
+			printfx("-moco -relative measures motion and writes no image, so the output name is its "
+			        "parameter file and must end in '.1D' (got '%s')\n", fout ? fout : "");
+			return 1;
+		}
+		*no_image_out = 1;   /* suppress the image write for the whole run */
+		return nii_moco_relative(nim, fout);
+	}
 	/* Header-only rejection of an oversized reference, before its payload is read. */
 	if (ref_file && nii_reject_oversize_aux(ref_file, "moco reference")) return 1;
 	return nii_moco(nim, par, ref_vol, ref_file);
 #else
 	(void)nim;
+	(void)fout; (void)no_image_out;
 	int ac = *pac;
-	while (ac + 1 < argc && (!strcmp(argv[ac], "-1Dfile") || !strcmp(argv[ac], "-ref"))) ac += 2;
+	while (ac < argc) {
+		if (!strcmp(argv[ac], "-relative")) { ac += 1; continue; }
+		if (ac + 1 < argc && (!strcmp(argv[ac], "-1Dfile") || !strcmp(argv[ac], "-ref"))) { ac += 2; continue; }
+		break;
+	}
 	*pac = ac;
 	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
 	return 1;
@@ -7604,6 +7647,10 @@ int main64(int argc, char *argv[]) {
 	   are execution/output modifiers that leave the voxels untouched, yet they became first_op
 	   and wrongly disqualified the rescale (reproduced with `-gz 0` before -romeo). */
 	int nmutating = 0;
+	/* Set by an operation whose whole product is a sidecar file rather than an image (-moco
+	   -relative), so the trailing positional names that sidecar and the final image write is
+	   skipped instead of duplicating the input to disk. */
+	int no_image_out = 0;
 	int nkernel = 0; // number of voxels in kernel
 	int *kernel = NULL; // default 3x3x3 kernel is created lazily by the first kernel op
 	char *end = NULL;
@@ -8256,7 +8303,7 @@ int main64(int argc, char *argv[]) {
 #ifdef HAVE_MOCO
 		else if (!strcmp(argv[ac], "-moco")) {
 			ac++;
-			ok = nifti_moco_wrap(nim, &ac, argc, argv);
+			ok = nifti_moco_wrap(nim, &ac, argc, argv, fout, &no_image_out);
 			if (ok)
 				goto fail;
 			continue; // ac already advanced past any -1Dfile pair
@@ -8562,7 +8609,10 @@ int main64(int argc, char *argv[]) {
 	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
 		goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
 	// if we get here, write the output dataset
-	int save_rc = nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
+	/* An operation may have declared that this run produces no image (-moco -relative); its
+	   sidecar is already published, so writing a copy of the untouched input here would be pure
+	   waste -- gigabytes for a real 4D series. */
+	int save_rc = no_image_out ? 0 : nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
 	// and clean up memory
 	nifti_image_free(nim);
 	if (kernel != NULL)

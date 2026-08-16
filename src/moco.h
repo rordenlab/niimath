@@ -52,6 +52,28 @@ extern "C" {
 // Returns 0 on success, non-zero on failure.
 int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file);
 
+// -moco -relative: MEASUREMENT ONLY.  Fits every sub-brick t (1..nt-1) onto sub-brick t-1 and
+// writes those parameters; `nim` is NOT modified and NO image is written -- on the command line
+// `-relative` is a flag and the trailing positional that would otherwise name the output image is
+// `rel_path` (the caller enforces the `.1D` suffix and suppresses the image write).  The base of each
+// pair is the ORIGINAL predecessor, never a corrected one, which keeps the pairs independent (so
+// the loop is parallel and thread-count invariant) and makes the numbers raw frame-to-frame motion
+// rather than residual drift after correction.  Row 0 is all zeros: volume 0 has no predecessor.
+//
+// Two files are published, both through exclusive sibling temporaries renamed on success:
+//   * `path` -- text, nt rows of six %12.8f fields (roll pitch yaw dS dL dP), the same convention
+//     and column order as -1Dfile but at the precision the estimator actually carries;
+//   * `path` + ".bin" -- the same numbers as nt*6 raw little-endian float64, row-major, no header,
+//     so a reader is np.fromfile(path + ".bin").reshape(-1, 6).
+// Neither is published if writing fails; only a failure BETWEEN the two renames can leave the text
+// file without its companion.  Because the estimator is shared with nii_moco (moco_base_setup +
+// moco_fit_one), the two modes cannot drift apart.
+//
+// Rebuilding the weight, the six derivative images and the normal equations for every pair makes
+// this roughly an order of magnitude more work per volume than the ordinary mode.
+// Returns 0 on success, non-zero on failure.
+int nii_moco_relative(nifti_image *nim, const char *rel_path);
+
 #ifdef __cplusplus
 }
 #endif

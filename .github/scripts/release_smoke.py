@@ -2454,8 +2454,94 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     if run_niimath(exe, [str(src_path), "-moco", "-ref", "0", "-ref", "1", str(tmp / "moco_bad7.nii")]).returncode == 0:
         raise AssertionError("-moco accepted -ref twice")
 
+    # ---- -relative: volume-to-previous measurement pass ---------------------------------------
+    # Its own fixture, deeper along k than the one above and displaced by a single voxel. -relative
+    # makes a DISPLACED volume the base of the next pair, and a displaced base is only a rigid
+    # transform of its neighbour while the object stays clear of the FOV edge -- shift it into the
+    # boundary and the two volumes genuinely differ by more than any rigid motion, so the fit is
+    # right to refuse it and the closed form no longer holds. Steps are +1 then -1, so consecutive
+    # rows must SWAP SIGN: a reference-based run of the same series cannot produce that, which is
+    # what makes this fail loudly if -relative ever fell back to the ordinary mode.
+    rnz = 28
+    rvol0 = [0.0] * (nx * ny * rnz)
+    for z in range(rnz):
+        for y in range(ny):
+            for x in range(nx):
+                rvol0[x + y * nx + z * nx * ny] = cell(x, y, z)
+
+    def rshift(sh: int) -> list[float]:
+        v = [0.0] * (nx * ny * rnz)
+        for z in range(rnz):
+            src = z - sh
+            if 0 <= src < rnz:
+                base_i = src * nx * ny
+                v[z * nx * ny : (z + 1) * nx * ny] = rvol0[base_i : base_i + nx * ny]
+        return v
+
+    rel_src = tmp / "moco_rel_in.nii"
+    write_float32_nifti(rel_src, (nx, ny, rnz), rshift(0) + rshift(1) + rshift(0), nt=3)
+    # -relative writes no image, so the trailing name IS its parameter file
+    rel_par = tmp / "moco_rel.1D"
+    require_success(run_niimath(exe, [str(rel_src), "-moco", "-relative", str(rel_par)]), "-moco -relative")
+    rel_src_vals = read_float32_nifti(rel_src)
+    nt, shift = 3, 1
+    rrel = moco_rows(rel_par)
+    if len(rrel) != nt:
+        raise AssertionError("-moco -relative: expected %d rows, got %d" % (nt, len(rrel)))
+    if any(v != 0.0 for v in rrel[0]):
+        raise AssertionError("-moco -relative: volume 0 has no predecessor, its row must be zeros")
+    if abs(rrel[1][3] + float(shift)) > 0.20:
+        raise AssertionError("-moco -relative: volume 1 dS should be %.1f, got %.4f" % (-float(shift), rrel[1][3]))
+    if abs(rrel[2][3] - float(shift)) > 0.20:
+        raise AssertionError(
+            "-moco -relative: volume 2 returns to volume 0's position, so dS should be %.1f, got %.4f"
+            % (float(shift), rrel[2][3])
+        )
+    for row in rel_par.read_text().splitlines():
+        if len(row) != 77:  # six %12.8f fields plus five single spaces
+            raise AssertionError("-moco -relative: row is not 77 chars: %r" % row)
+        for f in range(6):
+            body = row[f * 13 : f * 13 + 12].strip()
+            if "." not in body or len(body.split(".")[1]) != 8:
+                raise AssertionError("-moco -relative: field %d is not %%12.8f: %r" % (f, row))
+            float(body)
+    # the float64 companion: nt*6 raw little-endian doubles, row-major, no header
+    rel_bin = Path(str(rel_par) + ".bin")
+    if not rel_bin.exists():
+        raise AssertionError("-moco -relative did not write the .bin companion")
+    raw = rel_bin.read_bytes()
+    if len(raw) != nt * 6 * 8:
+        raise AssertionError("-moco -relative: .bin is %d bytes, expected %d" % (len(raw), nt * 6 * 8))
+    packed = struct.unpack("<%dd" % (nt * 6), raw)
+    for t in range(nt):
+        for k in range(6):
+            if abs(packed[t * 6 + k] - rrel[t][k]) > 5e-9:
+                raise AssertionError(
+                    "-moco -relative: .bin disagrees with the text at row %d column %d: %r vs %r"
+                    % (t, k, packed[t * 6 + k], rrel[t][k])
+                )
+    # measurement only: no image may be produced at all, and the input must be untouched
+    for stray in (Path(str(rel_par) + ".nii"), Path(str(rel_par) + ".nii.gz")):
+        if stray.exists():
+            raise AssertionError("-moco -relative wrote an image (%s); it must write parameters only" % stray)
+    if read_float32_nifti(rel_src) != rel_src_vals:
+        raise AssertionError("-moco -relative modified its input")
+    # options that presuppose a reference are refused rather than ignored, and because the trailing
+    # name is the parameter file, an image name there is a mistake rather than a request
+    for extra, out_name, what in (
+        (["-ref", "1"], "moco_rel_z.1D", "-ref"),
+        (["-1Dfile", str(tmp / "moco_rel_x.1D")], "moco_rel_z.1D", "-1Dfile"),
+        (["-relative"], "moco_rel_z.1D", "a repeated -relative"),
+        ([], "moco_bad8.nii", "an image output name"),
+    ):
+        if run_niimath(
+            exe, [str(rel_src), "-moco", "-relative"] + extra + [str(tmp / out_name)]
+        ).returncode == 0:
+            raise AssertionError("-moco -relative accepted %s" % what)
+
     print("  -moco: parameter sign/axis/format, base passthrough, alignment, rotation+clipping,")
-    print("         -ref volume/external image + grid rejection, output separation,")
+    print("         -ref volume/external image + grid rejection, -relative pairwise QC +")
+    print("         float64 companion + passthrough, output separation,")
     print("         existing-file preservation and 3D/singleton rejection OK")
 
 

@@ -405,6 +405,10 @@ int show_help( void ) {
 	printf("                            external reference image (all-digit argument = volume number; use './7' for a\n");
 	printf("                            file named 7); an external reference must be on the input's voxel grid\n");
 	printf("                            -1Dfile <p.1D> writes six columns per volume: roll pitch yaw dS dL dP\n");
+	printf("                            -relative measures each volume against the PREVIOUS one instead (QC):\n");
+	printf("                            nothing is registered and NO image is written, so the output name is the\n");
+	printf("                            parameter file itself and must end in '.1D' (niimath bold -moco -relative rel.1D);\n");
+	printf("                            written at %%12.8f, plus a float64 companion at <out>.bin (nt*6 doubles, row-major)\n");
 	printf("                            the parameter filename must end in '.1D'\n");
 	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
 #else
