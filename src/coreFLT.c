@@ -7004,33 +7004,88 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 #endif // HAVE_MEDIC
 
 #ifdef HAVE_MOCO
-/* -moco [-1Dfile <path>]: rigid-body motion correction of a 4D series onto sub-brick 0.
-   The optional "-1Dfile <path>" pair is consumed here; the trailing positional output name is
-   left to niimath's normal output handling. */
+#ifdef DT32
+/* Does `s` name a sub-brick of the input rather than a file?  It does when every character is a
+   decimal digit: that keeps the test decidable without touching the filesystem, so "-ref 7" never
+   means one thing on a machine where a file called "7" exists and another where it does not.  A
+   file whose name IS all digits can still be passed as "./7".  Returns 1 and sets *out on a
+   digits-only string that fits an int, 0 for a filename, -1 for digits that overflow.  Parsed by
+   hand rather than with strtol so this needs no errno.h in a header-sensitive translation unit. */
+staticx int moco_volume_index(const char *s, int *out) {
+	if (!s || !*s) return 0;
+	long long v = 0;
+	for (const char *p = s; *p; p++) {
+		if (*p < '0' || *p > '9') return 0;
+		if (v > (long long)INT_MAX / 10) return -1;
+		v = v * 10 + (*p - '0');
+		if (v > (long long)INT_MAX) return -1;
+	}
+	*out = (int)v;
+	return 1;
+}
+#endif // DT32
+
+/* -moco [-ref <n|image>] [-1Dfile <path>]: rigid-body motion correction of a 4D series.
+   The optional "-ref <arg>" and "-1Dfile <path>" pairs are consumed here in either order; the
+   trailing positional output name is left to niimath's normal output handling. */
 staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
 #ifdef DT32
 	int ac = *pac;
-	const char *par = NULL;
-	if (ac < argc && !strcmp(argv[ac], "-1Dfile")) {
-		if (ac + 1 >= argc) {
-			printfx("-moco -1Dfile requires a filename\n");
-			return 1;
+	const char *par = NULL, *ref_file = NULL;
+	int ref_vol = 0, seen_par = 0, seen_ref = 0;
+	while (ac < argc) {
+		if (!strcmp(argv[ac], "-1Dfile")) {
+			if (seen_par) {
+				printfx("-moco -1Dfile given more than once\n");
+				return 1;
+			}
+			if (ac + 1 >= argc) {
+				printfx("-moco -1Dfile requires a filename\n");
+				return 1;
+			}
+			par = argv[ac + 1];
+			size_t n = strlen(par);
+			/* Supported NIfTI outputs never end in .1D. Keeping the namespaces disjoint is clearer
+			   than guessing the writer's eventual extension, compression, or paired member here. */
+			if (n < 3 || strcmp(par + n - 3, ".1D")) {
+				printfx("-moco -1Dfile requires a filename ending in '.1D'\n");
+				return 1;
+			}
+			seen_par = 1;
+			ac += 2;
+			continue;
 		}
-		par = argv[ac + 1];
-		size_t n = strlen(par);
-		/* Supported NIfTI outputs never end in .1D. Keeping the namespaces disjoint is clearer
-		   than guessing the writer's eventual extension, compression, or paired member here. */
-		if (n < 3 || strcmp(par + n - 3, ".1D")) {
-			printfx("-moco -1Dfile requires a filename ending in '.1D'\n");
-			return 1;
+		if (!strcmp(argv[ac], "-ref")) {
+			if (seen_ref) {
+				printfx("-moco -ref given more than once\n");
+				return 1;
+			}
+			if (ac + 1 >= argc) {
+				printfx("-moco -ref requires a volume number or a reference image\n");
+				return 1;
+			}
+			const char *a = argv[ac + 1];
+			int isnum = moco_volume_index(a, &ref_vol);   /* range against nt: checked in nii_moco */
+			if (isnum < 0) {
+				printfx("-moco -ref '%s' is not a usable volume number\n", a);
+				return 1;
+			}
+			if (!isnum) ref_file = a;
+			seen_ref = 1;
+			ac += 2;
+			continue;
 		}
-		ac += 2;
+		break;
 	}
 	*pac = ac;
-	return nii_moco(nim, par);
+	/* Header-only rejection of an oversized reference, before its payload is read. */
+	if (ref_file && nii_reject_oversize_aux(ref_file, "moco reference")) return 1;
+	return nii_moco(nim, par, ref_vol, ref_file);
 #else
 	(void)nim;
-	if (*pac + 1 < argc && !strcmp(argv[*pac], "-1Dfile")) *pac += 2;
+	int ac = *pac;
+	while (ac + 1 < argc && (!strcmp(argv[ac], "-1Dfile") || !strcmp(argv[ac], "-ref"))) ac += 2;
+	*pac = ac;
 	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
 	return 1;
 #endif

@@ -574,8 +574,92 @@ static int moco_geom_init(const nifti_image *nim, moco_geom *g) {
 	return 0;
 }
 
+// ------------------------------------------------------------------ external reference image
+/* Read `fn` as a float32 image and check it can serve as the registration base for `nim`.
+   Returns the image (caller frees with nifti_image_free) or NULL after printing why.
+   -moco works entirely inside the input's voxel grid -- the four shear passes shift rows of that
+   grid -- so an external reference is usable only when it IS that grid.  Anything else would need
+   a resampling step whose interpolation is not part of the measured contract, and would leave the
+   .1D parameters referring to a grid the caller never supplied; reject instead of resampling. */
+static nifti_image *moco_read_ref(const char *fn, nifti_image *nim) {
+	{	/* Header-only preflight: reject a malformed or oversized reference BEFORE its payload is
+		   decompressed and allocated. */
+		nifti_image *h = nifti_image_read(fn, 0);
+		int bad = 0;
+		if (!h) {
+			printfx("-moco: failed to read the header of reference image '%s'\n", fn);
+			return NULL;
+		}
+		if (h->nvox < 1 || h->nx < 1 || h->ny < 1 || h->nz < 1) {
+			printfx("-moco: reference image '%s' has invalid dimensions\n", fn);
+			bad = 1;
+		} else if (h->nu > 1 || h->nv > 1 || h->nw > 1) {
+			printfx("-moco: reference image '%s' has more than 4 dimensions\n", fn);
+			bad = 1;
+		} else if ((int64_t)h->nvox > INT_MAX) {
+			printfx("-moco: reference image '%s' exceeds INT_MAX voxels; -moco is not a huge-image-safe operation\n", fn);
+			bad = 1;
+		}
+		nifti_image_free(h);
+		if (bad) return NULL;
+	}
+	nifti_image *ref = nifti_image_read(fn, 1);
+	if (!ref) {
+		printfx("-moco: failed to read reference image '%s'\n", fn);
+		return NULL;
+	}
+	/* Re-check after the load as well as before it: the preflight is what avoids decompressing a
+	   huge payload, this is the fail-closed guarantee if the file changed between the two reads. */
+	if (ref->nvox < 1 || ref->nx < 1 || ref->ny < 1 || ref->nz < 1 ||
+	    ref->nu > 1 || ref->nv > 1 || ref->nw > 1 || (int64_t)ref->nvox > INT_MAX) {
+		printfx("-moco: reference image '%s' changed on disk or has unusable dimensions\n", fn);
+		nifti_image_free(ref);
+		return NULL;
+	}
+	if (ref->nx != nim->nx || ref->ny != nim->ny || ref->nz != nim->nz) {
+		printfx("-moco: reference image '%s' is not on the same grid as the input "
+		        "(%lldx%lldx%lld vs %lldx%lldx%lld). -moco registers within the input voxel grid; "
+		        "reslice the reference onto the input first.\n",
+		        fn, (long long)ref->nx, (long long)ref->ny, (long long)ref->nz,
+		        (long long)nim->nx, (long long)nim->ny, (long long)nim->nz);
+		nifti_image_free(ref);
+		return NULL;
+	}
+	/* Same 0.001 mm corner-displacement gate --qc and --medic use for their own same-grid
+	   requirement: it covers rotation, scale, origin and xyz_units in one call. */
+	float disp = max_displacement_mm(ref, nim);
+	if (!(disp <= 0.001f)) {
+		printfx("-moco: reference image '%s' has the same dimensions as the input but a different "
+		        "voxel-to-world transform (corners differ by up to %g mm). -moco registers within "
+		        "the input voxel grid; reslice the reference onto the input first.\n",
+		        fn, (double)disp);
+		nifti_image_free(ref);
+		return NULL;
+	}
+	in_hdr ihdr = set_input_hdr(ref);
+	/* Convert when the stored type is not float32, but ALSO when it IS float32 and carries a
+	   non-trivial scl_slope/scl_inter -- otherwise a scaled float32 reference is used raw, which
+	   would bias the intensity scale the fit profiles out. */
+	if (ref->datatype != DT_FLOAT32 ||
+	    (ref->scl_slope != 0.0f && ref->scl_slope != 1.0f) || ref->scl_inter != 0.0f) {
+		if (nifti_image_change_datatype(ref, DT_FLOAT32, &ihdr) != 0) {
+			printfx("-moco: failed to convert reference image '%s' to float32\n", fn);
+			nifti_image_free(ref);
+			return NULL;
+		}
+	}
+	if (!ref->data) {
+		printfx("-moco: reference image '%s' has no voxel data\n", fn);
+		nifti_image_free(ref);
+		return NULL;
+	}
+	if ((ref->ndim > 3) && (ref->nt > 1))
+		printfx("-moco: reference image '%s' is 4D; using its volume 0\n", fn);
+	return ref;
+}
+
 // ------------------------------------------------------------------ entry point
-int nii_moco(nifti_image *nim, const char *par_path) {
+int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file) {
 	if (!nim || nim->datatype != DT_FLOAT32 || !nim->data) {
 		printfx("-moco: internal error (expected float32 image)\n");
 		return 1;
@@ -587,6 +671,11 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 	}
 	if (nim->ndim < 4 || nt < 2) {
 		printfx("-moco requires a 4D image with more than one volume (got nt = %lld)\n", (long long)nt);
+		return 1;
+	}
+	if (!ref_file && (ref_vol < 0 || ref_vol >= nt)) {
+		printfx("-moco -ref %d is outside the input series (it has %lld volumes, 0..%lld)\n",
+		        ref_vol, (long long)nt, (long long)(nt - 1));
 		return 1;
 	}
 	moco_geom g;
@@ -612,12 +701,11 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 		return 1;
 	}
 	const float *img = (const float *)nim->data;
-	const int base_idx = 0;
-	const float *base = img;
 
 	/* Every cleanup-owned pointer is declared and NULLed here, before any `goto done`, so the
 	   single cleanup block can never free an indeterminate pointer. */
 	int rc = 0;
+	nifti_image *ref = NULL;
 	float *wt = NULL, *out = NULL, *deriv = NULL, *pad = NULL;
 	float *rowbuf = NULL, *tmpA = NULL, *tmpB = NULL;
 	double *par = NULL;
@@ -628,9 +716,21 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 		printfx("-moco: image too large for this build\n");
 		return 1;
 	}
+	/* The registration base.  `base_idx` is the sub-brick of the INPUT that is the base and is
+	   therefore copied through unchanged with an all-zero parameter row; an external reference is
+	   not a sub-brick of the input, so it is -1 there and every volume gets registered. */
+	int base_idx = ref_file ? -1 : ref_vol;
+	const float *base;
+	if (ref_file) {
+		ref = moco_read_ref(ref_file, nim);
+		if (!ref) return 1;
+		base = (const float *)ref->data;
+	} else {
+		base = img + (size_t)base_idx * nvol;
+	}
 	wt = (float *)malloc(nb_vol);
-	out = (float *)malloc(nb_out);          /* every voxel is written below; see the memcpy of
-	                                           volume 0 and the per-volume writes */
+	out = (float *)malloc(nb_out);          /* every voxel is written below; see the memcpy of the
+	                                           base sub-brick and the per-volume writes */
 	par = (double *)calloc((size_t)nt * 6, sizeof(double));
 	deriv = (float *)malloc(nb_deriv);
 	pad = (float *)malloc(nb_pad);
@@ -703,7 +803,11 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 			}
 			NE[p][q] = NE[q][p] = s;
 		}
-	memcpy(out + (size_t)base_idx * nvol, base, nvol * sizeof(float));  // base copied unchanged
+	/* A base drawn from the series is copied through unchanged (and keeps its all-zero parameter
+	   row).  With an external reference there is no such sub-brick: the loop below writes every
+	   volume, so nothing is copied here. */
+	if (base_idx >= 0)
+		memcpy(out + (size_t)base_idx * nvol, base, nvol * sizeof(float));
 
 	/* A worker that cannot allocate MUST NOT leave its output volume unwritten: `out` would
 	   ship whatever was in it and -1Dfile would report "no motion" for that frame, at exit 0. */
@@ -910,7 +1014,7 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 		printfx("-moco: warning - the fit produced no step for %d of %lld volumes (first: volume "
 		        "%d); they are reported as zero motion and passed through uncorrected. A "
 		        "non-finite voxel or an empty frame is the usual cause.\n",
-		        nfit_failed, (long long)(nt - 1), first_failed);
+		        nfit_failed, (long long)(nt - (base_idx >= 0 ? 1 : 0)), first_failed);
 	}
 	if (par_path) {
 		/* Write through a sibling temporary and rename, so a failed run cannot truncate or
@@ -973,5 +1077,6 @@ int nii_moco(nifti_image *nim, const char *par_path) {
 done:
 	free(deriv); free(pad); free(rowbuf); free(tmpA); free(tmpB);
 	free(wt); free(out); free(par);
+	nifti_image_free(ref);
 	return rc;
 }

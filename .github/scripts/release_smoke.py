@@ -2347,8 +2347,116 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
             "-moco: rotation not corrected (interior sse %.4g after vs %.4g before)" % (num, den)
         )
 
+    # ---- -ref: a different sub-brick, or an external reference image ------------------------
+    # The fixture's volume 1 is volume 0 displaced by +shift voxels along k, so registering ONTO
+    # volume 1 has the same closed-form answer with the sign reversed.  What the checks pin:
+    # -ref 0 is byte-identical to the historical default; the chosen sub-brick (not volume 0) is
+    # the one copied through with a zero row; an external reference on the same grid gives the
+    # same parameters as naming that sub-brick; an all-digit argument is a volume number and never
+    # a filesystem probe; and a reference on any other grid is refused, never silently resliced.
+    def moco_rows(path: Path) -> list[list[float]]:
+        return [[float(v) for v in r.split()] for r in path.read_text().splitlines()]
+
+    ref0_par, ref0_out = tmp / "moco_ref0.1D", tmp / "moco_ref0.nii"
+    require_success(
+        run_niimath(exe, [str(src_path), "-moco", "-ref", "0", "-1Dfile", str(ref0_par), str(ref0_out)]),
+        "-moco -ref 0",
+    )
+    if ref0_par.read_bytes() != par_path.read_bytes():
+        raise AssertionError("-moco -ref 0 does not reproduce the default parameter file")
+    ref0_written = ref0_out if ref0_out.exists() else Path(str(ref0_out) + ".gz")
+    if ref0_written.suffix == ".gz":
+        ref0_plain = tmp / "moco_ref0_plain.nii"
+        require_success(run_niimath(exe, [str(ref0_written), "-gz", "0", str(ref0_plain)]), "-moco -ref 0 decompress")
+        ref0_written = ref0_plain
+    if read_float32_nifti(ref0_written) != vals:
+        raise AssertionError("-moco -ref 0 does not reproduce the default image")
+
+    # Volume 2 of the fixture is a second copy of volume 0, so "-ref 2" registers exactly what
+    # the default run did, from a different base index: volume 1 must get the SAME parameter row,
+    # volume 0 (identical data to the base) must get zeros, and volume 2 -- not volume 0 -- must
+    # be the one copied through.
+    ref2_par, ref2_out = tmp / "moco_ref2.1D", tmp / "moco_ref2.nii"
+    require_success(
+        run_niimath(exe, [str(src_path), "-moco", "-ref", "2", "-1Dfile", str(ref2_par), str(ref2_out)]),
+        "-moco -ref 2",
+    )
+    r2 = moco_rows(ref2_par)
+    if len(r2) != nt:
+        raise AssertionError("-moco -ref 2: expected %d rows, got %d" % (nt, len(r2)))
+    for k, v in enumerate(r2[2]):
+        if abs(v) > 1e-4:
+            raise AssertionError("-moco -ref 2: base row must be zeros, column %d is %g" % (k, v))
+    for k, v in enumerate(r2[0]):
+        if abs(v) > 1e-3:
+            raise AssertionError(
+                "-moco -ref 2: volume 0 duplicates the base, so it must report no motion; column %d is %g" % (k, v)
+            )
+    for k in range(6):
+        if abs(r2[1][k] - rows[1][k]) > 1e-3:
+            raise AssertionError(
+                "-moco -ref 2: volume 1 registered onto identical base data must match the default "
+                "run, column %d: %.4f vs %.4f" % (k, r2[1][k], rows[1][k])
+            )
+    ref2_written = ref2_out if ref2_out.exists() else Path(str(ref2_out) + ".gz")
+    if ref2_written.suffix == ".gz":
+        ref2_plain = tmp / "moco_ref2_plain.nii"
+        require_success(run_niimath(exe, [str(ref2_written), "-gz", "0", str(ref2_plain)]), "-moco -ref 2 decompress")
+        ref2_written = ref2_plain
+    ref2_vals = read_float32_nifti(ref2_written)
+    for i in range(n3):
+        if ref2_vals[2 * n3 + i] != src_vals[2 * n3 + i]:
+            raise AssertionError(
+                "-moco -ref 2: the chosen base volume must be copied through unchanged (voxel %d)" % i
+            )
+    before = 0.0
+    after = 0.0
+    for z in range(4, nz - 4):
+        for y in range(4, ny - 4):
+            for x in range(4, nx - 4):
+                i = x + y * nx + z * nx * ny
+                before += (src_vals[n3 + i] - src_vals[2 * n3 + i]) ** 2
+                after += (ref2_vals[n3 + i] - ref2_vals[2 * n3 + i]) ** 2
+    if not (after < before * 0.01):
+        raise AssertionError("-moco -ref 2: volume 1 was not aligned onto the chosen base")
+
+    # An external reference holding a copy of that base must behave the same way -- except that no
+    # sub-brick is special-cased, so every volume is registered and volume 2 gets a fitted row too.
+    ext_ref = tmp / "moco_ref_ext.nii"
+    write_float32_nifti(ext_ref, (nx, ny, nz), [float(v) for v in src_vals[2 * n3 : 3 * n3]])
+    ext_par, ext_out = tmp / "moco_ext.1D", tmp / "moco_ext.nii"
+    require_success(
+        run_niimath(exe, [str(src_path), "-moco", "-ref", str(ext_ref), "-1Dfile", str(ext_par), str(ext_out)]),
+        "-moco -ref <image>",
+    )
+    rext = moco_rows(ext_par)
+    if len(rext) != nt:
+        raise AssertionError("-moco -ref <image>: expected %d rows, got %d" % (nt, len(rext)))
+    for t in range(nt):
+        for k in range(6):
+            if abs(rext[t][k] - r2[t][k]) > 0.05:
+                raise AssertionError(
+                    "-moco -ref <image> disagrees with the equivalent -ref 2 at volume %d column %d: "
+                    "%.4f vs %.4f" % (t, k, rext[t][k], r2[t][k])
+                )
+
+    # rejections: an index past the end, and references that are not on the input's grid
+    if run_niimath(exe, [str(src_path), "-moco", "-ref", str(nt), str(tmp / "moco_bad4.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted -ref past the last volume")
+    small_ref = tmp / "moco_ref_small.nii"
+    write_float32_nifti(small_ref, (nx // 2, ny, nz), [0.0] * ((nx // 2) * ny * nz))
+    if run_niimath(exe, [str(src_path), "-moco", "-ref", str(small_ref), str(tmp / "moco_bad5.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted a reference image with different dimensions")
+    moved_ref = tmp / "moco_ref_moved.nii"
+    write_float32_nifti(moved_ref, (nx, ny, nz), [float(v) for v in src_vals[n3 : 2 * n3]], offset=(5.0, 0.0, 0.0))
+    if run_niimath(exe, [str(src_path), "-moco", "-ref", str(moved_ref), str(tmp / "moco_bad6.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted a reference image with a different voxel-to-world transform")
+    if run_niimath(exe, [str(src_path), "-moco", "-ref", "0", "-ref", "1", str(tmp / "moco_bad7.nii")]).returncode == 0:
+        raise AssertionError("-moco accepted -ref twice")
+
     print("  -moco: parameter sign/axis/format, base passthrough, alignment, rotation+clipping,")
-    print("         output separation, existing-file preservation and 3D/singleton rejection OK")
+    print("         -ref volume/external image + grid rejection, output separation,")
+    print("         existing-file preservation and 3D/singleton rejection OK")
 
 
 def _stc_reference(x: list[float], shift: int, nt: int) -> list[float]:

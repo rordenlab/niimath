@@ -20,12 +20,25 @@ extern "C" {
 
 #include "core.h"
 
-// -moco [-1Dfile <path>]: ordinary chain operation.  Registers every sub-brick of a 4D image
-// to sub-brick 0 and replaces `nim` with the corrected series.  `nim` must be float32 and 4D
-// with nt > 1.  When `par_path` is non-NULL the six motion parameters per sub-brick are written
-// there in AFNI `-1Dfile` format (roll pitch yaw dS dL dP).  The caller must supply a path ending
-// in `.1D`; that is enforced at parse time so the parameter file can never name a supported NIfTI
-// output and be silently replaced by the image writer.
+// -moco [-ref <n|image>] [-1Dfile <path>]: ordinary chain operation.  Registers every sub-brick
+// of a 4D image to a reference and replaces `nim` with the corrected series.  `nim` must be
+// float32 and 4D with nt > 1.  When `par_path` is non-NULL the six motion parameters per
+// sub-brick are written there in AFNI `-1Dfile` format (roll pitch yaw dS dL dP).  The caller
+// must supply a path ending in `.1D`; that is enforced at parse time so the parameter file can
+// never name a supported NIfTI output and be silently replaced by the image writer.
+//
+// The reference is chosen by exactly one of:
+//   * `ref_vol` >= 0 with `ref_file` NULL -- sub-brick `ref_vol` of the input series (0 is the
+//     historical default).  That sub-brick is copied through unchanged and its parameter row is
+//     all zeros, as it always has been for volume 0.
+//   * `ref_file` non-NULL -- an EXTERNAL reference image (`ref_vol` is ignored).  It must be on
+//     the same voxel grid as the input: identical nx/ny/nz and a voxel-to-world transform
+//     agreeing within 0.001 mm, the same gate --qc and --medic use.  -moco registers inside the
+//     input's own voxel grid, so a reference on any other grid cannot be honoured without a
+//     resampling step whose conventions are outside the measured contract; it is rejected with a
+//     diagnostic rather than silently resliced.  A 4D reference contributes its volume 0.  With
+//     an external reference NO sub-brick is copied through: every one of the nt volumes is
+//     registered and gets a non-zero parameter row.
 //
 // Failure behaviour, stated precisely because a chain operation cannot make the LATER image
 // write atomic by itself:
@@ -37,7 +50,7 @@ extern "C" {
 //     parameter file with no image.  Aliasing `par_path` with the input or the output image is
 //     rejected at parse time.
 // Returns 0 on success, non-zero on failure.
-int nii_moco(nifti_image *nim, const char *par_path);
+int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file);
 
 #ifdef __cplusplus
 }

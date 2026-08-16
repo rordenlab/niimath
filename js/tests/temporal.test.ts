@@ -221,4 +221,65 @@ describe('-moco in the WASM build', () => {
       ['in.nii', '-moco', '-gz', '0', 'out.nii'], 'out.nii');
     expect(r.exitCode).not.toBe(0);
   });
+
+  // -ref reads a SECOND file, which on wasm32 means an emscripten virtual-FS read rather than a
+  // real one, and it must be told apart from a volume number without touching that FS at all.
+  test('-ref accepts a volume number and an external reference image', async () => {
+    const { mod, log } = await loadModule(BSD_MODULE);
+    // volume 0 is displaced by +SHIFT along k; volumes 1 and 2 are the undisplaced object, so
+    // registering onto EITHER of them has the same known answer for volume 0.
+    const input = make4d(MX, MY, MZ, MT, (x, y, z, t) => {
+      const src = t === 0 ? z - SHIFT : z;
+      return src >= 0 && src < MZ ? cell(x, y, src) : 0;
+    }, 2.0);
+    const ref = make4d(MX, MY, MZ, 1, (x, y, z) => cell(x, y, z), 2.0);
+    const n3 = MX * MY * MZ;
+    const at = (buf: Uint8Array, i: number) =>
+      new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getFloat32(352 + i * 4, true);
+    const interiorRms = (a: Uint8Array, offA: number, b: Uint8Array, offB: number) => {
+      let tot = 0, cnt = 0;
+      for (let z = 4; z < MZ - 4; z++)
+        for (let y = 4; y < MY - 4; y++)
+          for (let x = 4; x < MX - 4; x++) {
+            const i = x + y * MX + z * MX * MY;
+            const d = at(a, offA + i) - at(b, offB + i);
+            tot += d * d; cnt++;
+          }
+      return Math.sqrt(tot / cnt);
+    };
+    const before = interiorRms(input, 0, input, n3);
+
+    // "-ref 1": volume 1 is the base, so IT is the sub-brick copied through -- not volume 0
+    const byIndex = await run(mod, log, [{ name: 'in.nii', data: input }],
+      ['in.nii', '-moco', '-ref', '1', '-gz', '0', 'out.nii'], 'out.nii');
+    expect(byIndex.exitCode).toBe(0);
+    expect(byIndex.output).not.toBeNull();
+    for (let v = 0; v < n3; v += 97)
+      expect(at(byIndex.output!, n3 + v)).toBe(at(input, n3 + v));
+    expect(interiorRms(byIndex.output!, 0, byIndex.output!, n3)).toBeLessThan(before * 0.1);
+
+    // "-ref ref.nii": the same base supplied as a SECOND file, read from the emscripten virtual
+    // filesystem. Same registration, so the same corrected volume 0.
+    const byFile = await run(mod, log,
+      [{ name: 'in.nii', data: input }, { name: 'ref.nii', data: ref }],
+      ['in.nii', '-moco', '-ref', 'ref.nii', '-gz', '0', 'out.nii'], 'out.nii');
+    expect(byFile.exitCode).toBe(0);
+    expect(byFile.output).not.toBeNull();
+    expect(interiorRms(byFile.output!, 0, ref, 0)).toBeLessThan(before * 0.1);
+    for (let v = 0; v < n3; v += 97)
+      expect(at(byFile.output!, v)).toBeCloseTo(at(byIndex.output!, v), 2);
+
+    // a volume number is decided by its digits, never by a filesystem probe, so an index past the
+    // end is refused even though a file called "9" does not exist either
+    const bad = await run(mod, log, [{ name: 'in.nii', data: input }],
+      ['in.nii', '-moco', '-ref', '9', '-gz', '0', 'out.nii'], 'out.nii');
+    expect(bad.exitCode).not.toBe(0);
+
+    // a reference on a different grid is rejected, not silently resliced
+    const small = make4d(MX / 2, MY, MZ, 1, () => 1, 2.0);
+    const mismatch = await run(mod, log,
+      [{ name: 'in.nii', data: input }, { name: 'small.nii', data: small }],
+      ['in.nii', '-moco', '-ref', 'small.nii', '-gz', '0', 'out.nii'], 'out.nii');
+    expect(mismatch.exitCode).not.toBe(0);
+  });
 });
