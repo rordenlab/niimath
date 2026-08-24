@@ -1724,14 +1724,19 @@ done:
  * it wrong on a `j-` acquisition doubles the distortion instead of correcting it.  Verified for
  * both polarities against the reference at displacement p95 0.045 mm (j) and 0.024 mm (j-). */
 static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold, int64_t *nunconv,
-	int allow_omp) {
+	int64_t *noob, int allow_omp) {
 	const int nx = c->nx, ny = c->ny, nz = c->nz;
 	const int m = c->pe_axis;
 	const int64_t n3 = c->n3;
 	const int64_t stride = (m == 0) ? 1 : ((m == 1) ? nx : (int64_t)nx * ny);
 	const int len = (m == 0) ? nx : ((m == 1) ? ny : nz);
 	int it, converged = 0;
-	int64_t i, folds = 0, slow = 0;
+	int64_t i, folds = 0, slow = 0, oobn = 0;
+	/* Which voxels ended up sampling the PAD -- i.e. their source position lies outside the field
+	   of view.  They are not folds and must not be counted as such: a fold is the forward map
+	   failing to be monotone, this is data that is simply not there. */
+	uint8_t *oob = (uint8_t *)calloc((size_t)n3, 1);
+	if (!oob) { MD_ERR("out of memory in the displacement inversion\n"); return 1; }
 #ifndef _OPENMP
 	(void)allow_omp;
 #endif
@@ -1760,14 +1765,26 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 				pos = (double)idx + (double)c->pe_sign * cur * c->trt;
 				if (!(pos >= -MD_POS_LIMIT && pos <= MD_POS_LIMIT)) pos = (double)idx;
 				if (len < 2) { fu[o] = fn[o]; continue; }   /* single slice along PE: nothing to interpolate */
-				if (pos < 0.0) pos = 0.0;
-				if (pos > (double)(len - 1)) pos = (double)(len - 1);
-				lo = (int)pos;
-				if (lo > len - 2) lo = (len > 1) ? len - 2 : 0;
-				frac = pos - (double)lo;
-				a = (double)fn[base + (int64_t)lo * stride];
-				b = (double)fn[base + (int64_t)((lo + 1 < len) ? lo + 1 : lo) * stride];
-				nv = a * (1.0 - frac) + b * frac;
+				/* ONE VOXEL OF ZERO PADDING at each end of the PE axis, cropped implicitly by
+				 * only ever writing in-FOV voxels (Gap 6, the one thing worth borrowing).
+				 *
+				 * This used to CLAMP the sample position to [0, len-1].  The inverse near an edge
+				 * is ill-posed in a specific way: a voxel at the FOV boundary can be the image of
+				 * a source position that genuinely lies OUTSIDE the field of view, and clamping
+				 * silently maps it to the nearest in-FOV value -- fabricating a plausible field
+				 * for a sample that does not exist, and biasing the last voxel or two of every
+				 * column along the phase-encode axis, precisely where large displacements push
+				 * data off the edge.  Reading zero there says "no data" instead, which is what
+				 * padding achieves and why it degrades gracefully. */
+				oob[o] = (uint8_t)(pos < 0.0 || pos > (double)(len - 1));
+				if (pos <= -1.0 || pos >= (double)len) { nv = 0.0; }
+				else {
+					lo = (int)floor(pos);        /* floor, NOT a cast: (int)(-0.3) is 0, not -1 */
+					frac = pos - (double)lo;
+					a = (lo < 0) ? 0.0 : (double)fn[base + (int64_t)lo * stride];
+					b = (lo + 1 >= len) ? 0.0 : (double)fn[base + (int64_t)(lo + 1) * stride];
+					nv = a * (1.0 - frac) + b * frac;
+				}
 				delta = fabs(nv - (double)fu[o]);
 				if (delta > worst) worst = delta;
 				if (last && delta > (double)MD_INVERT_TOL) slow++;
@@ -1790,14 +1807,18 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 				int idx = (m == 0) ? x : ((m == 1) ? y : z);
 				double dd;
 				if (idx + 1 >= len) continue;
+				if (oob[o] || oob[o + stride2]) continue;   /* out of FOV, not a fold */
 				dd = (double)c->pe_sign *
 					((double)fu[o + stride2] - (double)fu[o]) * c->trt;
 				if (dd <= -1.0) folds++;
 			}
 		}
 	}
+	for (i = 0; i < n3; i++) if (oob[i]) oobn++;
+	free(oob);
 	if (nfold) *nfold = folds;
 	if (nunconv) *nunconv = converged ? 0 : slow;
+	if (noob) *noob = oobn;
 	return converged ? 0 : 1;
 }
 
@@ -2043,7 +2064,8 @@ static void md_usage(void) {
 	printf("Outputs: <prefix>_fieldmaps_native (Hz, distorted grid), <prefix>_fieldmaps (Hz,\n");
 	printf("undistorted grid), <prefix>_displacementmaps (mm, pull map), all float32.\n\n");
 	printf("Emulates the MEDIC workflow of Van et al., Imaging Neuroscience 4 (2026),\n");
-	printf("doi:10.1162/IMAG.a.1262. Phase unwrapping is the MIT ROMEO port (Dymerska et al. 2020,\n");
+	printf("doi:10.1162/IMAG.a.1262. PLEASE CITE THAT PAPER if you use this implementation --\n");
+	printf("the method is theirs. Phase unwrapping is the MIT ROMEO port (Dymerska et al. 2020,\n");
 	printf("doi:10.1002/mrm.28563). Clean-room: developed from the paper and black-box measurement,\n");
 	printf("see test/medic_reference_manifest.md in the medic_bench repository.\n");
 }
@@ -2670,7 +2692,7 @@ int nii_medic(int argc, char *argv[]) {
 	/* ---- inversion and displacement ---------------------------------------------------------- */
 	{
 		double vox;
-		int64_t inv_folds = 0, inv_unconv = 0;
+		int64_t inv_folds = 0, inv_unconv = 0, inv_oob = 0;
 #ifdef _OPENMP
 		const int outer_par = frame_parallel;
 #else
@@ -2696,26 +2718,28 @@ int nii_medic(int argc, char *argv[]) {
 		 * accumulators use reductions either way, so diagnostics are exact and thread-count
 		 * independent. */
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) if (outer_par)
+		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) reduction(+:inv_oob) if (outer_par)
 #endif
 		for (t = 0; t < T; t++) {
-			int64_t q, nf = 0, nu = 0;
-			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu, !outer_par);
-			inv_folds += nf; inv_unconv += nu;
+			int64_t q, nf = 0, nu = 0, no = 0;
+			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu, &no, !outer_par);
+			inv_folds += nf; inv_unconv += nu; inv_oob += no;
 			for (q = 0; q < n3; q++)
 				disp[(int64_t)t * n3 + q] =
 					(float)(-(double)c.pe_sign * (double)fu[(int64_t)t * n3 + q] * c.trt * vox);
 		}
 		/* Report, do not hide: an unconverged frame or a folded region is exactly where this
 		   implementation and the reference disagree most. */
-		if (inv_unconv || inv_folds) {
+		if (inv_unconv || inv_folds || inv_oob) {
 			double tot = (double)n3 * T;
 			fprintf(stderr, "--medic: displacement inversion: %lld voxel(s) (%.3f%%) still moving "
 				"by >%g Hz after %d iterations; %lld folded adjacent pair(s) (%.3f%% of voxels) "
 				"mark columns where the forward map is not monotone, so the inverse is "
-				"multi-valued and the branch chosen is arbitrary\n",
+				"multi-valued and the branch chosen is arbitrary; %lld voxel(s) (%.3f%%) are the "
+				"image of a source position outside the field of view and read the zero pad\n",
 				(long long)inv_unconv, 100.0 * (double)inv_unconv / tot, (double)MD_INVERT_TOL,
-				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot);
+				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot,
+				(long long)inv_oob, 100.0 * (double)inv_oob / tot);
 		}
 	}
 
