@@ -377,16 +377,6 @@ ifneq ($(STCFLAGS),)
 	@$(CNAME) -O2 -std=gnu99 -I. -o stc_fft_selftest ../test/stc_fft_selftest.c -lm && ./stc_fft_selftest && rm -f stc_fft_selftest
 endif
 
-skullstrip-test:
-ifneq ($(SKULLSTRIPFLAGS),)
-	@$(CNAME) -O2 -std=gnu99 -I. -DHAVE_ZLIB -o skullstrip_selftest ../src/test_skullstrip_mesh.c skullstrip.c nifti_io.c -lz -lm && ./skullstrip_selftest > /dev/null && echo "  -skullstrip: surface primitive selftest OK" && rm -f skullstrip_selftest
-endif
-
-stc-test:
-ifneq ($(STCFLAGS),)
-	@$(CNAME) -O2 -std=gnu99 -I. -o stc_fft_selftest ../test/stc_fft_selftest.c -lm && ./stc_fft_selftest && rm -f stc_fft_selftest
-endif
-
 # The prebuilt registration objects are compiled with flags that depend on command-line
 # toggles (OMP=0, GPL=1, CNAME, feature flags), but make keys rebuilds on source timestamps
 # only. Without a flag dependency, `make` then `make OMP=0` reuses the OpenMP-compiled objects
