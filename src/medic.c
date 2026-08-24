@@ -974,7 +974,7 @@ static void md_apply_phase_scale(float *p, int64_t n, double mn, double mx) {
 static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int rank,
 	const uint8_t *masks, int border_rank, float fwhm) {
 	double *G = NULL, *V = NULL, *w = NULL, *P = NULL, *Pb = NULL;
-	float *vol = NULL, *B = NULL, *Bp = NULL;
+	float *vol = NULL, *den = NULL, *B = NULL, *Bp = NULL;
 	uint8_t *support = NULL;
 	int64_t *bidx = NULL;
 	int64_t v, nb = 0, nsup = 0;
@@ -1000,20 +1000,27 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 	P = (double *)malloc((size_t)T * T * sizeof(double));
 	Pb = (double *)malloc((size_t)T * T * sizeof(double));
 	vol = (float *)malloc((size_t)nvox * sizeof(float));
-	if (!support || !G || !V || !w || !P || !Pb || !vol) { MD_ERR("out of memory in the low-rank filter\n"); goto done; }
+	den = (float *)malloc((size_t)nvox * sizeof(float));
+	if (!support || !G || !V || !w || !P || !Pb || !vol || !den) { MD_ERR("out of memory in the low-rank filter\n"); goto done; }
 
-	/* Constant-support voxels, and the border index list. */
+	/* Constant-support voxels, and the border index list.  Tier membership is read from FRAME 0;
+	   tiers do move between frames, but only at the ring's own boundary, and a voxel that changes
+	   tier mid-run is also not constant-support. */
 	for (v = 0; v < nvox; v++) {
-		int all = 1, any = 0;
-		for (t = 0; t < T; t++) {
-			if (masks[(int64_t)t * nvox + v]) any = 1; else all = 0;
-		}
-		support[v] = (uint8_t)(all ? 1 : 0);
+		int all = 1;
+		for (t = 0; t < T; t++) if (!masks[(int64_t)t * nvox + v]) { all = 0; break; }
+		support[v] = (uint8_t)all;
 		if (all) nsup++;
-		(void)any;
 	}
 	for (v = 0; v < nvox; v++) if (support[v] && masks[v] == 1) nb++;
 	if (nsup < 2) { rc = 0; goto done; }           /* nothing to build a basis from */
+	{	size_t bytes;
+		if (nb > 0 && (nii_mul_size((size_t)nb, (size_t)T, &bytes) ||
+				nii_mul_size(bytes, sizeof(float), &bytes))) {
+			MD_ERR("the border scratch exceeds this build's address space\n");
+			goto done;
+		}
+	}
 
 	for (i = 0; i < T; i++) for (j = i; j < T; j++) {
 		double s = 0.0;
@@ -1026,6 +1033,7 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 	for (k = 0; k < r; k++) if (!(w[k] > w[0] * 1e-24) || !(w[k] > 0.0)) { r = k; break; }
 	if (r <= 0) { rc = 0; goto done; }
 	rb = border_rank < r ? border_rank : r;
+	if (rb < 1) rb = 1;          /* a non-positive border rank would zero the ring outright */
 	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
 		double s = 0.0, sb = 0.0;
 		for (k = 0; k < r; k++) { double p = V[(size_t)i * T + k] * V[(size_t)j * T + k];
@@ -1044,12 +1052,26 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 			for (v = 0; v < nvox; v++) if (support[v] && masks[v] == 1) bidx[q++] = v;
 		}
 		for (t = 0; t < T; t++) {
-			memcpy(vol, F + (int64_t)t * nvox, (size_t)nvox * sizeof(float));
+			/* NORMALISED blur -- smooth value x mask and mask separately, then divide.  A plain
+			   blur would pull the zeros outside the mask into the ring, and the ring is by
+			   construction the outermost voxels, so every one of them would be dragged toward
+			   zero by its own mask boundary.  Same trick reface.c uses inside its shell. */
+			const uint8_t *mt = masks + (int64_t)t * nvox;
+			for (v = 0; v < nvox; v++) {
+				den[v] = mt[v] ? 1.0f : 0.0f;
+				vol[v] = mt[v] ? F[(int64_t)t * nvox + v] : 0.0f;
+			}
 			if (nifti_smooth_gauss_f32(vol, c->nx, c->ny, c->nz, 1,
+					c->tmpl->dx, c->tmpl->dy, c->tmpl->dz, sig, sig, sig, -6.0f) ||
+				nifti_smooth_gauss_f32(den, c->nx, c->ny, c->nz, 1,
 					c->tmpl->dx, c->tmpl->dy, c->tmpl->dz, sig, sig, sig, -6.0f)) {
 				MD_ERR("the border smoothing failed\n"); goto done;
 			}
-			for (v = 0; v < nb; v++) B[v * T + t] = vol[bidx[v]];
+			for (v = 0; v < nb; v++) {
+				int64_t o = bidx[v];
+				B[v * T + t] = (den[o] > 1e-6f) ? (float)((double)vol[o] / (double)den[o])
+											    : F[(int64_t)t * nvox + o];
+			}
 		}
 		for (v = 0; v < nb; v++) {
 			const float *src = B + v * T;
@@ -1072,7 +1094,8 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 #endif
 		{
 			float *tmp = (float *)malloc((size_t)(CH < nvox ? CH : nvox) * T * sizeof(float));
-			if (!tmp) oom = 1;
+			double *col = (double *)malloc((size_t)T * sizeof(double));
+			if (!tmp || !col) oom = 1;
 #ifdef _OPENMP
 			#pragma omp for schedule(static)
 #endif
@@ -1084,18 +1107,33 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 					memcpy(tmp + (int64_t)ii * n, F + (int64_t)ii * nvox + chunk, (size_t)n * sizeof(float));
 				for (q = 0; q < n; q++) {
 					int64_t vv = chunk + q;
+					double mu = 0.0;
+					int nin = 0;
 					if (masks[vv] != 2) continue;          /* border and outside handled elsewhere */
+					/* Out-of-mask frames are IMPUTED with the voxel's own in-mask mean before
+					   projecting, and left untouched afterwards.  Feeding the gated zeros to the
+					   projection instead would drag a voxel that is in-mask in only a few frames
+					   toward zero in the frames where it IS valid -- the projection mixes across
+					   time, so a structural zero is not neutral there the way it is in a
+					   per-voxel operation. */
+					for (ii = 0; ii < T; ii++)
+						if (masks[(int64_t)ii * nvox + vv]) { mu += (double)tmp[(int64_t)ii * n + q]; nin++; }
+					if (nin < 1) continue;
+					mu /= (double)nin;
+					for (ii = 0; ii < T; ii++)
+						col[ii] = masks[(int64_t)ii * nvox + vv] ? (double)tmp[(int64_t)ii * n + q] : mu;
 					for (ii = 0; ii < T; ii++) {
 						double s = 0.0;
-						/* Gated PER FRAME: a voxel outside its own frame's mask is left
-						   unprojected, which is the third of Gap 1's structural changes. */
+						/* Write-back gated PER FRAME: a voxel outside its own frame's mask keeps
+						   its unfiltered value, which is the third of Gap 1's structural
+						   changes. */
 						if (!masks[(int64_t)ii * nvox + vv]) continue;
-						for (jj = 0; jj < T; jj++) s += P[(size_t)ii * T + jj] * (double)tmp[(int64_t)jj * n + q];
+						for (jj = 0; jj < T; jj++) s += P[(size_t)ii * T + jj] * col[jj];
 						F[(int64_t)ii * nvox + vv] = (float)s;
 					}
 				}
 			}
-			free(tmp);
+			free(tmp); free(col);
 		}
 		if (oom) { MD_ERR("out of memory in the low-rank filter; some voxels may be unfiltered\n"); goto done; }
 	}
@@ -1105,7 +1143,7 @@ static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int
 			if (masks[(int64_t)t * nvox + bidx[v]]) F[(int64_t)t * nvox + bidx[v]] = Bp[v * T + t];
 	rc = 0;
 done:
-	free(support); free(G); free(V); free(w); free(P); free(Pb); free(vol);
+	free(support); free(G); free(V); free(w); free(P); free(Pb); free(vol); free(den);
 	free(bidx); free(B); free(Bp);
 	return rc;
 }
@@ -1300,13 +1338,13 @@ static int md_branch_select(const md_ctx *c, const float *phase, const float *ma
 		int b;
 		for (b = 0; b < ncons; b++) {
 			double f;
-			for (j = 0; j < nc; j++) { buf[j] = fld[(cons[b] + 1) * nc + j]; }
-			/* md_wmedian sorts BOTH arrays, so the weights must be a scratch copy: reusing the
-			   shared `wgt` would leave it permuted for the next survivor. */
+			/* md_wmedian SORTS BOTH ARRAYS, so the weights have to be rebuilt for every
+			   survivor -- reusing them would hand the next one a permutation of itself. */
+			for (i = 0, j = 0; i < n3; i++)
+				if (omegac[i]) { wgt[j] = (float)((double)mag[n3 + i] * (double)mag[n3 + i]); j++; }
+			for (j = 0; j < nc; j++) buf[j] = fld[(cons[b] + 1) * nc + j];
 			f = fabs(md_wmedian(buf, wgt, nc));
 			if (b == 0 || f < best) { best = f; *nsel = cons[b]; }
-			for (j = 0; j < nc; j++) wgt[j] = 0.0f;   /* rebuilt below */
-			for (i = 0, j = 0; i < n3; i++) if (omegac[i]) { wgt[j] = (float)((double)mag[n3 + i] * (double)mag[n3 + i]); j++; }
 		}
 	}
 	rc = 0;
@@ -1414,7 +1452,11 @@ done:
 #define MD_ECHO_KMAX 64
 
 static int md_mode_int(const int *hist, int kmax) {
-	int best = 0, bestc = -1, k;
+	/* bestc STARTS AT 0, not -1.  With -1 the first bin wins on an empty histogram and the
+	   function returns -kmax, which would then be applied as a 2*pi*-64 shift to a whole echo --
+	   on an empty mask, silently, at exit 0.  Starting at 0 makes "nothing counted" return 0,
+	   which is the no-op. */
+	int best = 0, bestc = 0, k;
 	for (k = -kmax; k <= kmax; k++) {          /* ascending, strict >, so ties keep the smallest */
 		int cnt = hist[k + kmax];
 		if (cnt > bestc) { bestc = cnt; best = k; }
@@ -1550,7 +1592,6 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 	 * inner loop sequential over a compacted array instead of a masked scatter, which pays most of
 	 * it back. */
 	{
-		int32_t *idx = NULL;
 		int oom = 0;
 #ifdef _OPENMP
 		#pragma omp parallel reduction(| : oom)
@@ -1595,7 +1636,6 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 			}
 			free(ix); free(bm);
 		}
-		(void)idx;
 		if (oom) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 	}
 
@@ -1614,6 +1654,17 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 		}
 		fprintf(stderr, "--medic: temporal grouping at r > %.2f: group size %d..%d (mean %.1f) "
 			"of %d frames\n", MD_CORR_THRESH, lo, hi, tot / T, T);
+		/* A frame alone in its group has no reference to move toward, so if EVERY group is a
+		 * singleton the temporal correction does nothing at all -- silently, since each frame is
+		 * skipped individually.  Worth saying out loud, because there is a configuration that
+		 * reaches it: the grouping correlates UNWRAPPED PHASE, which presupposes that the global
+		 * 2*pi branch has been pinned, so --branch-correction 0 leaves each frame on its own
+		 * branch and the correlation falls below the threshold for every pair. */
+		if (hi < 2)
+			fprintf(stderr, "--medic: every frame is alone in its group, so the temporal 2*pi "
+				"correction has nothing to do and is inactive%s\n",
+				c->branch ? "" : " (--branch-correction 0 is the usual cause: the grouping "
+				"correlates unwrapped phase, which needs the global branch pinned first)");
 	}
 	for (t = 0; t < T; t++) {
 		int ng = 0;
@@ -2056,9 +2107,10 @@ static void md_usage(void) {
 	printf("                          reconstructed from far fewer temporal components than the\n");
 	printf("                          interior, and no voxel outside its own frame's mask is\n");
 	printf("                          projected.  0 gives the plain global truncation\n");
-	printf("  --mask <file>           use this mask verbatim for both unwrapping stages,\n");
-	printf("                          overriding --mask-mode; a supplied mask is the core tier,\n");
-	printf("                          so it has no border ring\n");
+	printf("  --mask <file>           use this mask verbatim for both unwrapping stages.  A supplied\n");
+	printf("                          mask is binary, so it becomes the core tier with no border\n");
+	printf("                          ring and --border-regularization has nothing to do.\n");
+	printf("                          Mutually exclusive with --mask-mode\n");
 	printf("  --save-intermediates    also write per-echo unwrapped phase, the masks, and (when\n");
 	printf("                          MCPC-3D-S runs) the estimated phase offset\n\n");
 	printf("Outputs: <prefix>_fieldmaps_native (Hz, distorted grid), <prefix>_fieldmaps (Hz,\n");
@@ -2124,6 +2176,7 @@ int nii_medic(int argc, char *argv[]) {
 	uint8_t *maskbuf = NULL;   /* per-frame masks, retained through the temporal correction */
 	uint8_t *grpbuf = NULL;    /* per-frame magnitude brain masks, likewise (Gap 5 grouping) */
 	romeo_opts ro = romeo_opts_default();
+	int mask_mode_set = 0;   /* was --mask-mode given explicitly?  See the --mask conflict below. */
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
 	   stages.  Against its own intermediates, romeo4 puts 99.76 % of in-mask voxels on the same
@@ -2229,6 +2282,7 @@ int nii_medic(int argc, char *argv[]) {
 			c.border_reg = (int)v;
 		} else if (!strcmp(a, "--mask-mode") && ac + 1 < argc) {
 			const char *v = argv[++ac];
+			mask_mode_set = 1;
 			if (!strcmp(v, "tiered")) c.mask_mode = MD_MASK_TIERED;
 			else if (!strcmp(v, "robustmask")) c.mask_mode = MD_MASK_ROBUST;
 			else if (!strcmp(v, "mindgrab")) c.mask_mode = MD_MASK_MINDGRAB;
@@ -2248,6 +2302,14 @@ int nii_medic(int argc, char *argv[]) {
 	if (!nmag || !npha || !nTE || !have_trt || !have_pe || !c.prefix) {
 		MD_ERR("missing a required option\n\n");
 		md_usage();
+		goto done;
+	}
+	if (c.maskfile && mask_mode_set) {
+		/* Ambiguous rather than merely redundant: --mask supplies a BINARY mask, which maps to the
+		   core tier and has no border ring, so it cannot express what --mask-mode selects.  Naming
+		   both asks for two different masks. */
+		MD_ERR("--mask and --mask-mode are mutually exclusive: --mask supplies the mask itself, "
+			"and being binary it has no border ring for --border-regularization to use\n");
 		goto done;
 	}
 	if (nmag != npha) { MD_ERR("%d magnitude file(s) but %d phase file(s); one of each per echo is required\n", nmag, npha); goto done; }

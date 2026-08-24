@@ -2173,8 +2173,11 @@ def exercise_medic_mask_mode(exe: str, tmp: Path) -> None:
         raise AssertionError("--branch-correction 1 produced non-finite or absurd field values")
 
     # (d) bad values are rejected, not silently ignored.
+    # --mask and --mask-mode name two different masks, so the combination is rejected rather than
+    # silently resolved in favour of one of them.
     for bad in (["--mask-mode", "bogus"], ["--branch-correction", "2"],
-                ["--branch-correction", "yes"]):
+                ["--branch-correction", "yes"],
+                ["--mask", str(user), "--mask-mode", "tiered"]):
         r = medic_run(exe, mags, phases, tes, tmp / "medic_mm_bad", bad)
         if r.returncode == 0:
             raise AssertionError(f"--medic accepted {' '.join(bad)}")
