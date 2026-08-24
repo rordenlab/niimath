@@ -44,6 +44,8 @@ _skbuild/niimath/_dist_ver.py
 /dwi/
 /qc/
 audit_*.md
+plan_*.md
+*_plan.md
 
 
 # allineate object-flag signature stamp (Makefile flag-change detection)

@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import os
+import random
 import re
 import shutil
 import struct
@@ -1496,7 +1497,8 @@ def exercise_medic_mask_temporal(exe: str, tmp: Path) -> None:
     prefix = tmp / "medic_mt_out"
     require_success(
         medic_run(exe, mags, phases, tes, prefix,
-                  ["--rank", "0", "--temporal-correction", "1", "--save-intermediates"]),
+                  ["--rank", "0", "--temporal-correction", "1", "--save-intermediates",
+                   "--mask-mode", "robustmask"]),
         "--medic --temporal-correction 1 with per-frame masks",
     )
     masks = medic_read_output(prefix, "_masks", tmp, "mtm")
@@ -1576,8 +1578,14 @@ def exercise_medic_rank_boundaries(exe: str, tmp: Path) -> None:
     zeros = medic_read_output(prefix, "_fieldmaps_native", tmp, "zero")
     if zeros is None:
         raise AssertionError("--medic wrote no field map for an all-zero series")
+    # Tolerance, not exact zero: the TE-independent offset that gives this fixture a stored phase
+    # range is removed by MCPC-3D-S in floating point, so the field lands within a few times 1e-7
+    # Hz of zero rather than on it.  1e-4 Hz is three orders above that and eight below the field
+    # values every other fixture asserts, so it cannot hide a filter that is actually doing
+    # something (the retired bug this pins failed the whole run, and --rank 1 on a rank-2 series
+    # moves the field by whole Hz).
     for i, v in enumerate(zeros):
-        if v != 0.0:
+        if not (abs(v) < 1e-4):
             raise AssertionError(f"--medic: an all-zero field series must stay zero, voxel {i} holds {v:g}")
 
     # (b)/(c) a rank-2 series.
@@ -1923,8 +1931,12 @@ def medic_rp_case(exe: str, tmp: Path, tag: str, tes, frames, enc_range, expect_
                   expect_slope=None, spike=None, nan_echo=None, old=""):
     mags, phases = medic_rp_series(tmp, tag, tes, frames, enc_range, spike=spike, nan_echo=nan_echo)
     prefix = tmp / f"{tag}_out"
+    # --mask-mode robustmask, because readphase runs BEFORE any mask and these fixtures are only
+    # 16x24x8: the default tiered mask grows a three-voxel ring that covers the whole volume at
+    # that size, which would drag the deliberately poisoned background voxel of the NaN case into
+    # the mask and fail the run for an unrelated reason.
     result = medic_run(exe, mags, phases, tes, prefix,
-                       ["--rank", "0", "--temporal-correction", "0"])
+                       ["--rank", "0", "--temporal-correction", "0", "--mask-mode", "robustmask"])
     require_success(result, f"--medic readphase fixture {tag}")
     got = medic_rp_range(result)
     if got != expect_range:
@@ -2008,13 +2020,175 @@ def exercise_medic_readphase(exe: str, tmp: Path) -> None:
     # too, deep inside its unwrapper.
     mags, phases = medic_rp_series(tmp, "medic_rp_flat", MEDIC_RP_TES2, 2,
                                    lambda e, t: (-100.0, 100.0), constant=True)
-    result = medic_run(exe, mags, phases, MEDIC_RP_TES2, tmp / "medic_rp_flat_out", ["--rank", "0"])
+    result = medic_run(exe, mags, phases, MEDIC_RP_TES2, tmp / "medic_rp_flat_out",
+                       ["--rank", "0", "--mask-mode", "robustmask"])
     if result.returncode == 0:
         raise AssertionError("--medic accepted a constant frame 0, which has no rescale range")
     if "no usable range" not in (result.stdout + result.stderr):
         raise AssertionError("--medic rejected a constant frame 0 without a diagnostic")
     print("  --medic readphase: frame-0 range, mode across echoes, tie and NaN rules, "
           "no short-circuit OK")
+
+
+# The tiered mask needs a volume big enough to hold a three-voxel ring, which MEDIC_DIMS is not.
+MEDIC_MM_DIMS = (28, 30, 26)
+
+
+def medic_mm_dilate(mask: list[int], dims, iters: int) -> list[int]:
+    """Binary dilation with an 18-CONNECTED structuring element -- faces and edges, no corners.
+
+    Recomputed here rather than trusted: the connectivity is a MEASURED property of the reference
+    (Dice 0.9997 at 18, 0.9304 at 6, 0.9699 at 26 against warpkit's own recovered mask), so a
+    silent change from 18 to 6 or 26 in medic.c would move every mask boundary while every other
+    fixture still passed."""
+    nx, ny, nz = dims
+    off = [(dx, dy, dz)
+           for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+           if (dx or dy or dz) and abs(dx) + abs(dy) + abs(dz) <= 2]
+    cur = list(mask)
+    for _ in range(iters):
+        nxt = list(cur)
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    i = x + nx * (y + ny * z)
+                    if cur[i]:
+                        continue
+                    for dx, dy, dz in off:
+                        xx, yy, zz = x + dx, y + dy, z + dz
+                        if 0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz and cur[xx + nx * (yy + ny * zz)]:
+                            nxt[i] = 1
+                            break
+        cur = nxt
+    return cur
+
+
+def medic_mm_series(tmp: Path, tes) -> tuple[list[str], list[str]]:
+    """An ellipsoid on a NOISY dim background with a TE-proportional field, on MEDIC_MM_DIMS.
+
+    The background phase has to be noise, not a continuation of the ramp.  The tiered mask unions
+    an Otsu magnitude threshold with an Otsu threshold on ROMEO's voxel-quality map, and a
+    noiseless ramp has excellent phase coherence everywhere -- so on a clean phantom the quality
+    component covers the whole volume, the union with it does too, and there is no outside tier
+    left to check.  Seeded, so the fixture is reproducible."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    rng = random.Random(20260824)
+    noise = [rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+    mags, phases = [], []
+    for e, te in enumerate(tes):
+        m, p = [], []
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    # Small enough that the core, its two dilations and the three-voxel ring all
+                    # fit inside the FOV with room to spare -- a saturated mask has no ring to
+                    # check, which is exactly how this fixture would go vacuous.
+                    r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+                         + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+                    inside = r < 1.0
+                    m.append(1000.0 if inside else 25.0)
+                    hz = 3.0 * (y - ny / 2.0) + 0.2 * x
+                    p.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0) if inside
+                             else noise[x + nx * (y + ny * z)])
+        mp, pp = tmp / f"medic_mm_mag{e}.nii", tmp / f"medic_mm_pha{e}.nii"
+        write_float32_nifti(mp, MEDIC_MM_DIMS, m)
+        write_float32_nifti(pp, MEDIC_MM_DIMS, p)
+        mags.append(str(mp))
+        phases.append(str(pp))
+    return mags, phases
+
+
+def exercise_medic_mask_mode(exe: str, tmp: Path) -> None:
+    """(14) --mask-mode and --branch-correction: the two public controls added for Gap 2 and
+    Gap 3(a).
+
+    The tiers are not decoration -- every stage tests `> 0` and only the border filter looks at the
+    value, so a tier leaking into arithmetic is silent.  It has happened twice already: md_temporal
+    accumulated its per-voxel valid count as `cnt += mask[i]`, which counts a core voxel twice and
+    HALVES the group mean, and ROMEO's rm_build_ctx forms `magnitude * (float)mask[i]`, which would
+    double the magnitude weights inside the brain."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    nvox = nx * ny * nz
+    tes = (10.0, 30.0)
+    mags, phases = medic_mm_series(tmp, tes)
+
+    def masks_for(tag: str, extra: list[str]):
+        prefix = tmp / f"medic_mm_{tag}"
+        require_success(medic_run(exe, mags, phases, tes, prefix,
+                                  ["--rank", "0", "--save-intermediates", *extra]),
+                        f"--medic {' '.join(extra)}")
+        m = medic_read_output(prefix, "_masks", tmp, f"mm{tag}")
+        if m is None:
+            raise AssertionError(f"--medic {' '.join(extra)} wrote no mask intermediate")
+        return [int(v) for v in m]
+
+    # (a) the default is tiered, and its tiers really are core + a three-voxel 18-connected ring.
+    tiered = masks_for("tiered", [])
+    if sorted(set(tiered)) != [0, 1, 2]:
+        raise AssertionError(f"--medic default mask has tiers {sorted(set(tiered))}, expected [0, 1, 2]")
+    core = [1 if v == 2 else 0 for v in tiered]
+    valid = [1 if v > 0 else 0 for v in tiered]
+    if sum(core) == 0 or sum(valid) >= nvox:
+        raise AssertionError(
+            f"the mask-mode fixture is degenerate: core {sum(core)}, valid {sum(valid)} of {nvox} "
+            f"(a saturated mask cannot show a ring)")
+    grown = medic_mm_dilate(core, MEDIC_MM_DIMS, 3)
+    wrong = sum(1 for a, b in zip(grown, valid) if a != b)
+    if wrong:
+        raise AssertionError(
+            f"--medic: the valid tier is not dilate(core, 3) with an 18-connected element "
+            f"({wrong} of {nvox} voxels disagree); the morphology connectivity is measured, "
+            f"see MD_MORPH_CONN in medic.c")
+
+    # (b) robustmask and an explicit --mask are BINARY and map to the core tier: no ring exists, so
+    # the border filter must have nothing to do on those paths.
+    robust = masks_for("robust", ["--mask-mode", "robustmask"])
+    if 1 in robust:
+        raise AssertionError("--mask-mode robustmask produced a border tier, which it has no way to know")
+    user = tmp / "medic_mm_usermask.nii"
+    write_float32_nifti(user, MEDIC_MM_DIMS, [float(v) for v in core])
+    supplied = masks_for("user", ["--mask", str(user)])
+    if 1 in supplied:
+        raise AssertionError("--mask produced a border tier; a supplied mask has no ring")
+    if any((v == 2) != bool(c) for v, c in zip(supplied, core)):
+        raise AssertionError("--mask was not used verbatim as the core tier")
+
+    # (c) --branch-correction 0 is a real switch, not a no-op that happens to be accepted.
+    on = masks_for("bc1", ["--branch-correction", "1"])
+    if on != tiered:
+        raise AssertionError("--branch-correction 1 is not the default")
+    prefix_off = tmp / "medic_mm_bc0"
+    require_success(medic_run(exe, mags, phases, tes, prefix_off,
+                              ["--rank", "0", "--branch-correction", "0"]),
+                    "--medic --branch-correction 0")
+    field_off = medic_read_output(prefix_off, "_fieldmaps_native", tmp, "mmbc0")
+    prefix_on = tmp / "medic_mm_bc1f"
+    require_success(medic_run(exe, mags, phases, tes, prefix_on, ["--rank", "0"]),
+                    "--medic --branch-correction 1")
+    field_on = medic_read_output(prefix_on, "_fieldmaps_native", tmp, "mmbc1")
+    if field_off is None or field_on is None:
+        raise AssertionError("--branch-correction runs wrote no field map")
+    if not all(abs(v) < 1e6 and v == v for v in field_on):
+        raise AssertionError("--branch-correction 1 produced non-finite or absurd field values")
+
+    # (d) bad values are rejected, not silently ignored.
+    for bad in (["--mask-mode", "bogus"], ["--branch-correction", "2"],
+                ["--branch-correction", "yes"]):
+        r = medic_run(exe, mags, phases, tes, tmp / "medic_mm_bad", bad)
+        if r.returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+
+    # (e) mindgrab is never a silent fallback.  It is an external dependency --medic otherwise does
+    # not have, so a missing executable must fail with an explanation rather than quietly using
+    # something else.
+    if shutil.which("brainchop-mindgrab") is None:
+        r = medic_run(exe, mags, phases, tes, tmp / "medic_mm_mg", ["--mask-mode", "mindgrab"])
+        if r.returncode == 0:
+            raise AssertionError("--mask-mode mindgrab succeeded without brainchop-mindgrab on PATH")
+        if "mindgrab" not in (r.stdout + r.stderr):
+            raise AssertionError("--mask-mode mindgrab failed without naming the missing tool")
+    print("  --medic mask modes: tiers, 18-connected ring, robustmask/--mask core mapping, "
+          "--branch-correction and rejections OK")
 
 
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
@@ -2032,6 +2206,7 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_rank_boundaries(exe, tmp)
     exercise_medic_xform_precedence(exe, tmp)
     exercise_medic_readphase(exe, tmp)
+    exercise_medic_mask_mode(exe, tmp)
     exercise_medic_parsing(exe, tmp)
     exercise_medic_output_transaction(exe, tmp)
 
