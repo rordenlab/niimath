@@ -44,6 +44,7 @@
 	#include <omp.h>
 #endif
 
+#include "core32.h"   /* nifti_smooth_gauss_f32, the border spatial smooth */
 #include "medic.h"
 #include "romeo.h"
 
@@ -464,7 +465,14 @@ static void md_jacobi_eigh(double *a, double *v, double *w, int n) {
  * EXPERIMENTAL, and deliberately labelled so: rank 10 is the paper's figure and a synthetic probe
  * confirmed the reference truncates at 10, but the reference's real 170-frame output retains a
  * broadband residual past component 10 (manifest 5.2) whose origin is unresolved and has NOT been
- * guessed at here.  This is the least reference-faithful stage; --rank 0 skips it entirely.
+ * guessed at here.  --rank 0 skips it entirely.
+ *
+ * The manifest's open question -- that the reference's output "retains a broadband residual past
+ * component 10 whose origin is unresolved" -- is ANSWERED, and it was the border.  Splitting the
+ * reference's own field map by its own tiers (medic_bench tools/m6_spectrum.py): the CORE carries
+ * 0.78 % of its energy past component 10 and the BORDER carries 28.3 %.  The interior is the
+ * rank-10 object the paper describes; the border is a differently-derived reconstruction.  See
+ * md_lowrank_border.
  *
  * Uses the T x T Gram matrix G = F^T F, whose eigenvectors are the right singular vectors of F.
  * Projecting each voxel's time course onto the leading k of them is exactly the truncated SVD:
@@ -867,6 +875,7 @@ typedef struct {
 	int mask_mode;                /* MD_MASK_* */
 	int branch;                   /* --branch-correction: global 2*pi handling (Gap 3) */
 	int echo_offset;              /* --echo-offset: intra-frame per-echo 2*pi offset (Gap 4) */
+	int border_reg;               /* --border-regularization: graded border filter (Gap 1) */
 	const char *maskfile;         /* --mask: use this mask verbatim, overriding --mask-mode */
 	const char *prefix;
 	nifti_image *tmpl;            /* header template (phase echo 1) */
@@ -924,6 +933,181 @@ static void md_apply_phase_scale(float *p, int64_t n, double mn, double mx) {
 	double slope = MD_2PI / (mx - mn), inter = -M_PI - mn * slope;
 	int64_t i;
 	for (i = 0; i < n; i++) p[i] = (float)((double)p[i] * slope + inter);
+}
+
+/* ================== Gap 1: graded regularisation at the brain border ========================
+ *
+ * The border of the brain has little signal, so phase estimates there are unreliable -- noisy, and
+ * prone to gross errors rather than small ones.  Those voxels still matter, because distortion is
+ * largest exactly where the field gradients are steepest, which is near tissue-air boundaries.
+ * Discarding them is not an option, and treating them like well-conditioned interior voxels lets
+ * their noise into the field map.  So the border needs HEAVIER regularisation than the interior,
+ * in both space and time.  That is the whole idea.
+ *
+ * The reference's specific structure is explicitly NOT a specification to match -- its component
+ * counts and smoothing width "were chosen empirically on our data and are not principled
+ * constants" -- so the numbers below are ours, and are judged on the behaviour rather than on
+ * agreement.  Recorded in medic_bench's tools/MILESTONES.md with the search that chose them.
+ *
+ * MEASURED first, before any of this was written (tools/m6_spectrum.py), because it resolves an
+ * open question in the manifest -- warpkit's output "retains a broadband residual past component
+ * 10 whose origin is unresolved".  Splitting the reference's own field map by its own tiers:
+ *
+ *     core   (tier 2, always in mask)   0.78 % of energy past component 10   <- rank 10
+ *     border (tier 1, always in mask)  28.3  % of energy past component 10   <- not rank 10
+ *
+ * on echo2, and 0.63 % / 28.5 % on echo3.  The interior IS the rank-10 object the paper describes;
+ * the border is a differently-derived reconstruction, and it is the whole of the residual.  A
+ * second, smaller contributor is the varying support: voxels in some frames' masks and not others
+ * carry 40.9 % past component 10, falling to 22.1 % when the support pattern alone is removed.
+ * The question is answered.
+ *
+ * Three structural changes from the plain filter: the Gram matrix is restricted to voxels with
+ * constant support, so the zero pattern of the varying-support voxels cannot contaminate the
+ * temporal basis; write-back is gated per FRAME, so a voxel outside its own frame's mask is left
+ * unprojected; and border voxels are spatially smoothed and then reconstructed from far fewer
+ * temporal components than the interior. */
+
+#define MD_BORDER_RANK 3        /* border components; the interior keeps --rank (default 10) */
+#define MD_BORDER_FWHM 4.0f     /* mm, spatial smoothing applied to the border only */
+
+static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int rank,
+	const uint8_t *masks, int border_rank, float fwhm) {
+	double *G = NULL, *V = NULL, *w = NULL, *P = NULL, *Pb = NULL;
+	float *vol = NULL, *B = NULL, *Bp = NULL;
+	uint8_t *support = NULL;
+	int64_t *bidx = NULL;
+	int64_t v, nb = 0, nsup = 0;
+	int i, j, k, r, rb, t, rc = 1;
+	float sig = fwhm / 2.354820045f;
+
+	if (rank <= 0 || T <= 1 || rank >= T) return 0;
+	if (T > MD_MAX_FRAMES_DENSE) {
+		MD_ERR("the low-rank filter needs a dense %dx%d matrix; %d frames exceeds this solver's "
+			"%d-frame ceiling (use --rank 0 to skip it)\n", T, T, T, MD_MAX_FRAMES_DENSE);
+		return 1;
+	}
+	{	size_t bytes;
+		if (nii_mul_size((size_t)T, (size_t)T, &bytes) || nii_mul_size(bytes, sizeof(double), &bytes)) {
+			MD_ERR("the %dx%d low-rank matrices exceed this build's address space\n", T, T);
+			return 1;
+		}
+	}
+	support = (uint8_t *)malloc((size_t)nvox);
+	G = (double *)calloc((size_t)T * T, sizeof(double));
+	V = (double *)malloc((size_t)T * T * sizeof(double));
+	w = (double *)malloc((size_t)T * sizeof(double));
+	P = (double *)malloc((size_t)T * T * sizeof(double));
+	Pb = (double *)malloc((size_t)T * T * sizeof(double));
+	vol = (float *)malloc((size_t)nvox * sizeof(float));
+	if (!support || !G || !V || !w || !P || !Pb || !vol) { MD_ERR("out of memory in the low-rank filter\n"); goto done; }
+
+	/* Constant-support voxels, and the border index list. */
+	for (v = 0; v < nvox; v++) {
+		int all = 1, any = 0;
+		for (t = 0; t < T; t++) {
+			if (masks[(int64_t)t * nvox + v]) any = 1; else all = 0;
+		}
+		support[v] = (uint8_t)(all ? 1 : 0);
+		if (all) nsup++;
+		(void)any;
+	}
+	for (v = 0; v < nvox; v++) if (support[v] && masks[v] == 1) nb++;
+	if (nsup < 2) { rc = 0; goto done; }           /* nothing to build a basis from */
+
+	for (i = 0; i < T; i++) for (j = i; j < T; j++) {
+		double s = 0.0;
+		const float *a = F + (int64_t)i * nvox, *b = F + (int64_t)j * nvox;
+		for (v = 0; v < nvox; v++) if (support[v]) s += (double)a[v] * (double)b[v];
+		G[(size_t)i * T + j] = G[(size_t)j * T + i] = s;
+	}
+	md_jacobi_eigh(G, V, w, T);
+	r = rank < T ? rank : T;
+	for (k = 0; k < r; k++) if (!(w[k] > w[0] * 1e-24) || !(w[k] > 0.0)) { r = k; break; }
+	if (r <= 0) { rc = 0; goto done; }
+	rb = border_rank < r ? border_rank : r;
+	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
+		double s = 0.0, sb = 0.0;
+		for (k = 0; k < r; k++) { double p = V[(size_t)i * T + k] * V[(size_t)j * T + k];
+			s += p; if (k < rb) sb += p; }
+		P[(size_t)i * T + j] = s;
+		Pb[(size_t)i * T + j] = sb;
+	}
+
+	/* --- the border: spatially smooth each frame, then reconstruct from rb components ------- */
+	if (nb > 0) {
+		bidx = (int64_t *)malloc((size_t)nb * sizeof(int64_t));
+		B = (float *)malloc((size_t)nb * T * sizeof(float));
+		Bp = (float *)malloc((size_t)nb * T * sizeof(float));
+		if (!bidx || !B || !Bp) { MD_ERR("out of memory in the border filter\n"); goto done; }
+		{	int64_t q = 0;
+			for (v = 0; v < nvox; v++) if (support[v] && masks[v] == 1) bidx[q++] = v;
+		}
+		for (t = 0; t < T; t++) {
+			memcpy(vol, F + (int64_t)t * nvox, (size_t)nvox * sizeof(float));
+			if (nifti_smooth_gauss_f32(vol, c->nx, c->ny, c->nz, 1,
+					c->tmpl->dx, c->tmpl->dy, c->tmpl->dz, sig, sig, sig, -6.0f)) {
+				MD_ERR("the border smoothing failed\n"); goto done;
+			}
+			for (v = 0; v < nb; v++) B[v * T + t] = vol[bidx[v]];
+		}
+		for (v = 0; v < nb; v++) {
+			const float *src = B + v * T;
+			float *dst = Bp + v * T;
+			for (i = 0; i < T; i++) {
+				double s = 0.0;
+				for (j = 0; j < T; j++) s += Pb[(size_t)i * T + j] * (double)src[j];
+				dst[i] = (float)s;
+			}
+		}
+	}
+
+	/* --- the interior: the ordinary rank-r projection, written back per frame --------------- */
+	{
+		int64_t chunk;
+		const int64_t CH = 1 << 16;
+		int oom = 0;
+#ifdef _OPENMP
+		#pragma omp parallel reduction(|:oom)
+#endif
+		{
+			float *tmp = (float *)malloc((size_t)(CH < nvox ? CH : nvox) * T * sizeof(float));
+			if (!tmp) oom = 1;
+#ifdef _OPENMP
+			#pragma omp for schedule(static)
+#endif
+			for (chunk = 0; chunk < nvox; chunk += CH) {
+				int64_t n = (nvox - chunk < CH) ? (nvox - chunk) : CH, q;
+				int ii, jj;
+				if (oom) continue;
+				for (ii = 0; ii < T; ii++)
+					memcpy(tmp + (int64_t)ii * n, F + (int64_t)ii * nvox + chunk, (size_t)n * sizeof(float));
+				for (q = 0; q < n; q++) {
+					int64_t vv = chunk + q;
+					if (masks[vv] != 2) continue;          /* border and outside handled elsewhere */
+					for (ii = 0; ii < T; ii++) {
+						double s = 0.0;
+						/* Gated PER FRAME: a voxel outside its own frame's mask is left
+						   unprojected, which is the third of Gap 1's structural changes. */
+						if (!masks[(int64_t)ii * nvox + vv]) continue;
+						for (jj = 0; jj < T; jj++) s += P[(size_t)ii * T + jj] * (double)tmp[(int64_t)jj * n + q];
+						F[(int64_t)ii * nvox + vv] = (float)s;
+					}
+				}
+			}
+			free(tmp);
+		}
+		if (oom) { MD_ERR("out of memory in the low-rank filter; some voxels may be unfiltered\n"); goto done; }
+	}
+	/* Border write-back last, and gated per frame like the interior. */
+	for (v = 0; v < nb; v++)
+		for (t = 0; t < T; t++)
+			if (masks[(int64_t)t * nvox + bidx[v]]) F[(int64_t)t * nvox + bidx[v]] = Bp[v * T + t];
+	rc = 0;
+done:
+	free(support); free(G); free(V); free(w); free(P); free(Pb); free(vol);
+	free(bidx); free(B); free(Bp);
+	return rc;
 }
 
 /* ===================== Gap 3(b): global 2*pi branch selection ===============================
@@ -1825,10 +2009,8 @@ static void md_usage(void) {
 	printf("phase and converts it to an EPI displacement map.\n\n");
 	printf("Options:\n");
 	printf("  --rank <N>              low-rank truncation of the field-map series (default %d; 0 disables)\n", MD_RANK_DEFAULT);
-	printf("                          EXPERIMENTAL: rank 10 is what the paper specifies, but the\n");
-	printf("                          reference's own output retains a broadband residual past\n");
-	printf("                          component 10 whose origin is unresolved, so this stage is the\n");
-	printf("                          least reference-faithful part of the pipeline (--rank 0 skips it)\n");
+	printf("                          Applies to the brain INTERIOR; the border ring is smoothed and\n");
+	printf("                          rebuilt from far fewer components (--border-regularization)\n");
 	printf("  --temporal-correction <0|1>  temporal 2*pi consistency correction (default 1)\n");
 	printf("  --phase-offset <mcpc|none>   MCPC-3D-S phase-offset correction (default mcpc)\n");
 	printf("  --noise-frames <N>, -f  drop N trailing frames from the outputs (default 0)\n");
@@ -1848,6 +2030,11 @@ static void md_usage(void) {
 	printf("                          selection\n");
 	printf("  --echo-offset <0|1>     intra-frame per-echo 2*pi offset (default 1): one integer\n");
 	printf("                          per echo per frame, from the echoes already corrected\n");
+	printf("  --border-regularization <0|1>  graded regularisation at the brain border\n");
+	printf("                          (default 1): the border ring is smoothed spatially and\n");
+	printf("                          reconstructed from far fewer temporal components than the\n");
+	printf("                          interior, and no voxel outside its own frame's mask is\n");
+	printf("                          projected.  0 gives the plain global truncation\n");
 	printf("  --mask <file>           use this mask verbatim for both unwrapping stages,\n");
 	printf("                          overriding --mask-mode; a supplied mask is the core tier,\n");
 	printf("                          so it has no border ring\n");
@@ -1939,6 +2126,7 @@ int nii_medic(int argc, char *argv[]) {
 	c.temporal = 1;
 	c.branch = 1;
 	c.echo_offset = 1;
+	c.border_reg = 1;
 	c.mcpc = 1;
 	c.pe_axis = -1;
 	c.pe_sign = 1;
@@ -2013,6 +2201,10 @@ int nii_medic(int argc, char *argv[]) {
 			long v;
 			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--echo-offset must be 0 or 1\n"); goto done; }
 			c.echo_offset = (int)v;
+		} else if (!strcmp(a, "--border-regularization") && ac + 1 < argc) {
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--border-regularization must be 0 or 1\n"); goto done; }
+			c.border_reg = (int)v;
 		} else if (!strcmp(a, "--mask-mode") && ac + 1 < argc) {
 			const char *v = argv[++ac];
 			if (!strcmp(v, "tiered")) c.mask_mode = MD_MASK_TIERED;
@@ -2463,7 +2655,17 @@ int nii_medic(int argc, char *argv[]) {
 	}
 
 	/* ---- rank-10 truncation ------------------------------------------------------------------ */
-	if (c.rank > 0 && T > 1 && md_lowrank(fields, n3, T, c.rank)) goto done;
+	/* Gap 1: with the border filter on, the low-rank stage treats tier 1 and tier 2 differently
+	   and gates its write-back per frame.  --border-regularization 0 takes the plain global
+	   projection, which is exactly the pre-Gap-1 behaviour.  A user --mask has no border ring, so
+	   there is nothing for the border filter to do and it is skipped. */
+	if (c.rank > 0 && T > 1) {
+		int has_border = c.border_reg && maskbuf && !c.maskfile;
+		if (has_border) {
+			if (md_lowrank_border(&c, fields, n3, T, c.rank, maskbuf, MD_BORDER_RANK, MD_BORDER_FWHM))
+				goto done;
+		} else if (md_lowrank(fields, n3, T, c.rank)) goto done;
+	}
 
 	/* ---- inversion and displacement ---------------------------------------------------------- */
 	{

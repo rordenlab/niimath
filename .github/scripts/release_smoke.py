@@ -2253,18 +2253,24 @@ def exercise_medic_echo_offset(exe: str, tmp: Path) -> None:
           "--echo-offset switch and rejections OK")
 
 
-def medic_group_series(tmp: Path, tes, frames: int, field_fn):
+def medic_group_series(tmp: Path, tes, frames: int, field_fn, bg_varies: bool = False):
     """A series whose MAGNITUDE is bit-identical in every frame while the phase is not.
 
     That identity is the whole fixture: a grouping that correlates magnitude cannot possibly
     separate these frames, so if the grouping splits them it is reading the phase."""
     nx, ny, nz = MEDIC_MM_DIMS
     rng = random.Random(20260824)
-    noise = [rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+    # `bg_varies` gives the background a DIFFERENT random phase in every frame.  The border fixture
+    # needs it: on a phantom with a sharp brain boundary the tier-1 ring lies in the background, so
+    # with a frame-invariant background it carries no temporal signal at all and the border filter
+    # has nothing to constrain -- the fixture would pass for the wrong reason.
+    noise = [[rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+             for _ in range(frames if bg_varies else 1)]
     mags, phases = [], []
     for e, te in enumerate(tes):
         m, p = [], []
         for t in range(frames):
+            bg = noise[t if bg_varies else 0]
             for z in range(nz):
                 for y in range(ny):
                     for x in range(nx):
@@ -2273,7 +2279,7 @@ def medic_group_series(tmp: Path, tes, frames: int, field_fn):
                         inside = r < 1.0
                         m.append(1000.0 if inside else 25.0)
                         p.append(medic_wrap(MEDIC_TWO_PI * field_fn(x, y, z, t) * te / 1000.0)
-                                 if inside else noise[x + nx * (y + ny * z)])
+                                 if inside else bg[x + nx * (y + ny * z)])
         mp, pp = tmp / f"medic_gr_mag{e}.nii", tmp / f"medic_gr_pha{e}.nii"
         write_float32_nifti(mp, MEDIC_MM_DIMS, m, nt=frames)
         write_float32_nifti(pp, MEDIC_MM_DIMS, p, nt=frames)
@@ -2344,6 +2350,90 @@ def exercise_medic_grouping(exe: str, tmp: Path) -> None:
           "groups identical frames OK")
 
 
+def exercise_medic_border(exe: str, tmp: Path) -> None:
+    """(17) Gap 1: graded regularisation at the brain border, and --border-regularization.
+
+    The behaviour, not a number: the border ring is smoothed spatially and reconstructed from far
+    fewer temporal components than the interior; the interior is not over-smoothed as a side
+    effect; and a voxel outside its own frame's mask is left unprojected rather than reconstructed.
+    The reference's component counts and smoothing width are explicitly not principled constants,
+    so agreement with it is deliberately NOT what this asserts."""
+    tes = (10.0, 30.0)
+    frames = 12
+    rank = "4"          # must be BELOW the frame count or md_lowrank has nothing to truncate
+    nx, ny, nz = MEDIC_MM_DIMS
+
+    # A field whose interior is genuinely low rank in time and whose outer shell carries
+    # BROADBAND per-voxel temporal noise -- the situation the border filter exists for.  The noise
+    # has to be broadband: a border component that is itself low rank is captured by the ordinary
+    # truncation and the fixture proves nothing.  Deterministic, so the test is reproducible.
+    def fld(x, y, z, t):
+        r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+             + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+        base = (1.0 + 0.2 * math.sin(0.7 * t)) * 3.0 * (y - ny / 2.0)
+        if r <= 0.55:
+            return base
+        h = ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791) ^ (t * 2654435761)) & 0xFFFF
+        return base + 2.5 * (h / 32767.5 - 1.0)
+
+    mags, phases = medic_group_series(tmp, tes, frames, fld, bg_varies=True)
+
+    def run(tag, extra):
+        prefix = tmp / f"medic_bd_{tag}"
+        r = medic_run(exe, mags, phases, tes, prefix,
+                      ["--rank", rank, "--save-intermediates", *extra])
+        require_success(r, f"--medic {' '.join(extra)}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"bd{tag}")
+        m = medic_read_output(prefix, "_masks", tmp, f"bdm{tag}")
+        if f is None or m is None:
+            raise AssertionError("--medic wrote no field/mask for the border fixture")
+        return f, [int(v) for v in m]
+
+    on, tiers = run("on", ["--border-regularization", "1"])
+    off, _ = run("off", ["--border-regularization", "0"])
+    n3 = nx * ny * nz
+
+    if on == off:
+        raise AssertionError("--border-regularization changed nothing on a series with a "
+                             "fast-varying border; the fixture or the stage is inert")
+
+    def median_change(sel):
+        d = sorted(max(abs(on[t * n3 + v] - off[t * n3 + v]) for t in range(frames)) for v in sel)
+        return d[len(d) // 2]
+
+    always = [v for v in range(n3) if all(tiers[t * n3 + v] for t in range(frames))]
+    core = [v for v in always if tiers[v] == 2]
+    ring = [v for v in always if tiers[v] == 1]
+    if len(core) < 50 or len(ring) < 50:
+        raise AssertionError(f"the border fixture is degenerate: {len(core)} core, {len(ring)} ring")
+
+    # The contract this fixture can check is that the stage is TARGETED: it must move the border
+    # far more than the interior.  How strongly the border ends up regularised is a property of
+    # real data, not of a phantom -- on a phantom with a sharp brain boundary the ring sits in the
+    # background, whose temporal noise the ordinary global truncation already annihilates, so the
+    # phantom cannot show the border being calmed.  That measurement lives in medic_bench
+    # (tools/MILESTONES.md, M6): border median temporal sd 3.03 -> 0.88 Hz while the interior moves
+    # from 1.2277 to 1.2312.
+    core_d, ring_d = median_change(core), median_change(ring)
+    if not (ring_d > 5.0 * core_d):
+        raise AssertionError(
+            f"--border-regularization is not targeted at the border: median absolute change "
+            f"{ring_d:.5f} Hz at the ring against {core_d:.5f} Hz in the interior")
+
+    # No voxel outside its own frame's mask may be reconstructed.
+    leaked = [i for i in range(len(on)) if tiers[i] == 0 and on[i] != 0.0]
+    if leaked:
+        raise AssertionError(
+            f"{len(leaked)} voxels outside their own frame's mask were projected (first at "
+            f"frame {leaked[0] // n3}, voxel {leaked[0] % n3})")
+
+    for bad in (["--border-regularization", "2"], ["--border-regularization", "yes"]):
+        if medic_run(exe, mags, phases, tes, tmp / "medic_bd_bad", ["--rank", rank, *bad]).returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+    print("  --medic border regularisation: targeted at the border, out-of-mask unprojected, "
+          "--border-regularization switch and rejections OK")
+
+
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
     if "--medic" not in help_text:
@@ -2362,6 +2452,7 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_mask_mode(exe, tmp)
     exercise_medic_echo_offset(exe, tmp)
     exercise_medic_grouping(exe, tmp)
+    exercise_medic_border(exe, tmp)
     exercise_medic_parsing(exe, tmp)
     exercise_medic_output_transaction(exe, tmp)
 
