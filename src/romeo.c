@@ -2252,6 +2252,11 @@ int romeo_voxelquality(const float *phase, int neco, int nx, int ny, int nz,
 	rm_wctx qc;
 	int flags[6];
 	if (!phase || !qmap || !TEs || !o || neco < 1 || nx < 1 || ny < 1 || nz < 1) return 1;
+	/* Upper bound too, matching romeo_unwrap_frame.  rm_build_ctx indexes both the phase buffer
+	   and the caller's TEs array at template_echo-1, so an out-of-range value reads off the end
+	   of two arrays.  Unreachable from the shipped CLI -- --medic never moves template_echo off
+	   1 -- but this is an exported header API and its sibling guards both ends. */
+	if (o->template_echo < 1 || o->template_echo > neco) return 1;
 	/* have_mag = 0: romeo/romeo4 resolve to the magnitude-free flag set, which is what
 	   "quality from phase alone" means. */
 	rm_flags_from_sel(o->weights_sel, 0, flags);

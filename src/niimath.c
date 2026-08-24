@@ -531,7 +531,7 @@ int show_help( void ) {
 	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv] : MRIQC-style hard-mask QC (CJV, CNR-noair, SNR, WM2MAX, EFC-brain, ICV) to TSV\n");
 #endif
 #ifdef HAVE_MEDIC
-	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");
+	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");
 #endif
 	printf(" --compare <ref>          : report if images are identical, terminates without saving new image\n");
 	printf(" --compare <theshr> <ref> : report if images are identical, terminates without saving, exits success if difference less than thresh\n");

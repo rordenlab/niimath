@@ -2154,22 +2154,33 @@ def exercise_medic_mask_mode(exe: str, tmp: Path) -> None:
     if any((v == 2) != bool(c) for v, c in zip(supplied, core)):
         raise AssertionError("--mask was not used verbatim as the core tier")
 
-    # (c) --branch-correction 0 is a real switch, not a no-op that happens to be accepted.
+    # (c) --branch-correction 0 is a real switch, not a no-op that happens to be accepted.  The
+    # first version of this block never compared the two field maps -- it only checked that each
+    # run produced one -- so it would have passed against a flag that was parsed and discarded.
     on = masks_for("bc1", ["--branch-correction", "1"])
     if on != tiered:
         raise AssertionError("--branch-correction 1 is not the default")
-    prefix_off = tmp / "medic_mm_bc0"
-    require_success(medic_run(exe, mags, phases, tes, prefix_off,
-                              ["--rank", "0", "--branch-correction", "0"]),
-                    "--medic --branch-correction 0")
-    field_off = medic_read_output(prefix_off, "_fieldmaps_native", tmp, "mmbc0")
-    prefix_on = tmp / "medic_mm_bc1f"
-    require_success(medic_run(exe, mags, phases, tes, prefix_on, ["--rank", "0"]),
-                    "--medic --branch-correction 1")
-    field_on = medic_read_output(prefix_on, "_fieldmaps_native", tmp, "mmbc1")
-    if field_off is None or field_on is None:
-        raise AssertionError("--branch-correction runs wrote no field map")
-    if not all(abs(v) < 1e6 and v == v for v in field_on):
+    # The default phantom cannot show this: its field ramps symmetrically about zero, so the median
+    # rounded turn count ROMEO's global correction acts on is 0 and both modes agree.  A uniform
+    # offset of one full wrap (1/dTE = 50 Hz at these echo times) makes that median 1, and the two
+    # modes then differ by exactly one wrap -- measured, and the reason for this specific number:
+    # +30 Hz is NOT enough (still identical), +60 Hz gives a clean 50.0000 Hz separation.
+    off_m, off_p = medic_mm_series(tmp, tes, bump=(60.0, 60.0), tag="medic_mm_off")
+    fields = {}
+    for tag, extra in (("bc0", ["--branch-correction", "0"]), ("bc1f", [])):
+        prefix = tmp / f"medic_mm_{tag}"
+        require_success(medic_run(exe, off_m, off_p, tes, prefix, ["--rank", "0", *extra]),
+                        f"--medic {' '.join(extra) or '(default branch correction)'}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"mm{tag}")
+        if f is None:
+            raise AssertionError("--branch-correction runs wrote no field map")
+        fields[tag] = f
+    if fields["bc0"] == fields["bc1f"]:
+        raise AssertionError(
+            "--branch-correction 0 and 1 produced identical field maps; the switch is inert. "
+            "ROMEO's global correction alone should move the field's absolute level, so this "
+            "phantom is either degenerate or the flag is being discarded")
+    if not all(abs(v) < 1e6 and v == v for v in fields["bc1f"]):
         raise AssertionError("--branch-correction 1 produced non-finite or absurd field values")
 
     # (d) bad values are rejected, not silently ignored.
