@@ -2063,7 +2063,7 @@ def medic_mm_dilate(mask: list[int], dims, iters: int) -> list[int]:
     return cur
 
 
-def medic_mm_series(tmp: Path, tes) -> tuple[list[str], list[str]]:
+def medic_mm_series(tmp: Path, tes, bump=None, tag: str = "medic_mm") -> tuple[list[str], list[str]]:
     """An ellipsoid on a NOISY dim background with a TE-proportional field, on MEDIC_MM_DIMS.
 
     The background phase has to be noise, not a continuation of the ramp.  The tiered mask unions
@@ -2076,6 +2076,7 @@ def medic_mm_series(tmp: Path, tes) -> tuple[list[str], list[str]]:
     noise = [rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
     mags, phases = [], []
     for e, te in enumerate(tes):
+        extra = bump[e] if bump else 0.0
         m, p = [], []
         for z in range(nz):
             for y in range(ny):
@@ -2087,10 +2088,10 @@ def medic_mm_series(tmp: Path, tes) -> tuple[list[str], list[str]]:
                          + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
                     inside = r < 1.0
                     m.append(1000.0 if inside else 25.0)
-                    hz = 3.0 * (y - ny / 2.0) + 0.2 * x
+                    hz = 3.0 * (y - ny / 2.0) + 0.2 * x + extra
                     p.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0) if inside
                              else noise[x + nx * (y + ny * z)])
-        mp, pp = tmp / f"medic_mm_mag{e}.nii", tmp / f"medic_mm_pha{e}.nii"
+        mp, pp = tmp / f"{tag}_mag{e}.nii", tmp / f"{tag}_pha{e}.nii"
         write_float32_nifti(mp, MEDIC_MM_DIMS, m)
         write_float32_nifti(pp, MEDIC_MM_DIMS, p)
         mags.append(str(mp))
@@ -2191,6 +2192,158 @@ def exercise_medic_mask_mode(exe: str, tmp: Path) -> None:
           "--branch-correction and rejections OK")
 
 
+# TEs chosen so the stage can fire at all.  ROMEO's own multi-echo unwrap already forces each echo
+# within half a turn of the template's prediction, so Gap 4's mode can only be nonzero when the
+# magnitude-squared-weighted fit over the EARLIER echoes disagrees with that prediction by more
+# than pi -- which needs three or more echoes and a long lever arm.  A closely spaced pair at 10
+# and 11 ms extrapolated out to 80 ms provides one: a field error on echo 1 is amplified about
+# eightfold by the time it reaches echo 2.  It never fires on either benchmark dataset, which is
+# correct (measured: niimath's per-echo unwrapped phase agrees with the reference's to zero whole
+# turns on 99.5 % of in-mask voxels), and is exactly why this fixture has to be contrived.
+MEDIC_EO_TES = (10.0, 11.0, 80.0)
+MEDIC_EO_BUMP = (0.0, 20.0, 0.0)     # Hz added to echo 1 only
+
+
+def exercise_medic_echo_offset(exe: str, tmp: Path) -> None:
+    """(15) Gap 4's intra-frame per-echo 2*pi offset, and its --echo-offset switch."""
+    def field(tag: str, mags, phases, extra):
+        prefix = tmp / f"medic_eo_{tag}"
+        r = medic_run(exe, mags, phases, MEDIC_EO_TES, prefix,
+                      ["--rank", "0", "--temporal-correction", "0", *extra])
+        require_success(r, f"--medic {' '.join(extra)}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"eo{tag}")
+        if f is None:
+            raise AssertionError("--medic wrote no field map for the echo-offset fixture")
+        return f, (r.stdout + r.stderr)
+
+    # (a) Consistent echoes: the stage must be an exact no-op.  This is the half that protects
+    # every other dataset -- a stage that fires when it should not would move real results.
+    ok_m, ok_p = medic_mm_series(tmp, MEDIC_EO_TES, tag="medic_eo_ok")
+    on, _ = field("ok_on", ok_m, ok_p, ["--echo-offset", "1"])
+    off, txt_off = field("ok_off", ok_m, ok_p, ["--echo-offset", "0"])
+    if on != off:
+        worst = max(abs(a - b) for a, b in zip(on, off))
+        raise AssertionError(
+            f"--echo-offset changed a consistent series by {worst:g} Hz; the mode of the "
+            f"per-voxel turn counts must be 0 when the echoes already agree")
+    if "echo offset" in txt_off:
+        raise AssertionError("--echo-offset 0 still reported an offset")
+
+    # (b) Echo 1 carrying a 20 Hz field of its own, extrapolated to 60 ms: the stage must fire,
+    # and it must change the result.  Without this the correction path ships untested -- it does
+    # not fire on either benchmark dataset or on any configuration of them.
+    bad_m, bad_p = medic_mm_series(tmp, MEDIC_EO_TES, bump=MEDIC_EO_BUMP, tag="medic_eo_bad")
+    on2, txt_on = field("bad_on", bad_m, bad_p, ["--echo-offset", "1"])
+    off2, txt_off2 = field("bad_off", bad_m, bad_p, ["--echo-offset", "0"])
+    if "echo offset" not in txt_on:
+        raise AssertionError(
+            "the echo-offset fixture is vacuous: the stage did not fire on a series whose "
+            "echo 1 carries a 20 Hz field of its own")
+    if "echo offset" in txt_off2:
+        raise AssertionError("--echo-offset 0 ran the stage anyway")
+    if on2 == off2:
+        raise AssertionError("--echo-offset reported a correction but changed nothing")
+    if not all(v == v and abs(v) < 1e6 for v in on2):
+        raise AssertionError("--echo-offset 1 produced non-finite or absurd field values")
+
+    for bad in (["--echo-offset", "2"], ["--echo-offset", "on"]):
+        if medic_run(exe, ok_m, ok_p, MEDIC_EO_TES, tmp / "medic_eo_bad_arg", bad).returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+    print("  --medic echo offset: no-op on consistent echoes, fires on inconsistent ones, "
+          "--echo-offset switch and rejections OK")
+
+
+def medic_group_series(tmp: Path, tes, frames: int, field_fn):
+    """A series whose MAGNITUDE is bit-identical in every frame while the phase is not.
+
+    That identity is the whole fixture: a grouping that correlates magnitude cannot possibly
+    separate these frames, so if the grouping splits them it is reading the phase."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    rng = random.Random(20260824)
+    noise = [rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+    mags, phases = [], []
+    for e, te in enumerate(tes):
+        m, p = [], []
+        for t in range(frames):
+            for z in range(nz):
+                for y in range(ny):
+                    for x in range(nx):
+                        r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+                             + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+                        inside = r < 1.0
+                        m.append(1000.0 if inside else 25.0)
+                        p.append(medic_wrap(MEDIC_TWO_PI * field_fn(x, y, z, t) * te / 1000.0)
+                                 if inside else noise[x + nx * (y + ny * z)])
+        mp, pp = tmp / f"medic_gr_mag{e}.nii", tmp / f"medic_gr_pha{e}.nii"
+        write_float32_nifti(mp, MEDIC_MM_DIMS, m, nt=frames)
+        write_float32_nifti(pp, MEDIC_MM_DIMS, p, nt=frames)
+        n3 = nx * ny * nz
+        first = m[:n3]
+        for t in range(1, frames):
+            if m[t * n3:(t + 1) * n3] != first:
+                raise AssertionError("the grouping fixture's magnitude is not frame-invariant")
+        mags.append(str(mp))
+        phases.append(str(pp))
+    return mags, phases
+
+
+def medic_group_sizes(result) -> tuple[int, int]:
+    for line in (result.stdout + result.stderr).splitlines():
+        if "temporal grouping" in line:
+            body = line.split("group size", 1)[1].split("(", 1)[0].strip()
+            lo, hi = body.split("..")
+            return int(lo), int(hi)
+    raise AssertionError("--medic did not report its temporal group sizes")
+
+
+def exercise_medic_grouping(exe: str, tmp: Path) -> None:
+    """(16) Gap 5: the temporal correction groups frames by UNWRAPPED PHASE, not by magnitude.
+
+    They are different questions.  The correction exists to find frames whose unwrapping SOLUTION
+    is consistent, which phase correlation measures directly; magnitude correlation is a proxy that
+    will happily group frames whose unwrapping diverged, and -- computed over the whole volume
+    including background, as it used to be -- is dominated by static structure common to every
+    frame, so it saturates near 1 and groups everything.
+
+    Neither benchmark dataset can show the difference: both are quiescent resting-state runs whose
+    phase correlation ALSO groups every frame together (measured: 170 of 170, 138 of 138).  This
+    fixture holds the magnitude bit-identical across frames while giving two blocks of frames
+    completely different spatial fields, so a magnitude-based grouping is arithmetically incapable
+    of separating them."""
+    tes = (10.0, 30.0)
+    frames = 6
+    nx, ny, _ = MEDIC_MM_DIMS
+
+    def two_blocks(x, y, z, t):
+        return 3.0 * (y - ny / 2.0) if t < 3 else 3.0 * (x - nx / 2.0)
+
+    mags, phases = medic_group_series(tmp, tes, frames, two_blocks)
+    r = medic_run(exe, mags, phases, tes, tmp / "medic_gr_out", ["--rank", "0"])
+    require_success(r, "--medic on the two-block grouping fixture")
+    lo, hi = medic_group_sizes(r)
+    if hi >= frames:
+        raise AssertionError(
+            f"the grouping put every frame in one group (sizes {lo}..{hi} of {frames}) on a "
+            f"series whose magnitude is frame-invariant and whose phase is not; the correlation "
+            f"is not reading the phase")
+    if lo < 1:
+        raise AssertionError(f"impossible group size {lo}")
+
+    # A single-block control: identical field in every frame must group them all, so the split
+    # above is a property of the data and not of the fixture always splitting.
+    mags1, phases1 = medic_group_series(tmp, tes, frames,
+                                        lambda x, y, z, t: 3.0 * (y - ny / 2.0))
+    r1 = medic_run(exe, mags1, phases1, tes, tmp / "medic_gr_one", ["--rank", "0"])
+    require_success(r1, "--medic on the single-block grouping fixture")
+    lo1, hi1 = medic_group_sizes(r1)
+    if lo1 != frames or hi1 != frames:
+        raise AssertionError(
+            f"frames carrying an identical field were split into groups of {lo1}..{hi1}; the "
+            f"grouping threshold is too aggressive")
+    print("  --medic temporal grouping: splits on phase where magnitude cannot, "
+          "groups identical frames OK")
+
+
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
     if "--medic" not in help_text:
@@ -2207,6 +2360,8 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_xform_precedence(exe, tmp)
     exercise_medic_readphase(exe, tmp)
     exercise_medic_mask_mode(exe, tmp)
+    exercise_medic_echo_offset(exe, tmp)
+    exercise_medic_grouping(exe, tmp)
     exercise_medic_parsing(exe, tmp)
     exercise_medic_output_transaction(exe, tmp)
 
