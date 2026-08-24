@@ -915,7 +915,10 @@ def medic_write_series(
 
     `nan_index` poisons a single voxel of the FIRST echo's phase (flat index into the whole
     series), which is how the silent all-zero-output bug is provoked.  `offset_rad` adds a
-    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove.
+    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove; it may
+    be a constant or a callable(x, y, z), the latter being how a fixture gives a ZERO-FIELD
+    series a non-degenerate stored phase range (the rescale needs one, and a literally constant
+    phase volume has none).
 
     `field_fn(x, y, z, t)` replaces amplitude(t)*medic_field(v) when a fixture needs a field whose
     SPATIAL shape (not just its scale) changes with the frame -- the only way to build a series of
@@ -933,7 +936,8 @@ def medic_write_series(
                 for y in range(ny):
                     for x in range(nx):
                         hz = field_fn(x, y, z, t) if field_fn is not None else scale * medic_field(x, y, z)
-                        phase_values.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0 + offset_rad))
+                        off = offset_rad(x, y, z) if callable(offset_rad) else offset_rad
+                        phase_values.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0 + off))
                         mag_values.append(
                             magnitude_fn(x, y, z, t) if magnitude_fn is not None else medic_magnitude(x, y, z)
                         )
@@ -1558,8 +1562,14 @@ def exercise_medic_rank_boundaries(exe: str, tmp: Path) -> None:
 
     # (a) all-zero phase in every echo and frame -> an all-zero field series; rank 2 < T = 4, so
     # the filter really runs.
-    zero_mags, zero_phases = medic_write_series(tmp, "medic_zero", tes, frames, lambda t: 0.0,
-                                                field_fn=lambda x, y, z, t: 0.0)
+    # The field is zero, but the stored phase must still span a range -- readphase estimates the
+    # rescale from frame 0 and a constant volume has none (the reference dies on that input too).
+    # A TE-INDEPENDENT spatial offset supplies one and MCPC-3D-S removes it, so the field stays
+    # exactly zero, which is what this fixture is about.
+    zero_mags, zero_phases = medic_write_series(
+        tmp, "medic_zero", tes, frames, lambda t: 0.0,
+        field_fn=lambda x, y, z, t: 0.0,
+        offset_rad=lambda x, y, z: medic_wrap(0.7 * x + 0.11 * y + 0.023 * z))
     prefix = tmp / "medic_zero_out"
     result = medic_run(exe, zero_mags, zero_phases, tes, prefix, ["--rank", "2"])
     require_success(result, "--medic --rank 2 on an all-zero field series")
@@ -1839,6 +1849,174 @@ def exercise_medic_output_transaction(exe: str, tmp: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------------------------
+# Gap 7 (readphase): the rescale range is estimated from FRAME 0 ONLY, per echo, and combined
+# across echoes by the MODE with ties broken by the SMALLEST value; non-finite entries lose every
+# tie; there is no already-in-radians short-circuit.  All four were measured against
+# `wk-medic --debug`, which prints the range it chose -- see medic_bench's tools/m1_rescale_probe.py.
+#
+# niimath prints the same line, so each fixture below asserts the CHOSEN RANGE directly and, where
+# the encode and decode ranges coincide so the decoded radians are exact, the recovered field too.
+# Cases whose correct answer mangles an echo assert only the range: a fixture cannot meaningfully
+# fit a slope through a halved sawtooth.
+MEDIC_RP_TES2 = (10.0, 30.0)
+MEDIC_RP_TES3 = (10.0, 20.0, 30.0)
+MEDIC_RP_SLOPE = 4.0          # Hz per j voxel, as in the main synthetic run
+
+
+def medic_rp_encode(phi: float, lo: float, hi: float) -> float:
+    """Radians -> stored units spanning [lo, hi]; the exact inverse of readphase's affine."""
+    return (phi + math.pi) / MEDIC_TWO_PI * (hi - lo) + lo
+
+
+def medic_rp_series(tmp: Path, tag: str, tes, frames: int, enc_range, spike=None,
+                    nan_echo: int | None = None, constant: bool = False):
+    """A multi-frame, multi-echo series whose STORED phase extrema are exact by construction.
+
+    `enc_range(e, t) -> (lo, hi)` is the range frame t of echo e is encoded into.  Two background
+    voxels of every frame are pinned to that frame's lo and hi so the observed extrema are exactly
+    those numbers.  `spike(e) -> (lo, hi) or None` overrides echo e's FRAME 0 pins, which is how
+    one echo is given a frame-0 range of its own.  `nan_echo` poisons one background voxel of that
+    echo's frame 0.  `constant` writes a single value everywhere, i.e. no range at all."""
+    nx, ny, nz = MEDIC_DIMS
+    mags: list[str] = []
+    phases: list[str] = []
+    for e, te in enumerate(tes):
+        mag_values: list[float] = []
+        phase_values: list[float] = []
+        for t in range(frames):
+            lo, hi = enc_range(e, t)
+            for z in range(nz):
+                for y in range(ny):
+                    for x in range(nx):
+                        hz = MEDIC_RP_SLOPE * (y - ny / 2.0)
+                        phi = medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0)
+                        phase_values.append(7.0 if constant else medic_rp_encode(phi, lo, hi))
+                        mag_values.append(medic_magnitude(x, y, z))
+            if not constant:
+                base = t * nx * ny * nz
+                pin_lo, pin_hi = (spike(e) if (spike and t == 0 and spike(e)) else (lo, hi))
+                phase_values[base + 0] = pin_lo          # (0,0,0): background, magnitude 30
+                phase_values[base + 1] = pin_hi          # (1,0,0): background
+                if nan_echo == e and t == 0:
+                    phase_values[base + 2] = float("nan")
+        mag_path = tmp / f"{tag}_mag{e}.nii"
+        phase_path = tmp / f"{tag}_pha{e}.nii"
+        write_float32_nifti(mag_path, MEDIC_DIMS, mag_values, nt=frames)
+        write_float32_nifti(phase_path, MEDIC_DIMS, phase_values, nt=frames)
+        mags.append(str(mag_path))
+        phases.append(str(phase_path))
+    return mags, phases
+
+
+def medic_rp_range(result) -> tuple[float, float]:
+    """Parse the range niimath reports; raises if the line is missing."""
+    for line in (result.stdout + result.stderr).splitlines():
+        if "phase rescale range" in line:
+            body = line.split("[", 1)[1].split("]", 1)[0]
+            lo, hi = body.split(",")
+            return float(lo), float(hi)
+    raise AssertionError("--medic did not report its phase rescale range")
+
+
+def medic_rp_case(exe: str, tmp: Path, tag: str, tes, frames, enc_range, expect_range,
+                  expect_slope=None, spike=None, nan_echo=None, old=""):
+    mags, phases = medic_rp_series(tmp, tag, tes, frames, enc_range, spike=spike, nan_echo=nan_echo)
+    prefix = tmp / f"{tag}_out"
+    result = medic_run(exe, mags, phases, tes, prefix,
+                       ["--rank", "0", "--temporal-correction", "0"])
+    require_success(result, f"--medic readphase fixture {tag}")
+    got = medic_rp_range(result)
+    if got != expect_range:
+        raise AssertionError(
+            f"--medic readphase {tag}: chose range {got}, expected {expect_range}{old}"
+        )
+    if expect_slope is not None:
+        field = medic_read_output(prefix, "_fieldmaps_native", tmp, tag)
+        if field is None:
+            raise AssertionError(f"--medic readphase {tag}: no field map")
+        slope, _ = medic_fit_along_j(field, 0)
+        if abs(slope - expect_slope) > 0.02 * abs(expect_slope):
+            raise AssertionError(
+                f"--medic readphase {tag}: frame-0 field slope {slope:.5f} Hz/voxel, "
+                f"expected {expect_slope}{old}"
+            )
+
+
+def exercise_medic_readphase(exe: str, tmp: Path) -> None:
+    """(13) The Gap 7 readphase rule.  Each case names what the OLD per-echo whole-series rule
+    would have chosen, since the fix cannot be reverted to prove it."""
+    # (a) Frame 0 governs.  Frame 0 is encoded narrow and frame 1 wide; the old rule took the
+    # whole series, i.e. [-200, 200], which halves frame 0's decoded radians and its field.
+    medic_rp_case(
+        exe, tmp, "medic_rp_frame0", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0) if t == 0 else (-200.0, 200.0),
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (the whole-series rule chose [-200, 200] and a slope of 2.0)")
+
+    # (b) Mode across echoes.  Echo 2's frame 0 carries two out-of-range background spikes, so its
+    # own extrema are [-200, 200] while echoes 0 and 1 report [-100, 100]; the mode keeps the pair
+    # that two echoes agree on and every echo decodes exactly.  A per-echo rule decoded echo 2 at
+    # twice the scale, and an all-echo min/max rule decoded ALL of them at half.
+    medic_rp_case(
+        exe, tmp, "medic_rp_mode", MEDIC_RP_TES3, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: (-200.0, 200.0) if e == 2 else None,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (a per-echo rule gave echo 2 [-200, 200] alone)")
+
+    # (c) A two-echo tie resolves to the SMALLEST.  The maxima are 100 and 300 with no majority;
+    # taking the larger would stretch every decoded radian by 400/200 and halve the field.
+    medic_rp_case(
+        exe, tmp, "medic_rp_tie", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: (-100.0, 300.0) if e == 1 else None,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (breaking the tie the other way gives [-100, 300] and a slope of 2.0)")
+
+    # (d) Three distinct maxima, so no mode at all: the smallest still wins.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nomode", MEDIC_RP_TES3, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: [None, (-100.0, 200.0), (-100.0, 300.0)][e],
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (any other tie rule gives 200 or 300)")
+
+    # (e) A NaN in frame 0 must not derail the range.  An implementation that let it through would
+    # make the span NaN and every output voxel with it -- silently, at exit 0.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nan", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0), nan_echo=0,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (a NaN-propagating mode gives a NaN range and an all-NaN field)")
+
+    # (e2) The NaN CONVENTION, which (e) cannot see: a non-finite entry loses the tie rather than
+    # being replaced by the echo's finite extrema.  Echo 0's content is encoded into [-100, 50] and
+    # carries a NaN, echo 1 into [-100, 100].  Propagating the NaN leaves echo 1 as the only finite
+    # candidate; skipping it would make the maxima {50, 100}, a tie the smallest wins, i.e. 50.
+    # Only the chosen range is asserted -- echo 0 decodes at the wrong scale either way, so there
+    # is no meaningful slope to fit.  Measured against wk-medic: a NaN echo against a distinct
+    # [-300, 300] echo reports max 300, which only the propagating rule produces.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nantie", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 50.0) if e == 0 else (-100.0, 100.0), nan_echo=0,
+        expect_range=(-100.0, 100.0),
+        old="  (dropping the NaN before the mode gives [-100, 50])")
+
+    # (f) No range at all is an error, not a silent pass-through.  The old code returned quietly
+    # and left the stored values in place, which are not radians; the reference dies on this input
+    # too, deep inside its unwrapper.
+    mags, phases = medic_rp_series(tmp, "medic_rp_flat", MEDIC_RP_TES2, 2,
+                                   lambda e, t: (-100.0, 100.0), constant=True)
+    result = medic_run(exe, mags, phases, MEDIC_RP_TES2, tmp / "medic_rp_flat_out", ["--rank", "0"])
+    if result.returncode == 0:
+        raise AssertionError("--medic accepted a constant frame 0, which has no rescale range")
+    if "no usable range" not in (result.stdout + result.stderr):
+        raise AssertionError("--medic rejected a constant frame 0 without a diagnostic")
+    print("  --medic readphase: frame-0 range, mode across echoes, tie and NaN rules, "
+          "no short-circuit OK")
+
+
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
     if "--medic" not in help_text:
@@ -1853,6 +2031,7 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_mask_temporal(exe, tmp)
     exercise_medic_rank_boundaries(exe, tmp)
     exercise_medic_xform_precedence(exe, tmp)
+    exercise_medic_readphase(exe, tmp)
     exercise_medic_parsing(exe, tmp)
     exercise_medic_output_transaction(exe, tmp)
 

@@ -599,24 +599,57 @@ typedef struct {
 	nifti_image *tmpl;            /* header template (phase echo 1) */
 } md_ctx;
 
-/* readphase: rescale observed [min,max] of the whole series onto [-pi,pi] (manifest §3.1).
-   Matches ROMEO's readphase, which is what the reference uses. */
-static void md_rescale_phase(float *p, int64_t n) {
-	int64_t i;
-	double mn = 0.0, mx = 0.0, slope, inter, span;
-	int seen = 0;
+/* readphase: rescale the stored phase onto [-pi,pi].
+ *
+ * The range comes from FRAME 0 ONLY, per echo, combined across echoes by the MODE -- not from
+ * the whole series, and there is no already-in-radians short-circuit.  All three were MEASURED
+ * against wk-medic --debug, which prints the range it settled on; the probe is
+ * tools/m1_rescale_probe.py in medic_bench and its record is manifest section 3.1.
+ *
+ *   frame 0 only   : a frame-0 range of [-100,100] under later frames spanning [-200,200] is
+ *                    reported as 100, and the mirror case (wide frame 0) as 200.
+ *   mode, ties low : three echoes at [-100,100],[-100,100],[-50,50] report 100; a two-echo tie
+ *                    at [-100,100],[-200,200] reports min -200 and max +100, i.e. each end
+ *                    independently takes the SMALLEST of the tied values.
+ *   non-finite     : an echo whose frame 0 contains a NaN contributes NaN, which loses every
+ *                    tie -- equivalently, non-finite entries are ignored.
+ *   no shortcut    : a phantom whose stored phase spans exactly 2.0 rad comes back with the
+ *                    same field as its exactly-[-pi,pi] twin (ratio 1.00005; a short-circuit
+ *                    would have given 0.3183), so the range is always applied.
+ *
+ * Why it matters: per-echo whole-series extrema diverge from this when the stored range varies
+ * by frame (one outlying frame widens the range and compresses every other) or by echo (the
+ * mode is robust to one odd echo; a per-echo min/max is not). */
+
+/* Mode of `n` doubles: most frequent value, ties broken by the smallest, non-finite ignored.
+ * Returns NaN when nothing is finite.  n is the echo count, so O(n^2) is free. */
+static double md_mode(const double *v, int n) {
+	double best = (double)NAN;
+	int i, j, bestc = 0;
 	for (i = 0; i < n; i++) {
-		double v = (double)p[i];
-		if (!isfinite(v)) continue;
-		if (!seen) { mn = mx = v; seen = 1; }
-		else { if (v < mn) mn = v; if (v > mx) mx = v; }
+		int c = 0;
+		if (!isfinite(v[i])) continue;
+		for (j = 0; j < n; j++) if (v[j] == v[i]) c++;
+		if (c > bestc || (c == bestc && v[i] < best)) { bestc = c; best = v[i]; }
 	}
-	if (!seen) return;
-	span = mx - mn;
-	if (fabs(span - MD_2PI) <= 0.1) return;   /* already radians */
-	if (!(span > 0.0)) return;
-	slope = MD_2PI / span;
-	inter = -M_PI - mn * slope;
+	return best;
+}
+
+static void md_frame0_range(const float *p, int64_t n3, double *mn, double *mx) {
+	int64_t i;
+	double lo = (double)p[0], hi = lo;
+	for (i = 1; i < n3; i++) {
+		double v = (double)p[i];
+		if (isnan(v)) { lo = hi = (double)NAN; break; }   /* NaN propagates within an echo */
+		if (v < lo) lo = v;
+		if (v > hi) hi = v;
+	}
+	*mn = lo; *mx = hi;
+}
+
+static void md_apply_phase_scale(float *p, int64_t n, double mn, double mx) {
+	double slope = MD_2PI / (mx - mn), inter = -M_PI - mn * slope;
+	int64_t i;
 	for (i = 0; i < n; i++) p[i] = (float)((double)p[i] * slope + inter);
 }
 
@@ -1122,6 +1155,7 @@ int nii_medic(int argc, char *argv[]) {
 	int nTE = 0, have_trt = 0, have_pe = 0;
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
 	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
+	double phmin[MD_MAX_ECHO], phmax[MD_MAX_ECHO];   /* frame-0 extrema, per echo */
 	int *frc = NULL;
 	uint8_t *maskbuf = NULL;   /* per-frame masks, retained through the temporal correction */
 	romeo_opts ro = romeo_opts_default();
@@ -1340,7 +1374,7 @@ int nii_medic(int argc, char *argv[]) {
 		mi = md_read_f32(magf[e], "magnitude");
 		if (!mi) { nifti_image_free(pi); goto done; }
 		pe = (float *)pi->data;
-		md_rescale_phase(pe, (int64_t)n3 * Tin);
+		md_frame0_range(pe, n3, &phmin[e], &phmax[e]);   /* rescale happens after the loop */
 		for (t = 0; t < T; t++) {
 			memcpy(phase + ((int64_t)t * c.neco + e) * n3, pe + (int64_t)t * n3, (size_t)n3 * sizeof(float));
 			memcpy(mag + ((int64_t)t * c.neco + e) * n3, ((float *)mi->data) + (int64_t)t * n3, (size_t)n3 * sizeof(float));
@@ -1348,6 +1382,22 @@ int nii_medic(int argc, char *argv[]) {
 		nifti_image_free(mi);
 		if (e == 0) { free(pi->data); pi->data = NULL; nifti_image_free(ph[0]); ph[0] = pi; c.tmpl = ph[0]; }
 		else nifti_image_free(pi);
+	}
+
+	/* One range for the whole run: the mode across echoes of frame 0's extrema.  Applied here
+	   rather than per echo above, because the mode cannot be taken until every echo has been
+	   seen -- see md_mode / md_frame0_range. */
+	{
+		double mn = md_mode(phmin, c.neco), mx = md_mode(phmax, c.neco);
+		if (!(mx > mn)) {
+			MD_ERR("frame 0 of the phase data has no usable range (mode across echoes gave "
+				"[%g, %g]); a constant or all-NaN first frame cannot be rescaled\n", mn, mx);
+			goto done;
+		}
+		md_apply_phase_scale(phase, (int64_t)n3 * c.neco * T, mn, mx);
+		/* Provenance, and the only direct read-out of the rule: the reference prints the same
+		   thing.  Stderr, never stdout -- the output image may be going to stdout. */
+		fprintf(stderr, "--medic: phase rescale range [%g, %g] (frame 0, mode across echoes)\n", mn, mx);
 	}
 
 	/* ---- per-frame: MCPC-3D-S -> ROMEO -> weighted regression ------------------------------- */
