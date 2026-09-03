@@ -1,36 +1,38 @@
+# Streaming NIfTI images through niimath
+
 ## About
 
-`niimath` is a high-performance command-line tool for manipulating NIfTI images. Because `niimath` is so fast, the main bottleneck in many workflows is disk I/O. To enable efficient workflows, niimath supports reading from and writing to standard input/output streams using the special filename `-`. It is important to note that both the input and output must be single-file NIfTI-1 images (e.g. `img.nii`). Compressed files (e.g. `img.nii.gz`) must be decompressed prior to using the memory stream input.
+`niimath` is a high-performance command-line tool for NIfTI images. Because `niimath` is so fast, disk I/O is the main bottleneck in many workflows. To avoid it, niimath can read from standard input and write to standard output. Use the special filename `-` for either stream. Both the input and the output must be single-file NIfTI-1 images (for example `img.nii`). Decompress compressed files (for example `img.nii.gz`) before you pipe them in.
 
-This streaming capability is especially useful for chaining tools together without writing intermediate results to disk. For example:
-
-```bash
-niimath - add 1 -     # read from stdin, add 1, write to stdout
-```
-
-Note that only one image can be piped at a time. For example:
+Streaming lets you chain tools without writing intermediate results to disk:
 
 ```bash
-niimath - add img.nii -   # input image is piped; second image is read from disk
+niimath - -add 1 -     # read from stdin, add 1, write to stdout
 ```
 
-## Demo Scripts
+Only one image can be piped at a time. A second image is read from disk:
 
-This folder contains minimal Python scripts demonstrating how to use these features. These assume niimath is available in your system path. Note that some scripts use nibabel while others demonstrate direct interaction if you do not wish to include nibabel as a dependency.
+```bash
+niimath - -add img.nii -   # the input image is piped; the second image is read from disk
+```
+
+## Demo scripts
+
+This folder contains minimal Python scripts that show these features. They assume that `niimath` is on your system path. Some scripts use nibabel. Others show direct interaction, for when you do not want nibabel as a dependency.
 
 ```bash
 # Generate a synthetic NIfTI volume with a 3D pattern
 python generate_borg.py
 
-# Use niimath to process a NIfTI file and return the result via stdout (no disk writes)
+# Process a NIfTI file and return the result via stdout (no disk writes)
 python write_stdout.py
 
-# Pipe a NIfTI image to niimath via stdin, output saved to disk
+# Pipe a NIfTI image to niimath via stdin, and save the output to disk
 python read_stdin.py
 
 # Pipe a NIfTI image to niimath and capture the output via stdout, fully in memory
 python read_write_stream.py
 
-# Use nibabel to_bytes() and from_bytes() to call niimath using pipes
+# Use nibabel to_bytes() and from_bytes() to call niimath through pipes
 python nibabel_niimath.py
 ```
