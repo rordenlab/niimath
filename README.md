@@ -117,7 +117,7 @@ sudo chown $(whoami) ./niimath/src/niimath
 
 ## JavaScript and WebAssembly
 
-niimath compiles to WebAssembly, so you can use it in web pages and Node.js projects. See the [live demo](https://niivue.github.io/niivue-niimath/), which links to source code and instructions, and the [@niivue/niimath README](https://github.com/rordenlab/niimath/blob/master/js/README.md). The rest of this README describes the `niimath` command-line program.
+niimath compiles to WebAssembly, so you can use it in web pages. The `@niivue/niimath` package runs the processing in a Web Worker and is meant for the browser, not for Node.js. See the [live demo](https://niivue.github.io/niivue-niimath/), which links to source code and instructions, and the [@niivue/niimath README](https://github.com/rordenlab/niimath/blob/master/js/README.md). The rest of this README describes the `niimath` command-line program.
 
 ## Usage
 
