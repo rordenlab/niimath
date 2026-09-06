@@ -3532,6 +3532,180 @@ def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
     print("        parsing and deltaTE/empty-mask rejections OK")
 
 
+def write_mz3(path: Path, tris, verts) -> None:
+    """Uncompressed MZ3: magic 0x5A4D, attr 3 (faces + verts), nface, nvert, nskip, int32 faces,
+    float32 verts."""
+    blob = struct.pack("<HHIII", 0x5A4D, 3, len(tris), len(verts), 0)
+    blob += b"".join(struct.pack("<3i", *t) for t in tris)
+    blob += b"".join(struct.pack("<3f", *v) for v in verts)
+    path.write_bytes(blob)
+
+
+def read_mz3_verts(path: Path) -> list:
+    """Vertices of an mz3 (gzipped or not), as (x, y, z) tuples."""
+    b = path.read_bytes()
+    if b[:2] == b"\x1f\x8b":
+        b = gzip.decompress(b)
+    _magic, _attr, nface, nvert, nskip = struct.unpack("<HHIII", b[:16])
+    o = 16 + nskip + nface * 12
+    return [struct.unpack_from("<3f", b, o + 12 * i) for i in range(nvert)]
+
+
+def mesh_report_line(result, label: str) -> dict:
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith("mesh check (%s):" % label):
+            d = {}
+            for tok in line.split(":", 1)[1].split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    d[k] = None if v == "n/a" else float(v)
+            return d
+    raise AssertionError("no 'mesh check (%s)' line in:\n%s" % (label, result.stdout + result.stderr))
+
+
+def exercise_mesh_report(exe: str, tmp: Path, help_text: str) -> None:
+    """The mesh quality report printed under -v 1.  Each defect class on a mesh built to have
+    exactly that defect and nothing else; the report is read off the simplifier's INPUT line,
+    which runs before any simplification touches the mesh."""
+    if "-mesh" not in help_text:
+        print("  mesh report: not built (NII2MESH) - skipping")
+        return
+    tet_v = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    tet_f = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+    cases = {
+        # name: (tris, verts, expected)
+        "closed": (tet_f, tet_v, dict(components=1, euler=2, genus=0, boundary_edges=0, holes=0,
+                                      nonmanifold_edges=0, self_intersecting=0)),
+        "hole": (tet_f[:3], tet_v, dict(holes=1, boundary_edges=3)),
+        # two tets sharing ONE edge (0-1): that edge has four faces
+        "nonmanifold": (tet_f + [(0, 1, 4), (0, 5, 1), (1, 4, 5), (0, 4, 5)],
+                        tet_v + [(0, -1, 0), (0, 0, -1)], dict(nonmanifold_edges=1)),
+        # two well-separated triangles crossing like a plus sign
+        "crossing": ([(0, 1, 2), (3, 4, 5)],
+                     [(-1, 0, -1), (1, 0, -1), (0, 0, 1), (0, -1, 0), (0, 1, 0), (0, 0, 2)],
+                     dict(self_intersecting=2)),
+    }
+    for name, (tris, verts, expect) in cases.items():
+        src = tmp / f"mesh_{name}.mz3"
+        write_mz3(src, tris, [tuple(float(c) for c in v) for v in verts])
+        r = run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}_out.mz3")])
+        rep = mesh_report_line(r, "input")
+        for key, want in expect.items():
+            got = rep[key]
+            if got != want:
+                raise AssertionError(f"mesh report on '{name}': {key}={got:g}, expected {want}")
+    # the crossing pair must NOT count when the triangles share a vertex (adjacent, not crossing)
+    src = tmp / "mesh_adjacent.mz3"
+    write_mz3(src, [(0, 1, 2), (0, 3, 4)], [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_adj_out.mz3")]), "input")
+    if rep["self_intersecting"] != 0:
+        raise AssertionError("mesh report counted vertex-sharing triangles as self-intersecting")
+    # documented limitation: coplanar overlap is NOT counted (Moller's coplanar branch is skipped)
+    src = tmp / "mesh_coplanar.mz3"
+    write_mz3(src, [(0, 1, 2), (3, 4, 5)], [(0, 0, 0), (2, 0, 0), (0, 2, 0), (1, 1, 0), (3, 1, 0), (1, 3, 0)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_cop_out.mz3")]), "input")
+    if rep["self_intersecting"] != 0:
+        raise AssertionError("coplanar overlap is documented as uncounted; update the docs if that changed")
+    # a bow-tie: two tets touching at one vertex -- every edge is manifold, the vertex is not
+    src = tmp / "mesh_bowtie.mz3"
+    write_mz3(src, tet_f + [(0, 5, 4), (0, 4, 6), (0, 6, 5), (4, 5, 6)],
+              [tuple(float(c) for c in v) for v in tet_v] + [(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_bt_out.mz3")]), "input")
+    if rep["nonmanifold_vertices"] != 1 or rep["nonmanifold_edges"] != 0 or rep["genus"] is not None:
+        raise AssertionError(f"bow-tie vertex misreported: {rep}")
+    engines = ("0",) if "half-edge simplifier not built" in help_text else ("0", "1")
+    if "1" in engines:
+        # the half-edge simplifier refuses non-manifold input (edge or vertex) and leaves it unsimplified
+        for name, faces in (("nonmanifold", 8), ("bowtie", 8)):
+            r = run_niimath(exe, [str(tmp / f"mesh_{name}.mz3"), "-n", "1", "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}_n1.mz3")])
+            if "not a manifold" not in r.stderr or mesh_report_line(r, "simplified")["F"] != faces:
+                raise AssertionError(f"-n 1 must reject a non-manifold mesh ({name}) unchanged:\n" + r.stdout + r.stderr)
+    else:
+        r = run_niimath(exe, [str(tmp / "mesh_nonmanifold.mz3"), "-n", "1", "-r", "0.5", str(tmp / "mesh_nm_n1.mz3")])
+        if r.returncode == 0 or "Q2=1" not in r.stderr:
+            raise AssertionError("-n 1 must fail clearly in a build without quadric2:\n" + r.stdout + r.stderr)
+    # a vertex of valence 70: past the 64-face ring that once truncated quadric2's link test, and the
+    # case that exposed quadric.c's ref-count overwrite (the old engine refuses apex edges above
+    # RING_MAX and collapses the rim instead)
+    rim = 70
+    verts = [(0.0, 0.0, 1.0), (0.0, 0.0, -1.0)] + [(math.cos(2 * math.pi * i / rim), math.sin(2 * math.pi * i / rim), 0.0) for i in range(rim)]
+    tris = [(0, 2 + i, 2 + (i + 1) % rim) for i in range(rim)] + [(1, 2 + (i + 1) % rim, 2 + i) for i in range(rim)]
+    src = tmp / "mesh_valence.mz3"
+    write_mz3(src, tris, verts)
+    for eng in engines:
+        r = run_niimath(exe, [str(src), "-n", eng, "-r", "0.25", "-v", "1", str(tmp / f"mesh_val{eng}_out.mz3")])
+        rep = mesh_report_line(r, "simplified")
+        if r.returncode != 0 or rep["euler"] != 2 or rep["nonmanifold_edges"] or rep["nonmanifold_vertices"] or rep["holes"]:
+            raise AssertionError(f"valence-70 simplification (-n {eng}) broke topology:\n" + r.stdout + r.stderr)
+        if eng == "1" and abs(rep["F"] - round(0.25 * len(tris))) > 1:   # the documented contract: within one face
+            raise AssertionError(f"-n 1 missed its target budget: F={rep['F']:g} for {round(0.25 * len(tris))}")
+    # open meshes: a bowl (one boundary loop) and an annulus (two loops, every vertex on a boundary,
+    # every interior edge a chord).  Both engines must keep the loops and never pinch them.
+    n = 16
+    ring = lambda r, z: [(r * math.cos(2 * math.pi * i / n), r * math.sin(2 * math.pi * i / n), z) for i in range(n)]
+    bowl_v = [(0.0, 0.0, -1.0)] + ring(1.0, 0.0)
+    bowl_f = [(0, 1 + (i + 1) % n, 1 + i) for i in range(n)]
+    ann_v = ring(1.0, 0.0) + ring(2.0, 0.0)
+    ann_f = []
+    for i in range(n):
+        j = (i + 1) % n
+        ann_f += [(i, j, n + i), (j, n + j, n + i)]
+    for name, otris, overts, loops in (("bowl", bowl_f, bowl_v, 1), ("annulus", ann_f, ann_v, 2)):
+        src = tmp / f"mesh_{name}.mz3"
+        write_mz3(src, otris, overts)
+        for eng in engines:
+            r = run_niimath(exe, [str(src), "-n", eng, "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}{eng}_out.mz3")])
+            rep = mesh_report_line(r, "simplified")
+            if r.returncode != 0 or rep["holes"] != loops or rep["nonmanifold_edges"] or rep["nonmanifold_vertices"] or rep["components"] != 1:
+                raise AssertionError(f"open-mesh simplification ({name}, -n {eng}) broke the boundary:\n" + r.stdout + r.stderr)
+    # -r 1 leaves the mesh untouched at every quality (the lossless finish rides -q 2 INSIDE the
+    # simplification; it must not run on its own), and the threshold schedule is unit-invariant:
+    # the same mesh in microns simplifies to the same face count
+    src = tmp / "mesh_valence.mz3"
+    r = run_niimath(exe, [str(src), "-r", "1", "-q", "2", "-v", "1", str(tmp / "mesh_untouched.mz3")])
+    if r.returncode != 0 or "mesh check (simplified)" in r.stdout + r.stderr or len(read_mz3_verts(tmp / "mesh_untouched.mz3")) != len(verts):
+        raise AssertionError("-r 1 must leave the mesh unsimplified at -q 2:\n" + r.stdout + r.stderr)
+    write_mz3(tmp / "mesh_valence_um.mz3", tris, [(1000.0 * x, 1000.0 * y, 1000.0 * z) for x, y, z in verts])
+    counts = []
+    for name in ("mesh_valence", "mesh_valence_um"):
+        r = run_niimath(exe, [str(tmp / f"{name}.mz3"), "-r", "0.25", "-q", "2", "-v", "1", str(tmp / f"{name}_out.mz3")])
+        counts.append(mesh_report_line(r, "simplified")["F"])
+    if counts[0] != counts[1]:
+        raise AssertionError(f"simplification is not unit-invariant: F={counts[0]:g} in mm, {counts[1]:g} in microns")
+    # a NaN coordinate: the report must say the scan could not run, not index with (int)NaN
+    write_mz3(tmp / "mesh_nan.mz3", tet_f, [(float("nan"), 0.0, 0.0)] + [tuple(float(c) for c in v) for v in tet_v[1:]])
+    r = run_niimath(exe, [str(tmp / "mesh_nan.mz3"), "-r", "1", "-v", "1", str(tmp / "mesh_nan_out.mz3")])
+    if r.returncode != 0 or mesh_report_line(r, "input")["self_intersecting"] is not None:
+        raise AssertionError("a NaN vertex must report self_intersecting=n/a:\n" + r.stdout + r.stderr)
+    # smoothing guard: a sheet with a tent over a flat sheet 0.005 below.  HC smoothing pulls the
+    # tent's second ring BELOW the plane (measured: -0.0088 after 10 iterations), through the
+    # lower sheet.  -q 1 must show the crossings, -q 2 none -- while still having smoothed the tent.
+    n = 9
+    verts, tris = [], []
+    for z, dx, tent in ((0.0, 0.0, 1.5), (-0.005, 0.5, 0.0)):
+        base = len(verts)
+        for y in range(n):
+            for x in range(n):
+                verts.append((x + dx, float(y), z + (tent if x == n // 2 and y == n // 2 else 0.0)))
+        for y in range(n - 1):
+            for x in range(n - 1):
+                a = base + y * n + x
+                tris += [(a, a + 1, a + n + 1), (a, a + n + 1, a + n)]
+    src = tmp / "mesh_sheets.mz3"
+    write_mz3(src, tris, verts)
+    for q, want_zero in (("1", False), ("2", True)):
+        out = tmp / f"mesh_sheets{q}.mz3"
+        r = run_niimath(exe, [str(src), "-r", "1", "-s", "10", "-q", q, "-v", "1", str(out)])
+        rep = mesh_report_line(r, "smoothed")
+        if r.returncode != 0 or (rep["self_intersecting"] == 0) != want_zero:
+            raise AssertionError(f"smoothing guard at -q {q}: {rep}\n" + r.stdout + r.stderr)
+    tent = max(v[2] for v in read_mz3_verts(tmp / "mesh_sheets2.mz3")[:n * n])
+    if not 0.05 < tent < 1.0:
+        raise AssertionError(f"guarded smoothing did not smooth the tent (apex z={tent:.3f}); reverting everything is not a guard")
+    print("  mesh report: closed/hole/non-manifold/self-intersection/coplanar/valence/open cases OK"
+          + (" (-n 1 half-edge engine exercised)" if "1" in engines else " (-n 1 not built: rejection checked)"))
+
+
 def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
     """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
     hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
@@ -4137,6 +4311,7 @@ def main() -> int:
         exercise_medic_regressions(exe, tmp, help_text)
         exercise_skullstrip(exe, tmp, help_text)
         exercise_openmp_scratch_ops(exe, tmp)
+        exercise_mesh_report(exe, tmp, help_text)
 
         # THE LOAD-BEARING COPYLEFT CHECK, and it runs for EVERY BSD-branded binary, not just
         # a packaged one -- it used to be gated on --expect-bsd, which meant only the wheel

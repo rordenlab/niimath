@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260726"
+#define kMTHdate "v1.0.20260906"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
@@ -224,23 +224,27 @@ void read_mz3(const char* filename, vec3d **verts, vec3i **tris, int* nvert, int
 	fclose(fp);
 }
 
-int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, bool verbose, int quality) {
+int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, int postSmooth, bool verbose, int quality, int newSimplify) {
 	vec3d *pts = NULL;
 	vec3i *tris = NULL;
 	int ntri, npt;
 	read_mz3(innm, &pts, &tris, &npt, &ntri);
-	double aggressiveness = 7.0; //7 = default for Simplify.h
-	if (quality == 0) //fast
-		aggressiveness = 8.0;
-	if (quality == 2) //best
-		aggressiveness = 5.0;
-	int startVert = npt;
-	int startTri = ntri;
-	int target_count = round((float)ntri * reduceFraction);
-	double startTime = clockMsec();
-	quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, aggressiveness, verbose, (quality > 1));
-	if (verbose)
-		printf("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
+	if (verbose) mesh_report(tris, pts, ntri, npt, "mesh check (input)");
+	if (postSmooth > 0) {
+		laplacian_smoothHC(pts, tris, npt, ntri, 0.1, 0.5, postSmooth, true, (quality > 1));
+		if (verbose) mesh_report(tris, pts, ntri, npt, "mesh check (smoothed)");
+	}
+	if (reduceFraction < 1.0) {
+		int startVert = npt;
+		int startTri = ntri;
+		int target_count = round((float)ntri * reduceFraction);
+		double startTime = clockMsec();
+		mesh_simplify(&pts, &tris, &npt, &ntri, target_count, quality, newSimplify, verbose);
+		if (verbose) {
+			printf("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
+			mesh_report(tris, pts, ntri, npt, "mesh check (simplified)");
+		}
+	}
 	save_mesh(outnm, tris, pts, ntri, npt, (quality > 0));
 	free(tris);
 	free(pts);
@@ -248,24 +252,33 @@ int simplify_mz3(const char * innm, const char * outnm, float reduceFraction, bo
 }
 
 int mainMz3(int argc,char **argv) {
-	int quality = 1;
+	int quality = 2;
+	int newSimplify = 0, postSmooth = 0;
 	float reduceFraction = 0.25;
 	bool verbose = true;
 	if (argc > 3) {
 		for (int i=2;i<(argc-1);i++) {
+			if (strcmp(argv[i],"-n") == 0) {
+				newSimplify = atoi(argv[i+1]);
+				#ifndef HAVE_QUADRIC2
+				if (newSimplify) { fprintf(stderr, "-n 1 needs a build with the half-edge simplifier (Q2=1 make / -DENABLE_QUADRIC2=ON)\n"); return EXIT_FAILURE; }
+				#endif
+			}
 			if (strcmp(argv[i],"-q") == 0)
 				quality = atoi(argv[i+1]);
 			if (strcmp(argv[i],"-r") == 0)
 				reduceFraction = atof(argv[i+1]);
+			if (strcmp(argv[i],"-s") == 0)
+				postSmooth = atoi(argv[i+1]);
 			if (strcmp(argv[i],"-v") == 0)
 				verbose = atoi(argv[i+1]);
 		}
 	}
-	if ((reduceFraction <= 0.0) || (reduceFraction >= 1.0)) {
-		fprintf(stderr,"Mesh reduction factor should be > 0 and < 1.\n");
+	if ((reduceFraction <= 0.0) || (reduceFraction > 1.0)) {
+		fprintf(stderr,"Mesh reduction factor should be > 0 and <= 1 (1 = no simplification).\n");
 		return(EXIT_FAILURE);
 	}
-	return simplify_mz3(argv[1], argv[argc-1], reduceFraction, verbose, quality);
+	return simplify_mz3(argv[1], argv[argc-1], reduceFraction, postSmooth, verbose, quality, newSimplify);
 }
 #endif // NII2MESH
 
@@ -484,15 +497,22 @@ int show_help( void ) {
 	printf(" -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')\n");
 	// We should indent the next few help lines to indicate that they are sub-options of -mesh
 	// DO NOT USE TABS!!! Use spaces to indent
-	printf("    -i <isovalue>            : 'd'ark, 'm'edium, 'b'right or numeric isosurface\n");
-	printf("    -a <atlasFile>           : roi based atlas to mesh\n");
-	printf("    -b <fillBubbles>         : fill bubbles\n");
-	printf("    -l <onlyLargest>         : only largest\n");
-	printf("    -o <originalMC>          : original marching cubes\n");
-	printf("    -q <quality>             : quality\n");
-	printf("    -s <postSmooth>          : post smooth\n");
-	printf("    -r <reduceFraction>      : reduce fraction\n");
-	printf("    -v <verbose>             : verbose\n");
+	printf("    -i <isovalue>            : 'd'ark, 'm'edium, 'b'right (Otsu thresholds) or numeric isosurface (default m)\n");
+	printf("    -a <atlasFile>           : roi based atlas to mesh: one mesh per label, named by the label file\n");
+	printf("    -b <0|1>                 : fill bubbles (interior cavities) before meshing (default 0)\n");
+	printf("    -l <0|1>                 : keep only the largest connected object (default 1)\n");
+	#ifdef HAVE_QUADRIC2
+	printf("    -n <0|1>                 : 1 = half-edge simplifier: within one face of the target, topology-preserving (default 0)\n");
+	#else
+	printf("    -n <0|1>                 : half-edge simplifier not built (Q2=1 make / -DENABLE_QUADRIC2=ON)\n");
+	#endif
+	printf("    -o <0|1>                 : 1 = classic marching cubes tables, no ambiguity resolution (default 0)\n");
+	printf("    -p <0|1>                 : smooth the volume before marching cubes (default 1)\n");
+	printf("    -q <0|1|2>               : quality: 0 quick, 1 balanced, 2 precise (default 2; adds self-intersection guards and a lossless finish)\n");
+	printf("    -s <iterations>          : post-smooth the mesh, Humphrey's Classes (default 0)\n");
+	printf("    -r <fraction>            : reduce to this fraction of the triangles; 1 = no simplification (default 0.25)\n");
+	printf("    -v <0|1>                 : verbose, prints a mesh check after every stage (default 1)\n");
+	printf("  A mesh can be the input: 'niimath in.mz3 -s 10 -r 0.5 out.mz3' accepts -r, -s, -q and -v\n");
 	// add -hollow <threshold> <wallThickness> if mesh support enabled
 	printf(" -hollow <threshold> <thickness> : hollow out a mesh\n");
 #endif

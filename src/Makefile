@@ -175,12 +175,16 @@ ifneq "$(AL)" "0"
     WASM_AL_PREREQ= wasm_al_objs
 endif
 
-#Marching Cubes flag: run "MC=1 make" for new MarchingCubes instead of classic oldcubes
-MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
-
-#run "MC=1 make" for new MarchingCubes algorithm (handles ambiguities)
-ifeq "$(MC)" "1"
-	MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c MarchingCubes.c
+#Marching cubes: Lewiner (MarchingCubes.c, resolves ambiguous cells against the trilinear
+#interpolant) is the default and what notarize.sh has always shipped; "MC=0 make" builds the
+#classic table-only oldcubes.c instead.  -mesh -o 1 selects the classic table within Lewiner.
+MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c MarchingCubes.c
+ifeq "$(MC)" "0"
+	MFLAGS= -DNII2MESH meshify.c quadric.c bwlabel.c radixsort.c fdr.c -DUSE_CLASSIC_CUBES oldcubes.c
+endif
+#Half-edge simplifier (-mesh -n 1): reference engine, equal fidelity, slower; "Q2=1 make" builds it in
+ifeq "$(Q2)" "1"
+	MFLAGS+= -DHAVE_QUADRIC2 quadric2.c
 endif
 #Bitmap ceation: either stb_image or spng, the latter creates more compact PNGs, requires ZFLAGS
 BMPFLAGS= -DHAVE_BMP filter.c bmp.c spng.c

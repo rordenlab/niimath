@@ -296,6 +296,8 @@ niimath bet.nii.gz -mesh -i m medIsolevel.gii
 niimath bet.nii.gz -mesh -i b brightIsolevel.gii
 ```
 
+Mesh quality. Marching cubes uses the Lewiner tables by default, which resolve the ambiguous cube configurations against the trilinear interpolant (`-o 1` selects the classic tables). Simplification never breaks the topology of the surface (a link condition rejects any collapse that would create a non-manifold edge). `-q` sets the quality level: `-q 2` (the default) adds a self-intersection guard to both the `-s` smoothing and the simplification and a lossless finishing pass; `-q 1` drops the guards and the lossless finish and runs in about 40% of the time (2.3 s against 5.7 s for a smoothed, simplified MNI surface); `-q 0` is fastest and writes uncompressed mz3. `-r 1` leaves the mesh unsimplified at every quality level. An existing mesh can be processed the same way: `niimath in.mz3 -s 10 -r 0.5 out.mz3` accepts `-r`, `-s`, `-q` and `-v`. With `-v 1` every stage prints a `mesh check` line: components, Euler characteristic and genus, boundary edges and holes, non-manifold edges and vertices, and self-intersecting triangles. A second, half-edge simplifier (`-n 1`) exists as a reference: it stops within one face of the requested count and refuses non-manifold input, at the same geometric fidelity and about 30% more time. It is not compiled by default (`Q2=1 make` or `-DENABLE_QUADRIC2=ON`).
+
 ## Creating bitmaps
 
 You can use the `--bitmap` option to visualize the results of any operations. This option has arguments inspired by fsl's slicer, but introduces new features. The [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap) provides examples and documentation.
