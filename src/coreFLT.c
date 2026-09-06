@@ -67,9 +67,6 @@
 #ifdef HAVE_BMP
 #include "bmp.h"
 #endif
-#ifdef HAVE_BUTTERWORTH
-#include "bw.h"
-#endif
 #ifdef NII2MESH
 #include "bwlabel.h"
 #include "fdr.h"
@@ -101,6 +98,15 @@
 #endif
 #ifdef HAVE_STC
 #include "stc.h" // slice-time correction (-stc)
+#endif
+#ifdef HAVE_FMAP
+#include "fmap.h" // B0 fieldmap EPI distortion correction (-fugue)
+#endif
+#ifdef HAVE_SKULLSTRIP
+// Guarded by HAVE_SKULLSTRIP ALONE. It once sat nested inside another feature's #ifdef, which
+// made the combination that disabled the outer feature fail to compile; keep this include and
+// the -skullstrip dispatch keyed to the same single flag.
+#include "skullstrip.h" // AFNI-style surface skull stripping (-skullstrip)
 #endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
@@ -1637,8 +1643,15 @@ staticx int nifti_unsharp(nifti_image *nim, flt SigmammX, flt SigmammY, flt Sigm
 		return 1;
 	// process each 3D volume independently: reduce memory pressure
 	nim->nvox = nvox3D;
-	flt *simg = (flt *)malloc(nim->nvox * sizeof(flt)); // output image
-	memset(simg, 0, nim->nvox * sizeof(flt));					// zero array
+	size_t sbytes;
+	if (nii_mul_size(nim->nvox, sizeof(flt), &sbytes))
+		return 1;
+	flt *simg = (flt *)malloc(sbytes); // output image
+	if (!simg) { // memset follows immediately, and nim->data is rebound just below
+		printfx("unsharp failed to allocate its scratch image\n");
+		return 1;
+	}
+	memset(simg, 0, sbytes);					// zero array
 	nim->data = (void *)simg;
 	for (int v = 0; v < nVol; v++) {
 		xmemcpy(simg, inimg, nim->nvox * sizeof(flt));
@@ -1749,6 +1762,11 @@ staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int 
 		return 1;
 	if ((x < 0) || (x >= nim->nx) || (y < 0) || (y >= nim->ny) || (z < 0) || (z >= nim->nz)) {
 		printfx("tfceS x/y/z must be in range 0..%" PRId64 "/0..%" PRId64 "/0..%" PRId64 "\n", nim->nx - 1, nim->ny - 1, nim->nz - 1);
+		// MUST return. This used to fall through to the handedness flip and `seed`, then read
+		// inimg[seed] out of bounds: `-tfceS 2 0.5 6 -100000 -100000 -100000 0.5` on a 16^3
+		// image computes seed = -27,308,800, i.e. a read ~109 MB before the buffer. It did not
+		// crash, which is exactly why a diagnostic without a return is worse than no check.
+		return 1;
 	}
 	if (!neg_determ(nim))
 		x = nim->nx - x - 1;
@@ -1771,6 +1789,10 @@ staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int 
 	}
 	// set up kernel to search for neighbors. Since we already included sides, we do not worry about A<->P and L<->R wrap
 	int32_t *k = (int32_t *)malloc(3 * numk * sizeof(int32_t)); // kernel: offset, x, y
+	if (!k) { // written unchecked on the lines below; numk <= 26 so no overflow check needed
+		printfx("tfce failed to allocate the neighbour kernel\n");
+		return 1;
+	}
 	int mxDx = 1;														// connectivity 6: faces only
 	if (numk == 18)
 		mxDx = 2; // connectivity 18: faces+edges
@@ -1792,14 +1814,44 @@ staticx int nifti_tfceS(nifti_image *nim, double H, double E, int c, int x, int 
 	for (size_t i = 0; i < nvox3D; i++)
 		mx = MAX((inimg[i]), mx);
 	double dh = mx / 100.0;
+	if (dh <= 0.0) { // same reference contract as nifti_tfce above; `<= 0` so all-NaN passes
+		free(k);
+		printfx("ERROR: TFCE failed, please check your file for valid sizes and voxel values.\n");
+		printfx("Error: tfce requires a positive deltaT input.\n");
+		return 1;
+	}
 
-	flt *outimg = (flt *)malloc(nvox3D * sizeof(flt));		  // output image
-	int32_t *q = (int32_t *)malloc(nvox3D * sizeof(int32_t)); // queue with untested seed
-	uint8_t *vxs = (uint8_t *)malloc(nvox3D * sizeof(uint8_t));
-	memset(outimg, 0, nvox3D * sizeof(flt)); // zero array
+	// Serial, so no oom flag is needed -- but the same crash was here, so it gets the same
+	// treatment. `k` is freed first on the error path, as in the parallel twin above.
+	size_t obytesS, qbytesS;
+	if (nii_mul_size((size_t)nvox3D, sizeof(flt), &obytesS) ||
+		nii_mul_size((size_t)nvox3D, sizeof(int32_t), &qbytesS)) {
+		free(k);
+		printfx("tfceS scratch size overflow\n");
+		return 1;
+	}
+	flt *outimg = (flt *)malloc(obytesS);					  // output image
+	int32_t *q = (int32_t *)malloc(qbytesS);				  // queue with untested seed
+	uint8_t *vxs = (uint8_t *)malloc((size_t)nvox3D);
+	if (!outimg || !q || !vxs) {
+		free(outimg);
+		free(q);
+		free(vxs);
+		free(k);
+		printfx("tfceS failed to allocate scratch memory\n");
+		return 1;
+	}
+	memset(outimg, 0, obytesS); // zero array
 	// for (int i = 0; i < nvox3D; i++)
 	//	outimg[i] = 0.0;
-	int n_steps = (int)ceil(mx / dh);
+	// `(int)` of a NaN or out-of-range double is UNDEFINED (UBSan flags it; arm64 renders it as
+	// some value, wasm32 would trap). It is reachable: an ALL-NaN volume gives dh = NaN, which
+	// the `dh <= 0` gate above deliberately lets through because fslmaths does. fslmaths then
+	// produces an ALL-ZERO image for that input -- i.e. zero steps run -- so match that RESULT
+	// deterministically rather than relying on what the cast happens to do. A magnitude guard,
+	// per the fast-math rule in AGENTS.md; the normal path (mx/dh == 100) is unaffected.
+	double nsteps_d = ceil(mx / dh);
+	int n_steps = (nsteps_d >= 1.0 && nsteps_d < 2147483647.0) ? (int)nsteps_d : 0;
 	// for (int step=0; step<n_steps; step++) {
 	for (int step = n_steps - 1; step >= 0; step--) {
 		flt thresh = (step + 1) * dh;
@@ -1866,6 +1918,10 @@ staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 	}
 	// set up kernel to search for neighbors. Since we already included sides, we do not worry about A<->P and L<->R wrap
 	int32_t *k = (int32_t *)malloc(3 * numk * sizeof(int32_t)); // kernel: offset, x, y
+	if (!k) { // written unchecked on the lines below; numk <= 26 so no overflow check needed
+		printfx("tfce failed to allocate the neighbour kernel\n");
+		return 1;
+	}
 	int mxDx = 1;														// connectivity 6: faces only
 	if (numk == 18)
 		mxDx = 2; // connectivity 18: faces+edges
@@ -1886,7 +1942,26 @@ staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 // omp notes: here we compute each volume independently.
 //  Christian Gaser computes the step loop in parallel, which accelerates 3D cases
 //  This code is very quick on 3D, so this does not seem crucial, and avoids critical sections
-#pragma omp parallel for
+	// Fail CLOSED on allocation failure, the pattern used five other places in this file
+	// (nifti_edt, nifti_dim_reduce, nifti_resize, nifti_unary's edge1 branch, nifti_fillh):
+	// signal out of the region with `reduction(| : oom)` and return non-zero. The op loop's
+	// `goto fail` frees nim WITHOUT calling nifti_save, so a non-zero return is enough --
+	// partially-filtered data is never published, and no snapshot/restore is needed.
+	// DEGENERATE INPUT, matching the reference implementation. fslmaths derives its step size
+	// as deltaT = max/100 and REJECTS the run when that is not positive, printing
+	// "tfce requires a positive deltaT input" and writing NO output (measured: exit 1 on an
+	// all-zero and on an all-negative volume, and on a 4D image where only ONE volume is
+	// degenerate -- a single bad volume fails the whole operation). Copying the wording is
+	// permitted; see the Matthew Webster note in license.txt.
+	//
+	// The test MUST be `dh <= 0`, NOT `!(dh > 0)`. An ALL-NaN volume gives dh = NaN, and
+	// `NaN <= 0` is false, so fslmaths ACCEPTS it (measured: exit 0, output written) -- the
+	// stricter spelling would reject it and diverge. Before this, niimath accepted every one
+	// of these and then evaluated `(int)ceil(mx / dh)` with dh = 0/100 = 0, i.e. `(int)NaN`:
+	// undefined behaviour, which UBSan flags at this line, which arm64 renders as some value
+	// and which wasm32 would trap on, and which exited 0 with a file written.
+	int oom = 0, baddt = 0;
+#pragma omp parallel for reduction(| : oom) reduction(| : baddt)
 	for (int vol = 0; vol < nvol; vol++) {
 		// identify clusters
 		flt *inimg = (flt *)nim->data;
@@ -1895,13 +1970,37 @@ staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 		for (size_t i = 0; i < nvox3D; i++)
 			mx = MAX((inimg[i]), mx);
 		double dh = mx / 100.0;
-		flt *outimg = (flt *)malloc(nvox3D * sizeof(flt));		  // output image
-		int32_t *q = (int32_t *)malloc(nvox3D * sizeof(int32_t)); // queue with untested seed
-		uint8_t *vxs = (uint8_t *)malloc(nvox3D * sizeof(uint8_t));
-		memset(outimg, 0, nvox3D * sizeof(flt)); // zero array
+		if (dh <= 0.0) { // see the note above: `<= 0`, so an all-NaN volume still passes
+			baddt = 1;
+			continue;
+		}
+		size_t obytes, qbytes;
+		if (nii_mul_size((size_t)nvox3D, sizeof(flt), &obytes) ||
+			nii_mul_size((size_t)nvox3D, sizeof(int32_t), &qbytes)) {
+			oom = 1;
+			continue;
+		}
+		flt *outimg = (flt *)malloc(obytes);					  // output image
+		int32_t *q = (int32_t *)malloc(qbytes);					  // queue with untested seed
+		uint8_t *vxs = (uint8_t *)malloc((size_t)nvox3D);
+		if (!outimg || !q || !vxs) {
+			free(outimg);
+			free(q);
+			free(vxs);
+			oom = 1;
+			continue; // `continue`, never `break`: you may not branch out of a worksharing loop
+		}
+		memset(outimg, 0, obytes); // zero array
 		// for (int i = 0; i < nvox3D; i++)
 		//	outimg[i] = 0.0;
-		int n_steps = (int)ceil(mx / dh);
+		// `(int)` of a NaN or out-of-range double is UNDEFINED (UBSan flags it; arm64 renders it as
+		// some value, wasm32 would trap). It is reachable: an ALL-NaN volume gives dh = NaN, which
+		// the `dh <= 0` gate above deliberately lets through because fslmaths does. fslmaths then
+		// produces an ALL-ZERO image for that input -- i.e. zero steps run -- so match that RESULT
+		// deterministically rather than relying on what the cast happens to do. A magnitude guard,
+		// per the fast-math rule in AGENTS.md; the normal path (mx/dh == 100) is unaffected.
+		double nsteps_d = ceil(mx / dh);
+		int n_steps = (nsteps_d >= 1.0 && nsteps_d < 2147483647.0) ? (int)nsteps_d : 0;
 		for (int step = 0; step < n_steps; step++) {
 			flt thresh = (step + 1) * dh;
 			memset(vxs, 0, nvox3D * sizeof(uint8_t));
@@ -1953,7 +2052,16 @@ staticx int nifti_tfce(nifti_image *nim, double H, double E, int c) {
 		free(vxs);
 		free(outimg);
 	}
-	free(k);
+	free(k); // freed BEFORE the reports below so no error path leaks it
+	if (baddt) {
+		printfx("ERROR: TFCE failed, please check your file for valid sizes and voxel values.\n");
+		printfx("Error: tfce requires a positive deltaT input.\n");
+		return 1;
+	}
+	if (oom) {
+		printfx("tfce failed to allocate thread scratch memory\n");
+		return 1;
+	}
 	return 0;
 } // nifti_tfce()
 
@@ -2212,182 +2320,51 @@ staticx int nifti_detrend_linear(nifti_image *nim) {
 		return 1;
 	}
 	flt *img = (flt *)nim->data;
-#pragma omp parallel for
-	for (size_t i = 0; i < nvox3D; i++) {
-		flt *data = (flt *)malloc(nvol * sizeof(flt));
-		// load one voxel across all timepoints
-		int j = 0;
-		for (size_t v = i; v < nim->nvox; v += nvox3D) {
-			data[j] = img[v];
-			j++;
-		}
-		// detrend
-		dtrend(data, nvol, 0);
-		// save one voxel across all timepoints
-		j = 0;
-		for (size_t v = i; v < nim->nvox; v += nvox3D) {
-			img[v] = data[j];
-			j++;
+	// The scratch is PER THREAD, not per voxel. It used to be malloc/free'd inside the loop,
+	// i.e. once for every voxel -- millions of allocator round-trips inside a parallel region,
+	// which is both contention and the reason a NULL return was plausible at all. Hoisting is
+	// safe because `data` carries NO state between voxels: the load loop below writes all
+	// `nvol` elements before dtrend() reads any of them, so reuse is unobservable and the
+	// output is bit-identical (verified byte-equal at -p 1 and -p 8, float32 and float64).
+	size_t scratchBytes;
+	if (nii_mul_size((size_t)nvol, sizeof(flt), &scratchBytes)) {
+		printfx("detrend scratch size overflow\n");
+		return 1;
+	}
+	int oom = 0;
+#pragma omp parallel reduction(| : oom)
+	{
+		flt *data = (flt *)malloc(scratchBytes);
+		if (!data)
+			oom = 1;
+#pragma omp for
+		for (size_t i = 0; i < nvox3D; i++) {
+			if (!data)
+				continue; // `continue`, never `break`: cannot branch out of a worksharing loop
+			// load one voxel across all timepoints
+			int j = 0;
+			for (size_t v = i; v < nim->nvox; v += nvox3D) {
+				data[j] = img[v];
+				j++;
+			}
+			// detrend
+			dtrend(data, nvol, 0);
+			// save one voxel across all timepoints
+			j = 0;
+			for (size_t v = i; v < nim->nvox; v += nvox3D) {
+				img[v] = data[j];
+				j++;
+			}
 		}
 		free(data);
+	}
+	if (oom) {
+		printfx("detrend failed to allocate thread scratch memory\n");
+		return 1;
 	}
 	return 0;
 } // nifti_detrend_linear()
 
-#ifdef HAVE_BUTTERWORTH
-// https://github.com/QtSignalProcessing/QtSignalProcessing/blob/master/src/iir.cpp
-// https://github.com/rkuchumov/day_plot_diagrams/blob/8df48af431dc76b1656a627f1965d83e8693ddd7/data.c
-// https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
-//  Sample rate and desired cutoff frequencies (in Hz).
-//  double highcut = 1250;
-//  double lowcut = 500;
-//  double samp_rate = 5000;
-//[b,a] = butter(2, [0.009, 0.08]);
-// https://afni.nimh.nih.gov/afni/community/board/read.php?1,84373,137180#msg-137180
-// Power 2011, Satterthwaite 2013, Carp 2011, Power's reply to Carp 2012
-//  https://github.com/lindenmp/rs-fMRI/blob/master/func/ButterFilt.m
-// https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.filtfilt.html
-
-/*
-The function butterworth_filter() emulates Jan Simon's FiltFiltM
- it uses Gustafsson’s method and padding to reduce ringing at start/end
-https://www.mathworks.com/matlabcentral/fileexchange/32261-filterm?focused=5193423&tab=function
-Copyright (c) 2011, Jan Simon
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
-
-	* Redistributions of source code must retain the above copyright
-	  notice, this list of conditions and the following disclaimer.
-	* Redistributions in binary form must reproduce the above copyright
-	  notice, this list of conditions and the following disclaimer in
-	  the documentation and/or other materials provided with the distribution
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGE.*/
-staticx int butterworth_filter(flt *img, int nvox3D, int nvol, double fs, double highcut, double lowcut) {
-	// sample rate, low cut and high cut are all in Hz
-	// this attempts to emulate performance of https://www.mathworks.com/matlabcentral/fileexchange/32261-filterm
-	//  specifically, prior to the forward and reverse pass the coefficients are estimated by a forward and reverse pass
-	int order = 2;
-	if (order <= 0)
-		return 1;
-	if ((highcut <= 0.0) && (lowcut <= 0.0))
-		return 1;
-	if (fs <= 0.0)
-		return 1;
-	if ((lowcut > 0.0) && (highcut > 0.0))
-		printfx("butter bandpass lowcut=%g highcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", lowcut, highcut, fs, order, 2 * order);
-	else if (highcut > 0.0)
-		printfx("butter lowpass highcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", highcut, fs, order, 2 * order);
-	else if (lowcut > 0.0)
-		printfx("butter highpass lowcut=%g fs=%g order=%d (effectively %d due to filtfilt)\n", lowcut, fs, order, 2 * order);
-	else {
-		printfx("Butterworth parameters do not make sense\n");
-		return 1;
-	}
-	double *a;
-	double *b;
-	double *IC;
-	int nX = nvol;
-	int nA = 0;
-	nA = butter_design(order, 2.0 * lowcut / fs, 2.0 * highcut / fs, &a, &b, &IC);
-	if (nA <= 1) {
-		printfx("Butterworth design does not make sense\n");
-		return EXIT_FAILURE;
-	}
-	int nEdge = 3 * (nA - 1);
-	if ((nA < 1) || (nX <= nEdge)) {
-		printfx("filter requires at least %d samples\n", nEdge);
-		free(a);
-		free(b);
-		free(IC);
-		return 1;
-	}
-#pragma omp parallel for
-	for (int vx = 0; vx < nvox3D; vx++) {
-		double *X = (double *)malloc(nX * sizeof(double));
-		size_t vo = vx;
-		flt mn = INFINITY;
-		flt mx = -INFINITY;
-		for (int j = 0; j < nX; j++) {
-			X[j] = img[vo];
-			mn = MIN(mn, X[j]);
-			mx = MAX(mx, X[j]);
-			vo += nvox3D;
-		}
-		if (mn < mx) { // some variability
-			double *Xi = (double *)malloc(nEdge * sizeof(double));
-			for (int i = 0; i < nEdge; i++)
-				Xi[nEdge - i - 1] = X[0] - (X[i + 1] - X[0]);
-			double *CC = (double *)malloc((nA - 1) * sizeof(double));
-			for (int i = 0; i < (nA - 1); i++)
-				CC[i] = IC[i] * Xi[0];
-			double *Xf = (double *)malloc(nEdge * sizeof(double));
-			for (int i = 0; i < nEdge; i++)
-				Xf[i] = X[nX - 1] - (X[nX - 2 - i] - X[nX - 1]);
-			Filt(Xi, nEdge, a, b, nA - 1, CC); // filter head
-			Filt(X, nX, a, b, nA - 1, CC);	   // filter array
-			Filt(Xf, nEdge, a, b, nA - 1, CC); // filter tail
-			// reverse
-			for (int i = 0; i < (nA - 1); i++)
-				CC[i] = IC[i] * Xf[nEdge - 1];
-			FiltRev(Xf, nEdge, a, b, nA - 1, CC); // filter tail
-			FiltRev(X, nX, a, b, nA - 1, CC);	  // filter array
-			free(Xi);
-			free(Xf);
-			free(CC);
-		} else { // else no variability: set all voxels to zero
-			for (int j = 0; j < nX; j++)
-				X[j] = 0;
-		}
-		// save data to 4D array
-		vo = vx;
-		for (int j = 0; j < nX; j++) {
-			img[vo] = X[j];
-			vo += nvox3D;
-		}
-		free(X);
-	} // for vx
-	free(b);
-	free(a);
-	free(IC);
-	return 0;
-} // butterworth_filter()
-
-staticx int nifti_bandpass(nifti_image *nim, double hp_hz, double lp_hz, double TRsec) {
-	if (nim->datatype != DT_CALC)
-		return 1;
-	size_t nvox3D = nim->nx * nim->ny * MAX(1, nim->nz);
-	if (TRsec <= 0.0)
-		TRsec = nim->nt; // pixdim[4];
-	if (TRsec <= 0) {
-		printfx("Unable to determine sample rate\n");
-		return 1;
-	}
-	if (nvox3D < 1)
-		return 1;
-	int nvol = nim->nvox / nvox3D;
-	if ((nvox3D * nvol) != nim->nvox)
-		return 1;
-	if (nvol < 1) {
-		printfx("bandpass requires 4D datasets\n");
-		return 1;
-	}
-	return butterworth_filter((flt *)nim->data, nvox3D, nvol, 1 / TRsec, hp_hz, lp_hz);
-} // nifti_bandpass()
-#endif // HAVE_BUTTERWORTH
 
 staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int demean) {
 	// Spielberg Matlab code: https://cpb-us-w2.wpmucdn.com/sites.udel.edu/dist/7/4542/files/2016/09/fsl_temporal_filt-15sywxn.m
@@ -2409,22 +2386,44 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 		printfx("bptf requires 4D datasets\n");
 		return 1;
 	}
-	int *hpStart, *hpEnd;
-	double *hpSumX, *hpDenom, *hpSumWt, *hp, *hp0;
+	// All reusables start NULL so ONE free(NULL)-safe cleanup path can serve every exit. They
+	// used to be uninitialised and unchecked, and each group is written through on the very
+	// next lines (hp0[k] = ..., hpStart[v] = ...), so an allocation failure wrote through a
+	// wild pointer. The per-thread scratch guard added earlier does NOT cover these -- they are
+	// allocated serially, before the parallel region.
+	// ALL TEN reusables are declared and NULL-initialised HERE, above every `goto bptf_done`.
+	// This is not tidiness. When the low-pass five were declared further down, the high-pass
+	// block's gotos jumped FORWARD OVER their initialisers -- legal C, but it leaves those
+	// pointers INDETERMINATE, and `bptf_done` then calls free() on them. Clang correctly treats
+	// that path as UB-unreachable and DELETED BOTH HIGH-PASS GUARDS from the optimised build:
+	// verified by disassembly, and at runtime `-bptf 400000000 -1` allocated 19.2 GB and exited
+	// 0 instead of being rejected. Never move a declaration below a goto that targets the
+	// cleanup label.
+	int *hpStart = NULL, *hpEnd = NULL;
+	double *hpSumX = NULL, *hpDenom = NULL, *hpSumWt = NULL, *hp = NULL, *hp0 = NULL;
+	int *lpStart = NULL, *lpEnd = NULL;
+	double *lpSumWt = NULL, *lp = NULL, *lp0 = NULL;
 	if (hp_sigma > 0) { // initialize high-pass reusables
 		// Spielberg's code uses 8*sigma, does not match current fslmaths:
 		// tested with fslmaths freq4d -bptf 10 -1 nhp
 		// cutoff ~3: most difference: 4->0.0128902 3->2.98023e-08 2->-0.0455322 1->0.379412
-		int cutoffhp = (int)(hp_sigma * 3);										   // confirmed by Taylor Hanyik
-		hp = (double *)malloc((cutoffhp + 1 + cutoffhp) * sizeof(double)); //-cutoffhp..+cutoffhp
+		// Guard the DOUBLE, then convert: `(int)` of a NaN or out-of-range double is undefined,
+		// and this ran before its own range test. `!(x >= 0 && x <= lim)` also rejects NaN.
+		double cutoffhp_d = hp_sigma * 3;										   // confirmed by Taylor Hanyik
+		if (!(cutoffhp_d >= 0.0 && cutoffhp_d <= (double)(INT_MAX / 2 - 1)))
+			goto bptf_done;
+		int cutoffhp = (int)cutoffhp_d;
+		hp = (double *)malloc(((size_t)cutoffhp + 1 + (size_t)cutoffhp) * sizeof(double)); //-cutoffhp..+cutoffhp
+		hpStart = (int *)malloc((size_t)nvol * sizeof(int));
+		hpEnd = (int *)malloc((size_t)nvol * sizeof(int));
+		hpSumX = (double *)malloc((size_t)nvol * sizeof(double));
+		hpDenom = (double *)malloc((size_t)nvol * sizeof(double)); // N*Sum(x^2) - (Sum(x))^2
+		hpSumWt = (double *)malloc((size_t)nvol * sizeof(double)); // sum of weight, N
+		if (!hp || !hpStart || !hpEnd || !hpSumX || !hpDenom || !hpSumWt) // ONE test for the group
+			goto bptf_done;
 		hp0 = hp + cutoffhp;													   // convert from 0..(2*cutoffhp) to -cutoffhp..+cutoffhp
 		for (int k = -cutoffhp; k <= cutoffhp; k++)								   // for each index in kernel
 			hp0[k] = exp(-sqr(k) / (2 * sqr(hp_sigma)));
-		hpStart = (int *)malloc(nvol * sizeof(int));
-		hpEnd = (int *)malloc(nvol * sizeof(int));
-		hpSumX = (double *)malloc(nvol * sizeof(double));
-		hpDenom = (double *)malloc(nvol * sizeof(double)); // N*Sum(x^2) - (Sum(x))^2
-		hpSumWt = (double *)malloc(nvol * sizeof(double)); // sum of weight, N
 		for (int v = 0; v < nvol; v++) {
 			// linear regression with "gauss" fitting
 			hpStart[v] = MAX(0, v - cutoffhp);
@@ -2448,22 +2447,25 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 		} // for each volume
 	} // high-pass reusables
 	// low-pass AFTER high-pass: fslmaths freq4d -bptf 45 5 fbp
-	int *lpStart, *lpEnd;
-	double *lpSumWt, *lp, *lp0;
 	if (lp_sigma > 0) { // initialize low-pass reusables
 		// simple Gaussian blur in time domain
 		// freq4d -bptf -1 5 flp
 		//  fslmaths rest -bptf -1 5 flp
 		//  3->0.00154053 4->3.5204e-05 5->2.98023e-07, 6->identical
 		//  Spielberg's code uses 8*sigma, so we will use that, even though precision seems excessive
-		int cutofflp = (int)(lp_sigma * 20) + 2;								   // confirmed by Taylor Hanyik
-		lp = (double *)malloc((cutofflp + 1 + cutofflp) * sizeof(double)); //-cutofflp..+cutofflp
+		double cutofflp_d = (lp_sigma * 20) + 2;								   // confirmed by Taylor Hanyik
+		if (!(cutofflp_d >= 0.0 && cutofflp_d <= (double)(INT_MAX / 2 - 1)))
+			goto bptf_done;
+		int cutofflp = (int)cutofflp_d;
+		lp = (double *)malloc(((size_t)cutofflp + 1 + (size_t)cutofflp) * sizeof(double)); //-cutofflp..+cutofflp
+		lpStart = (int *)malloc((size_t)nvol * sizeof(int));
+		lpEnd = (int *)malloc((size_t)nvol * sizeof(int));
+		lpSumWt = (double *)malloc((size_t)nvol * sizeof(double)); // sum of weight, N
+		if (!lp || !lpStart || !lpEnd || !lpSumWt) // ONE test for the group
+			goto bptf_done;
 		lp0 = lp + cutofflp;													   // convert from 0..(2*cutofflp) to -cutofflp..+cutofflp
 		for (int k = -cutofflp; k <= cutofflp; k++)								   // for each index in kernel
 			lp0[k] = exp(-sqr(k) / (2 * sqr(lp_sigma)));
-		lpStart = (int *)malloc(nvol * sizeof(int));
-		lpEnd = (int *)malloc(nvol * sizeof(int));
-		lpSumWt = (double *)malloc(nvol * sizeof(double)); // sum of weight, N
 		for (int v = 0; v < nvol; v++) {
 			lpStart[v] = MAX(0, v - cutofflp);
 			lpEnd[v] = MIN(nvol - 1, v + cutofflp);
@@ -2481,11 +2483,29 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 	// 100s that means 50 Trs, so the sigma, or HWHM, is 25 TRs.
 	//  -bptf <hp_sigma> <lp_sigma>
 	flt *img = (flt *)nim->data;
-#pragma omp parallel for
+	// PER THREAD, not per voxel -- this used to be TWO malloc/free pairs for every voxel inside
+	// the parallel region. Hoisting is safe because neither buffer carries state between
+	// voxels: `imgIn` is fully rewritten by the load loop below, and `imgOut` is fully written
+	// by whichever filter branch runs -- the function returns early above when hp_sigma and
+	// lp_sigma are both <= 0, and each branch assigns imgOut[v] for every v in [0, nvol).
+	// So no stale element can survive into a later voxel. Verified byte-equal at -p 1 and -p 8
+	// in float32 and float64; a thread-count difference is exactly what a bad hoist produces.
+	size_t scratchBytes;
+	if (nii_mul_size((size_t)nvol, sizeof(flt), &scratchBytes)) {
+		printfx("bptf scratch size overflow\n");
+		goto bptf_done;
+	}
+	int oom = 0;
+#pragma omp parallel reduction(| : oom)
+	{
+		flt *imgIn = (flt *)malloc(scratchBytes);
+		flt *imgOut = (flt *)malloc(scratchBytes);
+		if (!imgIn || !imgOut)
+			oom = 1;
+#pragma omp for
 	for (size_t i = 0; i < nvox3D; i++) {
-		// read input data
-		flt *imgIn = (flt *)malloc((nvol) * sizeof(flt));
-		flt *imgOut = (flt *)malloc((nvol) * sizeof(flt));
+		if (!imgIn || !imgOut)
+			continue; // `continue`, never `break`: cannot branch out of a worksharing loop
 		int j = 0;
 		for (size_t v = i; v < nim->nvox; v += nvox3D) {
 			imgIn[j] = img[v];
@@ -2538,24 +2558,28 @@ staticx int nifti_bptf(nifti_image *nim, double hp_sigma, double lp_sigma, int d
 			img[v] = imgOut[j];
 			j++;
 		}
+	}
 		free(imgIn);
 		free(imgOut);
 	}
-	if (hp_sigma > 0) { // initialize high-pass reuseables
-		free(hp);
-		free(hpStart);
-		free(hpEnd);
-		free(hpSumX);
-		free(hpDenom);
-		free(hpSumWt);
-	}
-	if (lp_sigma > 0) { // initialize high-pass reuseables
-		free(lp);
-		free(lpStart);
-		free(lpEnd);
-		free(lpSumWt);
+	// Freed flat, matching bptf_done: every reusable is NULL-initialised and free(NULL) is safe.
+	free(hp); free(hpStart); free(hpEnd); free(hpSumX); free(hpDenom); free(hpSumWt);
+	free(lp); free(lpStart); free(lpEnd); free(lpSumWt);
+	// The reusables above are freed FIRST so the oom path cannot leak them.
+	if (oom) {
+		printfx("bptf failed to allocate thread scratch memory\n");
+		return 1;
 	}
 	return 0;
+bptf_done: // ONE cleanup path for every failure: bad sigma, allocation, or scratch overflow.
+	// Deliberately NOT guarded by hp_sigma/lp_sigma: a jump out of the high-pass block reaches
+	// here with the low-pass pointers merely NULL (they are initialised at the top, which is
+	// what makes this label safe at all -- see the note there), and a sigma-guarded free would
+	// have to reason about which groups ran. free(NULL) is defined, so free flat.
+	free(hp); free(hpStart); free(hpEnd); free(hpSumX); free(hpDenom); free(hpSumWt);
+	free(lp); free(lpStart); free(lpEnd); free(lpSumWt);
+	printfx("bptf: filter setup failed (sigma out of range, or out of memory)\n");
+	return 1;
 } // nifti_bptf()
 
 staticx int nifti_demean(nifti_image *nim) {
@@ -2844,8 +2868,20 @@ staticx int *make_kernel_gauss(nifti_image *nim, int *nkernel, double sigmamm) {
 			}
 	*nkernel = n;
 	int kernelWeight = (int)((double)INT_MAX / (double)n);		 // requires <limits.h>
-	int *kernel = (int *)malloc((n * 4) * sizeof(int));	 // 4 values: offset, xpos, ypos, weight
-	double *wt = (double *)malloc((n) * sizeof(double)); // weight: temporary
+	// Size is USER-DRIVEN: `-kernel gauss 100` on a 2 mm image gives n = 601^3, a 3.5 GB
+	// request. Both buffers were written through unchecked on the lines below. `n * 4` is also
+	// computed in int and overflows above n = 536,870,911, so the product is done in size_t.
+	size_t kbytes, wbytes;
+	if (n < 1 || nii_mul_size((size_t)n * 4, sizeof(int), &kbytes) ||
+		nii_mul_size((size_t)n, sizeof(double), &wbytes))
+		return NULL;
+	int *kernel = (int *)malloc(kbytes);	 // 4 values: offset, xpos, ypos, weight
+	double *wt = (double *)malloc(wbytes); // weight: temporary
+	if (!kernel || !wt) { // the caller already handles a NULL return
+		free(kernel);
+		free(wt);
+		return NULL;
+	}
 	// second pass: fill surviving voxels
 	int i = 0;
 	double expd = 2.0 * sigmamm * sigmamm;
@@ -3975,6 +4011,14 @@ staticx int nifti_dogNew(nifti_image *nim, flt Sigmamm, flt SigmammNeg, int isEd
 	return ret;
 }*/
 
+#define NII_NEED_ARGS(n)                                                     \
+	do {                                                                         \
+		if ((argc - ac) < ((n) + 1)) {                                           \
+			printfx("not enough arguments for '%s'\n", argv[ac]);                \
+			goto fail;                                                           \
+		}                                                                        \
+	} while (0)
+
 staticx int nifti_roi(nifti_image *nim, int xmin, int xsize, int ymin, int ysize, int zmin, int zsize, int tmin, int tsize) {
 	// "fslmaths LAS -roi 3 32 0 40 0 40 0 5 f "
 	int nt = nim->nvox / (nim->nx * nim->ny * nim->nz);
@@ -4039,6 +4083,13 @@ staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 	int *kx = (int *)malloc((numk * 4) * sizeof(int)); // 4 values: offset, xpos, ypos, weight
 	int *ky = (int *)malloc((numk * 4) * sizeof(int)); // 4 values: offset, xpos, ypos, weight
 	int *kz = (int *)malloc((numk * 4) * sizeof(int)); // 4 values: offset, xpos, ypos, weight
+	if (!kx || !ky || !kz) { // written unchecked below; numk is 6, so no overflow check needed
+		free(kx);
+		free(ky);
+		free(kz);
+		printfx("sobel failed to allocate the neighbour kernels\n");
+		return 1;
+	}
 	int i = 0;
 	for (int x = 0; x <= 1; x++)
 		for (int y = -1; y <= 1; y++) {
@@ -4064,15 +4115,34 @@ staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 			i++;
 		} // for y
 	flt *i32 = (flt *)nim->data; // input volumes
-#pragma omp parallel for
+	int oom = 0;
+#pragma omp parallel for reduction(| : oom)
 	for (int v = 0; v < nvol; v++) {
 		flt *iv32 = i32 + (v * vox3D);
-		flt *imgin = (flt *)malloc(vox3D * sizeof(flt)); // input values prior to blur
+		size_t ibytes;
+		if (nii_mul_size((size_t)vox3D, sizeof(flt), &ibytes)) {
+			oom = 1;
+			continue;
+		}
+		flt *imgin = (flt *)malloc(ibytes); // input values prior to blur
+		if (!imgin) {
+			oom = 1;
+			continue; // `continue`, never `break`: cannot branch out of a worksharing loop
+		}
 		// edge information:
 		flt mx = 0.0;
-		uint8_t *imgdir = (uint8_t *)malloc(vox3D * sizeof(uint8_t)); // image direction
-		if (isBinary)
-			memset(imgdir, 0, vox3D * sizeof(uint8_t));
+		// imgdir is ONLY read under `if (isBinary)`, so it is allocated only there. It used to
+		// be allocated unconditionally -- vox3D bytes per thread of pure waste and pure failure
+		// surface on the plain -sobel path. Same over-allocation class as the nifti_fillh bug.
+		uint8_t *imgdir = NULL; // image direction (binary mode only)
+		if (isBinary) {
+			imgdir = (uint8_t *)calloc((size_t)vox3D, sizeof(uint8_t)); // == malloc + memset 0
+			if (!imgdir) {
+				free(imgin);
+				oom = 1;
+				continue;
+			}
+		}
 
 		xmemcpy(imgin, iv32, vox3D * sizeof(flt));
 		int i = 0;
@@ -4174,17 +4244,27 @@ staticx int nifti_sobel(nifti_image *nim, int isBinary) {
 						else if ((val > mxZ) && ((mxX > 0.0) || (mxY > 0.0))) // head/foot gradient
 							iv32[vx] = 1.0;
 					}
-			nim->scl_inter = 0.0;
-			nim->scl_slope = 1.0;
-			nim->cal_min = 0.0;
-			nim->cal_max = 1.0;
 		} // if isBinary
 		free(imgdir);
 		free(imgin);
 	} // for each volume
-	free(kx);
+	// Header rescaling, hoisted OUT of the parallel loop. These four shared fields used to be
+	// assigned by EVERY worker iteration: a data race, and writing identical values does not
+	// make concurrent non-atomic writes defined C. Done once, after the loop, and only if the
+	// run succeeded -- a failed run returns below without publishing anything anyway.
+	if (isBinary && !oom) {
+		nim->scl_inter = 0.0;
+		nim->scl_slope = 1.0;
+		nim->cal_min = 0.0;
+		nim->cal_max = 1.0;
+	}
+	free(kx); // freed BEFORE the oom report so the error path does not leak them
 	free(ky);
 	free(kz);
+	if (oom) {
+		printfx("sobel failed to allocate thread scratch memory\n");
+		return 1;
+	}
 	return 0;
 } // nifti_sobel()
 
@@ -4855,10 +4935,20 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		return 1;
 	if (nim->datatype != DT_CALC)
 		return 1;
-	int nvox3D = nim->nx * nim->ny * nim->nz;
+	size_t nvox3DSize;
+	if (nii_mul_size((size_t)nim->nx, (size_t)nim->ny, &nvox3DSize) ||
+			nii_mul_size(nvox3DSize, (size_t)nim->nz, &nvox3DSize) ||
+			nvox3DSize < 1 || nvox3DSize > INT_MAX ||
+			(nim->nvox % nvox3DSize) != 0 ||
+			(nim->nvox / nvox3DSize) > INT_MAX)
+		return 1;
+	int nvox3D = (int)nvox3DSize;
 	int nvol = nim->nvox / nvox3D;
-	// size_t nxy = nim->nx * nim->ny; //slice increment
-	uint8_t *vx = (uint8_t *)malloc(nim->nvox * sizeof(uint8_t));
+	uint8_t *vx = (uint8_t *)malloc(nim->nvox);
+	if (!vx) {
+		printfx("fillh failed to allocate memory\n");
+		return 1;
+	}
 	memset(vx, 0, nim->nvox * sizeof(uint8_t));
 	size_t n1 = 0;
 	flt *f32 = (flt *)nim->data;
@@ -4879,7 +4969,7 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 	int numk = 6;
 	if (is26)
 		numk = 26;
-	int32_t *k = (int32_t *)malloc(numk * sizeof(int32_t)); // queue with untested seed
+	int32_t k[26];
 	if (is26) {
 		int j = 0;
 		for (int z = -1; z <= 1; z++)
@@ -4899,13 +4989,20 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		k[5] = -1;
 	}
 // https://en.wikipedia.org/wiki/Flood_fill
-#pragma omp parallel for
+	int oom = 0;
+	#pragma omp parallel for reduction(| : oom)
 	for (int v = 0; v < nvol; v++) {
 		uint8_t *vxv = vx;
 		vxv += (v * nvox3D);
-		uint8_t *vxs = (uint8_t *)malloc(nim->nvox * sizeof(uint8_t));
+		uint8_t *vxs = (uint8_t *)malloc(nvox3DSize);
+		int32_t *q = (int32_t *)malloc(nvox3DSize * sizeof(int32_t)); // queue with untested seed
+		if (!vxs || !q) {
+			free(vxs);
+			free(q);
+			oom = 1;
+			continue;
+		}
 		xmemcpy(vxs, vxv, nvox3D * sizeof(uint8_t));					  // dst, src
-		int32_t *q = (int32_t *)malloc(nvox3D * sizeof(int32_t)); // queue with untested seed
 		int qlo = 0;
 		int qhi = -1; // ints always signed in C!
 		// load edges
@@ -4951,10 +5048,14 @@ staticx int nifti_fillh(nifti_image *nim, int is26) {
 		free(vxs);
 		free(q);
 	} // for each volume
+	if (oom) {
+		free(vx);
+		printfx("fillh failed to allocate thread scratch memory\n");
+		return 1;
+	}
 	for (size_t i = 0; i < nim->nvox; i++)
 		f32[i] = vx[i];
 	free(vx);
-	free(k);
 	return 0;
 }
 
@@ -5213,10 +5314,15 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			for (size_t i = 0; i < nim->nvox; i++)
 				f32[i] = 1;
 		} else {
-#pragma omp parallel for
+			int oom = 0;
+#pragma omp parallel for reduction(| : oom)
 			for (int i = 0; i < nvox3D; i++) {
 				// how do we handle ties?
-				struct sortIdx *k = (struct sortIdx *)malloc(nvol * sizeof(struct sortIdx));
+				struct sortIdx *k = (struct sortIdx *)malloc((size_t)nvol * sizeof(struct sortIdx));
+				if (!k) { // was dereferenced unchecked on the next line
+					oom = 1;
+					continue;
+				}
 				size_t j = i;
 				for (int v = 0; v < nvol; v++) {
 					k[v].val = f32[j];
@@ -5243,6 +5349,10 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 				}
 				free(k);
 			} // for i
+			if (oom) {
+				printfx("rank failed to allocate thread scratch memory\n");
+				return 1;
+			}
 		} // nvol > 1
 	} else if (op == ranknorm1) {
 		int nvox3D = nim->nx * nim->ny * nim->nz;
@@ -5255,9 +5365,14 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 			for (int i = 0; i < nim->nvox; i++)
 				f32[i] = kNaN;
 		} else {
-#pragma omp parallel for
+			int oom = 0;
+#pragma omp parallel for reduction(| : oom)
 			for (int i = 0; i < nvox3D; i++) {
-				struct sortIdx *k = (struct sortIdx *)malloc(nvol * sizeof(struct sortIdx));
+				struct sortIdx *k = (struct sortIdx *)malloc((size_t)nvol * sizeof(struct sortIdx));
+				if (!k) { // was dereferenced unchecked on the next line
+					oom = 1;
+					continue;
+				}
 				size_t j = i;
 				double sum = 0.0;
 				for (int v = 0; v < nvol; v++) {
@@ -5278,6 +5393,10 @@ staticx int nifti_unary(nifti_image *nim, enum eOp op) {
 					f32[k[v].idx] = (stdev * -qginv((double)(v + 0.5) / (double)nvol)) + mean;
 				free(k);
 			} // for i
+			if (oom) {
+				printfx("ranknorm failed to allocate thread scratch memory\n");
+				return 1;
+			}
 		} // nvol > 1
 	} else if (op == ztop1) {
 #ifdef DT32 // issue8
@@ -6056,6 +6175,32 @@ staticx int nifti_reslice(nifti_image *nim, char *fin, int isLinear) {
 #endif
 }
 
+#ifdef DT32
+// Reslice a float32 mask (any grid, any orientation) onto nim with nearest neighbor and
+// set every voxel the mask does not cover to nim's minimum intensity. nimMsk is CONSUMED
+// (resliced in place); the caller still owns and frees it. Used by -reslice_mask, which reads
+// the mask from a file. It is written to serve an in-memory mask too, so it stays general.
+staticx int nii_apply_reslice_mask(nifti_image *nim, nifti_image *nimMsk) {
+	flt *img = (flt *)nim->data;
+	flt mn = INFINITY;
+	for (size_t i = 0; i < nim->nvox; i++)
+		mn = MIN(mn, img[i]);
+	int isLinear = 0;
+	int ok = reslice(nimMsk, nim, isLinear);
+	if (ok != 0)
+		// reslice failed (e.g. a 4D working image — reslice is 3D-only): nimMsk was NOT resampled
+		// onto nim's grid, so it still holds only its own (smaller) 3D buffer. Bail before the
+		// mask-application loop, which would otherwise read nim->nvox elements past that buffer.
+		return ok;
+	flt *imgMsk = (flt *)nimMsk->data;
+	for (size_t i = 0; i < nim->nvox; i++) {
+		if (imgMsk[i] <= 0)
+			img[i] = mn;
+	}
+	return ok;
+}
+#endif // DT32
+
 staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 #ifdef DT32
 	if (nim->datatype != DT_FLOAT32) {
@@ -6080,24 +6225,7 @@ staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 		nifti_image_free(nimMsk); // was a leak on conversion failure
 		return 1;
 	}
-	flt *img = (flt *)nim->data;
-	flt mn = INFINITY;
-	for (size_t i = 0; i < nim->nvox; i++)
-		mn = MIN(mn, img[i]);
-	int isLinear = 0;
-	int ok = reslice(nimMsk, nim, isLinear);
-	if (ok != 0) {
-		// reslice failed (e.g. a 4D working image — reslice is 3D-only): nimMsk was NOT resampled
-		// onto nim's grid, so it still holds only its own (smaller) 3D buffer. Bail before the
-		// mask-application loop, which would otherwise read nim->nvox elements past that buffer.
-		nifti_image_free(nimMsk);
-		return ok;
-	}
-	flt *imgMsk = (flt *)nimMsk->data;
-	for (size_t i = 0; i < nim->nvox; i++) {
-		if (imgMsk[i] <= 0)
-			img[i] = mn;
-	}
+	int ok = nii_apply_reslice_mask(nim, nimMsk);
 	nifti_image_free(nimMsk);
 	return ok;
 #else
@@ -6105,6 +6233,29 @@ staticx int nifti_reslice_mask(nifti_image *nim, char *fin) {
 	return 1;
 #endif
 }
+
+#ifdef HAVE_SKULLSTRIP
+// -skullstrip: expand a surface from inside the head until it wraps the brain, then
+// return the ORIGINAL intensities inside it (an -orig_vol-style divergence from
+// AFNI's default, which rescales). DT32 only, scalar 3D, guarded -- deliberately NOT
+// in kHugeSafeOps. skullstrip_run() is fail-atomic, so a failure here leaves nim as
+// it was and the op loop reports it.
+staticx int nifti_skullstrip(nifti_image *nim, int in_datatype, int fast) {
+#ifdef DT32
+	int nvox3D = 0;
+	if (nii_nvox3d_int(nim, &nvox3D) || nim->nvox != (size_t)nvox3D) {
+		printfx("skullstrip: requires a scalar 3D image (not 4D, not oversized)\n");
+		return 1;
+	}
+	return skullstrip_run(nim, in_datatype, fast);
+#else
+	(void)nim; (void)in_datatype; (void)fast;
+	printfx("skullstrip: requires the float32 pipeline (not -dt double)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_SKULLSTRIP
+
 #endif // HAVE_CONFORM
 
 staticx void nifti_compare(nifti_image *nim, char *fin, double thresh) {
@@ -7003,6 +7154,94 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+#ifdef HAVE_FMAP
+/* -fugue <fieldmap> <dwell> <unwarpdir>: correct susceptibility distortion in an EPI using a B0
+   fieldmap in rad/s.  An ordinary chain operation, DT32 only.  All three arguments are positional
+   and must therefore sit strictly before the output name, so `ac + 2 >= argc` is the right guard
+   here -- the `ac + 1 <= argc` peek documented in AGENTS.md is for OPTIONAL trailing sub-options,
+   which this op has none of. */
+staticx int nifti_fugue_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *fmapfile, *dir, *dwellstr;
+	char *end = NULL;
+	double dwell;
+	if (ac + 2 >= argc) {
+		printfx("-fugue requires a fieldmap, a dwell time and an unwarp direction (-fugue <fieldmap> <dwell_seconds> <x|y|z|x-|y-|z->)\n");
+		return 1;
+	}
+	fmapfile = argv[ac];
+	dwellstr = argv[ac + 1];
+	dir = argv[ac + 2];
+	*pac = ac + 3;
+	dwell = strtod(dwellstr, &end);
+	/* Reject trailing junk rather than silently accepting the prefix strtod could parse: a
+	   transposed command line puts the unwarp direction here, and "y" parses as 0.0. */
+	if (!end || end == dwellstr || *end != '\0') {
+		printfx("-fugue dwell must be a number (the effective echo spacing in seconds); got '%s'\n", dwellstr);
+		return 1;
+	}
+	if (nii_reject_oversize_aux(fmapfile, "fugue fieldmap")) return 1;
+	return fmap_unwarp(nim, fmapfile, dwell, dir);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 2 < argc) *pac += 3;
+	printfx("'-dt double' does not support -fugue (fieldmap unwarping is float32 only)\n");
+	return 1;
+#endif
+}
+
+#ifdef HAVE_ROMEO
+/* -fmapprep <brain_magnitude> <deltaTE_ms>: build a rad/s B0 fieldmap from a wrapped two-echo
+   phase difference.  Both arguments are positional, so `ac + 1 >= argc` is the right guard. */
+staticx int nifti_fmapprep_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac;
+	const char *magfile, *testr;
+	char *end = NULL;
+	double te;
+	int debranch = 1;
+	if (ac + 1 >= argc) {
+		printfx("-fmapprep requires a brain-extracted magnitude and an echo time difference (-fmapprep <magnitude> <deltaTE_ms>)\n");
+		return 1;
+	}
+	magfile = argv[ac];
+	testr = argv[ac + 1];
+	ac += 2;
+	te = strtod(testr, &end);
+	if (!end || end == testr || *end != '\0') {
+		*pac = ac;
+		printfx("-fmapprep deltaTE must be a number (the echo time difference in milliseconds); got '%s'\n", testr);
+		return 1;
+	}
+	/* Optional trailing sub-option, so this peeks ONE PAST the last operand, per the op-loop gotcha
+	   in AGENTS.md: argc was decremented so argv[argc] is the output filename, and a lone
+	   `-no-debranch` can legally sit either immediately before it (ac < argc, consume it) or IN it
+	   (ac == argc, which means the user forgot the output name).  Stopping the scan at `ac < argc`
+	   would silently adopt the flag as the output filename and write a file called
+	   "-no-debranch" at exit 0. */
+	if (ac <= argc && !strcmp(argv[ac], "-no-debranch")) {
+		if (ac == argc) {
+			*pac = ac;
+			printfx("-fmapprep: '-no-debranch' is in the output-filename slot; put it before the output name\n");
+			return 1;
+		}
+		debranch = 0;
+		ac++;
+	}
+	*pac = ac;
+	if (nii_reject_oversize_aux(magfile, "fmapprep magnitude")) return 1;
+	return fmap_prepare(nim, magfile, te, debranch);
+#else
+	(void)nim; (void)argc; (void)argv;
+	if (*pac + 1 < argc) *pac += 2;
+	printfx("'-dt double' does not support -fmapprep (fieldmap preparation is float32 only)\n");
+	return 1;
+#endif
+}
+#endif // HAVE_ROMEO
+#endif // HAVE_FMAP
+
 #ifdef HAVE_MOCO
 /* -moco [-1Dfile <path>]: rigid-body motion correction of a 4D series onto sub-brick 0.
    The optional "-1Dfile <path>" pair is consumed here; the trailing positional output name is
@@ -7489,6 +7728,11 @@ int main64(int argc, char *argv[]) {
 	}
 	// printf("read time: %ld ms\n", timediff(startTime, clock()));
 	in_hdr ihdr = set_input_hdr(nim);
+	// Stored datatype of the dataset that currently owns the working voxels. Most operations
+	// mutate that dataset in place, so its storage contract remains the input's; -restart is
+	// the exception and updates this when it adopts a replacement image.
+	int current_in_datatype = ihdr.datatype;
+	(void)current_in_datatype;   // only -skullstrip reads it, and that is off by default
 	// check for "-odt" must be last couplet
 	if (!strcmp(argv[argc - 2], "-odt")) {
 		if (!strcmp(argv[argc - 1], "double")) {
@@ -7792,12 +8036,14 @@ int main64(int argc, char *argv[]) {
 			int tsize = atoi(argv[ac]);
 			ok = nifti_roi(nim, xmin, xsize, ymin, ysize, zmin, zsize, tmin, tsize);
 		} else if (!strcmp(argv[ac], "-bptfm")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double hp_sigma = strtod(argv[ac], &end);
 			ac++;
 			double lp_sigma = strtod(argv[ac], &end);
 			ok = nifti_bptf(nim, hp_sigma, lp_sigma, 0);
 		} else if (!strcmp(argv[ac], "-bptf")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double hp_sigma = strtod(argv[ac], &end);
 			ac++;
@@ -7890,17 +8136,6 @@ int main64(int argc, char *argv[]) {
 			nifti_image_free(nim);
 			return ok;
 #endif
-#ifdef HAVE_BUTTERWORTH
-		} else if (!strcmp(argv[ac], "-bandpass")) {
-			// niimath test4D -bandpass 0.08 0.008 0 c
-			ac++;
-			double lp_hz = strtod(argv[ac], &end);
-			ac++;
-			double hp_hz = strtod(argv[ac], &end);
-			ac++;
-			double TRsec = strtod(argv[ac], &end);
-			ok = nifti_bandpass(nim, lp_hz, hp_hz, TRsec);
-#endif
 		} else if (!strcmp(argv[ac], "-roc")) {
 			//-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth>
 			//-roc <AROC-thresh> <outfile> [4Dnoiseonly] <truth>
@@ -7922,12 +8157,14 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			}
 		} else if (!strcmp(argv[ac], "-hollow")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double thresh = strtod(argv[ac], &end);
 			ac++;
 			double thick = strtod(argv[ac], &end);
 			ok = nifti_hollow(nim, thresh, thick);
 		} else if (!strcmp(argv[ac], "-unsharp")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double sigma = strtod(argv[ac], &end);
 			ac++;
@@ -8014,6 +8251,7 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_robustfov(nim, fovmm);
 		}
 		else if (!strcmp(argv[ac], "-resize")) {
+			NII_NEED_ARGS(4);
 			ac++;
 			double X = strtod(argv[ac], &end);
 			ac++;
@@ -8024,6 +8262,7 @@ int main64(int argc, char *argv[]) {
 			int interp_method = atoi(argv[ac]);
 			ok = nifti_resize(nim, X, Y, Z, interp_method);
 		} else if (!strcmp(argv[ac], "-crop")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			int tmin = atoi(argv[ac]);
 			ac++;
@@ -8081,6 +8320,7 @@ int main64(int argc, char *argv[]) {
 			ok = nifti_comply(nim, outDims, outPixDims, f_high, isLinear);
 #endif
 		} else if (!strcmp(argv[ac], "-close")) {
+			NII_NEED_ARGS(3);
 			// "-close 1 2 3" with arguments iso, dx1, dx2 is an alias for
 			// niimath scalar -thr $iso -binv -edt -thr $dx1 -binv -edt -thr $dx2 -bin -mul $iso -mas scalar imgout
 			ac++;
@@ -8091,12 +8331,14 @@ int main64(int argc, char *argv[]) {
 			double dx2 = strtod(argv[ac], &end);
 			ok = nifti_close(nim, iso, dx1, dx2);
 		} else if (!strcmp(argv[ac], "-dilate")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double iso = strtod(argv[ac], &end);
 			ac++;
 			double dx = strtod(argv[ac], &end);
 			ok = nifti_dilate(nim, iso, dx);
 		} else if (!strcmp(argv[ac], "-erode")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double iso = strtod(argv[ac], &end);
 			ac++;
@@ -8198,6 +8440,24 @@ int main64(int argc, char *argv[]) {
 			continue; // ac already advanced past the map and axis
 		}
 #endif
+#if defined(HAVE_FMAP) && defined(HAVE_ROMEO)
+		else if (!strcmp(argv[ac], "-fmapprep")) {
+			ac++;
+			ok = nifti_fmapprep_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the magnitude and deltaTE
+		}
+#endif
+#ifdef HAVE_FMAP
+		else if (!strcmp(argv[ac], "-fugue")) {
+			ac++;
+			ok = nifti_fugue_wrap(nim, &ac, argc, argv);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the fieldmap, dwell and direction
+		}
+#endif
 #ifdef HAVE_MOCO
 		else if (!strcmp(argv[ac], "-moco")) {
 			ac++;
@@ -8251,13 +8511,49 @@ int main64(int argc, char *argv[]) {
 			goto fail;
 		}
 #endif
-		/* Removed alias: -skullstrip ran the identical mask-based removal. Give
-		 * existing scripts a targeted migration message rather than the generic
-		 * "unsupported operation". Universal (outside HAVE_ALLINEATE) so every
-		 * build emits the migration hint, even AL=0/no-allineate. */
+		/* -skullstrip: AFNI-style surface skull stripping (skullstrip.c).
+		 * NOTE THE SEMANTIC REUSE: this name previously aliased the template+mask
+		 * removal now spelled -deface, and errored with a migration hint. It now
+		 * names a different operation that takes NO template and NO mask. Scripts
+		 * written against the old error get working-but-different behaviour; the
+		 * -deface path is untouched. See README. */
 		else if (!strcmp(argv[ac], "-skullstrip")) {
-			printfx("-skullstrip was removed; use -deface with the same template and brain mask (identical operation)\n");
-			goto fail;
+#ifdef HAVE_SKULLSTRIP
+			// `-faithful` selects the pre-optimisation deformation kernel: same algorithm,
+			// but bit-identical to the release the parity numbers were measured against, so a
+			// regression diff has something exact to compare with. THE PEEK RULE, which applies
+			// to every sub-option in this loop: `argc` was decremented above so argv[argc] is
+			// the OUTPUT filename and is still a valid pointer, so peek one PAST it
+			// (ac + 1 <= argc, NOT < argc). Otherwise a trailing `-skullstrip -faithful` makes
+			// "-faithful" the output name and silently writes a file called that after a full
+			// strip. A retired op learned this the expensive way; do not weaken it to < argc.
+			int ssFast = 1;
+			if ((ac + 1 <= argc) && (!strcmp(argv[ac + 1], "-faithful"))) {
+				if (ac + 1 >= argc) { // it is sitting where the output name has to be
+					printfx("skullstrip: -faithful must come before the output name\n");
+					goto fail;
+				}
+				ssFast = 0;
+				ac += 1;
+			}
+			// Catch the LEGACY two-operand form before doing 5-100 seconds of work.
+			// `-skullstrip` used to mean `-skullstrip <tmpl> <mask>` (now `-deface`), and the
+			// new op takes no arguments -- so an old command line would run the whole strip
+			// and only then fail on a leftover positional token, with a generic message.
+			// argc was decremented before this loop so argv[argc] is the output name; a
+			// non-option token strictly before it can only be a stale operand.
+			if (ac + 1 < argc && argv[ac + 1][0] != '-') {
+				printfx("'-skullstrip' takes no arguments: it needs no template and no mask.\n");
+				printfx("This name previously aliased the template+mask operation, which is now "
+						"'-deface <tmpl> <mask>' and is unchanged. Use that instead.\n");
+				ok = 1;
+			} else
+				ok = nifti_skullstrip(nim, current_in_datatype, ssFast);
+#else
+			printfx("'-skullstrip' requires a build with SKULLSTRIP=1 (or -DENABLE_SKULLSTRIP=ON)\n");
+			printfx("(this name previously aliased -deface; that operation is still available as -deface)\n");
+			ok = 1;
+#endif
 		}
 		else if (!strcmp(argv[ac], "-edt"))
 			ok = nifti_edt(nim);
@@ -8374,9 +8670,11 @@ int main64(int argc, char *argv[]) {
 					return 2;
 				} else if (nifti_set_filenames(nim, fout, 0, 1)) {
 					nifti_image_free(nim); nim = NULL; ok = 1;
-				}
+				} else
+					current_in_datatype = rhdr.datatype;
 			}
 		} else if (!strcmp(argv[ac], "-grid")) {
+			NII_NEED_ARGS(2);
 			ac++;
 			double v = strtod(argv[ac], &end);
 			ac++;
@@ -8410,6 +8708,7 @@ int main64(int argc, char *argv[]) {
 			printfx("sform_code: %d -> %d\n", nim->sform_code, c);
 			nim->sform_code = c;
 		} else if (!strcmp(argv[ac], "-tfce")) {
+			NII_NEED_ARGS(3);
 			ac++;
 			double H = strtod(argv[ac], &end);
 			ac++;
@@ -8418,6 +8717,7 @@ int main64(int argc, char *argv[]) {
 			int c = atoi(argv[ac]);
 			ok = nifti_tfce(nim, H, E, c);
 		} else if (!strcmp(argv[ac], "-tfceS")) {
+			NII_NEED_ARGS(7);
 			ac++;
 			double H = strtod(argv[ac], &end);
 			ac++;

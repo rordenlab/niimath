@@ -44,7 +44,7 @@ endif()
 
 option(ENABLE_ZSTD "Enable zstd (.nii.zst) compression support" ON)
 option(BUILD_BMP "Build bitmap (PNG) output support" ON)
-option(ENABLE_GPL "Enable optional GPL spm_coreg module (-spm_coreg/-spm_deface); GPL-2 binary" OFF)
+option(ENABLE_GPL "Enable optional copyleft module (-spm_coreg/-spm_deface); GPL-2-or-later binary" OFF)
 # These mirror src/CMakeLists.txt options; declare and forward them here so the
 # documented top-level build (cmake .. on the repo root) actually honours them
 # instead of silently reporting an unused variable.
@@ -58,6 +58,23 @@ option(ENABLE_MEDIC "Enable MEDIC multi-echo distortion correction (--medic, -un
 # per-target rule must be applied HERE as well as in src/CMakeLists.txt.
 option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
 option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
+option(ENABLE_FMAP "Enable B0 fieldmap distortion correction (-fugue, -fmapprep)" ON)
+# Forwarded as an explicit -D below: src/ own option() default can never override a
+# SuperBuild cache entry, so a platform rule must be mirrored in BOTH files.
+option(ENABLE_SKULLSTRIP "Enable AFNI-style surface skull stripping (-skullstrip)" OFF)
+# Mirrored from src/CMakeLists.txt, per the rule in AGENTS.md known-issue 2: this value is
+# forwarded as an explicit -D cache entry that src/'s own option() default can never override,
+# so a platform rule enforced only there would let the top level configure cleanly and then
+# hard-fail inside the inner project. Reject the unsupported request here too.
+if(ENABLE_SKULLSTRIP AND (CMAKE_SIZEOF_VOID_P EQUAL 4 OR NOT BUILD_FLAVOR STREQUAL "all"))
+  message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON requires a 64-bit native BUILD_FLAVOR=all build.")
+endif()
+# Mirror the Emscripten guard too, not only the pointer-size/flavor one: wasm64 reports 8-byte
+# pointers and would pass the test above, so an outer configure could succeed and the inner
+# project then hard-fail.
+if(ENABLE_SKULLSTRIP AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
+  message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON is not supported for WebAssembly targets.")
+endif()
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -128,6 +145,8 @@ ExternalProject_Add(src
         -DENABLE_MEDIC:BOOL=${ENABLE_MEDIC}
         -DENABLE_MOCO:BOOL=${ENABLE_MOCO}
         -DENABLE_STC:BOOL=${ENABLE_STC}
+        -DENABLE_FMAP:BOOL=${ENABLE_FMAP}
+        -DENABLE_SKULLSTRIP:BOOL=${ENABLE_SKULLSTRIP}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}
@@ -140,3 +159,4 @@ ExternalProject_Add(src
 
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION ${SKBUILD_PROJECT_NAME}/bin
         USE_SOURCE_PERMISSIONS)
+

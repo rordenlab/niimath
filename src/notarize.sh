@@ -23,15 +23,26 @@ cd "$(dirname "$0")"
 
 mkdir ${APP_DIR}
 
-DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_BUTTERWORTH -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE -DHAVE_ROMEO -DHAVE_MEDIC"
-SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c bw.c core.c tensor.c dtifit.c qc.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c medic.c"
+# THIS SCRIPT BUILDS THE SHIPPED, BSD-2-BRANDED macOS BINARY. Never add anything from
+# src/GPL/ to SRCS, and never add -DHAVE_GPL (or any other copyleft define) to DFLAGS: doing
+# so links GPL-licensed code into an artifact distributed as BSD-2, and the binary's own
+# version string would still end in " BSD". If you want the copyleft payload, build with
+# GPL=1 (make) or -DENABLE_GPL=ON (CMake) instead -- that is a separate, GPL-2-or-later
+# artifact and is not what gets notarized. This rule used to be stated only as a note about
+# -bandpass/bw.c; that op was retired and the note went with it, so it is restated here in
+# general form. release_smoke.py's copyleft check is the backstop, not the rule.
+DFLAGS="-DHAVE_ZLIB -DFSLSTYLE -DPIGZ -DREJECT_COMPLEX -DNII2MESH -DHAVE_64BITS -DHAVE_FORMATS -DHAVE_TENSOR -DHAVE_DTIFIT -DHAVE_QC -DHAVE_CONFORM -DHAVE_BMP -DHAVE_ALLINEATE -DHAVE_ROMEO -DHAVE_MEDIC"
+SRCS="niimath.c MarchingCubes.c meshify.c quadric.c base64.c radixsort.c fdr.c bwlabel.c core.c tensor.c dtifit.c qc.c core32.c core64.c conform.c unifize.c filter.c bmp.c spng.c nifti_io.c medic.c"
 AL_SRCS="allineate.c powell_newuoa.c coreg_fast.c reface.c"
-
 build_arch() {
     local target="$1" minver="$2" output="$3"
     # -moco and -stc build for BOTH slices: their Apple-Silicon-only gate was lifted once CI began
     # checking both numerically (release_smoke.py) on every shipped target.
-    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC" arch_srcs="${SRCS} moco.c stc.c"
+    # -skullstrip is DELIBERATELY absent here: it is OFF by default pending the native-release
+    # gate in skullstrip_plan.md, so the notarised release must not ship it.
+    # Add "-DHAVE_SKULLSTRIP" and "skullstrip.c"
+    # to the two strings below when it is promoted to default-on.
+    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC -DHAVE_FMAP" arch_srcs="${SRCS} moco.c stc.c fmap.c"
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
     # (allineate no longer needs a separate scoped compile — everything is fast-math now.)
@@ -56,6 +67,7 @@ rm ./niimathX86; rm ./niimathARM
 
 #code sign executable
 codesign --timestamp --options=runtime -s "${APPLE_ID_APP}" -v ./${APP_DIR}/${APP_NAME}
+
 
 #create a DMG
 hdiutil create -volname ${APP_NAME} -srcfolder ./${APP_DIR} -ov -format UDZO -layout SPUD -fs HFS+J  ${APP_NAME}_macOS.dmg

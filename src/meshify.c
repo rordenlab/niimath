@@ -1,6 +1,9 @@
+#include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _MSC_VER
@@ -412,6 +415,227 @@ int meshify(float *img, short dim[3], int originalMC, float isolevel, vec3i **t,
 	*nt = ntri;
 	*np = npt;
 	return EXIT_SUCCESS;
+}
+
+/* ================================ mesh quality report =======================================
+ * Topology from an edge hash (holes = boundary edges, non-manifold = edges with >2 faces, vertex
+ * umbrellas that split into more than one fan), connectivity and genus from Euler's formula, and
+ * self-intersections by Moller's 1997 triangle-triangle test on a uniform grid.  No dependencies.
+ * Counts TRIANGLES that intersect, not pairs, so grid double-visits need no dedupe. */
+
+typedef struct { uint64_t key; int32_t n; int32_t t0, t1; } mc_edge;   /* t0/t1: first two faces */
+
+static uint64_t mc_ekey(int a, int b) {
+	return a < b ? ((uint64_t)a << 32) | (uint32_t)b : ((uint64_t)b << 32) | (uint32_t)a;
+}
+
+static mc_edge *mc_efind(mc_edge *h, size_t cap, uint64_t key) {   /* open addressing, key 0 = empty */
+	size_t i = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 20) & (cap - 1);
+	while (h[i].key && h[i].key != key) i = (i + 1) & (cap - 1);
+	return h + i;
+}
+
+static int mc_find(int *uf, int i) { while (uf[i] != i) { uf[i] = uf[uf[i]]; i = uf[i]; } return i; }
+static void mc_union(int *uf, int a, int b) { a = mc_find(uf, a); b = mc_find(uf, b); if (a != b) uf[a] = b; }
+
+/* Moller: do triangles (v0,v1,v2) and (u0,u1,u2) intersect?  Coplanar pairs are ignored --
+   ponytail: a coplanar overlap on a marching-cubes surface is a degenerate fold, vanishingly rare,
+   and the 2D case is a page of code for it. */
+static void mc_sub(const double *a, const double *b, double *o) { o[0]=a[0]-b[0]; o[1]=a[1]-b[1]; o[2]=a[2]-b[2]; }
+static void mc_cross(const double *a, const double *b, double *o) {
+	o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0]; }
+static double mc_dot(const double *a, const double *b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+/* interval of a triangle's projection onto the intersection line, given signed distances d */
+static int mc_interval(double p0, double p1, double p2, double d0, double d1, double d2, double *lo, double *hi) {
+	double a, b;
+	if (d0 * d1 > 0.0) { a = p2 + (p0 - p2) * d2 / (d2 - d0); b = p2 + (p1 - p2) * d2 / (d2 - d1); }
+	else if (d0 * d2 > 0.0) { a = p1 + (p0 - p1) * d1 / (d1 - d0); b = p1 + (p2 - p1) * d1 / (d1 - d2); }
+	else if (d1 * d2 > 0.0 || d0 != 0.0) { a = p0 + (p1 - p0) * d0 / (d0 - d1); b = p0 + (p2 - p0) * d0 / (d0 - d2); }
+	else if (d1 != 0.0) { a = p1 + (p0 - p1) * d1 / (d1 - d0); b = p1 + (p2 - p1) * d1 / (d1 - d2); }
+	else if (d2 != 0.0) { a = p2 + (p0 - p2) * d2 / (d2 - d0); b = p2 + (p1 - p2) * d2 / (d2 - d1); }
+	else return 0;   /* coplanar */
+	*lo = MIN(a, b); *hi = MAX(a, b);
+	return 1;
+}
+
+int mesh_tri_tri(const double *v0, const double *v1, const double *v2,
+	const double *u0, const double *u1, const double *u2) {
+	double e1[3], e2[3], n1[3], n2[3], d[3], dv[3], du[3], lo1, hi1, lo2, hi2, mx;
+	int i;
+	mc_sub(v1, v0, e1); mc_sub(v2, v0, e2); mc_cross(e1, e2, n1);
+	{ double d1 = -mc_dot(n1, v0);
+	  dv[0] = mc_dot(n1, u0) + d1; dv[1] = mc_dot(n1, u1) + d1; dv[2] = mc_dot(n1, u2) + d1; }
+	if ((dv[0] > 0 && dv[1] > 0 && dv[2] > 0) || (dv[0] < 0 && dv[1] < 0 && dv[2] < 0)) return 0;
+	mc_sub(u1, u0, e1); mc_sub(u2, u0, e2); mc_cross(e1, e2, n2);
+	{ double d2 = -mc_dot(n2, u0);
+	  du[0] = mc_dot(n2, v0) + d2; du[1] = mc_dot(n2, v1) + d2; du[2] = mc_dot(n2, v2) + d2; }
+	if ((du[0] > 0 && du[1] > 0 && du[2] > 0) || (du[0] < 0 && du[1] < 0 && du[2] < 0)) return 0;
+	mc_cross(n1, n2, d);
+	mx = fabs(d[0]); i = 0;
+	if (fabs(d[1]) > mx) { mx = fabs(d[1]); i = 1; }
+	if (fabs(d[2]) > mx) i = 2;
+	if (!mc_interval(v0[i], v1[i], v2[i], du[0], du[1], du[2], &lo1, &hi1)) return 0;
+	if (!mc_interval(u0[i], u1[i], u2[i], dv[0], dv[1], dv[2], &lo2, &hi2)) return 0;
+	return hi1 >= lo2 && hi2 >= lo1;
+}
+
+/* Self-intersecting triangles: uniform grid over triangle AABBs, Moller tri-tri on cell-mates that
+   share no vertex (coplanar overlap is deliberately not counted).  hit[t] = 1 for each crossing
+   triangle.  Returns their count, or -1 when the grid did not fit in memory. */
+int mesh_self_intersections(vec3i *tris, vec3d *pts, int ntri, int npt, uint8_t *hit) {
+	int nself = 0;
+	if (npt < 1) return 0;
+	memset(hit, 0, (size_t)ntri);
+	double lo[3] = { pts[0].x, pts[0].y, pts[0].z }, hi[3] = { lo[0], lo[1], lo[2] }, elen = 0.0, cell;
+	for (int k = 0; k < 3; k++) if (!(fabs(lo[k]) <= DBL_MAX)) return -1;
+	int g[3], *cnt = NULL, *cell_tri = NULL;
+	int64_t ncell;
+	for (int i = 1; i < npt; i++) {
+		double p[3] = { pts[i].x, pts[i].y, pts[i].z };
+		for (int k = 0; k < 3; k++) { if (!(fabs(p[k]) <= DBL_MAX)) return -1; lo[k] = MIN(lo[k], p[k]); hi[k] = MAX(hi[k], p[k]); }   /* NaN/Inf: no grid */
+	}
+	for (int t = 0; t < ntri; t++) elen += dx(pts[tris[t].x], pts[tris[t].y]);
+	cell = ntri ? 2.0 * elen / ntri : 1.0;
+	if (!(cell > 0.0)) cell = 1.0;
+	for (int k = 0; k < 3; k++) { double c = (hi[k] - lo[k]) / 256 + 1e-9; if (c > cell) cell = c; }   /* <= 257^3 cells */
+	for (int k = 0; k < 3; k++) g[k] = (int)((hi[k] - lo[k]) / cell) + 1;
+	ncell = (int64_t)g[0] * g[1] * g[2];
+	cnt = (int *)calloc((size_t)ncell + 1, sizeof(int));
+	if (!cnt) return -1;
+	{
+		#define MC_CELLS(t, c0, c1) do { \
+			int _v[3] = { tris[t].x, tris[t].y, tris[t].z }; \
+			double _p[3][3] = { { pts[_v[0]].x, pts[_v[0]].y, pts[_v[0]].z }, { pts[_v[1]].x, pts[_v[1]].y, pts[_v[1]].z }, { pts[_v[2]].x, pts[_v[2]].y, pts[_v[2]].z } }; \
+			for (int _k = 0; _k < 3; _k++) { \
+				double _a = MIN(_p[0][_k], MIN(_p[1][_k], _p[2][_k])), _b = MAX(_p[0][_k], MAX(_p[1][_k], _p[2][_k])); \
+				c0[_k] = MAX(0, MIN(g[_k] - 1, (int)((_a - lo[_k]) / cell))); c1[_k] = MAX(0, MIN(g[_k] - 1, (int)((_b - lo[_k]) / cell))); } } while (0)
+		int64_t total = 0;
+		for (int t = 0; t < ntri; t++) {
+			int c0[3], c1[3];
+			MC_CELLS(t, c0, c1);
+			total += (int64_t)(c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
+			for (int z = c0[2]; z <= c1[2]; z++) for (int y = c0[1]; y <= c1[1]; y++) for (int x = c0[0]; x <= c1[0]; x++)
+				cnt[1 + x + g[0] * (y + (int64_t)g[1] * z)]++;
+		}
+		if (total > INT_MAX) { free(cnt); return -1; }   /* only a hostile mesh: faces spanning the whole grid */
+		for (int64_t i = 0; i < ncell; i++) cnt[i + 1] += cnt[i];
+		cell_tri = (int *)malloc((size_t)cnt[ncell] * sizeof(int));
+		int *fill = (int *)calloc((size_t)ncell, sizeof(int));
+		if (!cell_tri || !fill) { free(fill); free(cnt); free(cell_tri); return -1; }
+		{
+			for (int t = 0; t < ntri; t++) {
+				int c0[3], c1[3];
+				MC_CELLS(t, c0, c1);
+				for (int z = c0[2]; z <= c1[2]; z++) for (int y = c0[1]; y <= c1[1]; y++) for (int x = c0[0]; x <= c1[0]; x++) {
+					int64_t c = x + g[0] * (y + (int64_t)g[1] * z);
+					cell_tri[cnt[c] + fill[c]++] = t;
+				}
+			}
+			/* -mesh -a runs nii2mesh per label inside its own parallel region; this one then
+			   runs serially on the encountering thread (nested parallelism is inactive) */
+			#ifdef _OPENMP
+			#pragma omp parallel for schedule(dynamic, 4096)
+			#endif
+			for (int64_t c = 0; c < ncell; c++) {
+				for (int i = cnt[c]; i < cnt[c + 1]; i++) for (int j = i + 1; j < cnt[c + 1]; j++) {
+					int a = cell_tri[i], b = cell_tri[j];
+					int va[3] = { tris[a].x, tris[a].y, tris[a].z }, vb[3] = { tris[b].x, tris[b].y, tris[b].z }, adj = 0;
+					for (int p = 0; p < 3; p++) for (int q = 0; q < 3; q++) if (va[p] == vb[q]) adj = 1;
+					if (adj) continue;
+					if (mesh_tri_tri(&pts[va[0]].x, &pts[va[1]].x, &pts[va[2]].x, &pts[vb[0]].x, &pts[vb[1]].x, &pts[vb[2]].x)) {
+						#ifdef _OPENMP
+						#pragma omp atomic write
+						#endif
+						hit[a] = 1;
+						#ifdef _OPENMP
+						#pragma omp atomic write
+						#endif
+						hit[b] = 1;
+					}
+				}
+			}
+		}
+		free(fill);
+	}
+	free(cnt); free(cell_tri);
+	for (int t = 0; t < ntri; t++) nself += hit[t];
+	return nself;
+}
+
+int mesh_report(vec3i *tris, vec3d *pts, int ntri, int npt, const char *label) {
+	double t0 = clockMsec();
+	size_t cap = 1;
+	while (cap < (size_t)ntri * 6) cap <<= 1;
+	mc_edge *h = (mc_edge *)calloc(cap, sizeof(mc_edge));
+	int *uf = (int *)malloc((size_t)npt * sizeof(int));
+	int *deg = (int *)calloc((size_t)npt + 1, sizeof(int));
+	int *vt = (int *)malloc((size_t)ntri * 3 * sizeof(int));   /* vertex -> incident triangles, CSR */
+	uint8_t *hit = (uint8_t *)calloc((size_t)ntri, 1);
+	int nedge = 0, nbound = 0, nnonman = 0, nnmv = 0, ncomp = 0, nloops = 0, nself;
+	if (!h || !uf || !deg || !vt || !hit) { free(h); free(uf); free(deg); free(vt); free(hit); return 1; }
+	for (int i = 0; i < npt; i++) uf[i] = i;
+	for (int t = 0; t < ntri; t++) {
+		int v[3] = { tris[t].x, tris[t].y, tris[t].z };
+		for (int k = 0; k < 3; k++) {
+			mc_edge *e = mc_efind(h, cap, mc_ekey(v[k], v[(k + 1) % 3]) + 1);   /* +1: 0 is empty */
+			if (!e->key) { e->key = mc_ekey(v[k], v[(k + 1) % 3]) + 1; e->t0 = t; e->t1 = -1; nedge++; }
+			else if (e->t1 < 0) e->t1 = t;
+			e->n++;
+			mc_union(uf, v[k], v[(k + 1) % 3]);
+			deg[v[k] + 1]++;
+		}
+	}
+	for (size_t i = 0; i < cap; i++) if (h[i].key) { if (h[i].n == 1) nbound++; else if (h[i].n > 2) nnonman++; }
+	for (int i = 0; i < npt; i++) if (deg[i + 1] && mc_find(uf, i) == i) ncomp++;
+	/* boundary loops: union-find over boundary edges' endpoints, on a fresh forest.  Reported as
+	   holes; two loops touching at one vertex count once (that vertex is also non-manifold). */
+	for (int i = 0; i < npt; i++) uf[i] = i;
+	for (size_t i = 0; i < cap; i++) if (h[i].key && h[i].n == 1) {
+		uint64_t k = h[i].key - 1;
+		mc_union(uf, (int)(k >> 32), (int)(uint32_t)k);
+	}
+	{	uint8_t *onb = (uint8_t *)calloc((size_t)npt, 1);
+		if (onb) {
+			for (size_t i = 0; i < cap; i++) if (h[i].key && h[i].n == 1) {
+				uint64_t k = h[i].key - 1; onb[k >> 32] = 1; onb[(uint32_t)k] = 1; }
+			for (int i = 0; i < npt; i++) if (onb[i] && mc_find(uf, i) == i) nloops++;
+			free(onb);
+		}
+	}
+	/* non-manifold vertices: the incident triangles must form ONE fan joined by edges through v */
+	for (int i = 0; i < npt; i++) deg[i + 1] += deg[i];
+	{	int *fill = (int *)calloc((size_t)npt, sizeof(int));
+		if (fill) {
+			for (int t = 0; t < ntri; t++) {
+				int v[3] = { tris[t].x, tris[t].y, tris[t].z };
+				for (int k = 0; k < 3; k++) vt[deg[v[k]] + fill[v[k]]++] = t;
+			}
+			for (int v = 0; v < npt; v++) {
+				int n = deg[v + 1] - deg[v], *tv = vt + deg[v], comps = n;
+				if (n < 2 || n > npt) continue;   /* uf is the scratch forest; n > npt only on duplicate-face garbage */
+				for (int a = 0; a < n; a++) uf[a] = a;   /* uf reused as a tiny local forest */
+				for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) {
+					int ta = tv[a], tb = tv[b], va[3] = { tris[ta].x, tris[ta].y, tris[ta].z }, vb[3] = { tris[tb].x, tris[tb].y, tris[tb].z }, shared = 0;
+					for (int p = 0; p < 3; p++) for (int q = 0; q < 3; q++) if (va[p] != v && va[p] == vb[q]) shared = 1;
+					if (shared && mc_find(uf, a) != mc_find(uf, b)) { uf[mc_find(uf, a)] = mc_find(uf, b); comps--; }
+				}
+				if (comps > 1) nnmv++;
+			}
+			free(fill);
+		}
+	}
+	nself = mesh_self_intersections(tris, pts, ntri, npt, hit);
+	{	int euler = npt - nedge + ntri;
+		int genus2 = 2 * ncomp - nloops - euler;   /* 2G, from V - E + F = 2C - 2G - B */
+		char self[16] = "n/a", genus[16] = "n/a";   /* self: the grid did not fit; genus: only meaningful on a manifold */
+		if (nself >= 0) snprintf(self, sizeof self, "%d", nself);
+		if (!nnonman && !nnmv) snprintf(genus, sizeof genus, "%g", genus2 / 2.0);
+		printf("%s: V=%d E=%d F=%d components=%d euler=%d genus=%s boundary_edges=%d holes=%d nonmanifold_edges=%d nonmanifold_vertices=%d self_intersecting=%s (%ld ms)\n",
+			label, npt, nedge, ntri, ncomp, euler, genus, nbound, nloops, nnonman, nnmv, self, timediff(t0, clockMsec()));
+	}
+	free(h); free(uf); free(deg); free(vt); free(hit);
+	return 0;
 }
 
 static bool littleEndianPlatform() {

@@ -121,6 +121,10 @@ void *nii_malloc(size_t count, size_t size) {
 	return ptr;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waggressive-loop-optimizations"
+#endif
 int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 //H: Histogram H[0..nBin-1] with each bin storing nuumber of pixels of this brightness
 //nBin: number of bins in histogram, e.g. 256 for H[0..255]
@@ -236,6 +240,9 @@ int nii_otsu(int* H, int nBin, int mode, int *dark, int *mid, int *bright) {
 	free(S);
 	return thresh;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	char extnii[5] = ".nii"; /* modifiable, for possible uppercase */
@@ -1069,7 +1076,7 @@ int *make_kernel_sphere(nifti_image *nim, int *nkernel, double mm) {
 }
 
 #ifdef NII2MESH
-int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, float reduceFraction, int preSmooth, bool onlyLargest, bool fillBubbles, int postSmooth, bool verbose, char * outnm, int quality) {
+int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, float reduceFraction, int preSmooth, bool onlyLargest, bool fillBubbles, int postSmooth, bool verbose, char * outnm, int quality, int newSimplify) {
 	vec3d *pts = NULL;
 	vec3i *tris = NULL;
 	int ntri, npt;
@@ -1084,25 +1091,25 @@ int nii2mesh (float * img, nifti_image * nim, int originalMC, float isolevel, fl
 	float srow_y[4] = {(float)nim->sto_xyz.m[1][0], (float)nim->sto_xyz.m[1][1], (float)nim->sto_xyz.m[1][2], (float)nim->sto_xyz.m[1][3]} ;
 	float srow_z[4] = {(float)nim->sto_xyz.m[2][0], (float)nim->sto_xyz.m[2][1], (float)nim->sto_xyz.m[2][2], (float)nim->sto_xyz.m[2][3]} ;
 	apply_sform(tris, pts, ntri, npt, srow_x, srow_y, srow_z);
+	if (verbose) mesh_report(tris, pts, ntri, npt, "mesh check (marching cubes)");
 	double startTime = clockMsec();
 	if (postSmooth > 0) {
-		laplacian_smoothHC(pts, tris, npt, ntri, 0.1, 0.5, postSmooth, true);
-		if (verbose)
+		laplacian_smoothHC(pts, tris, npt, ntri, 0.1, 0.5, postSmooth, true, (quality > 1));
+		if (verbose) {
 			printfx("post-smooth: %ld ms\n", timediff(startTime, clockMsec()));
+			mesh_report(tris, pts, ntri, npt, "mesh check (smoothed)");
+		}
 		startTime = clockMsec();
 	}
-	if ((reduceFraction < 1.0) || (quality > 1)) { //lossless for high quality
-		double aggressiveness = 7.0; //7 = default for Simplify.h
-		if (quality == 0) //fast
-			aggressiveness = 8.0;
-		if (quality == 2) //best
-			aggressiveness = 5.0;
+	if (reduceFraction < 1.0) {   /* -r 1 means untouched; the lossless finish rides -q 2 inside the simplification */
 		int startVert = npt;
 		int startTri = ntri;
 		int target_count = round((float)ntri * reduceFraction);
-		quadric_simplify_mesh(&pts, &tris, &npt, &ntri, target_count, aggressiveness, verbose, (quality > 1));
-		if (verbose)
+		mesh_simplify(&pts, &tris, &npt, &ntri, target_count, quality, newSimplify, verbose);
+		if (verbose) {
 			printfx("simplify vertices %d->%d triangles %d->%d (r = %g): %ld ms\n", startVert, npt, startTri, ntri, (float)ntri / (float) startTri, timediff(startTime, clockMsec()));
+			mesh_report(tris, pts, ntri, npt, "mesh check (simplified)");
+		}
 		startTime = clockMsec();
 	}
 	save_mesh(outnm, tris, pts, ntri, npt, (quality > 0));
@@ -1124,7 +1131,8 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 	bool fillBubbles = false;
 	int postSmooth = 0;
 	int originalMC = 0;
-	int quality = 1;
+	int quality = 2;
+	int newSimplify = 0;
 	bool verbose = true;
 	char atlasFilename[mxStr] = "";
 	for (int i=arg;i<argc;i++) {
@@ -1145,6 +1153,12 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 		}
 		if (strcmp(argv[i],"-l") == 0)
 			onlyLargest = atoi(argv[i+1]);
+		if (strcmp(argv[i],"-n") == 0) {
+			newSimplify = atoi(argv[i+1]);
+			#ifndef HAVE_QUADRIC2
+			if (newSimplify) { printfx("-mesh -n 1 needs a build with the half-edge simplifier (Q2=1 make / -DENABLE_QUADRIC2=ON)\n"); return EXIT_FAILURE; }
+			#endif
+		}
 		if (strcmp(argv[i],"-o") == 0)
 			originalMC = atoi(argv[i+1]);
 		if (strcmp(argv[i],"-p") == 0)
@@ -1237,7 +1251,7 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 				}
 				char outnm[mxStr];
 				if (snprintf(outnm,sizeof(outnm),"%s%s%s", basenm, atlasLabels[i].str, ext) < 0) exit(EXIT_FAILURE);
-				int reti = nii2mesh(imgbinary, nim, originalMC, 0.5, reduceFraction, preSmooth, onlyLargest, fillBubbles, postSmooth, verbose, outnm, quality);
+				int reti = nii2mesh(imgbinary, nim, originalMC, 0.5, reduceFraction, preSmooth, onlyLargest, fillBubbles, postSmooth, verbose, outnm, quality, newSimplify);
 				if (reti == EXIT_SUCCESS)
 					partial_OK ++;
 				free(imgbinary);
@@ -1254,7 +1268,7 @@ int nifti_mesh(nifti_image * nim, float darkThresh, float midThresh, float brigh
 		return EXIT_SUCCESS;
 	} else {
 		float * img = (float *)nim->data;
-		return nii2mesh (img, nim, originalMC, isolevel, reduceFraction, preSmooth,onlyLargest, fillBubbles, postSmooth, verbose, argv[argc-1], quality);
+		return nii2mesh (img, nim, originalMC, isolevel, reduceFraction, preSmooth,onlyLargest, fillBubbles, postSmooth, verbose, argv[argc-1], quality, newSimplify);
 	}
 	#else
 		printfx("Not compiled for meshify.\n");

@@ -1,8 +1,10 @@
 // stc.c - slice-time correction for 4D datasets (-stc)
 //
 // Clean-room implementation of AFNI 3dTshift's default Fourier method.  The published help
-// supplies the method name and the "detrend -> interpolate -> retrend" outline; AFNI's GPL-2
+// supplies the method name and the "detrend -> interpolate -> retrend" outline; AFNI's
 // 3dTshift.c, its shifting engine and its FFT were NOT read, translated or paraphrased and
+// (they were MCW GPL-2 at the time; MCW relicensed its 1994-2000 AFNI code to CC BY 4.0 on
+// 2026-05-12, which lifts the copyleft bar but adds an attribution obligation this code avoids)
 // served only as a black-box oracle.  See stc.h and the moco_bench repository's test/stc_reference_manifest.md, which
 // records the experiment behind every convention marked "measured" below.
 //
@@ -96,7 +98,9 @@ static int stc_factor(int64_t n, int *rad, int maxrad) {
 // PROVENANCE: this kernel is original niimath code.  No FFT implementation was read or adapted
 // for it -- not kissfft, muFFT or pffft (evaluated as dependencies and rejected: none can
 // express AFNI's length set with the batching this workload wants), and certainly not AFNI's own
-// GPL-2 csfft.  What IS borrowed is the ALGORITHM, which is classical published mathematics:
+// csfft (MCW; GPL-2 when this was written, CC BY 4.0 since 2026-05-12 -- still not used here,
+// and this kernel is faster for the batched workload anyway).  What IS borrowed is the
+// ALGORITHM, which is classical published mathematics:
 // Stockham's autosort FFT (Stockham 1966; the mixed-radix index map is textbook, e.g. Van Loan,
 // "Computational Frameworks for the FFT", SIAM 1992), plus the standard radix-3 and radix-5
 // butterflies, which are just the roots-of-unity identities written out.  The index map below

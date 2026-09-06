@@ -15,6 +15,7 @@ import gzip
 import json
 import math
 import os
+import random
 import re
 import shutil
 import struct
@@ -111,6 +112,7 @@ def write_float32_nifti(
     scl_inter: float = 0.0,
     tr: float = 0.0,
     time_units: int = 0,
+    scale: float = 1.0,  # voxel size, for fixtures whose PHYSICAL size matters
 ) -> None:
     nvox = dims[0] * dims[1] * dims[2] * nt
     if len(data) != nvox:
@@ -118,7 +120,7 @@ def write_float32_nifti(
     payload = struct.pack(f"<{nvox}f", *data)
     header = bytearray(
         nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope,
-                     scl_inter=scl_inter, tr=tr, time_units=time_units)
+                     scl_inter=scl_inter, tr=tr, time_units=time_units, scale=scale)
     )
     if nt > 1:
         struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
@@ -131,6 +133,25 @@ def read_float32_nifti(path: Path) -> list[float]:
     nvox = _prod(dim[1 : dim[0] + 1])
     offset = int(struct.unpack_from("<f", blob, 108)[0])
     return list(struct.unpack_from(f"<{nvox}f", blob, offset))
+
+
+def exercise_fillh(exe: str, tmp: Path) -> None:
+    """Exercise independent 3D scratch on a multi-volume flood fill."""
+    dims = (5, 5, 5)
+    n3 = _prod(dims)
+    first = [1.0] * n3
+    first[2 + 5 * (2 + 5 * 2)] = 0.0
+    second = [0.0] * n3
+    src = tmp / "fillh_4d.nii"
+    out = tmp / "fillh_4d_out.nii"
+    write_float32_nifti(src, dims, first + second, nt=2)
+    require_success(
+        run_niimath(exe, [str(src), "-fillh", "-gz", "0", str(out)]),
+        "multi-volume -fillh",
+    )
+    result = read_float32_nifti(out)
+    if result[:n3] != [1.0] * n3 or result[n3:] != second:
+        raise AssertionError("-fillh did not process 4D volumes independently")
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -895,7 +916,10 @@ def medic_write_series(
 
     `nan_index` poisons a single voxel of the FIRST echo's phase (flat index into the whole
     series), which is how the silent all-zero-output bug is provoked.  `offset_rad` adds a
-    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove.
+    TE-independent phase offset to every echo, i.e. the term MCPC-3D-S exists to remove; it may
+    be a constant or a callable(x, y, z), the latter being how a fixture gives a ZERO-FIELD
+    series a non-degenerate stored phase range (the rescale needs one, and a literally constant
+    phase volume has none).
 
     `field_fn(x, y, z, t)` replaces amplitude(t)*medic_field(v) when a fixture needs a field whose
     SPATIAL shape (not just its scale) changes with the frame -- the only way to build a series of
@@ -913,7 +937,8 @@ def medic_write_series(
                 for y in range(ny):
                     for x in range(nx):
                         hz = field_fn(x, y, z, t) if field_fn is not None else scale * medic_field(x, y, z)
-                        phase_values.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0 + offset_rad))
+                        off = offset_rad(x, y, z) if callable(offset_rad) else offset_rad
+                        phase_values.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0 + off))
                         mag_values.append(
                             magnitude_fn(x, y, z, t) if magnitude_fn is not None else medic_magnitude(x, y, z)
                         )
@@ -1472,7 +1497,8 @@ def exercise_medic_mask_temporal(exe: str, tmp: Path) -> None:
     prefix = tmp / "medic_mt_out"
     require_success(
         medic_run(exe, mags, phases, tes, prefix,
-                  ["--rank", "0", "--temporal-correction", "1", "--save-intermediates"]),
+                  ["--rank", "0", "--temporal-correction", "1", "--save-intermediates",
+                   "--mask-mode", "robustmask"]),
         "--medic --temporal-correction 1 with per-frame masks",
     )
     masks = medic_read_output(prefix, "_masks", tmp, "mtm")
@@ -1538,16 +1564,28 @@ def exercise_medic_rank_boundaries(exe: str, tmp: Path) -> None:
 
     # (a) all-zero phase in every echo and frame -> an all-zero field series; rank 2 < T = 4, so
     # the filter really runs.
-    zero_mags, zero_phases = medic_write_series(tmp, "medic_zero", tes, frames, lambda t: 0.0,
-                                                field_fn=lambda x, y, z, t: 0.0)
+    # The field is zero, but the stored phase must still span a range -- readphase estimates the
+    # rescale from frame 0 and a constant volume has none (the reference dies on that input too).
+    # A TE-INDEPENDENT spatial offset supplies one and MCPC-3D-S removes it, so the field stays
+    # exactly zero, which is what this fixture is about.
+    zero_mags, zero_phases = medic_write_series(
+        tmp, "medic_zero", tes, frames, lambda t: 0.0,
+        field_fn=lambda x, y, z, t: 0.0,
+        offset_rad=lambda x, y, z: medic_wrap(0.7 * x + 0.11 * y + 0.023 * z))
     prefix = tmp / "medic_zero_out"
     result = medic_run(exe, zero_mags, zero_phases, tes, prefix, ["--rank", "2"])
     require_success(result, "--medic --rank 2 on an all-zero field series")
     zeros = medic_read_output(prefix, "_fieldmaps_native", tmp, "zero")
     if zeros is None:
         raise AssertionError("--medic wrote no field map for an all-zero series")
+    # Tolerance, not exact zero: the TE-independent offset that gives this fixture a stored phase
+    # range is removed by MCPC-3D-S in floating point, so the field lands within a few times 1e-7
+    # Hz of zero rather than on it.  1e-4 Hz is three orders above that and eight below the field
+    # values every other fixture asserts, so it cannot hide a filter that is actually doing
+    # something (the retired bug this pins failed the whole run, and --rank 1 on a rank-2 series
+    # moves the field by whole Hz).
     for i, v in enumerate(zeros):
-        if v != 0.0:
+        if not (abs(v) < 1e-4):
             raise AssertionError(f"--medic: an all-zero field series must stay zero, voxel {i} holds {v:g}")
 
     # (b)/(c) a rank-2 series.
@@ -1819,6 +1857,597 @@ def exercise_medic_output_transaction(exe: str, tmp: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------------------------
+# Gap 7 (readphase): the rescale range is estimated from FRAME 0 ONLY, per echo, and combined
+# across echoes by the MODE with ties broken by the SMALLEST value; non-finite entries lose every
+# tie; there is no already-in-radians short-circuit.  All four were measured against
+# `wk-medic --debug`, which prints the range it chose -- see medic_bench's tools/m1_rescale_probe.py.
+#
+# niimath prints the same line, so each fixture below asserts the CHOSEN RANGE directly and, where
+# the encode and decode ranges coincide so the decoded radians are exact, the recovered field too.
+# Cases whose correct answer mangles an echo assert only the range: a fixture cannot meaningfully
+# fit a slope through a halved sawtooth.
+MEDIC_RP_TES2 = (10.0, 30.0)
+MEDIC_RP_TES3 = (10.0, 20.0, 30.0)
+MEDIC_RP_SLOPE = 4.0          # Hz per j voxel, as in the main synthetic run
+
+
+def medic_rp_encode(phi: float, lo: float, hi: float) -> float:
+    """Radians -> stored units spanning [lo, hi]; the exact inverse of readphase's affine."""
+    return (phi + math.pi) / MEDIC_TWO_PI * (hi - lo) + lo
+
+
+def medic_rp_series(tmp: Path, tag: str, tes, frames: int, enc_range, spike=None,
+                    nan_echo: int | None = None, constant: bool = False):
+    """A multi-frame, multi-echo series whose STORED phase extrema are exact by construction.
+
+    `enc_range(e, t) -> (lo, hi)` is the range frame t of echo e is encoded into.  Two background
+    voxels of every frame are pinned to that frame's lo and hi so the observed extrema are exactly
+    those numbers.  `spike(e) -> (lo, hi) or None` overrides echo e's FRAME 0 pins, which is how
+    one echo is given a frame-0 range of its own.  `nan_echo` poisons one background voxel of that
+    echo's frame 0.  `constant` writes a single value everywhere, i.e. no range at all."""
+    nx, ny, nz = MEDIC_DIMS
+    mags: list[str] = []
+    phases: list[str] = []
+    for e, te in enumerate(tes):
+        mag_values: list[float] = []
+        phase_values: list[float] = []
+        for t in range(frames):
+            lo, hi = enc_range(e, t)
+            for z in range(nz):
+                for y in range(ny):
+                    for x in range(nx):
+                        hz = MEDIC_RP_SLOPE * (y - ny / 2.0)
+                        phi = medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0)
+                        phase_values.append(7.0 if constant else medic_rp_encode(phi, lo, hi))
+                        mag_values.append(medic_magnitude(x, y, z))
+            if not constant:
+                base = t * nx * ny * nz
+                pin_lo, pin_hi = (spike(e) if (spike and t == 0 and spike(e)) else (lo, hi))
+                phase_values[base + 0] = pin_lo          # (0,0,0): background, magnitude 30
+                phase_values[base + 1] = pin_hi          # (1,0,0): background
+                if nan_echo == e and t == 0:
+                    phase_values[base + 2] = float("nan")
+        mag_path = tmp / f"{tag}_mag{e}.nii"
+        phase_path = tmp / f"{tag}_pha{e}.nii"
+        write_float32_nifti(mag_path, MEDIC_DIMS, mag_values, nt=frames)
+        write_float32_nifti(phase_path, MEDIC_DIMS, phase_values, nt=frames)
+        mags.append(str(mag_path))
+        phases.append(str(phase_path))
+    return mags, phases
+
+
+def medic_rp_range(result) -> tuple[float, float]:
+    """Parse the range niimath reports; raises if the line is missing."""
+    for line in (result.stdout + result.stderr).splitlines():
+        if "phase rescale range" in line:
+            body = line.split("[", 1)[1].split("]", 1)[0]
+            lo, hi = body.split(",")
+            return float(lo), float(hi)
+    raise AssertionError("--medic did not report its phase rescale range")
+
+
+def medic_rp_case(exe: str, tmp: Path, tag: str, tes, frames, enc_range, expect_range,
+                  expect_slope=None, spike=None, nan_echo=None, old=""):
+    mags, phases = medic_rp_series(tmp, tag, tes, frames, enc_range, spike=spike, nan_echo=nan_echo)
+    prefix = tmp / f"{tag}_out"
+    # --mask-mode robustmask, because readphase runs BEFORE any mask and these fixtures are only
+    # 16x24x8: the default tiered mask grows a three-voxel ring that covers the whole volume at
+    # that size, which would drag the deliberately poisoned background voxel of the NaN case into
+    # the mask and fail the run for an unrelated reason.
+    result = medic_run(exe, mags, phases, tes, prefix,
+                       ["--rank", "0", "--temporal-correction", "0", "--mask-mode", "robustmask"])
+    require_success(result, f"--medic readphase fixture {tag}")
+    got = medic_rp_range(result)
+    if got != expect_range:
+        raise AssertionError(
+            f"--medic readphase {tag}: chose range {got}, expected {expect_range}{old}"
+        )
+    if expect_slope is not None:
+        field = medic_read_output(prefix, "_fieldmaps_native", tmp, tag)
+        if field is None:
+            raise AssertionError(f"--medic readphase {tag}: no field map")
+        slope, _ = medic_fit_along_j(field, 0)
+        if abs(slope - expect_slope) > 0.02 * abs(expect_slope):
+            raise AssertionError(
+                f"--medic readphase {tag}: frame-0 field slope {slope:.5f} Hz/voxel, "
+                f"expected {expect_slope}{old}"
+            )
+
+
+def exercise_medic_readphase(exe: str, tmp: Path) -> None:
+    """(13) The Gap 7 readphase rule.  Each case names what the OLD per-echo whole-series rule
+    would have chosen, since the fix cannot be reverted to prove it."""
+    # (a) Frame 0 governs.  Frame 0 is encoded narrow and frame 1 wide; the old rule took the
+    # whole series, i.e. [-200, 200], which halves frame 0's decoded radians and its field.
+    medic_rp_case(
+        exe, tmp, "medic_rp_frame0", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0) if t == 0 else (-200.0, 200.0),
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (the whole-series rule chose [-200, 200] and a slope of 2.0)")
+
+    # (b) Mode across echoes.  Echo 2's frame 0 carries two out-of-range background spikes, so its
+    # own extrema are [-200, 200] while echoes 0 and 1 report [-100, 100]; the mode keeps the pair
+    # that two echoes agree on and every echo decodes exactly.  A per-echo rule decoded echo 2 at
+    # twice the scale, and an all-echo min/max rule decoded ALL of them at half.
+    medic_rp_case(
+        exe, tmp, "medic_rp_mode", MEDIC_RP_TES3, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: (-200.0, 200.0) if e == 2 else None,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (a per-echo rule gave echo 2 [-200, 200] alone)")
+
+    # (c) A two-echo tie resolves to the SMALLEST.  The maxima are 100 and 300 with no majority;
+    # taking the larger would stretch every decoded radian by 400/200 and halve the field.
+    medic_rp_case(
+        exe, tmp, "medic_rp_tie", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: (-100.0, 300.0) if e == 1 else None,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (breaking the tie the other way gives [-100, 300] and a slope of 2.0)")
+
+    # (d) Three distinct maxima, so no mode at all: the smallest still wins.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nomode", MEDIC_RP_TES3, 2,
+        lambda e, t: (-100.0, 100.0),
+        spike=lambda e: [None, (-100.0, 200.0), (-100.0, 300.0)][e],
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (any other tie rule gives 200 or 300)")
+
+    # (e) A NaN in frame 0 must not derail the range.  An implementation that let it through would
+    # make the span NaN and every output voxel with it -- silently, at exit 0.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nan", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 100.0), nan_echo=0,
+        expect_range=(-100.0, 100.0), expect_slope=MEDIC_RP_SLOPE,
+        old="  (a NaN-propagating mode gives a NaN range and an all-NaN field)")
+
+    # (e2) The NaN CONVENTION, which (e) cannot see: a non-finite entry loses the tie rather than
+    # being replaced by the echo's finite extrema.  Echo 0's content is encoded into [-100, 50] and
+    # carries a NaN, echo 1 into [-100, 100].  Propagating the NaN leaves echo 1 as the only finite
+    # candidate; skipping it would make the maxima {50, 100}, a tie the smallest wins, i.e. 50.
+    # Only the chosen range is asserted -- echo 0 decodes at the wrong scale either way, so there
+    # is no meaningful slope to fit.  Measured against wk-medic: a NaN echo against a distinct
+    # [-300, 300] echo reports max 300, which only the propagating rule produces.
+    medic_rp_case(
+        exe, tmp, "medic_rp_nantie", MEDIC_RP_TES2, 2,
+        lambda e, t: (-100.0, 50.0) if e == 0 else (-100.0, 100.0), nan_echo=0,
+        expect_range=(-100.0, 100.0),
+        old="  (dropping the NaN before the mode gives [-100, 50])")
+
+    # (f) No range at all is an error, not a silent pass-through.  The old code returned quietly
+    # and left the stored values in place, which are not radians; the reference dies on this input
+    # too, deep inside its unwrapper.
+    mags, phases = medic_rp_series(tmp, "medic_rp_flat", MEDIC_RP_TES2, 2,
+                                   lambda e, t: (-100.0, 100.0), constant=True)
+    result = medic_run(exe, mags, phases, MEDIC_RP_TES2, tmp / "medic_rp_flat_out",
+                       ["--rank", "0", "--mask-mode", "robustmask"])
+    if result.returncode == 0:
+        raise AssertionError("--medic accepted a constant frame 0, which has no rescale range")
+    if "no usable range" not in (result.stdout + result.stderr):
+        raise AssertionError("--medic rejected a constant frame 0 without a diagnostic")
+    print("  --medic readphase: frame-0 range, mode across echoes, tie and NaN rules, "
+          "no short-circuit OK")
+
+
+# The tiered mask needs a volume big enough to hold a three-voxel ring, which MEDIC_DIMS is not.
+MEDIC_MM_DIMS = (28, 30, 26)
+
+
+def medic_mm_dilate(mask: list[int], dims, iters: int) -> list[int]:
+    """Binary dilation with an 18-CONNECTED structuring element -- faces and edges, no corners.
+
+    Recomputed here rather than trusted: the connectivity is a MEASURED property of the reference
+    (Dice 0.9997 at 18, 0.9304 at 6, 0.9699 at 26 against warpkit's own recovered mask), so a
+    silent change from 18 to 6 or 26 in medic.c would move every mask boundary while every other
+    fixture still passed."""
+    nx, ny, nz = dims
+    off = [(dx, dy, dz)
+           for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+           if (dx or dy or dz) and abs(dx) + abs(dy) + abs(dz) <= 2]
+    cur = list(mask)
+    for _ in range(iters):
+        nxt = list(cur)
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    i = x + nx * (y + ny * z)
+                    if cur[i]:
+                        continue
+                    for dx, dy, dz in off:
+                        xx, yy, zz = x + dx, y + dy, z + dz
+                        if 0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz and cur[xx + nx * (yy + ny * zz)]:
+                            nxt[i] = 1
+                            break
+        cur = nxt
+    return cur
+
+
+def medic_mm_series(tmp: Path, tes, bump=None, tag: str = "medic_mm") -> tuple[list[str], list[str]]:
+    """An ellipsoid on a NOISY dim background with a TE-proportional field, on MEDIC_MM_DIMS.
+
+    The background phase has to be noise, not a continuation of the ramp.  The tiered mask unions
+    an Otsu magnitude threshold with an Otsu threshold on ROMEO's voxel-quality map, and a
+    noiseless ramp has excellent phase coherence everywhere -- so on a clean phantom the quality
+    component covers the whole volume, the union with it does too, and there is no outside tier
+    left to check.  Seeded, so the fixture is reproducible."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    rng = random.Random(20260824)
+    noise = [rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+    mags, phases = [], []
+    for e, te in enumerate(tes):
+        extra = bump[e] if bump else 0.0
+        m, p = [], []
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    # Small enough that the core, its two dilations and the three-voxel ring all
+                    # fit inside the FOV with room to spare -- a saturated mask has no ring to
+                    # check, which is exactly how this fixture would go vacuous.
+                    r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+                         + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+                    inside = r < 1.0
+                    m.append(1000.0 if inside else 25.0)
+                    hz = 3.0 * (y - ny / 2.0) + 0.2 * x + extra
+                    p.append(medic_wrap(MEDIC_TWO_PI * hz * te / 1000.0) if inside
+                             else noise[x + nx * (y + ny * z)])
+        mp, pp = tmp / f"{tag}_mag{e}.nii", tmp / f"{tag}_pha{e}.nii"
+        write_float32_nifti(mp, MEDIC_MM_DIMS, m)
+        write_float32_nifti(pp, MEDIC_MM_DIMS, p)
+        mags.append(str(mp))
+        phases.append(str(pp))
+    return mags, phases
+
+
+def exercise_medic_mask_mode(exe: str, tmp: Path) -> None:
+    """(14) --mask-mode and --branch-correction: the two public controls added for Gap 2 and
+    Gap 3(a).
+
+    The tiers are not decoration -- every stage tests `> 0` and only the border filter looks at the
+    value, so a tier leaking into arithmetic is silent.  It has happened twice already: md_temporal
+    accumulated its per-voxel valid count as `cnt += mask[i]`, which counts a core voxel twice and
+    HALVES the group mean, and ROMEO's rm_build_ctx forms `magnitude * (float)mask[i]`, which would
+    double the magnitude weights inside the brain."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    nvox = nx * ny * nz
+    tes = (10.0, 30.0)
+    mags, phases = medic_mm_series(tmp, tes)
+
+    def masks_for(tag: str, extra: list[str]):
+        prefix = tmp / f"medic_mm_{tag}"
+        require_success(medic_run(exe, mags, phases, tes, prefix,
+                                  ["--rank", "0", "--save-intermediates", *extra]),
+                        f"--medic {' '.join(extra)}")
+        m = medic_read_output(prefix, "_masks", tmp, f"mm{tag}")
+        if m is None:
+            raise AssertionError(f"--medic {' '.join(extra)} wrote no mask intermediate")
+        return [int(v) for v in m]
+
+    # (a) the default is tiered, and its tiers really are core + a three-voxel 18-connected ring.
+    tiered = masks_for("tiered", [])
+    if sorted(set(tiered)) != [0, 1, 2]:
+        raise AssertionError(f"--medic default mask has tiers {sorted(set(tiered))}, expected [0, 1, 2]")
+    core = [1 if v == 2 else 0 for v in tiered]
+    valid = [1 if v > 0 else 0 for v in tiered]
+    if sum(core) == 0 or sum(valid) >= nvox:
+        raise AssertionError(
+            f"the mask-mode fixture is degenerate: core {sum(core)}, valid {sum(valid)} of {nvox} "
+            f"(a saturated mask cannot show a ring)")
+    grown = medic_mm_dilate(core, MEDIC_MM_DIMS, 3)
+    wrong = sum(1 for a, b in zip(grown, valid) if a != b)
+    if wrong:
+        raise AssertionError(
+            f"--medic: the valid tier is not dilate(core, 3) with an 18-connected element "
+            f"({wrong} of {nvox} voxels disagree); the morphology connectivity is measured, "
+            f"see MD_MORPH_CONN in medic.c")
+
+    # (b) robustmask and an explicit --mask are BINARY and map to the core tier: no ring exists, so
+    # the border filter must have nothing to do on those paths.
+    robust = masks_for("robust", ["--mask-mode", "robustmask"])
+    if 1 in robust:
+        raise AssertionError("--mask-mode robustmask produced a border tier, which it has no way to know")
+    user = tmp / "medic_mm_usermask.nii"
+    write_float32_nifti(user, MEDIC_MM_DIMS, [float(v) for v in core])
+    supplied = masks_for("user", ["--mask", str(user)])
+    if 1 in supplied:
+        raise AssertionError("--mask produced a border tier; a supplied mask has no ring")
+    if any((v == 2) != bool(c) for v, c in zip(supplied, core)):
+        raise AssertionError("--mask was not used verbatim as the core tier")
+
+    # (c) --branch-correction 0 is a real switch, not a no-op that happens to be accepted.  The
+    # first version of this block never compared the two field maps -- it only checked that each
+    # run produced one -- so it would have passed against a flag that was parsed and discarded.
+    on = masks_for("bc1", ["--branch-correction", "1"])
+    if on != tiered:
+        raise AssertionError("--branch-correction 1 is not the default")
+    # The default phantom cannot show this: its field ramps symmetrically about zero, so the median
+    # rounded turn count ROMEO's global correction acts on is 0 and both modes agree.  A uniform
+    # offset of one full wrap (1/dTE = 50 Hz at these echo times) makes that median 1, and the two
+    # modes then differ by exactly one wrap -- measured, and the reason for this specific number:
+    # +30 Hz is NOT enough (still identical), +60 Hz gives a clean 50.0000 Hz separation.
+    off_m, off_p = medic_mm_series(tmp, tes, bump=(60.0, 60.0), tag="medic_mm_off")
+    fields = {}
+    for tag, extra in (("bc0", ["--branch-correction", "0"]), ("bc1f", [])):
+        prefix = tmp / f"medic_mm_{tag}"
+        require_success(medic_run(exe, off_m, off_p, tes, prefix, ["--rank", "0", *extra]),
+                        f"--medic {' '.join(extra) or '(default branch correction)'}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"mm{tag}")
+        if f is None:
+            raise AssertionError("--branch-correction runs wrote no field map")
+        fields[tag] = f
+    if fields["bc0"] == fields["bc1f"]:
+        raise AssertionError(
+            "--branch-correction 0 and 1 produced identical field maps; the switch is inert. "
+            "ROMEO's global correction alone should move the field's absolute level, so this "
+            "phantom is either degenerate or the flag is being discarded")
+    if not all(abs(v) < 1e6 and v == v for v in fields["bc1f"]):
+        raise AssertionError("--branch-correction 1 produced non-finite or absurd field values")
+
+    # (d) bad values are rejected, not silently ignored.
+    # --mask and --mask-mode name two different masks, so the combination is rejected rather than
+    # silently resolved in favour of one of them.
+    for bad in (["--mask-mode", "bogus"], ["--branch-correction", "2"],
+                ["--branch-correction", "yes"],
+                ["--mask", str(user), "--mask-mode", "tiered"]):
+        r = medic_run(exe, mags, phases, tes, tmp / "medic_mm_bad", bad)
+        if r.returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+
+    # (e) mindgrab is never a silent fallback.  It is an external dependency --medic otherwise does
+    # not have, so a missing executable must fail with an explanation rather than quietly using
+    # something else.
+    if shutil.which("brainchop-mindgrab") is None:
+        r = medic_run(exe, mags, phases, tes, tmp / "medic_mm_mg", ["--mask-mode", "mindgrab"])
+        if r.returncode == 0:
+            raise AssertionError("--mask-mode mindgrab succeeded without brainchop-mindgrab on PATH")
+        if "mindgrab" not in (r.stdout + r.stderr):
+            raise AssertionError("--mask-mode mindgrab failed without naming the missing tool")
+    print("  --medic mask modes: tiers, 18-connected ring, robustmask/--mask core mapping, "
+          "--branch-correction and rejections OK")
+
+
+# TEs chosen so the stage can fire at all.  ROMEO's own multi-echo unwrap already forces each echo
+# within half a turn of the template's prediction, so Gap 4's mode can only be nonzero when the
+# magnitude-squared-weighted fit over the EARLIER echoes disagrees with that prediction by more
+# than pi -- which needs three or more echoes and a long lever arm.  A closely spaced pair at 10
+# and 11 ms extrapolated out to 80 ms provides one: a field error on echo 1 is amplified about
+# eightfold by the time it reaches echo 2.  It never fires on either benchmark dataset, which is
+# correct (measured: niimath's per-echo unwrapped phase agrees with the reference's to zero whole
+# turns on 99.5 % of in-mask voxels), and is exactly why this fixture has to be contrived.
+MEDIC_EO_TES = (10.0, 11.0, 80.0)
+MEDIC_EO_BUMP = (0.0, 20.0, 0.0)     # Hz added to echo 1 only
+
+
+def exercise_medic_echo_offset(exe: str, tmp: Path) -> None:
+    """(15) Gap 4's intra-frame per-echo 2*pi offset, and its --echo-offset switch."""
+    def field(tag: str, mags, phases, extra):
+        prefix = tmp / f"medic_eo_{tag}"
+        r = medic_run(exe, mags, phases, MEDIC_EO_TES, prefix,
+                      ["--rank", "0", "--temporal-correction", "0", *extra])
+        require_success(r, f"--medic {' '.join(extra)}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"eo{tag}")
+        if f is None:
+            raise AssertionError("--medic wrote no field map for the echo-offset fixture")
+        return f, (r.stdout + r.stderr)
+
+    # (a) Consistent echoes: the stage must be an exact no-op.  This is the half that protects
+    # every other dataset -- a stage that fires when it should not would move real results.
+    ok_m, ok_p = medic_mm_series(tmp, MEDIC_EO_TES, tag="medic_eo_ok")
+    on, _ = field("ok_on", ok_m, ok_p, ["--echo-offset", "1"])
+    off, txt_off = field("ok_off", ok_m, ok_p, ["--echo-offset", "0"])
+    if on != off:
+        worst = max(abs(a - b) for a, b in zip(on, off))
+        raise AssertionError(
+            f"--echo-offset changed a consistent series by {worst:g} Hz; the mode of the "
+            f"per-voxel turn counts must be 0 when the echoes already agree")
+    if "echo offset" in txt_off:
+        raise AssertionError("--echo-offset 0 still reported an offset")
+
+    # (b) Echo 1 carrying a 20 Hz field of its own, extrapolated to 60 ms: the stage must fire,
+    # and it must change the result.  Without this the correction path ships untested -- it does
+    # not fire on either benchmark dataset or on any configuration of them.
+    bad_m, bad_p = medic_mm_series(tmp, MEDIC_EO_TES, bump=MEDIC_EO_BUMP, tag="medic_eo_bad")
+    on2, txt_on = field("bad_on", bad_m, bad_p, ["--echo-offset", "1"])
+    off2, txt_off2 = field("bad_off", bad_m, bad_p, ["--echo-offset", "0"])
+    if "echo offset" not in txt_on:
+        raise AssertionError(
+            "the echo-offset fixture is vacuous: the stage did not fire on a series whose "
+            "echo 1 carries a 20 Hz field of its own")
+    if "echo offset" in txt_off2:
+        raise AssertionError("--echo-offset 0 ran the stage anyway")
+    if on2 == off2:
+        raise AssertionError("--echo-offset reported a correction but changed nothing")
+    if not all(v == v and abs(v) < 1e6 for v in on2):
+        raise AssertionError("--echo-offset 1 produced non-finite or absurd field values")
+
+    for bad in (["--echo-offset", "2"], ["--echo-offset", "on"]):
+        if medic_run(exe, ok_m, ok_p, MEDIC_EO_TES, tmp / "medic_eo_bad_arg", bad).returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+    print("  --medic echo offset: no-op on consistent echoes, fires on inconsistent ones, "
+          "--echo-offset switch and rejections OK")
+
+
+def medic_group_series(tmp: Path, tes, frames: int, field_fn, bg_varies: bool = False):
+    """A series whose MAGNITUDE is bit-identical in every frame while the phase is not.
+
+    That identity is the whole fixture: a grouping that correlates magnitude cannot possibly
+    separate these frames, so if the grouping splits them it is reading the phase."""
+    nx, ny, nz = MEDIC_MM_DIMS
+    rng = random.Random(20260824)
+    # `bg_varies` gives the background a DIFFERENT random phase in every frame.  The border fixture
+    # needs it: on a phantom with a sharp brain boundary the tier-1 ring lies in the background, so
+    # with a frame-invariant background it carries no temporal signal at all and the border filter
+    # has nothing to constrain -- the fixture would pass for the wrong reason.
+    noise = [[rng.uniform(-math.pi, math.pi) for _ in range(nx * ny * nz)]
+             for _ in range(frames if bg_varies else 1)]
+    mags, phases = [], []
+    for e, te in enumerate(tes):
+        m, p = [], []
+        for t in range(frames):
+            bg = noise[t if bg_varies else 0]
+            for z in range(nz):
+                for y in range(ny):
+                    for x in range(nx):
+                        r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+                             + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+                        inside = r < 1.0
+                        m.append(1000.0 if inside else 25.0)
+                        p.append(medic_wrap(MEDIC_TWO_PI * field_fn(x, y, z, t) * te / 1000.0)
+                                 if inside else bg[x + nx * (y + ny * z)])
+        mp, pp = tmp / f"medic_gr_mag{e}.nii", tmp / f"medic_gr_pha{e}.nii"
+        write_float32_nifti(mp, MEDIC_MM_DIMS, m, nt=frames)
+        write_float32_nifti(pp, MEDIC_MM_DIMS, p, nt=frames)
+        n3 = nx * ny * nz
+        first = m[:n3]
+        for t in range(1, frames):
+            if m[t * n3:(t + 1) * n3] != first:
+                raise AssertionError("the grouping fixture's magnitude is not frame-invariant")
+        mags.append(str(mp))
+        phases.append(str(pp))
+    return mags, phases
+
+
+def medic_group_sizes(result) -> tuple[int, int]:
+    for line in (result.stdout + result.stderr).splitlines():
+        if "temporal grouping" in line:
+            body = line.split("group size", 1)[1].split("(", 1)[0].strip()
+            lo, hi = body.split("..")
+            return int(lo), int(hi)
+    raise AssertionError("--medic did not report its temporal group sizes")
+
+
+def exercise_medic_grouping(exe: str, tmp: Path) -> None:
+    """(16) Gap 5: the temporal correction groups frames by UNWRAPPED PHASE, not by magnitude.
+
+    They are different questions.  The correction exists to find frames whose unwrapping SOLUTION
+    is consistent, which phase correlation measures directly; magnitude correlation is a proxy that
+    will happily group frames whose unwrapping diverged, and -- computed over the whole volume
+    including background, as it used to be -- is dominated by static structure common to every
+    frame, so it saturates near 1 and groups everything.
+
+    Neither benchmark dataset can show the difference: both are quiescent resting-state runs whose
+    phase correlation ALSO groups every frame together (measured: 170 of 170, 138 of 138).  This
+    fixture holds the magnitude bit-identical across frames while giving two blocks of frames
+    completely different spatial fields, so a magnitude-based grouping is arithmetically incapable
+    of separating them."""
+    tes = (10.0, 30.0)
+    frames = 6
+    nx, ny, _ = MEDIC_MM_DIMS
+
+    def two_blocks(x, y, z, t):
+        return 3.0 * (y - ny / 2.0) if t < 3 else 3.0 * (x - nx / 2.0)
+
+    mags, phases = medic_group_series(tmp, tes, frames, two_blocks)
+    r = medic_run(exe, mags, phases, tes, tmp / "medic_gr_out", ["--rank", "0"])
+    require_success(r, "--medic on the two-block grouping fixture")
+    lo, hi = medic_group_sizes(r)
+    if hi >= frames:
+        raise AssertionError(
+            f"the grouping put every frame in one group (sizes {lo}..{hi} of {frames}) on a "
+            f"series whose magnitude is frame-invariant and whose phase is not; the correlation "
+            f"is not reading the phase")
+    if lo < 1:
+        raise AssertionError(f"impossible group size {lo}")
+
+    # A single-block control: identical field in every frame must group them all, so the split
+    # above is a property of the data and not of the fixture always splitting.
+    mags1, phases1 = medic_group_series(tmp, tes, frames,
+                                        lambda x, y, z, t: 3.0 * (y - ny / 2.0))
+    r1 = medic_run(exe, mags1, phases1, tes, tmp / "medic_gr_one", ["--rank", "0"])
+    require_success(r1, "--medic on the single-block grouping fixture")
+    lo1, hi1 = medic_group_sizes(r1)
+    if lo1 != frames or hi1 != frames:
+        raise AssertionError(
+            f"frames carrying an identical field were split into groups of {lo1}..{hi1}; the "
+            f"grouping threshold is too aggressive")
+    print("  --medic temporal grouping: splits on phase where magnitude cannot, "
+          "groups identical frames OK")
+
+
+def exercise_medic_border(exe: str, tmp: Path) -> None:
+    """(17) Gap 1: graded regularisation at the brain border, and --border-regularization.
+
+    The behaviour, not a number: the border ring is smoothed spatially and reconstructed from far
+    fewer temporal components than the interior; the interior is not over-smoothed as a side
+    effect; and a voxel outside its own frame's mask is left unprojected rather than reconstructed.
+    The reference's component counts and smoothing width are explicitly not principled constants,
+    so agreement with it is deliberately NOT what this asserts."""
+    tes = (10.0, 30.0)
+    frames = 12
+    rank = "4"          # must be BELOW the frame count or md_lowrank has nothing to truncate
+    nx, ny, nz = MEDIC_MM_DIMS
+
+    # A field whose interior is genuinely low rank in time and whose outer shell carries
+    # BROADBAND per-voxel temporal noise -- the situation the border filter exists for.  The noise
+    # has to be broadband: a border component that is itself low rank is captured by the ordinary
+    # truncation and the fixture proves nothing.  Deterministic, so the test is reproducible.
+    def fld(x, y, z, t):
+        r = (((x - nx / 2.0) / (nx * 0.20)) ** 2 + ((y - ny / 2.0) / (ny * 0.20)) ** 2
+             + ((z - nz / 2.0) / (nz * 0.20)) ** 2)
+        base = (1.0 + 0.2 * math.sin(0.7 * t)) * 3.0 * (y - ny / 2.0)
+        if r <= 0.55:
+            return base
+        h = ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791) ^ (t * 2654435761)) & 0xFFFF
+        return base + 2.5 * (h / 32767.5 - 1.0)
+
+    mags, phases = medic_group_series(tmp, tes, frames, fld, bg_varies=True)
+
+    def run(tag, extra):
+        prefix = tmp / f"medic_bd_{tag}"
+        r = medic_run(exe, mags, phases, tes, prefix,
+                      ["--rank", rank, "--save-intermediates", *extra])
+        require_success(r, f"--medic {' '.join(extra)}")
+        f = medic_read_output(prefix, "_fieldmaps_native", tmp, f"bd{tag}")
+        m = medic_read_output(prefix, "_masks", tmp, f"bdm{tag}")
+        if f is None or m is None:
+            raise AssertionError("--medic wrote no field/mask for the border fixture")
+        return f, [int(v) for v in m]
+
+    on, tiers = run("on", ["--border-regularization", "1"])
+    off, _ = run("off", ["--border-regularization", "0"])
+    n3 = nx * ny * nz
+
+    if on == off:
+        raise AssertionError("--border-regularization changed nothing on a series with a "
+                             "fast-varying border; the fixture or the stage is inert")
+
+    def median_change(sel):
+        d = sorted(max(abs(on[t * n3 + v] - off[t * n3 + v]) for t in range(frames)) for v in sel)
+        return d[len(d) // 2]
+
+    always = [v for v in range(n3) if all(tiers[t * n3 + v] for t in range(frames))]
+    core = [v for v in always if tiers[v] == 2]
+    ring = [v for v in always if tiers[v] == 1]
+    if len(core) < 50 or len(ring) < 50:
+        raise AssertionError(f"the border fixture is degenerate: {len(core)} core, {len(ring)} ring")
+
+    # The contract this fixture can check is that the stage is TARGETED: it must move the border
+    # far more than the interior.  How strongly the border ends up regularised is a property of
+    # real data, not of a phantom -- on a phantom with a sharp brain boundary the ring sits in the
+    # background, whose temporal noise the ordinary global truncation already annihilates, so the
+    # phantom cannot show the border being calmed.  That measurement lives in medic_bench
+    # (tools/MILESTONES.md, M6): border median temporal sd 3.03 -> 0.88 Hz while the interior moves
+    # from 1.2277 to 1.2312.
+    core_d, ring_d = median_change(core), median_change(ring)
+    if not (ring_d > 5.0 * core_d):
+        raise AssertionError(
+            f"--border-regularization is not targeted at the border: median absolute change "
+            f"{ring_d:.5f} Hz at the ring against {core_d:.5f} Hz in the interior")
+
+    # No voxel outside its own frame's mask may be reconstructed.
+    leaked = [i for i in range(len(on)) if tiers[i] == 0 and on[i] != 0.0]
+    if leaked:
+        raise AssertionError(
+            f"{len(leaked)} voxels outside their own frame's mask were projected (first at "
+            f"frame {leaked[0] // n3}, voxel {leaked[0] % n3})")
+
+    for bad in (["--border-regularization", "2"], ["--border-regularization", "yes"]):
+        if medic_run(exe, mags, phases, tes, tmp / "medic_bd_bad", ["--rank", rank, *bad]).returncode == 0:
+            raise AssertionError(f"--medic accepted {' '.join(bad)}")
+    print("  --medic border regularisation: targeted at the border, out-of-mask unprojected, "
+          "--border-regularization switch and rejections OK")
+
+
 def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     """Regressions for the MEDIC correctness fixes; see each helper for the bug it pins."""
     if "--medic" not in help_text:
@@ -1833,6 +2462,11 @@ def exercise_medic_regressions(exe: str, tmp: Path, help_text: str) -> None:
     exercise_medic_mask_temporal(exe, tmp)
     exercise_medic_rank_boundaries(exe, tmp)
     exercise_medic_xform_precedence(exe, tmp)
+    exercise_medic_readphase(exe, tmp)
+    exercise_medic_mask_mode(exe, tmp)
+    exercise_medic_echo_offset(exe, tmp)
+    exercise_medic_grouping(exe, tmp)
+    exercise_medic_border(exe, tmp)
     exercise_medic_parsing(exe, tmp)
     exercise_medic_output_transaction(exe, tmp)
 
@@ -2619,6 +3253,800 @@ def exercise_stc(exe: str, tmp: Path, help_text: str) -> None:
     print("        toffset, non-finite policy, parser rejections, @file and chaining OK")
 
 
+def _skullstrip_geometry(path: Path) -> tuple:
+    """Everything that locates the voxels in world space. -skullstrip works on a fixed internal
+    grid and pulls the mask back, so a regression there shows up as a changed header, not as a
+    changed value."""
+    blob = read_nifti_bytes(path)
+    return (
+        struct.unpack_from("<8h", blob, 40),    # dim
+        struct.unpack_from("<8f", blob, 76),    # pixdim
+        struct.unpack_from("<2h", blob, 252),   # qform_code, sform_code
+        struct.unpack_from("<6f", blob, 256),   # quatern b/c/d, qoffset x/y/z
+        struct.unpack_from("<12f", blob, 280),  # srow_x/y/z
+    )
+
+
+def exercise_fmap(exe: str, tmp: Path, help_text: str) -> None:
+    """-fugue / -fmapprep: closed-form checks of the measured contract, with no FSL dependency.
+
+    Everything asserted here is derivable analytically, which is the point: the reference is a
+    non-redistributable binary, so the smoke test must stand on the arithmetic rather than on a
+    golden file.  See fmap_bench's test/fmap_reference_manifest.md for the experiment behind each
+    convention.
+    """
+    if "-fugue" not in help_text or "NOT in this build" in _help_line(help_text, "-fugue"):
+        print("  -fugue/-fmapprep: not built (FMAP=0) - skipping")
+        return
+
+    # A cube, so a 2-voxel shift of a centrally placed impulse stays inside the FOV along EVERY
+    # axis -- with a short z the "z-" case silently walks off the end and the test measures
+    # out-of-FOV fill instead of the sign convention.
+    nx, ny, nz = 8, 8, 8
+    n3 = nx * ny * nz
+    dwell = 0.001
+    two_pi = 2.0 * math.pi
+
+    # An impulse makes the output literally the interpolation kernel.
+    impulse = [0.0] * n3
+    impulse[3 + 3 * nx + 3 * nx * ny] = 1000.0
+    src = tmp / "fugue_impulse.nii"
+    write_float32_nifti(src, (nx, ny, nz), impulse)
+
+    def constant_field(shift_vox: float, axis_n: int) -> Path:
+        """A uniform field whose implied shift is exactly `shift_vox` voxels."""
+        val = shift_vox * two_pi / (dwell * axis_n)
+        p = tmp / ("fugue_f_%g_%d.nii" % (shift_vox, axis_n))
+        write_float32_nifti(p, (nx, ny, nz), [val] * n3)
+        return p
+
+    def unwarp(field: Path, direction: str, inp: Path = src) -> list[float]:
+        out = tmp / "fugue_out.nii"
+        require_success(run_niimath(exe, [str(inp), "-fugue", str(field), repr(dwell),
+                                          direction, "-gz", "0", str(out)]), "-fugue")
+        return read_float32_nifti(out)
+
+    # Whole-voxel shift, and the sign convention: a POSITIVE field moves signal toward -axis for
+    # "y" and toward +axis for "y-".  N is the dimension along the UNWARP axis, so the same
+    # displacement along z needs a field scaled by nz, not ny.
+    for direction, di, dj, dk, axis_n in (("y", 0, -2, 0, ny), ("y-", 0, 2, 0, ny),
+                                          ("x", -2, 0, 0, nx), ("x-", 2, 0, 0, nx),
+                                          ("z", 0, 0, -2, nz), ("z-", 0, 0, 2, nz)):
+        vals = unwarp(constant_field(2.0, axis_n), direction)
+        want = (3 + di) + (3 + dj) * nx + (3 + dk) * nx * ny
+        hot = [i for i, v in enumerate(vals) if abs(v) > 1e-3]
+        if hot != [want] or abs(vals[want] - 1000.0) > 1e-2:
+            raise SystemExit("-fugue: --unwarpdir %s put the impulse at %s (expected [%d], value %g)"
+                             % (direction, hot, want, vals[want] if hot else float("nan")))
+
+    # Half-voxel shift must split EXACTLY 500/500.  This is the check that pins the kernel to
+    # linear: no cubic, spline or windowed-sinc kernel can produce two taps.
+    vals = unwarp(constant_field(1.5, ny), "y")
+    hot = sorted(i for i, v in enumerate(vals) if abs(v) > 1e-3)
+    # out(v) = in(v + 1.5), so the impulse at y=3 lands half in y=1 and half in y=2.
+    want = sorted([3 + 1 * nx + 3 * nx * ny, 3 + 2 * nx + 3 * nx * ny])
+    if hot != want or any(abs(vals[i] - 500.0) > 1e-2 for i in hot):
+        raise SystemExit("-fugue: a 1.5-voxel shift did not split 500/500; got %s at %s"
+                         % ([vals[i] for i in hot], hot))
+
+    # EXTRAPOLATION.  A zero fieldmap is unsupported, and the reference does NOT read that as
+    # zero shift -- it extrapolates the shift field along each line before resampling.  Without
+    # this case every fieldmap in this test is either uniform or all-zero, so three of
+    # fm_fill_line's four branches never run, and the naive model would pass.
+    #
+    # Field is 0 for y < 2 and a 1-voxel shift elsewhere; input is a ramp in y.  Linear
+    # interpolation of a linear function is exact, so out - (1000 + y) == -1.0 at EVERY y
+    # including y = 0 and 1 IFF the leading run replicated the first supported value.
+    ramp = [0.0] * n3
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                ramp[x + y * nx + z * nx * ny] = 1000.0 + y
+    ramp_src = tmp / "fugue_ramp.nii"
+    write_float32_nifti(ramp_src, (nx, ny, nz), ramp)
+    partial = [0.0] * n3
+    val = 1.0 * two_pi / (dwell * ny)
+    for z in range(nz):
+        for y in range(2, ny):
+            for x in range(nx):
+                partial[x + y * nx + z * nx * ny] = val
+    pf = tmp / "fugue_partial.nii"
+    write_float32_nifti(pf, (nx, ny, nz), partial)
+    vals = unwarp(pf, "y", inp=ramp_src)
+    for y in range(ny - 1):          # last row pulls out of FOV, so skip it
+        v = vals[3 + y * nx + 3 * nx * ny]
+        if abs(v - (1000.0 + y + 1.0)) > 1e-2:
+            raise SystemExit("-fugue: shift field was not extrapolated over unsupported voxels; "
+                             "row y=%d is %g, expected %g (a naive model gives %g at y<2)"
+                             % (y, v, 1000.0 + y + 1.0, 1000.0 + y))
+
+    # 4D: one 3D fieldmap must be applied identically to every volume.
+    vol4 = [0.0] * (n3 * 3)
+    for t in range(3):
+        vol4[t * n3 + (3 + (3 + t) * nx + 3 * nx * ny)] = 1000.0
+    src4 = tmp / "fugue_4d.nii"
+    write_float32_nifti(src4, (nx, ny, nz), vol4, nt=3)
+    vals = unwarp(constant_field(2.0, ny), "y", inp=src4)
+    for t in range(3):
+        want = 3 + (1 + t) * nx + 3 * nx * ny
+        hot = [i - t * n3 for i, v in enumerate(vals[t * n3:(t + 1) * n3], start=t * n3)
+               if abs(v) > 1e-3]
+        if hot != [want]:
+            raise SystemExit("-fugue: 4D volume %d put the impulse at %s, expected [%d]"
+                             % (t, hot, want))
+
+    # A zero fieldmap is an exact identity -- the cheapest possible check that the extrapolation
+    # path cannot introduce a shift where there is no field.
+    zero = tmp / "fugue_zero.nii"
+    write_float32_nifti(zero, (nx, ny, nz), [0.0] * n3)
+    if unwarp(zero, "y") != impulse:
+        raise SystemExit("-fugue: an all-zero fieldmap was not an exact identity")
+
+    # Out-of-FOV samples contribute 0, and no Jacobian modulation is applied.  Use a UNIFORM
+    # input, not the impulse: with an impulse an all-zero output is also what ANY bug that
+    # simply blanks the image produces, so the assertion would not distinguish them.  Here the
+    # rows that still pull from inside the FOV must keep their value exactly.
+    uniform = tmp / "fugue_uniform.nii"
+    write_float32_nifti(uniform, (nx, ny, nz), [1000.0] * n3)
+    vals = unwarp(constant_field(2.0, ny), "y", inp=uniform)
+    for y in range(ny):
+        v = vals[3 + y * nx + 3 * nx * ny]
+        want = 1000.0 if y + 2 < ny else 0.0
+        if abs(v - want) > 1e-3:
+            raise SystemExit("-fugue: out-of-FOV fill wrong at y=%d: %g, expected %g" % (y, v, want))
+
+    # -no-debranch must reach fmap_prepare, not merely parse: on a smooth phase the correction
+    # is inert, so the two outputs have to be byte-identical.
+    vals = unwarp(constant_field(float(ny), ny), "y")
+    if any(abs(v) > 1e-6 for v in vals):
+        raise SystemExit("-fugue: a whole-FOV shift should have emptied the image")
+
+    # -p 1 vs -p 8 byte-equality: every line is independent, so this must hold exactly.
+    outs = []
+    for threads in ("1", "8"):
+        o = tmp / ("fugue_p%s.nii" % threads)
+        require_success(run_niimath(exe, [str(src), "-p", threads, "-fugue",
+                                          str(constant_field(1.5, ny)), repr(dwell), "y",
+                                          "-gz", "0", str(o)]), "-fugue -p " + threads)
+        outs.append(o.read_bytes())
+    if outs[0] != outs[1]:
+        raise SystemExit("-fugue: -p 1 and -p 8 outputs differ")
+
+    # Rejections, all of which must fail closed rather than write a wrong image.
+    field = constant_field(1.0, ny)
+    bad = tmp / "fugue_bad.nii"
+    for args, label in (
+        (["-fugue", str(field)], "missing dwell and direction"),
+        (["-fugue", str(field), "y", "0.001"], "transposed dwell/direction"),
+        (["-fugue", str(field), repr(dwell), "q"], "unknown unwarpdir"),
+        (["-fugue", str(field), "0", "y"], "zero dwell"),
+        (["-fugue", str(field), "-0.001", "y"], "negative dwell"),
+    ):
+        if run_niimath(exe, [str(src), *args, "-gz", "0", str(bad)]).returncode == 0:
+            raise SystemExit("-fugue: accepted %s" % label)
+
+    # A fieldmap whose world transform is NaN must be REFUSED, not accepted.  Under -ffast-math
+    # the natural spelling `max_displacement_mm(...) > tol` is FALSE for NaN, so it accepts a
+    # pair whose geometry could not be measured -- measured, that wrote a full output at exit 0.
+    nanx = tmp / "fugue_nanxform.nii"
+    write_float32_nifti(nanx, (nx, ny, nz), [1.0] * n3)
+    raw = bytearray(nanx.read_bytes())
+    struct.pack_into("<h", raw, 252, 0)          # qform_code = 0
+    struct.pack_into("<h", raw, 254, 1)          # sform_code = 1, so the sform is the one used
+    for off in (280, 296, 312):                  # srow_x, srow_y, srow_z
+        struct.pack_into("<4f", raw, off, *([float("nan")] * 4))
+    nanx.write_bytes(raw)
+    nan_out = tmp / "fugue_nanxform_out.nii"
+    if nan_out.exists():
+        nan_out.unlink()
+    if run_niimath(exe, [str(src), "-fugue", str(nanx), repr(dwell), "y",
+                         "-gz", "0", str(nan_out)]).returncode == 0 or nan_out.exists():
+        raise SystemExit("-fugue: accepted a fieldmap whose world transform is NaN")
+
+    # A 4D fieldmap and an off-grid fieldmap must both be refused.
+    fmap4d = tmp / "fugue_f4d.nii"
+    write_float32_nifti(fmap4d, (nx, ny, nz), [1.0] * (n3 * 2), nt=2)
+    offgrid = tmp / "fugue_off.nii"
+    write_float32_nifti(offgrid, (nx, ny, nz), [1.0] * n3, offset=(25.0, 0.0, 0.0))
+    for f, label in ((fmap4d, "4D fieldmap"), (offgrid, "off-grid fieldmap")):
+        if run_niimath(exe, [str(src), "-fugue", str(f), repr(dwell), "y",
+                             "-gz", "0", str(bad)]).returncode == 0:
+            raise SystemExit("-fugue: accepted a %s" % label)
+    if run_niimath(exe, ["-dt", "double", str(src), "-fugue", str(field), repr(dwell), "y",
+                         "-gz", "0", str(bad)]).returncode == 0:
+        raise SystemExit("-fugue: accepted -dt double")
+
+    print("  -fugue: shift constant, all six directions, linear kernel, zero-field identity,")
+    print("        out-of-FOV fill, -p 1 vs -p 8 byte-equality and parser rejections OK")
+
+    if "-fmapprep" not in help_text:
+        print("  -fmapprep: not built (needs ROMEO) - skipping")
+        return
+
+    # -fmapprep on a smooth, non-wrapping phase ramp: unwrapping is then the identity, so the
+    # whole op reduces to closed form -- scale by 2*pi/span, divide by deltaTE, subtract the
+    # median over the mask, zero outside it.
+    delta_te_ms = 2.5
+    mag = [0.0] * n3
+    phase = [0.0] * n3
+    inside = []
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                v = x + y * nx + z * nx * ny
+                phase[v] = float(y)  # a gentle ramp: no wraps for the unwrapper to resolve
+                if 1 <= x < nx - 1 and 1 <= y < ny - 1:
+                    mag[v] = 100.0
+                    inside.append(v)
+    pha = tmp / "fmapprep_phase.nii"
+    mgn = tmp / "fmapprep_mag.nii"
+    write_float32_nifti(pha, (nx, ny, nz), phase)
+    write_float32_nifti(mgn, (nx, ny, nz), mag)
+    out = tmp / "fmapprep_out.nii"
+    require_success(run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                                      "-gz", "0", str(out)]), "-fmapprep")
+    got = read_float32_nifti(out)
+
+    span = max(phase) - min(phase)
+    rad = [(p - min(phase)) / span * two_pi - math.pi for p in phase]
+    field = [r * 1000.0 / delta_te_ms for r in rad]
+    ordered = sorted(field[v] for v in inside)
+    median = ordered[len(ordered) // 2]  # UPPER central value, not the average
+    for v in range(n3):
+        want = (field[v] - median) if mag[v] != 0.0 else 0.0
+        if abs(got[v] - want) > 1e-2:
+            raise SystemExit("-fmapprep: voxel %d is %g, expected %g" % (v, got[v], want))
+
+    # The mask is the magnitude's nonzero support, verbatim -- no erosion, no dilation.
+    if [v for v in range(n3) if got[v] != 0.0 and mag[v] == 0.0]:
+        raise SystemExit("-fmapprep: wrote nonzero values outside the magnitude mask")
+
+    # -no-debranch is accepted before the output name and REJECTED in it, so a truncated command
+    # line cannot silently produce a file called "-no-debranch".
+    require_success(run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                                      "-no-debranch", "-gz", "0", str(out)]), "-fmapprep -no-debranch")
+    if run_niimath(exe, [str(pha), "-fmapprep", str(mgn), repr(delta_te_ms),
+                         "-no-debranch"]).returncode == 0:
+        raise SystemExit("-fmapprep: accepted '-no-debranch' as the output filename")
+    stray = tmp / "-no-debranch"
+    if stray.exists():
+        raise SystemExit("-fmapprep: wrote a file named after its own flag")
+
+    for args, label in (
+        ([str(pha), "-fmapprep", str(mgn)], "missing deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "0"], "zero deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "-2.5"], "negative deltaTE"),
+        ([str(pha), "-fmapprep", str(mgn), "abc"], "non-numeric deltaTE"),
+    ):
+        if run_niimath(exe, [*args, "-gz", "0", str(tmp / "fmapprep_bad.nii")]).returncode == 0:
+            raise SystemExit("-fmapprep: accepted %s" % label)
+
+    # An empty mask has no median to subtract, so it must be refused rather than divided by.
+    empty = tmp / "fmapprep_empty.nii"
+    write_float32_nifti(empty, (nx, ny, nz), [0.0] * n3)
+    if run_niimath(exe, [str(pha), "-fmapprep", str(empty), repr(delta_te_ms),
+                         "-gz", "0", str(tmp / "fmapprep_bad.nii")]).returncode == 0:
+        raise SystemExit("-fmapprep: accepted an all-zero magnitude (empty mask)")
+
+    print("  -fmapprep: closed-form scale/median/mask contract, verbatim mask, -no-debranch")
+    print("        parsing and deltaTE/empty-mask rejections OK")
+
+
+def write_mz3(path: Path, tris, verts) -> None:
+    """Uncompressed MZ3: magic 0x5A4D, attr 3 (faces + verts), nface, nvert, nskip, int32 faces,
+    float32 verts."""
+    blob = struct.pack("<HHIII", 0x5A4D, 3, len(tris), len(verts), 0)
+    blob += b"".join(struct.pack("<3i", *t) for t in tris)
+    blob += b"".join(struct.pack("<3f", *v) for v in verts)
+    path.write_bytes(blob)
+
+
+def read_mz3_verts(path: Path) -> list:
+    """Vertices of an mz3 (gzipped or not), as (x, y, z) tuples."""
+    b = path.read_bytes()
+    if b[:2] == b"\x1f\x8b":
+        b = gzip.decompress(b)
+    _magic, _attr, nface, nvert, nskip = struct.unpack("<HHIII", b[:16])
+    o = 16 + nskip + nface * 12
+    return [struct.unpack_from("<3f", b, o + 12 * i) for i in range(nvert)]
+
+
+def mesh_report_line(result, label: str) -> dict:
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith("mesh check (%s):" % label):
+            d = {}
+            for tok in line.split(":", 1)[1].split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    d[k] = None if v == "n/a" else float(v)
+            return d
+    raise AssertionError("no 'mesh check (%s)' line in:\n%s" % (label, result.stdout + result.stderr))
+
+
+def exercise_mesh_report(exe: str, tmp: Path, help_text: str) -> None:
+    """The mesh quality report printed under -v 1.  Each defect class on a mesh built to have
+    exactly that defect and nothing else; the report is read off the simplifier's INPUT line,
+    which runs before any simplification touches the mesh."""
+    if "-mesh" not in help_text:
+        print("  mesh report: not built (NII2MESH) - skipping")
+        return
+    tet_v = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    tet_f = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+    cases = {
+        # name: (tris, verts, expected)
+        "closed": (tet_f, tet_v, dict(components=1, euler=2, genus=0, boundary_edges=0, holes=0,
+                                      nonmanifold_edges=0, self_intersecting=0)),
+        "hole": (tet_f[:3], tet_v, dict(holes=1, boundary_edges=3)),
+        # two tets sharing ONE edge (0-1): that edge has four faces
+        "nonmanifold": (tet_f + [(0, 1, 4), (0, 5, 1), (1, 4, 5), (0, 4, 5)],
+                        tet_v + [(0, -1, 0), (0, 0, -1)], dict(nonmanifold_edges=1)),
+        # two well-separated triangles crossing like a plus sign
+        "crossing": ([(0, 1, 2), (3, 4, 5)],
+                     [(-1, 0, -1), (1, 0, -1), (0, 0, 1), (0, -1, 0), (0, 1, 0), (0, 0, 2)],
+                     dict(self_intersecting=2)),
+    }
+    for name, (tris, verts, expect) in cases.items():
+        src = tmp / f"mesh_{name}.mz3"
+        write_mz3(src, tris, [tuple(float(c) for c in v) for v in verts])
+        r = run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}_out.mz3")])
+        rep = mesh_report_line(r, "input")
+        for key, want in expect.items():
+            got = rep[key]
+            if got != want:
+                raise AssertionError(f"mesh report on '{name}': {key}={got:g}, expected {want}")
+    # the crossing pair must NOT count when the triangles share a vertex (adjacent, not crossing)
+    src = tmp / "mesh_adjacent.mz3"
+    write_mz3(src, [(0, 1, 2), (0, 3, 4)], [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_adj_out.mz3")]), "input")
+    if rep["self_intersecting"] != 0:
+        raise AssertionError("mesh report counted vertex-sharing triangles as self-intersecting")
+    # documented limitation: coplanar overlap is NOT counted (Moller's coplanar branch is skipped)
+    src = tmp / "mesh_coplanar.mz3"
+    write_mz3(src, [(0, 1, 2), (3, 4, 5)], [(0, 0, 0), (2, 0, 0), (0, 2, 0), (1, 1, 0), (3, 1, 0), (1, 3, 0)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_cop_out.mz3")]), "input")
+    if rep["self_intersecting"] != 0:
+        raise AssertionError("coplanar overlap is documented as uncounted; update the docs if that changed")
+    # a bow-tie: two tets touching at one vertex -- every edge is manifold, the vertex is not
+    src = tmp / "mesh_bowtie.mz3"
+    write_mz3(src, tet_f + [(0, 5, 4), (0, 4, 6), (0, 6, 5), (4, 5, 6)],
+              [tuple(float(c) for c in v) for v in tet_v] + [(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
+    rep = mesh_report_line(run_niimath(exe, [str(src), "-r", "0.5", "-v", "1", str(tmp / "mesh_bt_out.mz3")]), "input")
+    if rep["nonmanifold_vertices"] != 1 or rep["nonmanifold_edges"] != 0 or rep["genus"] is not None:
+        raise AssertionError(f"bow-tie vertex misreported: {rep}")
+    engines = ("0",) if "half-edge simplifier not built" in help_text else ("0", "1")
+    if "1" in engines:
+        # the half-edge simplifier refuses non-manifold input (edge or vertex) and leaves it unsimplified
+        for name, faces in (("nonmanifold", 8), ("bowtie", 8)):
+            r = run_niimath(exe, [str(tmp / f"mesh_{name}.mz3"), "-n", "1", "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}_n1.mz3")])
+            if "not a manifold" not in r.stderr or mesh_report_line(r, "simplified")["F"] != faces:
+                raise AssertionError(f"-n 1 must reject a non-manifold mesh ({name}) unchanged:\n" + r.stdout + r.stderr)
+    else:
+        r = run_niimath(exe, [str(tmp / "mesh_nonmanifold.mz3"), "-n", "1", "-r", "0.5", str(tmp / "mesh_nm_n1.mz3")])
+        if r.returncode == 0 or "Q2=1" not in r.stderr:
+            raise AssertionError("-n 1 must fail clearly in a build without quadric2:\n" + r.stdout + r.stderr)
+    # a vertex of valence 70: past the 64-face ring that once truncated quadric2's link test, and the
+    # case that exposed quadric.c's ref-count overwrite (the old engine refuses apex edges above
+    # RING_MAX and collapses the rim instead)
+    rim = 70
+    verts = [(0.0, 0.0, 1.0), (0.0, 0.0, -1.0)] + [(math.cos(2 * math.pi * i / rim), math.sin(2 * math.pi * i / rim), 0.0) for i in range(rim)]
+    tris = [(0, 2 + i, 2 + (i + 1) % rim) for i in range(rim)] + [(1, 2 + (i + 1) % rim, 2 + i) for i in range(rim)]
+    src = tmp / "mesh_valence.mz3"
+    write_mz3(src, tris, verts)
+    for eng in engines:
+        r = run_niimath(exe, [str(src), "-n", eng, "-r", "0.25", "-v", "1", str(tmp / f"mesh_val{eng}_out.mz3")])
+        rep = mesh_report_line(r, "simplified")
+        if r.returncode != 0 or rep["euler"] != 2 or rep["nonmanifold_edges"] or rep["nonmanifold_vertices"] or rep["holes"]:
+            raise AssertionError(f"valence-70 simplification (-n {eng}) broke topology:\n" + r.stdout + r.stderr)
+        if eng == "1" and abs(rep["F"] - round(0.25 * len(tris))) > 1:   # the documented contract: within one face
+            raise AssertionError(f"-n 1 missed its target budget: F={rep['F']:g} for {round(0.25 * len(tris))}")
+    # open meshes: a bowl (one boundary loop) and an annulus (two loops, every vertex on a boundary,
+    # every interior edge a chord).  Both engines must keep the loops and never pinch them.
+    n = 16
+    ring = lambda r, z: [(r * math.cos(2 * math.pi * i / n), r * math.sin(2 * math.pi * i / n), z) for i in range(n)]
+    bowl_v = [(0.0, 0.0, -1.0)] + ring(1.0, 0.0)
+    bowl_f = [(0, 1 + (i + 1) % n, 1 + i) for i in range(n)]
+    ann_v = ring(1.0, 0.0) + ring(2.0, 0.0)
+    ann_f = []
+    for i in range(n):
+        j = (i + 1) % n
+        ann_f += [(i, j, n + i), (j, n + j, n + i)]
+    for name, otris, overts, loops in (("bowl", bowl_f, bowl_v, 1), ("annulus", ann_f, ann_v, 2)):
+        src = tmp / f"mesh_{name}.mz3"
+        write_mz3(src, otris, overts)
+        for eng in engines:
+            r = run_niimath(exe, [str(src), "-n", eng, "-r", "0.5", "-v", "1", str(tmp / f"mesh_{name}{eng}_out.mz3")])
+            rep = mesh_report_line(r, "simplified")
+            if r.returncode != 0 or rep["holes"] != loops or rep["nonmanifold_edges"] or rep["nonmanifold_vertices"] or rep["components"] != 1:
+                raise AssertionError(f"open-mesh simplification ({name}, -n {eng}) broke the boundary:\n" + r.stdout + r.stderr)
+    # -r 1 leaves the mesh untouched at every quality (the lossless finish rides -q 2 INSIDE the
+    # simplification; it must not run on its own), and the threshold schedule is unit-invariant:
+    # the same mesh in microns simplifies to the same face count
+    src = tmp / "mesh_valence.mz3"
+    r = run_niimath(exe, [str(src), "-r", "1", "-q", "2", "-v", "1", str(tmp / "mesh_untouched.mz3")])
+    if r.returncode != 0 or "mesh check (simplified)" in r.stdout + r.stderr or len(read_mz3_verts(tmp / "mesh_untouched.mz3")) != len(verts):
+        raise AssertionError("-r 1 must leave the mesh unsimplified at -q 2:\n" + r.stdout + r.stderr)
+    write_mz3(tmp / "mesh_valence_um.mz3", tris, [(1000.0 * x, 1000.0 * y, 1000.0 * z) for x, y, z in verts])
+    counts = []
+    for name in ("mesh_valence", "mesh_valence_um"):
+        r = run_niimath(exe, [str(tmp / f"{name}.mz3"), "-r", "0.25", "-q", "2", "-v", "1", str(tmp / f"{name}_out.mz3")])
+        counts.append(mesh_report_line(r, "simplified")["F"])
+    if counts[0] != counts[1]:
+        raise AssertionError(f"simplification is not unit-invariant: F={counts[0]:g} in mm, {counts[1]:g} in microns")
+    # a NaN coordinate: the report must say the scan could not run, not index with (int)NaN
+    write_mz3(tmp / "mesh_nan.mz3", tet_f, [(float("nan"), 0.0, 0.0)] + [tuple(float(c) for c in v) for v in tet_v[1:]])
+    r = run_niimath(exe, [str(tmp / "mesh_nan.mz3"), "-r", "1", "-v", "1", str(tmp / "mesh_nan_out.mz3")])
+    if r.returncode != 0 or mesh_report_line(r, "input")["self_intersecting"] is not None:
+        raise AssertionError("a NaN vertex must report self_intersecting=n/a:\n" + r.stdout + r.stderr)
+    # smoothing guard: a sheet with a tent over a flat sheet 0.005 below.  HC smoothing pulls the
+    # tent's second ring BELOW the plane (measured: -0.0088 after 10 iterations), through the
+    # lower sheet.  -q 1 must show the crossings, -q 2 none -- while still having smoothed the tent.
+    n = 9
+    verts, tris = [], []
+    for z, dx, tent in ((0.0, 0.0, 1.5), (-0.005, 0.5, 0.0)):
+        base = len(verts)
+        for y in range(n):
+            for x in range(n):
+                verts.append((x + dx, float(y), z + (tent if x == n // 2 and y == n // 2 else 0.0)))
+        for y in range(n - 1):
+            for x in range(n - 1):
+                a = base + y * n + x
+                tris += [(a, a + 1, a + n + 1), (a, a + n + 1, a + n)]
+    src = tmp / "mesh_sheets.mz3"
+    write_mz3(src, tris, verts)
+    for q, want_zero in (("1", False), ("2", True)):
+        out = tmp / f"mesh_sheets{q}.mz3"
+        r = run_niimath(exe, [str(src), "-r", "1", "-s", "10", "-q", q, "-v", "1", str(out)])
+        rep = mesh_report_line(r, "smoothed")
+        if r.returncode != 0 or (rep["self_intersecting"] == 0) != want_zero:
+            raise AssertionError(f"smoothing guard at -q {q}: {rep}\n" + r.stdout + r.stderr)
+    tent = max(v[2] for v in read_mz3_verts(tmp / "mesh_sheets2.mz3")[:n * n])
+    if not 0.05 < tent < 1.0:
+        raise AssertionError(f"guarded smoothing did not smooth the tent (apex z={tent:.3f}); reverting everything is not a guard")
+    print("  mesh report: closed/hole/non-manifold/self-intersection/coplanar/valence/open cases OK"
+          + (" (-n 1 half-edge engine exercised)" if "1" in engines else " (-n 1 not built: rejection checked)"))
+
+
+def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
+    """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
+    hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
+
+    These ops had NO in-repo coverage at all before this, which is how eight unchecked
+    allocations survived a hardening sweep that fixed six siblings in the same file.  The
+    checks below are chosen for what they can actually catch:
+
+    * -detrend on an exactly-linear time series must return all-zero.  Catches a wrong scratch
+      size (nvol vs nvox3D) and any cross-voxel bleed from the hoisted buffer.
+    * -bptf at -p 1 vs -p 8 must be BYTE-IDENTICAL.  This is the check that catches a botched
+      hoist: a scratch buffer that is not fully overwritten before each read produces
+      thread-count-dependent output, and nothing else here would notice.
+    * -sobel_binary must be two-valued, and plain -sobel must be unaffected by imgdir now
+      being allocated only in the binary branch.
+    """
+    nx, ny, nz, nt = 6, 6, 4, 12
+    nvox3d = nx * ny * nz
+    # voxel v has series a_v + b_v * t -- exactly linear, so a linear detrend must null it.
+    linear = []
+    for t in range(nt):
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    v = i + j * nx + k * nx * ny
+                    linear.append(float(v % 5) + 0.25 * (v % 3 + 1) * t)
+    src = tmp / "omp_linear.nii"
+    write_float32_nifti(src, (nx, ny, nz), linear, nt=nt)  # dims is 3-tuple; nt is separate
+
+    det = tmp / "omp_detrend.nii"
+    require_success(run_niimath(exe, [str(src), "-detrend", "-gz", "0", str(det)]), "-detrend")
+    for idx, value in enumerate(read_float32_nifti(det)):
+        if abs(value) > 1e-3:
+            raise AssertionError(f"-detrend left {value} at voxel {idx}; a linear series must null out")
+
+    # Thread-count byte-equality: the real regression detector for the hoisted scratch.
+    for op in (["-bptf", "4", "2"], ["-bptf", "3", "-1"], ["-bptfm", "4", "2"], ["-detrend"]):
+        outs = []
+        for threads in ("1", "8"):
+            dst = tmp / ("omp_%s_p%s.nii" % (op[0].lstrip("-"), threads))
+            require_success(
+                run_niimath(exe, [str(src)] + op + ["-p", threads, "-gz", "0", str(dst)]),
+                " ".join(op) + " -p " + threads,
+            )
+            outs.append(dst.read_bytes())
+        if outs[0] != outs[1]:
+            raise AssertionError(
+                " ".join(op) + " is not byte-identical at -p 1 vs -p 8; worker scratch is "
+                "carrying state between voxels")
+
+    # -tfce and -tfceS must run and stay finite; -tfceS is 3D-only.
+    blob = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                inside = (i - 3) ** 2 + (j - 3) ** 2 + (k - 2) ** 2 <= 4
+                blob.append(100.0 if inside else 1.0)
+    src3 = tmp / "omp_blob.nii"
+    write_float32_nifti(src3, (nx, ny, nz), blob)
+    for name, args in (("-tfce", ["-tfce", "2", "0.5", "6"]),
+                       ("-tfceS", ["-tfceS", "2", "0.5", "6", "3", "3", "2", "0.5"])):
+        dst = tmp / ("omp_%s.nii" % name.lstrip("-"))
+        require_success(run_niimath(exe, [str(src3)] + args + ["-gz", "0", str(dst)]), name)
+        values = read_float32_nifti(dst)
+        if len(values) != nvox3d:
+            raise AssertionError(f"{name} changed the voxel count")
+        for value in values:
+            if value != value or value in (float("inf"), float("-inf")):
+                raise AssertionError(f"{name} produced a non-finite value")
+
+    # -sobel_binary is two-valued; plain -sobel must not have been perturbed by imgdir now
+    # being allocated only in the binary branch (it is never read when isBinary == 0).
+    edge = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                edge.append(200.0 if i >= nx // 2 else 10.0)
+    src_edge = tmp / "omp_edge.nii"
+    write_float32_nifti(src_edge, (nx, ny, nz), edge)
+    sb = tmp / "omp_sobelb.nii"
+    require_success(run_niimath(exe, [str(src_edge), "-sobel_binary", "-gz", "0", str(sb)]), "-sobel_binary")
+    if not set(read_float32_nifti(sb)) <= {0.0, 1.0}:
+        raise AssertionError("-sobel_binary must emit only 0 and 1")
+    so = tmp / "omp_sobel.nii"
+    require_success(run_niimath(exe, [str(src_edge), "-sobel", "-gz", "0", str(so)]), "-sobel")
+    svals = read_float32_nifti(so)
+    if len(svals) != nvox3d or max(svals) <= min(svals):
+        raise AssertionError("-sobel produced no gradient on a step edge")
+
+    # Degenerate TFCE input, matching the reference implementation. fslmaths derives its step
+    # size as max/100 and REJECTS a run where that is not positive -- exit 1, no output written,
+    # and for 4D a SINGLE degenerate volume fails the whole operation. An all-NaN volume is
+    # NOT rejected (NaN <= 0 is false), and both tools emit an all-zero image for it.
+    # Before this contract existed niimath accepted all of these and evaluated (int)NaN.
+    flat = [0.0] * nvox3d
+    zero_src = tmp / "omp_tfce_zero.nii"
+    write_float32_nifti(zero_src, (nx, ny, nz), flat)
+    zero_out = tmp / "omp_tfce_zero_out.nii"
+    rej = run_niimath(exe, [str(zero_src), "-tfce", "2", "0.5", "6", "-gz", "0", str(zero_out)])
+    if rej.returncode == 0:
+        raise AssertionError("-tfce must reject a volume whose maximum is not positive")
+    if zero_out.exists():
+        raise AssertionError("-tfce wrote an output for a rejected degenerate volume")
+    if "deltaT" not in (rej.stdout + rej.stderr):
+        raise AssertionError("-tfce rejection must name the positive-deltaT requirement")
+    # 4D: one degenerate volume fails the whole run.
+    mixed = [(100.0 if v % 7 == 0 else 1.0) for v in range(nvox3d)] + flat
+    mixed_src = tmp / "omp_tfce_mixed.nii"
+    write_float32_nifti(mixed_src, (nx, ny, nz), mixed, nt=2)
+    mixed_out = tmp / "omp_tfce_mixed_out.nii"
+    if run_niimath(exe, [str(mixed_src), "-tfce", "2", "0.5", "6", "-gz", "0", str(mixed_out)]).returncode == 0:
+        raise AssertionError("-tfce must fail the whole run when any volume is degenerate")
+    if mixed_out.exists():
+        raise AssertionError("-tfce wrote an output despite a degenerate volume")
+
+    # -tfceS coordinate validation. The range check used to print a diagnostic and then FALL
+    # THROUGH, computing seed from the rejected coordinate and reading inimg[seed] out of
+    # bounds -- on a 16^3 image, -100000 in each axis reads ~109 MB before the buffer, and it
+    # did not crash, which is why a diagnostic without a return is worse than no check at all.
+    seed_src = tmp / "omp_tfces.nii"
+    write_float32_nifti(seed_src, (nx, ny, nz), [100.0 if v % 5 == 0 else 1.0 for v in range(nvox3d)])
+    for bad in (["-100000", "-100000", "-100000"], ["999", "999", "999"], ["-1", "0", "0"],
+                [str(nx), "0", "0"], ["0", str(ny), "0"], ["0", "0", str(nz)]):
+        dst = tmp / ("omp_tfces_bad_%s.nii" % "_".join(bad).replace("-", "m"))
+        res = run_niimath(exe, [str(seed_src), "-tfceS", "2", "0.5", "6"] + bad + ["0.5", "-gz", "0", str(dst)])
+        if res.returncode == 0:
+            raise AssertionError("-tfceS accepted out-of-range coordinate " + " ".join(bad))
+        if dst.exists():
+            raise AssertionError("-tfceS wrote an output for out-of-range coordinate " + " ".join(bad))
+    # ...and an in-range coordinate must still work, so the check is not simply rejecting all.
+    ok_dst = tmp / "omp_tfces_ok.nii"
+    require_success(
+        run_niimath(exe, [str(seed_src), "-tfceS", "2", "0.5", "6", "0", "0", "0", "0.5",
+                          "-gz", "0", str(ok_dst)]),
+        "-tfceS with an in-range coordinate",
+    )
+
+    print("  -tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: linear-detrend nulling, -p 1 vs -p 8")
+    print("        byte-equality, finiteness, sobel two-valuedness and the fslmaths")
+    print("        positive-deltaT rejection (3D and 4D) and -tfceS bounds rejection OK")
+
+
+def exercise_skullstrip(exe: str, tmp: Path, help_text: str) -> None:
+    """-skullstrip: end-to-end CLI contract on a synthetic head.
+
+    test_skullstrip_mesh.c checks the surface primitives analytically and nothing checked the
+    OPERATION -- which is how both repositioning stages once sat inside the SSV() diagnostic macro
+    and ran only when SKULLSTRIP_VERBOSE was set, with the whole suite green.  The verbose-equality
+    case below is the regression test for exactly that: a diagnostic must never move a voxel.
+
+    The working grid is a fixed 167x212x175 whatever the input, so a 48^3 fixture costs the same
+    ~2 s as a real head.  The numerics stay in skullstrip_bench; this is dispatch and contract.
+    """
+    line = _help_line(help_text, "-skullstrip")
+    if not line:
+        raise AssertionError("-skullstrip help line missing entirely (it must be #ifdef-paired)")
+
+    if "NOT in this build" in line:
+        # OFF by default, so a disabled build must still say how to enable it and must refuse the
+        # op rather than passing the image through unstripped.
+        if "SKULLSTRIP=1" not in line:
+            raise AssertionError("disabled -skullstrip help must name SKULLSTRIP=1")
+        src = tmp / "ss_disabled_in.nii"
+        out = tmp / "ss_disabled.nii"
+        write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
+        result = run_niimath(exe, [str(src), "-skullstrip", str(out)])
+        if result.returncode == 0 or out.exists():
+            raise AssertionError("-skullstrip must fail in a build without SKULLSTRIP")
+        if "SKULLSTRIP=1" not in (result.stdout + result.stderr):
+            raise AssertionError("disabled -skullstrip must say how to enable it")
+        print("  -skullstrip: not built (SKULLSTRIP=0) - contract checked")
+        return
+
+    # 4D input: rejected before any surface work, and nothing at all is created.
+    src4d = tmp / "ss_4d.nii"
+    write_float32_nifti(src4d, (8, 8, 8), [float(i % 7) for i in range(8 * 8 * 8 * 3)], nt=3)
+    before = sorted(p.name for p in tmp.iterdir())
+    result = run_niimath(exe, [str(src4d), "-skullstrip", str(tmp / "ss_4d_out.nii")])
+    after = sorted(p.name for p in tmp.iterdir())
+    if result.returncode == 0:
+        raise AssertionError("-skullstrip must reject 4D input")
+    if before != after:
+        raise AssertionError(f"-skullstrip on 4D input wrote {set(after) - set(before)}")
+
+    # A ~190 mm ellipsoid on a 4 mm grid: normalisation measures from the top of the head, so a
+    # fixture that is small in MILLIMETRES (rather than in voxels) has degenerate contrast and is
+    # rejected -- the physical size is what matters here, not the voxel count.
+    dims = (48, 48, 48)
+    values: list[float] = []
+    for k in range(dims[2]):
+        for j in range(dims[1]):
+            for i in range(dims[0]):
+                r = ((i - 23.5) / 13.0) ** 2 + ((j - 23.5) / 15.0) ** 2 + ((k - 23.5) / 12.0) ** 2
+                values.append(400.0 if r <= 1.0 else (120.0 if r <= 1.6 else 5.0))
+    src = tmp / "ss_head.nii"
+    write_float32_nifti(src, dims, values, scale=4.0)
+
+    # DT32 only: -dt double must say so, not quietly emit a float64 result.
+    dbl_out = tmp / "ss_double.nii"
+    dbl = run_niimath(exe, ["-dt", "double", str(src), "-skullstrip", str(dbl_out)])
+    if dbl.returncode == 0 or dbl_out.exists():
+        raise AssertionError("-skullstrip must reject -dt double")
+    if "double" not in (dbl.stdout + dbl.stderr):
+        raise AssertionError("-skullstrip -dt double rejection must name the datatype")
+
+    out = tmp / "ss_out.nii"
+    require_success(run_niimath(exe, [str(src), "-skullstrip", "-gz", "0", str(out)]), "-skullstrip")
+    if not out.exists():
+        raise AssertionError("-skullstrip wrote no output")
+    if _skullstrip_geometry(src) != _skullstrip_geometry(out):
+        raise AssertionError("-skullstrip changed the header geometry (dims/pixdim/qform/sform)")
+
+    # Output contract (skullstrip.h): in-mask voxels keep their ORIGINAL value, out-of-mask voxels
+    # become the image MINIMUM. So the result is a strict subset of the input -- no value may
+    # appear that the input did not contain, and every changed voxel must hold the minimum.
+    vmin = min(values)
+
+    def check_subset(result, label):
+        """The output contract, stated ONCE. Both kernels are held to the same rule -- writing it
+        twice is how two rules for one contract quietly drift apart. Returns the removed count."""
+        if len(result) != len(values):
+            raise AssertionError(f"{label} changed the voxel count")
+        if min(result) != vmin:
+            raise AssertionError(f"{label} background is {min(result)}, expected the input minimum {vmin}")
+        if not set(result) <= set(values):
+            raise AssertionError(f"{label} invented values {sorted(set(result) - set(values))}")
+        n_removed = 0
+        for i in range(len(values)):
+            if result[i] != values[i]:
+                if result[i] != vmin:
+                    raise AssertionError(f"{label} voxel {i} became {result[i]}, not the minimum {vmin}")
+                n_removed += 1
+        if sum(1 for value in result if value == 400.0) == 0:
+            raise AssertionError(f"{label} removed the whole brain")
+        # KNOW WHAT THIS FIXTURE CAN AND CANNOT SEE. It is a concentric ellipsoid whose
+        # background value (5.0) IS vmin, so blanking a background voxel is a no-op that no
+        # assertion can detect: 90,784 of its 110,592 voxels are invisible to this check and only
+        # the 19,808 bright ones (9,800 at 400.0 + 10,008 at 120.0) can ever register as removed.
+        # Measured, ~330 do -- about 3% of the shell -- so this is a DISPATCH AND CONTRACT test,
+        # not a segmentation-quality test, and it would still pass against a nearly-identity mask.
+        # Mask quality lives in strip_bench (Dice against external reference masks); do not add a
+        # quality claim here. The floor below is only strong enough to catch the mask never being
+        # applied at all. (An earlier draft asserted the far-corner voxel was removed -- vacuous,
+        # because that voxel already holds vmin in the input.)
+        if n_removed < 100:
+            raise AssertionError(f"{label} removed only {n_removed} voxels; the fixture no longer exercises the mask")
+        return n_removed
+
+    stripped = read_float32_nifti(out)
+    removed = check_subset(stripped, "-skullstrip")
+
+    # -restart adopts a new dataset, including its STORED datatype. Start from an integer image,
+    # restart from the float fixture, and require the same result as processing that float fixture
+    # directly. Passing the original input's datatype through restart selects the wrong AFNI
+    # normalization branch.
+    restart_seed = tmp / "ss_restart_seed.nii"
+    write_uint8_nifti(restart_seed)
+    restart_out = tmp / "ss_restart_out.nii"
+    require_success(
+        run_niimath(
+            exe,
+            [str(restart_seed), "-restart", str(src), "-skullstrip", "-gz", "0", str(restart_out)],
+        ),
+        "-restart float dataset followed by -skullstrip",
+    )
+    if read_float32_nifti(restart_out) != stripped:
+        raise AssertionError("-restart left -skullstrip using the original input's stored datatype")
+
+    # THE REGRESSION TEST: a diagnostic environment variable must not change the segmentation.
+    verbose_env = os.environ.copy()
+    verbose_env["SKULLSTRIP_VERBOSE"] = "1"
+    vout = tmp / "ss_out_verbose.nii"
+    verbose_result = run_niimath(
+        exe, [str(src), "-skullstrip", "-gz", "0", str(vout)], env=verbose_env
+    )
+    require_success(
+        verbose_result,
+        "-skullstrip with SKULLSTRIP_VERBOSE=1",
+    )
+    if "skullstrip: deformation kernel fast" not in verbose_result.stderr:
+        raise AssertionError("default -skullstrip did not select the fast deformation kernel")
+    if vout.read_bytes() != out.read_bytes():
+        raise AssertionError("SKULLSTRIP_VERBOSE=1 changed the -skullstrip output")
+
+    # -faithful selects the reference deformation kernel.  Two things are worth pinning: it must
+    # be ACCEPTED and produce a real strip (a silently-ignored sub-option would look identical to
+    # a working one on a pass/fail check), and it must not be swallowed as the output name -- the
+    # op-loop peek gotcha: a sub-option in the output-name slot must not become the output name.
+    fout = tmp / "ss_faithful.nii"
+    faithful_result = run_niimath(
+        exe,
+        [str(src), "-skullstrip", "-faithful", "-gz", "0", str(fout)],
+        env=verbose_env,
+    )
+    require_success(
+        faithful_result,
+        "-skullstrip -faithful",
+    )
+    if "skullstrip: deformation kernel faithful" not in faithful_result.stderr:
+        raise AssertionError("-skullstrip -faithful did not select the faithful deformation kernel")
+    faithful = read_float32_nifti(fout)
+    check_subset(faithful, "-skullstrip -faithful")
+    # The faithful kernel needs its OWN verbose byte-equality check. The one above covers the
+    # default kernel only, and -faithful is otherwise run exclusively WITH SKULLSTRIP_VERBOSE=1
+    # (to read the dispatch line) -- yet verbose does gate work on this path too, via
+    # `ss_verbose() ? &xs : NULL` in skullstrip.c. A diagnostic must never move a voxel in
+    # EITHER kernel.
+    fquiet = tmp / "ss_faithful_quiet.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-skullstrip", "-faithful", "-gz", "0", str(fquiet)]),
+        "-skullstrip -faithful without SKULLSTRIP_VERBOSE",
+    )
+    if fquiet.read_bytes() != fout.read_bytes():
+        raise AssertionError("SKULLSTRIP_VERBOSE=1 changed the -skullstrip -faithful output")
+
+    # Rejected AND writes nothing -- both halves matter, because an op
+    # that errors after creating the file is a different bug from one that errors cleanly.
+    before = set(os.listdir(tmp))
+    trailing = run_niimath(exe, [str(src), "-skullstrip", "-faithful"])
+    if trailing.returncode == 0:
+        raise AssertionError("trailing -skullstrip -faithful must fail, not become the output name")
+    if set(os.listdir(tmp)) != before:
+        raise AssertionError("trailing -skullstrip -faithful wrote a file; it must write nothing")
+
+    # -skullstrip is an ordinary chain op, not a terminal subcommand.
+    chained = tmp / "ss_chain.nii"
+    require_success(
+        run_niimath(exe, [str(src), "-skullstrip", "-mul", "2", "-gz", "0", str(chained)]),
+        "-skullstrip chained with -mul",
+    )
+    doubled = read_float32_nifti(chained)
+    for i in range(len(stripped)):
+        if abs(doubled[i] - 2.0 * stripped[i]) > 1e-3:
+            raise AssertionError("-skullstrip did not chain into the following operation")
+
+    print("  -skullstrip: 4D/-dt double rejections, geometry preserved, %d of %d voxels kept,"
+          % (len(values) - removed, len(values)))
+    print("        subset-of-input contract, restart datatype, SKULLSTRIP_VERBOSE equality,")
+    print("        -faithful kernel accepted and not swallowed as the output name, and chaining OK")
+
+
 def _help_line(help_text: str, tag: str) -> str:
     """The help line for one operation, so a caller can tell "absent" from "present but
     disabled" -- a platform-gated feature prints a '... NOT in this build' line rather than
@@ -2642,9 +4070,27 @@ def main() -> int:
         info = run_niimath(exe, [])
         require_success(info, "help/version")
         help_text = info.stdout + info.stderr
-        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-bandpass", "-mesh", "-romeo"):
+        for token in ("-conform", "-allineate", "-deface", "--dtifit", "--qc", "-bitmap", "-mesh", "-romeo"):
             if token not in help_text:
                 raise AssertionError(f"packaged binary help is missing {token}")
+        # COPYLEFT SELF-CONSISTENCY -- and KNOW EXACTLY WHAT THIS DOES AND DOES NOT PROVE.
+        # -spm_coreg is the entire copyleft payload (SPM, GPL-2-or-later, in the src/GPL
+        # submodule). Both the " GPL " version brand (niimath.c's kLicense) and the -spm_coreg
+        # help line are emitted under the SAME `HAVE_GPL` macro, so the two checks below cannot
+        # disagree unless the build is HALF-wired -- GPL sources compiled with the brand or the
+        # help line out of step. That is a real failure mode and worth catching, but it is NOT
+        # a proof that a BSD-branded binary is free of GPL object code: a build that linked
+        # GPL/*.c WITHOUT -DHAVE_GPL would brand itself BSD, hide the op, and pass. Proving
+        # absence needs a symbol check (nm), which this stdlib-only cross-platform script
+        # cannot do. Do not describe this as a licence gate; the load-bearing check is the
+        # BEHAVIOURAL one below, which requires the op to actually refuse to run.
+        # (It used to key on -bandpass, retired along with Exstrom's LGPL-3 bw.c; with that
+        # gone the payload is SPM alone, so a GPL=1 binary is GPL-2-or-later, not GPL-3.)
+        is_gpl_build = " GPL " in help_text
+        if is_gpl_build and "-spm_coreg" not in help_text:
+            raise AssertionError("GPL build brands itself GPL but hides -spm_coreg (half-wired build)")
+        if not is_gpl_build and "-spm_coreg" in help_text:
+            raise AssertionError("BSD-branded build advertises -spm_coreg (half-wired build)")
         if args.expect_bsd and " BSD " not in help_text:
             raise AssertionError("expected a BSD build version string")
 
@@ -2854,18 +4300,39 @@ def main() -> int:
             raise AssertionError("binary operation failed to detect a y-axis spatial mismatch")
 
         exercise_qc(exe, tmp)
+        exercise_fillh(exe, tmp)
 
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
         exercise_medic(exe, tmp, help_text)
         exercise_moco(exe, tmp, help_text)
         exercise_stc(exe, tmp, help_text)
+        exercise_fmap(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
+        exercise_skullstrip(exe, tmp, help_text)
+        exercise_openmp_scratch_ops(exe, tmp)
+        exercise_mesh_report(exe, tmp, help_text)
 
-        if args.expect_bsd:
-            spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
-            if spm.returncode == 0 or "requires a build with the optional GPL module" not in (spm.stdout + spm.stderr):
-                raise AssertionError("BSD package should reject -spm_coreg with the GPL-module message")
+        # THE LOAD-BEARING COPYLEFT CHECK, and it runs for EVERY BSD-branded binary, not just
+        # a packaged one -- it used to be gated on --expect-bsd, which meant only the wheel
+        # build exercised it. Behavioural, not a help-string grep: the op must actually REFUSE
+        # to run. Still not a proof of absent object code (see the note further up), but it is
+        # the strongest thing available here.
+        spm = run_niimath(exe, [str(small), "-spm_coreg", str(small), str(tmp / "spm.nii")])
+        spm_out = spm.stdout + spm.stderr
+        stub_msg = "requires a build with the optional GPL module"
+        if not is_gpl_build:
+            if spm.returncode == 0 or stub_msg not in spm_out:
+                raise AssertionError("BSD-branded binary must reject -spm_coreg with the GPL-module message")
+        else:
+            # The other half of the same half-wiring test. A build where niimath.c received
+            # -DHAVE_GPL but core32/core64.c did not would brand itself GPL, print the help
+            # line, satisfy both greps above -- and still dispatch to the !HAVE_GPL stub. Only
+            # running the op catches that. Deliberately does NOT require success: -spm_coreg on
+            # a degenerate 8-bit fixture may legitimately fail to converge, and this is a
+            # wiring check, not a registration-quality check.
+            if stub_msg in spm_out:
+                raise AssertionError("GPL-branded binary dispatched -spm_coreg to the !HAVE_GPL stub (half-wired build)")
 
         if args.expect_zstd:
             env = os.environ.copy()

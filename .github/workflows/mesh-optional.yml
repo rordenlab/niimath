@@ -1,0 +1,42 @@
+name: Mesh optional build & smoke
+
+# Build the OPT-IN half-edge simplifier (src/quadric2.c, -mesh -n 1) and exercise it.
+#
+# Why: HAVE_QUADRIC2 is OFF in every default build, including notarize.sh and wasm, so without
+# this job its parser, dispatch and release_smoke.py fixtures would rot with the suite green
+# (release_smoke.py takes its "-n 1 not built" branch everywhere else). Both build systems are
+# covered because the feature inventory is duplicated (AGENTS.md known issue 2). Additional check,
+# not a required gate; produces no artifact.
+on:
+  push:
+    branches: [master]
+    paths: ['src/**', '.github/workflows/mesh-optional.yml', '.github/scripts/release_smoke.py']
+  pull_request:
+    paths: ['src/**', '.github/workflows/mesh-optional.yml', '.github/scripts/release_smoke.py']
+  workflow_dispatch:
+
+jobs:
+  quadric2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev
+
+      - name: Makefile Q2=1 + release smoke
+        run: |
+          set -euo pipefail
+          make -C src Q2=1
+          python3 .github/scripts/release_smoke.py ./src/niimath 2>&1 | tee smoke.txt
+          grep -q 'half-edge engine exercised' smoke.txt || {
+            echo 'release_smoke.py did not exercise -n 1'; exit 1; }
+
+      - name: CMake ENABLE_QUADRIC2=ON + release smoke
+        run: |
+          set -euo pipefail
+          cmake -S src -B build-q2 -DBUILD_FLAVOR=all -DENABLE_QUADRIC2=ON
+          cmake --build build-q2 -j 4
+          python3 .github/scripts/release_smoke.py ./build-q2/niimath 2>&1 | tee cmake_smoke.txt
+          grep -q 'half-edge engine exercised' cmake_smoke.txt || {
+            echo 'CMake niimath did not exercise -n 1'; exit 1; }

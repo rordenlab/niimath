@@ -112,6 +112,11 @@ int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	int nx, int ny, int nz, int neco, const double *TEs,
 	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out);
 
+// ROMEO's voxel-quality map from WRAPPED phase alone (all-ones magnitude weights), for callers
+// that need phase coherence as a mask ingredient.  qmap is caller-owned, nx*ny*nz floats.
+int romeo_voxelquality(const float *phase, int neco, int nx, int ny, int nz,
+	const double *TEs, const romeo_opts *o, float *qmap);
+
 // ROMEO's robustmask on its own, for callers that need the mask before unwrapping.
 // `mask` is caller-owned, nx*ny*nz bytes. Returns 0 on success.
 int romeo_robustmask(const float *mag, int nx, int ny, int nz, uint8_t *mask);

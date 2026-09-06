@@ -167,7 +167,7 @@ def gen_nifti2():
 
 
 def gen_bold():
-    # a small 4D timeseries (>=12 timepoints) so temporal filters (-bandpass) are exercisable
+    # a small 4D timeseries (>=12 timepoints) so temporal filters (-bptf) are exercisable
     rng = np.random.default_rng(SEED + 4)
     nx = ny = nz = 4
     nt = 20

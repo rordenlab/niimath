@@ -2238,6 +2238,35 @@ int romeo_robustmask(const float *mag, int nx, int ny, int nz, uint8_t *mask) {
 	return 0;
 }
 
+/* Compute ROMEO's voxel-quality map from WRAPPED phase alone -- all-ones magnitude weights, so
+   the result reflects phase coherence only.  This is `voxelquality(phase; TEs, ...)` with no
+   `mag` keyword, i.e. the same call ROMEO makes internally for -romeo's quality mask except that
+   the magnitude is deliberately not supplied.  --medic's tiered mask unions it with an Otsu
+   magnitude mask precisely because the two fail differently: the magnitude mask is occasionally
+   too aggressive, the quality mask permissive but noisy.
+
+   `phase` is neco wrapped volumes of nx*ny*nz; `qmap` is caller-owned, nx*ny*nz floats.
+   Returns 0 on success. */
+int romeo_voxelquality(const float *phase, int neco, int nx, int ny, int nz,
+	const double *TEs, const romeo_opts *o, float *qmap) {
+	rm_wctx qc;
+	int flags[6];
+	if (!phase || !qmap || !TEs || !o || neco < 1 || nx < 1 || ny < 1 || nz < 1) return 1;
+	/* Upper bound too, matching romeo_unwrap_frame.  rm_build_ctx indexes both the phase buffer
+	   and the caller's TEs array at template_echo-1, so an out-of-range value reads off the end
+	   of two arrays.  Unreachable from the shipped CLI -- --medic never moves template_echo off
+	   1 -- but this is an exported header API and its sibling guards both ends. */
+	if (o->template_echo < 1 || o->template_echo > neco) return 1;
+	/* have_mag = 0: romeo/romeo4 resolve to the magnitude-free flag set, which is what
+	   "quality from phase alone" means. */
+	rm_flags_from_sel(o->weights_sel, 0, flags);
+	if (o->weights_sel == RM_W_FLAGS) memcpy(flags, o->flags, sizeof flags);
+	/* p2ref = 2 regardless of the template echo: voxelquality's own 4D overload does that. */
+	if (rm_build_ctx(&qc, phase, NULL, 0, NULL, NULL, TEs, neco,
+			o->template_echo > 0 ? o->template_echo : 1, 2, nx, ny, nz, flags)) return 1;
+	return rm_voxelquality(&qc, qmap);
+}
+
 /* ---- the runner ---------------------------------------------------------------------------- */
 
 int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,

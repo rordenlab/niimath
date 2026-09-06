@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #ifndef _MSC_VER
 	#include <unistd.h>   /* getpid() for the temporary output prefix */
+	#include <sys/wait.h>
 #else
 	#include <process.h>
 	#define getpid _getpid
@@ -43,6 +44,7 @@
 	#include <omp.h>
 #endif
 
+#include "core32.h"   /* nifti_smooth_gauss_f32, the border spatial smooth */
 #include "medic.h"
 #include "romeo.h"
 
@@ -463,7 +465,14 @@ static void md_jacobi_eigh(double *a, double *v, double *w, int n) {
  * EXPERIMENTAL, and deliberately labelled so: rank 10 is the paper's figure and a synthetic probe
  * confirmed the reference truncates at 10, but the reference's real 170-frame output retains a
  * broadband residual past component 10 (manifest 5.2) whose origin is unresolved and has NOT been
- * guessed at here.  This is the least reference-faithful stage; --rank 0 skips it entirely.
+ * guessed at here.  --rank 0 skips it entirely.
+ *
+ * The manifest's open question -- that the reference's output "retains a broadband residual past
+ * component 10 whose origin is unresolved" -- is ANSWERED, and it was the border.  Splitting the
+ * reference's own field map by its own tiers (medic_bench tools/m6_spectrum.py): the CORE carries
+ * 0.78 % of its energy past component 10 and the BORDER carries 28.3 %.  The interior is the
+ * rank-10 object the paper describes; the border is a differently-derived reconstruction.  See
+ * md_lowrank_border.
  *
  * Uses the T x T Gram matrix G = F^T F, whose eigenvectors are the right singular vectors of F.
  * Projecting each voxel's time course onto the leading k of them is exactly the truncated SVD:
@@ -582,6 +591,277 @@ static int md_all_finite(const float *v, int64_t n) {
 }
 
 
+/* ================================ the tiered brain mask ======================================
+ *
+ * Gap 2 of medic_bench/MEDIC_GAPS.md.  The default mask is a union of two independent estimates
+ * -- one from magnitude, one from phase coherence -- cleaned up morphologically and encoded in
+ * three tiers: 2 = core, 1 = border ring, 0 = outside.  Everything that asks "is this voxel
+ * valid" uses `> 0`; only the border filter distinguishes 1 from 2.
+ *
+ * The two components are combined precisely because they fail differently: an Otsu magnitude
+ * threshold is occasionally too aggressive, while the quality map is permissive but noisy.
+ *
+ * The author's own note postdates the gap analysis and softens it -- any reasonable brain mask
+ * plus a bit extra outside the brain would do, and `--mask-mode mindgrab` is the intended
+ * replacement.  This is implemented anyway, and for a diagnostic reason rather than a fidelity
+ * one: with matching masks, every remaining field-map difference is attributable to a stage
+ * DOWNSTREAM of the mask, which is what makes the later milestones' numbers interpretable.
+ *
+ * Note `romeo_robustmask` remains the right default for the `-romeo` chain op; this replaces it
+ * only inside --medic, and `--mask-mode robustmask` keeps the old behaviour for bisection. */
+
+#define MD_MASK_BINS 256
+
+/* --mask-mode.  TIERED is the default; ROBUSTMASK is the pre-Gap-2 behaviour, kept for
+   bisection; MINDGRAB shells out to the external brainchop-mindgrab executable. */
+#define MD_MASK_TIERED 0
+#define MD_MASK_ROBUST 1
+#define MD_MASK_MINDGRAB 2
+
+/* skimage.filters.threshold_otsu at its default 256 bins: histogram the finite values over
+   [min, max], maximise the inter-class variance, and return the BIN CENTRE.  Callers threshold
+   with a strict `>`, as skimage's own examples do.  Returns NaN if there is nothing to
+   threshold. */
+static double md_otsu(const float *v, int64_t n) {
+	double lo = 0.0, hi = 0.0, w = 0.0, cum = 0.0, cumw = 0.0, tot = 0.0, totw = 0.0;
+	double best = -1.0, thr = (double)NAN;
+	int64_t h[MD_MASK_BINS], i;
+	int b, seen = 0;
+	for (b = 0; b < MD_MASK_BINS; b++) h[b] = 0;
+	for (i = 0; i < n; i++) {
+		double x = (double)v[i];
+		if (!isfinite(x)) continue;
+		if (!seen) { lo = hi = x; seen = 1; }
+		else { if (x < lo) lo = x; if (x > hi) hi = x; }
+	}
+	if (!seen || !(hi > lo)) return thr;
+	w = (hi - lo) / MD_MASK_BINS;
+	for (i = 0; i < n; i++) {
+		double x = (double)v[i];
+		int k;
+		if (!isfinite(x)) continue;
+		k = (int)((x - lo) / w);
+		if (k < 0) k = 0;
+		if (k >= MD_MASK_BINS) k = MD_MASK_BINS - 1;
+		h[k]++;
+	}
+	for (b = 0; b < MD_MASK_BINS; b++) {
+		double c = lo + (b + 0.5) * w;
+		tot += (double)h[b];
+		totw += (double)h[b] * c;
+	}
+	for (b = 0; b < MD_MASK_BINS - 1; b++) {
+		double c = lo + (b + 0.5) * w, w1, w2, m1, m2, var;
+		cum += (double)h[b];
+		cumw += (double)h[b] * c;
+		w1 = cum; w2 = tot - cum;
+		if (!(w1 > 0.0) || !(w2 > 0.0)) continue;
+		m1 = cumw / w1;
+		m2 = (totw - cumw) / w2;
+		var = w1 * w2 * (m1 - m2) * (m1 - m2);
+		if (var > best) { best = var; thr = c; }
+	}
+	return thr;
+}
+
+/* Neighbour offsets for a 6-, 18- or 26-connected structuring element (scipy's
+   generate_binary_structure(3, 1|2|3)).  Returns the count. */
+static int md_nbr_offsets(int conn, int d[26][3]) {
+	int rank = (conn == 6) ? 1 : (conn == 18) ? 2 : 3;
+	int n = 0, dx, dy, dz;
+	for (dz = -1; dz <= 1; dz++) for (dy = -1; dy <= 1; dy++) for (dx = -1; dx <= 1; dx++) {
+		if (!dx && !dy && !dz) continue;
+		if (abs(dx) + abs(dy) + abs(dz) > rank) continue;
+		d[n][0] = dx; d[n][1] = dy; d[n][2] = dz; n++;
+	}
+	return n;
+}
+
+/* Erosion and dilation use an 18-CONNECTED element -- faces and edges, not corners.
+ *
+ * Gap 2 does not say which structuring element, and 6-connected (scipy's default) is the obvious
+ * guess.  It is wrong: MEASURED against warpkit's own recovered mask on echo2 frame 0, a search
+ * over {6, 18, 26} for erosion and dilation, {6, 26} for the connected components and {6, 26} for
+ * the hole fill puts 18 far ahead -- valid-tier Dice 0.9997 at 18, against 0.9304 at 6 (13% too
+ * small) and 0.9699 at 26 (4% too large).  The component and hole-fill connectivities barely
+ * matter by comparison (0.9997 vs 0.9995).  See medic_bench's tools/m2_mask_search.py. */
+#define MD_MORPH_CONN 18
+#define MD_CC_CONN 26
+#define MD_FILL_CONN 26
+
+/* Per-frame scratch for the mask build.  Allocated once per worker rather than per call: the
+   mask is built inside the frame loop, and a malloc/free pair per morphological pass would
+   dominate it. */
+typedef struct { int32_t *lab; int32_t *stk; uint8_t *a, *b; float *q; } md_maskwork;
+
+static void md_maskwork_free(md_maskwork *w) {
+	if (!w) return;
+	free(w->lab); free(w->stk); free(w->a); free(w->b); free(w->q);
+	memset(w, 0, sizeof *w);
+}
+
+static int md_maskwork_alloc(md_maskwork *w, int64_t n3) {
+	memset(w, 0, sizeof *w);
+	/* The flood-fill stack holds voxel indices as int32 -- one entry per voxel is already 4 MB
+	   per worker on a typical frame, and --medic is not a huge-image op (it is deliberately
+	   absent from kHugeSafeOps), so the narrower index is the right trade. */
+	if (n3 > 2147483647LL) return 1;
+	w->lab = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
+	w->stk = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
+	w->a = (uint8_t *)malloc((size_t)n3);
+	w->b = (uint8_t *)malloc((size_t)n3);
+	w->q = (float *)malloc((size_t)n3 * sizeof(float));
+	if (!w->lab || !w->stk || !w->a || !w->b || !w->q) { md_maskwork_free(w); return 1; }
+	return 0;
+}
+
+/* Flood-fill from every voxel of `seed` value `want` in `m`, labelling reachable voxels.
+   Iterative with an explicit stack: n3 can be 2e5 and a recursive fill would blow the stack. */
+static void md_flood(const uint8_t *m, int nx, int ny, int nz, int conn, uint8_t want,
+	int32_t *lab, int32_t *stk, int64_t start, int32_t tag, int64_t *count) {
+	int d[26][3], nd = md_nbr_offsets(conn, d), k;
+	int64_t sp = 0, n = 0;
+	lab[start] = tag; stk[sp++] = (int32_t)start; n = 1;
+	while (sp > 0) {
+		int64_t v = stk[--sp];
+		int x = (int)(v % nx), y = (int)((v / nx) % ny), z = (int)(v / ((int64_t)nx * ny));
+		for (k = 0; k < nd; k++) {
+			int xx = x + d[k][0], yy = y + d[k][1], zz = z + d[k][2];
+			int64_t u;
+			if (xx < 0 || yy < 0 || zz < 0 || xx >= nx || yy >= ny || zz >= nz) continue;
+			u = xx + (int64_t)nx * (yy + (int64_t)ny * zz);
+			if (lab[u] || m[u] != want) continue;
+			lab[u] = tag; stk[sp++] = (int32_t)u; n++;
+		}
+	}
+	if (count) *count = n;
+}
+
+/* Keep only the largest connected component of the foreground.  A no-op on an empty mask. */
+static void md_largest_cc(uint8_t *m, int nx, int ny, int nz, int conn, md_maskwork *w) {
+	int64_t n3 = (int64_t)nx * ny * nz, i, best = 0;
+	int32_t tag = 0, bestt = 0;
+	memset(w->lab, 0, (size_t)n3 * sizeof(int32_t));
+	for (i = 0; i < n3; i++) {
+		int64_t c = 0;
+		if (!m[i] || w->lab[i]) continue;
+		md_flood(m, nx, ny, nz, conn, 1, w->lab, w->stk, i, ++tag, &c);
+		if (c > best) { best = c; bestt = tag; }
+	}
+	if (!bestt) return;
+	for (i = 0; i < n3; i++) if (m[i] && w->lab[i] != bestt) m[i] = 0;
+}
+
+/* Fill holes: background not reachable from the volume border becomes foreground.  `conn` is
+   the connectivity of the BACKGROUND, which is what a structuring element means here. */
+static void md_fill_holes(uint8_t *m, int nx, int ny, int nz, int conn, md_maskwork *w) {
+	int64_t n3 = (int64_t)nx * ny * nz, i;
+	int x, y, z;
+	memset(w->lab, 0, (size_t)n3 * sizeof(int32_t));
+	for (z = 0; z < nz; z++) for (y = 0; y < ny; y++) for (x = 0; x < nx; x++) {
+		int64_t v;
+		if (x && y && z && x < nx - 1 && y < ny - 1 && z < nz - 1) continue;   /* border only */
+		v = x + (int64_t)nx * (y + (int64_t)ny * z);
+		if (m[v] || w->lab[v]) continue;
+		md_flood(m, nx, ny, nz, conn, 0, w->lab, w->stk, v, 1, NULL);
+	}
+	for (i = 0; i < n3; i++) if (!m[i] && !w->lab[i]) m[i] = 1;
+}
+
+/* Binary erosion or dilation, `iters` passes with a 6-connected structuring element.
+   EROSION TREATS THE VOLUME BORDER AS INSIDE -- without that it eats inward from every FOV face
+   and the mask loses a shell of brain wherever the head touches the edge of the field of view. */
+static void md_morph(uint8_t *m, int nx, int ny, int nz, int iters, int dilate, uint8_t *scratch) {
+	int64_t n3 = (int64_t)nx * ny * nz, v;
+	int d[26][3], nd = md_nbr_offsets(MD_MORPH_CONN, d), it, k, x, y, z;
+	for (it = 0; it < iters; it++) {
+		memcpy(scratch, m, (size_t)n3);
+		for (z = 0; z < nz; z++) for (y = 0; y < ny; y++) for (x = 0; x < nx; x++) {
+			int hit = 0;
+			v = x + (int64_t)nx * (y + (int64_t)ny * z);
+			if (scratch[v] == (dilate ? 1 : 0)) continue;      /* already at the extreme */
+			for (k = 0; k < nd && !hit; k++) {
+				int xx = x + d[k][0], yy = y + d[k][1], zz = z + d[k][2];
+				int64_t u;
+				/* Outside the volume: foreground for erosion (so a face of the FOV cannot
+				   erode the mask) and background for dilation.  Neither sets `hit`, which is
+				   why the two cases collapse to one `continue`. */
+				if (xx < 0 || yy < 0 || zz < 0 || xx >= nx || yy >= ny || zz >= nz) continue;
+				u = xx + (int64_t)nx * (yy + (int64_t)ny * zz);
+				if (dilate ? scratch[u] : !scratch[u]) hit = 1;
+			}
+			m[v] = (uint8_t)(dilate ? (hit ? 1 : 0) : (hit ? 0 : 1));
+		}
+	}
+}
+
+/* Gap 2 step 2: the magnitude brain mask of ONE echo, WITHOUT any caller-specific extra erosion.
+   The extra erosions the other three call sites need (branch scoring 2, temporal grouping 1,
+   echo offset 0) are applied by the caller to a copy of this, never folded in here -- eroding
+   before the required dilation is a different mask, and keeping the two apart is what stops a
+   future caller getting that order wrong. */
+static int md_mag_brainmask(const float *mag, int nx, int ny, int nz, md_maskwork *w, uint8_t *out) {
+	int64_t n3 = (int64_t)nx * ny * nz, i, nz_count = 0;
+	double thr = md_otsu(mag, n3);
+	if (!isfinite(thr)) { memset(out, 1, (size_t)n3); return 0; }
+	for (i = 0; i < n3; i++) out[i] = ((double)mag[i] > thr) ? 1 : 0;
+	md_fill_holes(out, nx, ny, nz, MD_FILL_CONN, w);
+	md_morph(out, nx, ny, nz, 2, 0, w->b);
+	md_largest_cc(out, nx, ny, nz, MD_CC_CONN, w);
+	md_morph(out, nx, ny, nz, 2, 1, w->b);
+	for (i = 0; i < n3; i++) if (out[i]) nz_count++;
+	/* An empty magnitude component is a failed threshold, not a statement that the frame is
+	   empty; propagating it would silently produce an all-zero field map at exit 0. */
+	if (!nz_count) memset(out, 1, (size_t)n3);
+	return 0;
+}
+
+/* Gap 2 steps 1, 3 and 4: the tiered mask.  `out` gets 2 (core), 1 (border ring) or 0. */
+/* Gap 2's three DERIVED masks -- branch scoring (2 extra erosions), temporal grouping (1) and the
+   intra-frame echo offset (0) -- are all the SAME magnitude brain mask with a different final
+   erosion count, so only the base is stored (`magm`) and each caller erodes a copy.  The base and
+   the extra erosion stay separate on purpose: eroding before the dilation md_mag_brainmask ends
+   with is a DIFFERENT mask, and keeping them apart is what stops a future caller getting that
+   order wrong. */
+#define MD_ERODE_BRANCH 2      /* Gap 3(b) branch scoring */
+#define MD_ERODE_GROUP  1      /* Gap 5 temporal grouping */
+/* Gap 4's intra-frame echo offset uses the base mask with NO extra erosion, so it has no macro
+   here -- it reads `magm` directly.  Spelling it as a `#define ... 0` implied a symmetry the code
+   does not have and invited someone to "use" it. */
+
+static int md_tiered_mask(const float *phase, const float *mag, int neco, int nx, int ny, int nz,
+	const double *TEs, const romeo_opts *ro, md_maskwork *w, uint8_t *out, uint8_t *magm,
+	float *qout) {
+	int64_t n3 = (int64_t)nx * ny * nz, i, ncore = 0;
+	double thr;
+	/* 1. voxel quality, from phase alone (all-ones magnitude weights). */
+	if (romeo_voxelquality(phase, neco, nx, ny, nz, TEs, ro, w->q)) return 1;
+	if (qout) memcpy(qout, w->q, (size_t)n3 * sizeof(float));
+	thr = md_otsu(w->q, n3);
+	if (isfinite(thr)) {
+		for (i = 0; i < n3; i++) w->a[i] = ((double)w->q[i] > thr) ? 1 : 0;
+		md_fill_holes(w->a, nx, ny, nz, MD_FILL_CONN, w);
+		md_largest_cc(w->a, nx, ny, nz, MD_CC_CONN, w);
+	} else memset(w->a, 0, (size_t)n3);
+	/* 2. magnitude, shortest echo. */
+	if (md_mag_brainmask(mag, nx, ny, nz, w, out)) return 1;
+	if (magm) memcpy(magm, out, (size_t)n3);
+	/* 3. core = dilate(largest_cc(erode(largest_cc(magnitude | quality), 2)), 2). */
+	for (i = 0; i < n3; i++) out[i] = (uint8_t)((out[i] || w->a[i]) ? 1 : 0);
+	md_largest_cc(out, nx, ny, nz, MD_CC_CONN, w);
+	md_morph(out, nx, ny, nz, 2, 0, w->b);
+	md_largest_cc(out, nx, ny, nz, MD_CC_CONN, w);
+	md_morph(out, nx, ny, nz, 2, 1, w->b);
+	for (i = 0; i < n3; i++) if (out[i]) ncore++;
+	if (!ncore) return 1;
+	/* 4. tiers: dilate the core by 3 and add.  2 = core, 1 = ring, 0 = outside. */
+	memcpy(w->a, out, (size_t)n3);
+	md_morph(w->a, nx, ny, nz, 3, 1, w->b);
+	for (i = 0; i < n3; i++) out[i] = (uint8_t)(out[i] + w->a[i]);
+	return 0;
+}
+
+
 typedef struct {
 	int nx, ny, nz, neco, nframe;
 	int64_t n3;
@@ -594,30 +874,505 @@ typedef struct {
 	int mcpc;
 	int noiseframes;
 	int save_intermediates;
-	const char *maskfile;         /* --mask: use this mask verbatim instead of robustmask */
+	int mask_mode;                /* MD_MASK_* */
+	int branch;                   /* --branch-correction: global 2*pi handling (Gap 3) */
+	int echo_offset;              /* --echo-offset: intra-frame per-echo 2*pi offset (Gap 4) */
+	int border_reg;               /* --border-regularization: graded border filter (Gap 1) */
+	const char *maskfile;         /* --mask: use this mask verbatim, overriding --mask-mode */
 	const char *prefix;
 	nifti_image *tmpl;            /* header template (phase echo 1) */
 } md_ctx;
 
-/* readphase: rescale observed [min,max] of the whole series onto [-pi,pi] (manifest §3.1).
-   Matches ROMEO's readphase, which is what the reference uses. */
-static void md_rescale_phase(float *p, int64_t n) {
-	int64_t i;
-	double mn = 0.0, mx = 0.0, slope, inter, span;
-	int seen = 0;
+/* readphase: rescale the stored phase onto [-pi,pi].
+ *
+ * The range comes from FRAME 0 ONLY, per echo, combined across echoes by the MODE -- not from
+ * the whole series, and there is no already-in-radians short-circuit.  All three were MEASURED
+ * against wk-medic --debug, which prints the range it settled on; the probe is
+ * tools/m1_rescale_probe.py in medic_bench and its record is manifest section 3.1.
+ *
+ *   frame 0 only   : a frame-0 range of [-100,100] under later frames spanning [-200,200] is
+ *                    reported as 100, and the mirror case (wide frame 0) as 200.
+ *   mode, ties low : three echoes at [-100,100],[-100,100],[-50,50] report 100; a two-echo tie
+ *                    at [-100,100],[-200,200] reports min -200 and max +100, i.e. each end
+ *                    independently takes the SMALLEST of the tied values.
+ *   non-finite     : an echo whose frame 0 contains a NaN contributes NaN, which loses every
+ *                    tie -- equivalently, non-finite entries are ignored.
+ *   no shortcut    : a phantom whose stored phase spans exactly 2.0 rad comes back with the
+ *                    same field as its exactly-[-pi,pi] twin (ratio 1.00005; a short-circuit
+ *                    would have given 0.3183), so the range is always applied.
+ *
+ * Why it matters: per-echo whole-series extrema diverge from this when the stored range varies
+ * by frame (one outlying frame widens the range and compresses every other) or by echo (the
+ * mode is robust to one odd echo; a per-echo min/max is not). */
+
+/* Mode of `n` doubles: most frequent value, ties broken by the smallest, non-finite ignored.
+ * Returns NaN when nothing is finite.  n is the echo count, so O(n^2) is free. */
+static double md_mode(const double *v, int n) {
+	double best = (double)NAN;
+	int i, j, bestc = 0;
 	for (i = 0; i < n; i++) {
-		double v = (double)p[i];
-		if (!isfinite(v)) continue;
-		if (!seen) { mn = mx = v; seen = 1; }
-		else { if (v < mn) mn = v; if (v > mx) mx = v; }
+		int c = 0;
+		if (!isfinite(v[i])) continue;
+		for (j = 0; j < n; j++) if (v[j] == v[i]) c++;
+		if (c > bestc || (c == bestc && v[i] < best)) { bestc = c; best = v[i]; }
 	}
-	if (!seen) return;
-	span = mx - mn;
-	if (fabs(span - MD_2PI) <= 0.1) return;   /* already radians */
-	if (!(span > 0.0)) return;
-	slope = MD_2PI / span;
-	inter = -M_PI - mn * slope;
+	return best;
+}
+
+static void md_frame0_range(const float *p, int64_t n3, double *mn, double *mx) {
+	int64_t i;
+	double lo = (double)p[0], hi = lo;
+	for (i = 1; i < n3; i++) {
+		double v = (double)p[i];
+		if (isnan(v)) { lo = hi = (double)NAN; break; }   /* NaN propagates within an echo */
+		if (v < lo) lo = v;
+		if (v > hi) hi = v;
+	}
+	*mn = lo; *mx = hi;
+}
+
+static void md_apply_phase_scale(float *p, int64_t n, double mn, double mx) {
+	double slope = MD_2PI / (mx - mn), inter = -M_PI - mn * slope;
+	int64_t i;
 	for (i = 0; i < n; i++) p[i] = (float)((double)p[i] * slope + inter);
+}
+
+/* ================== Gap 1: graded regularisation at the brain border ========================
+ *
+ * The border of the brain has little signal, so phase estimates there are unreliable -- noisy, and
+ * prone to gross errors rather than small ones.  Those voxels still matter, because distortion is
+ * largest exactly where the field gradients are steepest, which is near tissue-air boundaries.
+ * Discarding them is not an option, and treating them like well-conditioned interior voxels lets
+ * their noise into the field map.  So the border needs HEAVIER regularisation than the interior,
+ * in both space and time.  That is the whole idea.
+ *
+ * The reference's specific structure is explicitly NOT a specification to match -- its component
+ * counts and smoothing width "were chosen empirically on our data and are not principled
+ * constants" -- so the numbers below are ours, and are judged on the behaviour rather than on
+ * agreement.  Recorded in medic_bench's tools/MILESTONES.md with the search that chose them.
+ *
+ * MEASURED first, before any of this was written (tools/m6_spectrum.py), because it resolves an
+ * open question in the manifest -- warpkit's output "retains a broadband residual past component
+ * 10 whose origin is unresolved".  Splitting the reference's own field map by its own tiers:
+ *
+ *     core   (tier 2, always in mask)   0.78 % of energy past component 10   <- rank 10
+ *     border (tier 1, always in mask)  28.3  % of energy past component 10   <- not rank 10
+ *
+ * on echo2, and 0.63 % / 28.5 % on echo3.  The interior IS the rank-10 object the paper describes;
+ * the border is a differently-derived reconstruction, and it is the whole of the residual.  A
+ * second, smaller contributor is the varying support: voxels in some frames' masks and not others
+ * carry 40.9 % past component 10, falling to 22.1 % when the support pattern alone is removed.
+ * The question is answered.
+ *
+ * Three structural changes from the plain filter: the Gram matrix is restricted to voxels with
+ * constant support, so the zero pattern of the varying-support voxels cannot contaminate the
+ * temporal basis; write-back is gated per FRAME, so a voxel outside its own frame's mask is left
+ * unprojected; and border voxels are spatially smoothed and then reconstructed from far fewer
+ * temporal components than the interior. */
+
+#define MD_BORDER_RANK 3        /* border components; the interior keeps --rank (default 10) */
+#define MD_BORDER_FWHM 4.0f     /* mm, spatial smoothing applied to the border only */
+
+static int md_lowrank_border(const md_ctx *c, float *F, int64_t nvox, int T, int rank,
+	const uint8_t *masks, int border_rank, float fwhm) {
+	double *G = NULL, *V = NULL, *w = NULL, *P = NULL, *Pb = NULL;
+	float *vol = NULL, *den = NULL, *B = NULL, *Bp = NULL;
+	uint8_t *support = NULL;
+	int64_t *bidx = NULL;
+	int64_t v, nb = 0, nsup = 0;
+	int i, j, k, r, rb, t, rc = 1;
+	float sig = fwhm / 2.354820045f;
+
+	if (rank <= 0 || T <= 1 || rank >= T) return 0;
+	if (T > MD_MAX_FRAMES_DENSE) {
+		MD_ERR("the low-rank filter needs a dense %dx%d matrix; %d frames exceeds this solver's "
+			"%d-frame ceiling (use --rank 0 to skip it)\n", T, T, T, MD_MAX_FRAMES_DENSE);
+		return 1;
+	}
+	{	size_t bytes;
+		if (nii_mul_size((size_t)T, (size_t)T, &bytes) || nii_mul_size(bytes, sizeof(double), &bytes)) {
+			MD_ERR("the %dx%d low-rank matrices exceed this build's address space\n", T, T);
+			return 1;
+		}
+	}
+	support = (uint8_t *)malloc((size_t)nvox);
+	G = (double *)calloc((size_t)T * T, sizeof(double));
+	V = (double *)malloc((size_t)T * T * sizeof(double));
+	w = (double *)malloc((size_t)T * sizeof(double));
+	P = (double *)malloc((size_t)T * T * sizeof(double));
+	Pb = (double *)malloc((size_t)T * T * sizeof(double));
+	if (!support || !G || !V || !w || !P || !Pb) { MD_ERR("out of memory in the low-rank filter\n"); goto done; }
+
+	/* Constant-support voxels, split by STABLE tier membership.
+	 *
+	 * Reading the tier from frame 0 was wrong, and not rarely: MEASURED on the benchmark data,
+	 * 2991 of 99008 constant-support voxels on echo2 (3.0%, and 2698 of 99441 on echo3) sit in
+	 * the core in some frames and the ring in others while staying in-mask throughout -- the
+	 * ring's inner boundary moves as the brain mask does.  A frame-0 rule gave those voxels the
+	 * aggressive border reconstruction in frames where they are core, and the interior projection
+	 * in frames where they are ring.
+	 *
+	 * They are not projected per-frame-tier either, which would splice two different
+	 * reconstructions into one timeseries and reintroduce exactly the broadband content this
+	 * stage exists to remove.  Each voxel gets ONE tier for the whole run, by MAJORITY over
+	 * frames.
+	 *
+	 * Majority rather than "core in every frame": the stricter rule sends a voxel that is core in
+	 * 168 frames and ring in 2 to the aggressive border reconstruction for all 170, which
+	 * over-regularises it.  Measured on echo2 against the reference's core tier, p99 is 3.45 Hz
+	 * under the old (wrong) frame-0 rule, 4.85 Hz under the strict rule and 3.79 Hz under this
+	 * one -- so the correctness fix costs ~0.34 Hz, not 1.4 Hz.  The border metric is unmoved
+	 * either way (median temporal sd 3.03 -> 0.92 Hz). */
+	for (v = 0; v < nvox; v++) {
+		int all = 1, ncore = 0;
+		for (t = 0; t < T; t++) {
+			uint8_t m = masks[(int64_t)t * nvox + v];
+			if (!m) { all = 0; break; }
+			if (m == 2) ncore++;
+		}
+		support[v] = (uint8_t)(all ? (2 * ncore > T ? 2 : 1) : 0);   /* 2 core, 1 border, 0 out */
+		if (all) nsup++;
+	}
+	for (v = 0; v < nvox; v++) if (support[v] == 1) nb++;
+	if (nsup < 2) { rc = 0; goto done; }           /* nothing to build a basis from */
+	{	size_t bytes;
+		if (nb > 0 && (nii_mul_size((size_t)nb, (size_t)T, &bytes) ||
+				nii_mul_size(bytes, sizeof(float), &bytes))) {
+			MD_ERR("the border scratch exceeds this build's address space\n");
+			goto done;
+		}
+	}
+
+	for (i = 0; i < T; i++) for (j = i; j < T; j++) {
+		double s = 0.0;
+		const float *a = F + (int64_t)i * nvox, *b = F + (int64_t)j * nvox;
+		for (v = 0; v < nvox; v++) if (support[v]) s += (double)a[v] * (double)b[v];   /* 1 or 2 */
+		G[(size_t)i * T + j] = G[(size_t)j * T + i] = s;
+	}
+	md_jacobi_eigh(G, V, w, T);
+	r = rank < T ? rank : T;
+	for (k = 0; k < r; k++) if (!(w[k] > w[0] * 1e-24) || !(w[k] > 0.0)) { r = k; break; }
+	if (r <= 0) { rc = 0; goto done; }
+	rb = border_rank < r ? border_rank : r;
+	if (rb < 1) rb = 1;          /* a non-positive border rank would zero the ring outright */
+	for (i = 0; i < T; i++) for (j = 0; j < T; j++) {
+		double s = 0.0, sb = 0.0;
+		for (k = 0; k < r; k++) { double p = V[(size_t)i * T + k] * V[(size_t)j * T + k];
+			s += p; if (k < rb) sb += p; }
+		P[(size_t)i * T + j] = s;
+		Pb[(size_t)i * T + j] = sb;
+	}
+
+	/* --- the border: spatially smooth each frame, then reconstruct from rb components ------- */
+	if (nb > 0) {
+		vol = (float *)malloc((size_t)nvox * sizeof(float));
+		den = (float *)malloc((size_t)nvox * sizeof(float));
+		bidx = (int64_t *)malloc((size_t)nb * sizeof(int64_t));
+		B = (float *)malloc((size_t)nb * T * sizeof(float));
+		Bp = (float *)malloc((size_t)nb * T * sizeof(float));
+		if (!vol || !den || !bidx || !B || !Bp) { MD_ERR("out of memory in the border filter\n"); goto done; }
+		{	int64_t q = 0;
+			for (v = 0; v < nvox; v++) if (support[v] == 1) bidx[q++] = v;
+		}
+		for (t = 0; t < T; t++) {
+			/* NORMALISED blur -- smooth value x mask and mask separately, then divide.  A plain
+			   blur would pull the zeros outside the mask into the ring, and the ring is by
+			   construction the outermost voxels, so every one of them would be dragged toward
+			   zero by its own mask boundary.  Same trick reface.c uses inside its shell. */
+			const uint8_t *mt = masks + (int64_t)t * nvox;
+			for (v = 0; v < nvox; v++) {
+				den[v] = mt[v] ? 1.0f : 0.0f;
+				vol[v] = mt[v] ? F[(int64_t)t * nvox + v] : 0.0f;
+			}
+			if (nifti_smooth_gauss_f32(vol, c->nx, c->ny, c->nz, 1,
+					c->tmpl->dx, c->tmpl->dy, c->tmpl->dz, sig, sig, sig, -6.0f) ||
+				nifti_smooth_gauss_f32(den, c->nx, c->ny, c->nz, 1,
+					c->tmpl->dx, c->tmpl->dy, c->tmpl->dz, sig, sig, sig, -6.0f)) {
+				MD_ERR("the border smoothing failed\n"); goto done;
+			}
+			for (v = 0; v < nb; v++) {
+				int64_t o = bidx[v];
+				B[v * T + t] = (den[o] > 1e-6f) ? (float)((double)vol[o] / (double)den[o])
+											    : F[(int64_t)t * nvox + o];
+			}
+		}
+		for (v = 0; v < nb; v++) {
+			const float *src = B + v * T;
+			float *dst = Bp + v * T;
+			for (i = 0; i < T; i++) {
+				double s = 0.0;
+				for (j = 0; j < T; j++) s += Pb[(size_t)i * T + j] * (double)src[j];
+				dst[i] = (float)s;
+			}
+		}
+	}
+
+	/* --- the interior: the ordinary rank-r projection, written back per frame --------------- */
+	{
+		int64_t chunk;
+		const int64_t CH = 1 << 16;
+		int oom = 0;
+#ifdef _OPENMP
+		#pragma omp parallel reduction(|:oom)
+#endif
+		{
+			float *tmp = (float *)malloc((size_t)(CH < nvox ? CH : nvox) * T * sizeof(float));
+			double *col = (double *)malloc((size_t)T * sizeof(double));
+			if (!tmp || !col) oom = 1;
+#ifdef _OPENMP
+			#pragma omp for schedule(static)
+#endif
+			for (chunk = 0; chunk < nvox; chunk += CH) {
+				int64_t n = (nvox - chunk < CH) ? (nvox - chunk) : CH, q;
+				int ii, jj;
+				if (oom) continue;
+				for (ii = 0; ii < T; ii++)
+					memcpy(tmp + (int64_t)ii * n, F + (int64_t)ii * nvox + chunk, (size_t)n * sizeof(float));
+				for (q = 0; q < n; q++) {
+					int64_t vv = chunk + q;
+					double mu = 0.0;
+					int nin = 0;
+					if (support[vv] != 2) continue;        /* border and unstable handled elsewhere */
+					/* Out-of-mask frames are IMPUTED with the voxel's own in-mask mean before
+					   projecting, and left untouched afterwards.  Feeding the gated zeros to the
+					   projection instead would drag a voxel that is in-mask in only a few frames
+					   toward zero in the frames where it IS valid -- the projection mixes across
+					   time, so a structural zero is not neutral there the way it is in a
+					   per-voxel operation. */
+					for (ii = 0; ii < T; ii++)
+						if (masks[(int64_t)ii * nvox + vv]) { mu += (double)tmp[(int64_t)ii * n + q]; nin++; }
+					if (nin < 1) continue;
+					mu /= (double)nin;
+					for (ii = 0; ii < T; ii++)
+						col[ii] = masks[(int64_t)ii * nvox + vv] ? (double)tmp[(int64_t)ii * n + q] : mu;
+					for (ii = 0; ii < T; ii++) {
+						double s = 0.0;
+						/* Write-back gated PER FRAME: a voxel outside its own frame's mask keeps
+						   its unfiltered value, which is the third of Gap 1's structural
+						   changes. */
+						if (!masks[(int64_t)ii * nvox + vv]) continue;
+						for (jj = 0; jj < T; jj++) s += P[(size_t)ii * T + jj] * col[jj];
+						F[(int64_t)ii * nvox + vv] = (float)s;
+					}
+				}
+			}
+			free(tmp); free(col);
+		}
+		if (oom) { MD_ERR("out of memory in the low-rank filter; some voxels may be unfiltered\n"); goto done; }
+	}
+	/* Border write-back last, and gated per frame like the interior. */
+	for (v = 0; v < nb; v++)
+		for (t = 0; t < T; t++)
+			if (masks[(int64_t)t * nvox + bidx[v]]) F[(int64_t)t * nvox + bidx[v]] = Bp[v * T + t];
+	rc = 0;
+done:
+	free(support); free(G); free(V); free(w); free(P); free(Pb); free(vol); free(den);
+	free(bidx); free(B); free(Bp);
+	return rc;
+}
+
+/* ===================== Gap 3(b): global 2*pi branch selection ===============================
+ *
+ * MCPC-3D-S recovers the coil phase offset by extrapolating the unwrapped echo-1-minus-echo-0
+ * phase difference back to t = 0.  The unwrapper only restores turns BETWEEN neighbouring voxels,
+ * so the absolute turn count of that difference is undetermined and every integer N gives a
+ * self-consistent (offset, field) pair -- a ladder of candidates one wrap of field apart.  ROMEO's
+ * global correction picks the rung whose field is smallest, which is right whenever the bulk field
+ * sits well inside the half-wrap 1/(2*dTE) and is a coin toss when it does not.  Because the
+ * choice is remade on every frame from that frame's own noisy median, a subject whose field sits
+ * near the boundary gets ISOLATED FRAMES displaced by exactly one wrap: a time series that is
+ * stable to a fraction of a hertz across most frames and a full wrap out on a scattered subset.
+ *
+ * No statistic computed from the phase can rank the candidates against each other -- for evenly
+ * spaced echoes they all predict the same recorded phase.  What CAN be detected is a candidate
+ * that is not a rung at all: the offset comes from one unwrapping and the field from a second, so
+ * when the first tips, the pipeline pairs an offset from one rung with a field from another, and
+ * the line fitted through the offset-removed echoes no longer passes through the origin.  Its
+ * INTERCEPT is that signature, and it is a global constant, identical at every echo.
+ *
+ * So the procedure is a filter followed by a rule, and the order is load-bearing: the intercept
+ * DISCARDS candidates the data contradicts, and only among the survivors does the smallest-field
+ * prior choose.  The prior can therefore never override the evidence.
+ *
+ * Specification: MEDIC_GAPS.md Gap 3, and warpkit's notes/phase-offset-ambiguities.pdf section 8
+ * (an approved theory reference; no warpkit source was read).  The reference logs its own
+ * per-frame decision under --debug -- "branch selection: n=+0 (intercepts={...})" -- which is what
+ * this was validated against.
+ *
+ * Two details are easy to get wrong and both are stated in the note.  The intercept reduction is a
+ * PLAIN median, because it estimates one global constant; the tie-break reduction is a median
+ * WEIGHTED BY THE SECOND ECHO'S SQUARED MAGNITUDE, because it summarises a wide right-skewed
+ * distribution whose tails come from air-tissue interfaces, and the field is read from a
+ * difference whose noise is dominated by the weaker echo.  A mean, an M-estimator, an argmax, or
+ * m0^2 weighting all flip between consecutive frames. */
+
+/* Median of `n` floats, destructive.  Quickselect, no comparator -- medic.c is in the wasm build
+   and emscripten's qsort dispatches its comparator through call_indirect (AGENTS.md). */
+static float md_select_kth(float *v, int64_t n, int64_t k) {
+	int64_t lo = 0, hi = n - 1;
+	while (lo < hi) {
+		float p = v[(lo + hi) / 2], t;
+		int64_t i = lo, j = hi;
+		while (i <= j) {
+			while (v[i] < p) i++;
+			while (v[j] > p) j--;
+			if (i <= j) { t = v[i]; v[i] = v[j]; v[j] = t; i++; j--; }
+		}
+		if (k <= j) hi = j;
+		else if (k >= i) lo = i;
+		else return v[k];
+	}
+	return v[lo];
+}
+
+static double md_median(float *v, int64_t n) {
+	if (n < 1) return (double)NAN;
+	if (n & 1) return (double)md_select_kth(v, n, n / 2);
+	{	/* Even n: the average of the two central order statistics.  The second selection runs
+		   over the already-partitioned lower half, so it is cheap. */
+		double a = (double)md_select_kth(v, n, n / 2);
+		double b = (double)md_select_kth(v, n / 2, n / 2 - 1);
+		return 0.5 * (a + b);
+	}
+}
+
+/* Weighted median: the value at which the cumulative weight, over voxels sorted by value, first
+   reaches half the total.  Heapsort on (value, weight) pairs -- again comparator-free.  Only
+   reached when more than one candidate survives the filter, which is the uncommon case. */
+static void md_wsort(float *v, float *w, int64_t n) {
+	int64_t start, end;
+	for (start = n / 2 - 1; start >= 0; start--) {
+		int64_t root = start;
+		for (;;) {
+			int64_t child = 2 * root + 1, sw;
+			if (child >= n) break;
+			if (child + 1 < n && v[child] < v[child + 1]) child++;
+			if (!(v[root] < v[child])) break;
+			{ float t = v[root]; v[root] = v[child]; v[child] = t;
+			  t = w[root]; w[root] = w[child]; w[child] = t; }
+			sw = child; root = sw;
+		}
+	}
+	for (end = n - 1; end > 0; end--) {
+		int64_t root = 0;
+		{ float t = v[0]; v[0] = v[end]; v[end] = t; t = w[0]; w[0] = w[end]; w[end] = t; }
+		for (;;) {
+			int64_t child = 2 * root + 1;
+			if (child >= end) break;
+			if (child + 1 < end && v[child] < v[child + 1]) child++;
+			if (!(v[root] < v[child])) break;
+			{ float t = v[root]; v[root] = v[child]; v[child] = t;
+			  t = w[root]; w[root] = w[child]; w[child] = t; }
+			root = child;
+		}
+	}
+}
+
+static double md_wmedian(float *v, float *w, int64_t n) {
+	double tot = 0.0, cum = 0.0;
+	int64_t i;
+	if (n < 1) return (double)NAN;
+	md_wsort(v, w, n);
+	for (i = 0; i < n; i++) tot += (double)w[i];
+	if (!(tot > 0.0)) return (double)v[n / 2];
+	for (i = 0; i < n; i++) { cum += (double)w[i]; if (cum >= 0.5 * tot) return (double)v[i]; }
+	return (double)v[n - 1];
+}
+
+/* Choose the branch N in {-1, 0, +1} to add to the unwrapped phase difference `duw`.
+ *
+ * `omega` is the generous unwrapping mask (binary), `omegac` the conservative interior mask used
+ * for both reductions.  Returns 0 on success with *nsel set; nonzero on allocation failure.
+ * A degenerate or unmeasurable case leaves *nsel = 0, which changes nothing -- a failed fit is
+ * not evidence for any candidate. */
+static int md_branch_select(const md_ctx *c, const float *phase, const float *mag,
+	const float *duw, const romeo_opts *ro, const uint8_t *omega, const uint8_t *omegac,
+	int *nsel, double *scores) {
+	const int64_t n3 = c->n3;
+	const double dTE = c->TEs[1] - c->TEs[0];           /* ms */
+	const double t0 = c->TEs[0] * 1e-3, t1 = c->TEs[1] * 1e-3, dt = t1 - t0;   /* s */
+	const double k = c->TEs[0] / dTE;
+	double delta, sigma, cN[3], best = 0.0;
+	float *psi = NULL, *buf = NULL, *fld = NULL, *wgt = NULL;
+	int64_t i, nc = 0, j;
+	int n, rc = 1, cons[3], ncons = 0;
+	romeo_opts o = *ro;
+	double TEs2[2];
+
+	*nsel = 0;
+	if (scores) scores[0] = scores[1] = scores[2] = (double)NAN;
+	if (c->neco < 2 || !(fabs(dTE) > 1e-12)) return 0;
+	/* delta = |W(2*pi*k)| is the analytic separation between neighbouring candidates' offsets.
+	   When TE0/dTE is an integer the offset does not move at all, the candidates are
+	   indistinguishable, and no choice can change the output.  Tested against a tolerance, not
+	   exact zero: W(2*pi*k) evaluates to a rounding residue near 1e-16 rather than to zero. */
+	delta = fabs((double)md_wrapf(MD_2PI * k));
+	if (!(delta > 1e-9)) return 0;
+
+	for (i = 0, nc = 0; i < n3; i++) if (omegac[i]) nc++;
+	if (nc < 1) return 0;                                /* no interior to reduce over */
+
+	psi = (float *)malloc((size_t)2 * n3 * sizeof(float));
+	buf = (float *)malloc((size_t)nc * sizeof(float));
+	fld = (float *)malloc((size_t)3 * nc * sizeof(float));
+	wgt = (float *)malloc((size_t)nc * sizeof(float));
+	if (!psi || !buf || !fld || !wgt) goto done;
+
+	TEs2[0] = c->TEs[0]; TEs2[1] = c->TEs[1];
+	o.nTE = 2; o.TEs[0] = TEs2[0]; o.TEs[1] = TEs2[1];
+	o.te_epi = 0; o.template_echo = 1; o.individual = 0;
+	o.correctglobal = 1;   /* the second imposition of the global rule; see the note, section 5 */
+
+	for (n = -1; n <= 1; n++) {
+		double sl;
+		for (i = 0; i < n3; i++) {
+			float off = md_wrapf((double)phase[i] - k * ((double)duw[i] + MD_2PI * n));
+			psi[i] = md_wrapf((double)phase[i] - (double)off);
+			psi[n3 + i] = md_wrapf((double)phase[n3 + i] - (double)off);
+		}
+		if (romeo_unwrap_frame(psi, mag, 2, c->nx, c->ny, c->nz, 2, TEs2, &o, omega, NULL))
+			goto done;
+		for (i = 0, j = 0; i < n3; i++) {
+			if (!omegac[i]) continue;
+			sl = ((double)psi[n3 + i] - (double)psi[i]) / dt;      /* rad/s */
+			buf[j] = (float)((double)psi[i] - sl * t0);            /* intercept at t = 0 */
+			fld[(n + 1) * nc + j] = (float)(sl / MD_2PI);          /* Hz */
+			j++;
+		}
+		cN[n + 1] = fabs(md_median(buf, nc));
+		if (scores) scores[n + 1] = cN[n + 1];
+	}
+
+	/* sigma = min(max_N c_N, delta).  Taking the SMALLER of the observed and analytic scales makes
+	   the consistency test harder to pass, which biases the procedure toward leaving N = 0 -- the
+	   safe direction, since a failed fit is not evidence for any candidate. */
+	sigma = cN[0];
+	if (cN[1] > sigma) sigma = cN[1];
+	if (cN[2] > sigma) sigma = cN[2];
+	if (delta < sigma) sigma = delta;
+	if (!(sigma > 0.0) || !(sigma <= DBL_MAX)) { rc = 0; goto done; }
+
+	for (n = -1; n <= 1; n++) if (cN[n + 1] < 0.5 * sigma) cons[ncons++] = n;
+	if (ncons == 1) *nsel = cons[0];
+	else if (ncons > 1) {
+		/* A tie: the survivors are indistinguishable to the data, so the prior decides -- the
+		   smallest |field|, by the m1^2-weighted median over the interior mask. */
+		int b;
+		for (b = 0; b < ncons; b++) {
+			double f;
+			/* md_wmedian SORTS BOTH ARRAYS, so the weights have to be rebuilt for every
+			   survivor -- reusing them would hand the next one a permutation of itself. */
+			for (i = 0, j = 0; i < n3; i++)
+				if (omegac[i]) { wgt[j] = (float)((double)mag[n3 + i] * (double)mag[n3 + i]); j++; }
+			for (j = 0; j < nc; j++) buf[j] = fld[(cons[b] + 1) * nc + j];
+			f = fabs(md_wmedian(buf, wgt, nc));
+			if (b == 0 || f < best) { best = f; *nsel = cons[b]; }
+		}
+	}
+	rc = 0;
+done:
+	free(psi); free(buf); free(fld); free(wgt);
+	return rc;
 }
 
 /* MCPC-3D-S monopolar phase offset (paper §2.1.2 Eq. 4).
@@ -633,7 +1388,7 @@ static void md_rescale_phase(float *p, int64_t n) {
  *
  * `phase` (n3*neco) is corrected IN PLACE; `offset_out` may be NULL. */
 static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const romeo_opts *ro,
-	const uint8_t *mask, float *offset_out) {
+	const uint8_t *mask, const uint8_t *omegac, double *blog, float *offset_out) {
 	const int64_t n3 = c->n3;
 	float *hipp = NULL, *hipm = NULL;
 	double dTE = c->TEs[1] - c->TEs[0], k;
@@ -662,11 +1417,28 @@ static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const rom
 		double te1 = fabs(dTE);
 		romeo_opts o = *ro;
 		o.nTE = 1; o.TEs[0] = te1; o.te_epi = 0; o.template_echo = 1;
-		o.individual = 0; o.correctglobal = 0;
+		o.individual = 0;
+		/* Gap 3(a): ROMEO's own global correction, ON at BOTH unwrap calls -- this one and the
+		   multi-echo unwrap.  It removes a whole-volume 2*pi offset that is otherwise left
+		   wherever the region growing happens to seed, which makes the field's absolute level
+		   depend on the mask.  --branch-correction 0 restores the previous behaviour. */
+		o.correctglobal = c->branch ? 1 : 0;
 		if (romeo_unwrap_frame(hipp, hipm, 1, c->nx, c->ny, c->nz, 1, &te1, &o, mask, NULL)) {
 			MD_ERR("ROMEO failed while unwrapping the MCPC-3D-S phase difference\n");
 			goto done;
 		}
+	}
+	if (c->branch && omegac) {
+		/* Gap 3(b): choose the 2*pi branch of the unwrapped difference before extrapolating it
+		   back to t = 0.  Applied here, to `hipp`, so the offset below is computed from the
+		   corrected difference exactly as it would have been from an uncorrected one. */
+		int nsel = 0;
+		if (md_branch_select(c, phase, mag, hipp, ro, mask, omegac, &nsel, blog ? blog + 1 : NULL)) {
+			MD_ERR("out of memory during 2*pi branch selection\n");
+			goto done;
+		}
+		if (blog) blog[0] = (double)nsel;
+		if (nsel) for (i = 0; i < n3; i++) hipp[i] = (float)((double)hipp[i] + MD_2PI * nsel);
 	}
 	for (i = 0; i < n3; i++) {
 		float off = md_wrapf((double)phase[i] - k * (double)hipp[i]);
@@ -678,6 +1450,80 @@ static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const rom
 done:
 	free(hipp); free(hipm);
 	return rc;
+}
+
+/* ============== Gap 4: the intra-frame per-echo global 2*pi offset =========================
+ *
+ * A missing STAGE, not a wrong one: it runs immediately after the multi-echo unwrap of a frame and
+ * before anything temporal.  For each echo n = 1 .. N-1 in increasing order, predict that echo's
+ * phase from the echoes ALREADY CORRECTED with a through-origin magnitude-squared-weighted fit,
+ * round the discrepancy to whole turns, and add ONE integer -- the mode over the mask -- to the
+ * entire echo volume, in and out of mask alike.
+ *
+ * Do not confuse this with the temporal correction's echo handling.  That one applies PER-VOXEL
+ * integers, at a different stage; this one applies a single global integer per echo per frame.
+ * Both exist in the reference and they are not redundant: without this, the temporal stage
+ * inherits per-echo branch errors and has to absorb them per voxel, which it does less cleanly.
+ *
+ * Two-echo data can only ever correct echo 1, and then the fit reduces to phi_0 * TE_1/TE_0, so
+ * the stage is nearly trivial there; three or more echoes are where it earns its place. */
+
+/* Mode of the per-voxel turn counts, ties resolving to the SMALLEST value.  A bounded histogram:
+   the values are tiny by construction, and a voxel whose fit is degenerate can produce a wild one,
+   which must not be allowed to index memory. */
+#define MD_ECHO_KMAX 64
+
+static int md_mode_int(const int *hist, int kmax) {
+	/* bestc STARTS AT 0, not -1.  With -1 the first bin wins on an empty histogram and the
+	   function returns -kmax, which would then be applied as a 2*pi*-64 shift to a whole echo --
+	   on an empty mask, silently, at exit 0.  Starting at 0 makes "nothing counted" return 0,
+	   which is the no-op. */
+	int best = 0, bestc = 0, k;
+	for (k = -kmax; k <= kmax; k++) {          /* ascending, strict >, so ties keep the smallest */
+		int cnt = hist[k + kmax];
+		if (cnt > bestc) { bestc = cnt; best = k; }
+	}
+	return best;
+}
+
+/* Returns the number of echoes it actually moved, so the caller can report a rare event without
+   printing from inside a parallel frame loop. */
+static int md_echo_offset(const md_ctx *c, float *phase, const float *mag, const uint8_t *bm) {
+	const int64_t n3 = c->n3;
+	int hist[2 * MD_ECHO_KMAX + 1];
+	int64_t i;
+	int e, f, k, moved = 0;
+	for (e = 1; e < c->neco; e++) {
+		float *pe = phase + (int64_t)e * n3;
+		double te = c->TEs[e] * 1e-3;
+		int mode;
+		for (k = 0; k < 2 * MD_ECHO_KMAX + 1; k++) hist[k] = 0;
+		for (i = 0; i < n3; i++) {
+			double num = 0.0, den = 0.0, pred, d;
+			if (!bm[i]) continue;
+			for (f = 0; f < e; f++) {
+				double t = c->TEs[f] * 1e-3;
+				double w = (double)mag[(int64_t)f * n3 + i];
+				double w2 = w * w;
+				num += w2 * t * (double)phase[(int64_t)f * n3 + i];
+				den += w2 * t * t;
+			}
+			if (!(den > 0.0)) continue;
+			pred = (num / den) * te;
+			d = (pred - (double)pe[i]) / MD_2PI;
+			/* Guard the DOUBLE before the cast: a degenerate fit can make this non-finite, and
+			   (int)NaN is undefined. */
+			if (!(d >= -(double)MD_ECHO_KMAX && d <= (double)MD_ECHO_KMAX)) continue;
+			k = (int)nearbyint(d);
+			if (k < -MD_ECHO_KMAX || k > MD_ECHO_KMAX) continue;
+			hist[k + MD_ECHO_KMAX]++;
+		}
+		mode = md_mode_int(hist, MD_ECHO_KMAX);
+		if (!mode) continue;
+		for (i = 0; i < n3; i++) pe[i] = (float)((double)pe[i] + MD_2PI * mode);
+		moved++;
+	}
+	return moved;
 }
 
 /* Magnitude-weighted regression through the origin (paper §3.4; measured exact, manifest §3.2).
@@ -701,9 +1547,11 @@ static void md_regress(const md_ctx *c, const float *phase, const float *mag, fl
 
 /* Temporal 2*pi consistency correction (paper §2.1.3, Eqs. 5-6).
  *
- * Frames are grouped by magnitude correlation >= MD_CORR_THRESH on the FIRST echo; each frame's
- * first-echo unwrapped phase is moved to the 2*pi branch nearest its group mean, and every later
- * echo to the branch predicted by ALL previously corrected echoes.
+ * Frames are grouped by correlation STRICTLY ABOVE MD_CORR_THRESH of the FIRST echo's UNWRAPPED
+ * PHASE, over that frame's own brain mask eroded by one (Gap 5 -- it used to be the first echo's
+ * MAGNITUDE over the whole volume, which is a different question and saturates near 1).  Each
+ * frame's first-echo unwrapped phase is then moved to the 2*pi branch nearest its group mean, and
+ * every later echo to the branch predicted by ALL previously corrected echoes.
  *
  * That prediction is the paper's Eq. 6: a through-origin fit over the echoes already corrected,
  *
@@ -722,10 +1570,11 @@ static void md_regress(const md_ctx *c, const float *phase, const float *mag, fl
  * parameter here that the black box could not be made to reveal.
  *
  * `uw` and `mag` are neco * nframe volumes, echo-major within frame. */
-static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8_t *masks) {
+static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8_t *masks,
+	const uint8_t *grp) {
 	const int64_t n3 = c->n3;
 	const int T = c->nframe;
-	double *mu = NULL, *sd = NULL, *corr = NULL;
+	double *corr = NULL;
 	float *acc = NULL, *snap = NULL, *allacc = NULL;
 	int32_t *cnt = NULL, *allcnt = NULL;   /* per-voxel count of frames valid at that voxel */
 	int t, u, e, rc = 1;
@@ -739,49 +1588,117 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 		MD_ERR("frame count %d is too large for the temporal correction on this build\n", T);
 		return 1;
 	}
-	mu = (double *)malloc((size_t)T * sizeof(double));
-	sd = (double *)malloc((size_t)T * sizeof(double));
 	corr = (double *)malloc((size_t)T * T * sizeof(double));
 	acc = (float *)malloc((size_t)n3 * sizeof(float));
 	cnt = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
 	/* snapshot of every frame's FIRST-echo unwrapped phase, so group means are order-independent */
 	snap = (float *)malloc((size_t)n3 * T * sizeof(float));
-	if (!mu || !sd || !corr || !acc || !snap || !cnt) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
+	if (!corr || !acc || !snap || !cnt) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 	for (t = 0; t < T; t++)
 		memcpy(snap + (int64_t)t * n3, uw + ((int64_t)t * c->neco) * n3, (size_t)n3 * sizeof(float));
 
-	for (t = 0; t < T; t++) {
-		const float *m = mag + (int64_t)t * c->neco * n3;
-		double s = 0.0, s2 = 0.0;
-		for (i = 0; i < n3; i++) s += (double)m[i];
-		mu[t] = s / (double)n3;
-		for (i = 0; i < n3; i++) { double d = (double)m[i] - mu[t]; s2 += d * d; }
-		sd[t] = sqrt(s2);
-	}
+	/* Grouping correlates the UNWRAPPED FIRST-ECHO PHASE, over frame t's own brain mask eroded
+	 * by one, and thresholds STRICTLY above MD_CORR_THRESH (Gap 5).
+	 *
+	 * It used to correlate the first echo's MAGNITUDE over the whole volume including background.
+	 * Both halves of that were wrong.  The correction exists to detect frames whose UNWRAPPING
+	 * SOLUTION is consistent, and phase correlation measures that directly; magnitude correlation
+	 * is a proxy that will happily group frames whose unwrapping diverged.  And over the whole
+	 * volume it is dominated by static background structure common to every frame, so it saturates
+	 * near 1 and groups almost everything -- the old comment on the all-frames fast path, that "a
+	 * quiescent run has all magnitudes correlating well above 0.98", was that saturation being
+	 * mistaken for a property of the data.
+	 *
+	 * The reduction is over frame t's mask, not over the pair's, so `corr` is NOT SYMMETRIC and
+	 * the old fill-by-symmetry shortcut is gone.  That doubles the work; the index list makes the
+	 * inner loop sequential over a compacted array instead of a masked scatter, which pays most of
+	 * it back. */
+	{
+		int oom = 0;
 #ifdef _OPENMP
-	#pragma omp parallel for schedule(dynamic)
+		#pragma omp parallel reduction(| : oom)
 #endif
-	for (t = 0; t < T; t++) {
-		int v;
-		for (v = 0; v < T; v++) {
-			const float *a = mag + (int64_t)t * c->neco * n3;
-			const float *b = mag + (int64_t)v * c->neco * n3;
-			double s = 0.0;
-			int64_t q;
-			if (v < t) { corr[(size_t)t * T + v] = 0.0; continue; }   /* filled by symmetry below */
-			for (q = 0; q < n3; q++) s += ((double)a[q] - mu[t]) * ((double)b[q] - mu[v]);
-			corr[(size_t)t * T + v] = (sd[t] > 0.0 && sd[v] > 0.0) ? s / (sd[t] * sd[v]) : 0.0;
+		{
+			int32_t *ix = (int32_t *)malloc((size_t)n3 * sizeof(int32_t));
+			uint8_t *bm = (uint8_t *)malloc((size_t)2 * n3);
+			int tt;
+			if (!ix || !bm) oom = 1;
+#ifdef _OPENMP
+			#pragma omp for schedule(dynamic)
+#endif
+			for (tt = 0; tt < T; tt++) {
+				int64_t q, nt = 0;
+				int v;
+				const float *a;
+				if (oom) continue;
+				if (grp) {
+					memcpy(bm, grp + (int64_t)tt * n3, (size_t)n3);
+					md_morph(bm, c->nx, c->ny, c->nz, MD_ERODE_GROUP, 0, bm + n3);
+					for (q = 0; q < n3; q++) if (bm[q]) ix[nt++] = (int32_t)q;
+				} else if (masks) {
+					for (q = 0; q < n3; q++) if (masks[(int64_t)tt * n3 + q]) ix[nt++] = (int32_t)q;
+				} else {
+					for (q = 0; q < n3; q++) ix[nt++] = (int32_t)q;
+				}
+				a = snap + (int64_t)tt * n3;
+				for (v = 0; v < T; v++) {
+					const float *b = snap + (int64_t)v * n3;
+					double sa = 0.0, sb = 0.0, sab = 0.0, saa = 0.0, sbb = 0.0, na = (double)nt;
+					double ca, cb, cab;
+					if (nt < 2) { corr[(size_t)tt * T + v] = (tt == v) ? 1.0 : 0.0; continue; }
+					for (q = 0; q < nt; q++) {
+						double x = (double)a[ix[q]], y = (double)b[ix[q]];
+						sa += x; sb += y; sab += x * y; saa += x * x; sbb += y * y;
+					}
+					ca = saa - sa * sa / na;
+					cb = sbb - sb * sb / na;
+					cab = sab - sa * sb / na;
+					corr[(size_t)tt * T + v] = (ca > 0.0 && cb > 0.0) ? cab / sqrt(ca * cb) : 0.0;
+				}
+			}
+			free(ix); free(bm);
 		}
+		if (oom) { MD_ERR("out of memory in the temporal correction\n"); goto done; }
 	}
-	for (t = 0; t < T; t++) for (u = 0; u < t; u++) corr[(size_t)t * T + u] = corr[(size_t)u * T + t];
 
+	{	/* Group sizes are the observable for Gap 5: correlating the unwrapped phase over the
+		   brain instead of the magnitude over the whole volume is supposed to stop the grouping
+		   saturating.  Reported so that "it grouped everything anyway" is visible rather than
+		   assumed. */
+		int lo = T, hi = 0;
+		double tot = 0.0;
+		for (t = 0; t < T; t++) {
+			int ng = 0;
+			for (u = 0; u < T; u++) if (corr[(size_t)t * T + u] > MD_CORR_THRESH) ng++;
+			if (ng < lo) lo = ng;
+			if (ng > hi) hi = ng;
+			tot += ng;
+		}
+		fprintf(stderr, "--medic: temporal grouping at r > %.2f: group size %d..%d (mean %.1f) "
+			"of %d frames\n", MD_CORR_THRESH, lo, hi, tot / T, T);
+		/* A frame alone in its group has no reference to move toward, so if EVERY group is a
+		 * singleton the temporal correction does nothing at all -- silently, since each frame is
+		 * skipped individually.  Worth saying out loud, because there is a configuration that
+		 * reaches it: the grouping correlates UNWRAPPED PHASE, which presupposes that the global
+		 * 2*pi branch has been pinned, so --branch-correction 0 leaves each frame on its own
+		 * branch and the correlation falls below the threshold for every pair. */
+		if (hi < 2)
+			fprintf(stderr, "--medic: every frame is alone in its group, so the temporal 2*pi "
+				"correction has nothing to do and is inactive%s\n",
+				c->branch ? "" : " (--branch-correction 0 is the usual cause: the grouping "
+				"correlates unwrapped phase, which needs the global branch pinned first)");
+	}
 	for (t = 0; t < T; t++) {
 		int ng = 0;
-		for (u = 0; u < T; u++) if (corr[(size_t)t * T + u] >= MD_CORR_THRESH) ng++;
+		/* STRICTLY greater, not >=.  Measured convention (Gap 5); with a saturating magnitude
+		   correlation the difference was invisible, with a phase correlation it is not. */
+		for (u = 0; u < T; u++) if (corr[(size_t)t * T + u] > MD_CORR_THRESH) ng++;
 		if (ng < 2) continue;   /* a frame alone in its group has no reference to move toward */
-		/* Fast path: when EVERY frame is in this frame's group -- the common case, because a
-		   quiescent run has all magnitudes correlating well above 0.98 -- the accumulation is
-		   identical for every t, so compute it once and reuse it.  EXACT, not an approximation:
+		/* Fast path: when EVERY frame is in this frame's group the accumulation is identical for
+		   every t, so compute it once and reuse it.  It still fires on both benchmark datasets --
+		   quiescent resting-state runs whose unwrapping solution genuinely is consistent frame to
+		   frame -- but no longer for the reason the old comment gave, which cited the MAGNITUDE
+		   correlation saturating near 1 as though that were a property of the data.  EXACT, not an approximation:
 		   the same values summed in the same order, hoisted out of the t loop.  Takes the inner
 		   work from O(T * group * n3) (~7.7e9 adds on the 170-frame demo) to O(T * n3). */
 		if (ng == T) {
@@ -793,7 +1710,9 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 				for (u = 0; u < T; u++) {
 					const float *pu = snap + (int64_t)u * n3;
 					const uint8_t *mu2 = masks ? masks + (int64_t)u * n3 : NULL;
-					if (mu2) for (i = 0; i < n3; i++) { allacc[i] += pu[i]; allcnt[i] += mu2[i]; }
+					/* `!= 0`, NOT the mask value -- the mask carries TIERS (see the sibling
+					   accumulation below). */
+					if (mu2) for (i = 0; i < n3; i++) { allacc[i] += pu[i]; allcnt[i] += (mu2[i] != 0); }
 					else     for (i = 0; i < n3; i++) { allacc[i] += pu[i]; allcnt[i]++; }
 				}
 			}
@@ -810,13 +1729,16 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 		for (u = 0; u < T; u++) {
 			const float *p;
 			const uint8_t *mu_ = masks ? masks + (int64_t)u * n3 : NULL;
-			if (corr[(size_t)t * T + u] < MD_CORR_THRESH) continue;
+			if (!(corr[(size_t)t * T + u] > MD_CORR_THRESH)) continue;
 			p = snap + (int64_t)u * n3;   /* snapshot, not the live (partly corrected) series */
 			/* Branchless: the phase is ALREADY zero outside the mask (gated before this
 			   function runs), so the sum needs no test -- only the per-voxel valid count does.
 			   This inner loop runs T * group_size * n3 times (~7.7e9 on the 170-frame demo), so a
 			   per-voxel branch here is worth removing. */
-			if (mu_) for (i = 0; i < n3; i++) { acc[i] += p[i]; cnt[i] += mu_[i]; }
+			/* `!= 0`, NOT the mask value: the mask carries TIERS (2 core, 1 border ring), so
+			   a bare `cnt[i] += mu_[i]` would count every core voxel twice and halve the group
+			   mean. */
+			if (mu_) for (i = 0; i < n3; i++) { acc[i] += p[i]; cnt[i] += (mu_[i] != 0); }
 			else     for (i = 0; i < n3; i++) { acc[i] += p[i]; cnt[i]++; }
 		}
 		}
@@ -832,19 +1754,24 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 				p1[i] = (float)((double)p1[i] + MD_2PI * n);
 			}
 			for (e = 1; e < c->neco; e++) {
-				/* Eq. 6: through-origin fit over the echoes already corrected (0..e-1).
-				   denom is voxel-independent, so hoist it out of the voxel loop. */
+				/* Eq. 6: through-origin fit over the echoes already corrected (0..e-1),
+				   MAGNITUDE-SQUARED WEIGHTED (Gap 5).  The weight makes `denom` voxel-dependent,
+				   so unlike the unweighted form it cannot be hoisted out of the voxel loop. */
 				float *pe = uw + ((int64_t)t * c->neco + e) * n3;
-				double tn = c->TEs[e], denom = 0.0;
+				const float *mg = mag + (int64_t)t * c->neco * n3;
+				double tn = c->TEs[e];
 				int k;
-				for (k = 0; k < e; k++) denom += c->TEs[k] * c->TEs[k];
-				if (!(denom > 0.0)) continue;
 				for (i = 0; i < n3; i++) {
-					double num = 0.0, pred, n;
+					double num = 0.0, den = 0.0, pred, n;
 					if (mt && !mt[i]) continue;      /* keep excluded voxels at their gated zero */
-					for (k = 0; k < e; k++)
-						num += (double)uw[((int64_t)t * c->neco + k) * n3 + i] * c->TEs[k];
-					pred = tn * num / denom;
+					for (k = 0; k < e; k++) {
+						double w = (double)mg[(int64_t)k * n3 + i];
+						double w2t = w * w * c->TEs[k];
+						num += w2t * (double)uw[((int64_t)t * c->neco + k) * n3 + i];
+						den += w2t * c->TEs[k];
+					}
+					if (!(den > 0.0)) continue;
+					pred = tn * num / den;
 					n = nearbyint((pred - (double)pe[i]) / MD_2PI);
 					pe[i] = (float)((double)pe[i] + MD_2PI * n);
 				}
@@ -853,7 +1780,7 @@ static int md_temporal(const md_ctx *c, float *uw, const float *mag, const uint8
 	}
 	rc = 0;
 done:
-	free(mu); free(sd); free(corr); free(acc); free(snap); free(cnt); free(allacc); free(allcnt);
+	free(corr); free(acc); free(snap); free(cnt); free(allacc); free(allcnt);
 	return rc;
 }
 
@@ -861,8 +1788,9 @@ done:
  *
  *     f_undistorted(y) = f_native( y + s * f_undistorted(y) * TRT )     [voxels]
  *
- * solved by direct iteration from zero with LINEAR interpolation and edge clamping -- measured to
- * be the reference's sampling (linear p95 0.041 Hz; cubic 2.05; nearest 4.07).  Note the
+ * solved by direct iteration from zero with LINEAR interpolation -- measured to be the reference's
+ * sampling (linear p95 0.041 Hz; cubic 2.05; nearest 4.07).  The FOV edge is ZERO-PADDED by one
+ * voxel rather than clamped; see the sampling step below for why.  Note the
  * composition runs along the voxel axis, unlike the RESAMPLING in §3.5, which runs along the
  * canonical world axis; both were measured separately.
  *
@@ -872,14 +1800,24 @@ done:
  * it wrong on a `j-` acquisition doubles the distortion instead of correcting it.  Verified for
  * both polarities against the reference at displacement p95 0.045 mm (j) and 0.024 mm (j-). */
 static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold, int64_t *nunconv,
-	int allow_omp) {
+	int64_t *noob, int allow_omp) {
 	const int nx = c->nx, ny = c->ny, nz = c->nz;
 	const int m = c->pe_axis;
 	const int64_t n3 = c->n3;
 	const int64_t stride = (m == 0) ? 1 : ((m == 1) ? nx : (int64_t)nx * ny);
 	const int len = (m == 0) ? nx : ((m == 1) ? ny : nz);
 	int it, converged = 0;
-	int64_t i, folds = 0, slow = 0;
+	int64_t i, folds = 0, slow = 0, oobn = 0;
+	/* Which voxels ended up sampling the PAD -- i.e. their source position lies outside the field
+	   of view.  They are not folds and must not be counted as such: a fold is the forward map
+	   failing to be monotone, this is data that is simply not there. */
+	uint8_t *oob = (uint8_t *)calloc((size_t)n3, 1);
+	/* -1, NOT 1.  This function has always returned 1 for the benign "did not converge after
+	   MD_INVERT_ITERS" diagnostic, which the caller deliberately ignores -- so returning 1 here
+	   would have made an allocation failure indistinguishable from it, and `fu` is malloc'd by
+	   the caller and not zeroed until AFTER this point, so the frame's displacement would have
+	   been computed from indeterminate heap and published at exit 0. */
+	if (!oob) { MD_ERR("out of memory in the displacement inversion\n"); return -1; }
 #ifndef _OPENMP
 	(void)allow_omp;
 #endif
@@ -908,14 +1846,26 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 				pos = (double)idx + (double)c->pe_sign * cur * c->trt;
 				if (!(pos >= -MD_POS_LIMIT && pos <= MD_POS_LIMIT)) pos = (double)idx;
 				if (len < 2) { fu[o] = fn[o]; continue; }   /* single slice along PE: nothing to interpolate */
-				if (pos < 0.0) pos = 0.0;
-				if (pos > (double)(len - 1)) pos = (double)(len - 1);
-				lo = (int)pos;
-				if (lo > len - 2) lo = (len > 1) ? len - 2 : 0;
-				frac = pos - (double)lo;
-				a = (double)fn[base + (int64_t)lo * stride];
-				b = (double)fn[base + (int64_t)((lo + 1 < len) ? lo + 1 : lo) * stride];
-				nv = a * (1.0 - frac) + b * frac;
+				/* ONE VOXEL OF ZERO PADDING at each end of the PE axis, cropped implicitly by
+				 * only ever writing in-FOV voxels (Gap 6, the one thing worth borrowing).
+				 *
+				 * This used to CLAMP the sample position to [0, len-1].  The inverse near an edge
+				 * is ill-posed in a specific way: a voxel at the FOV boundary can be the image of
+				 * a source position that genuinely lies OUTSIDE the field of view, and clamping
+				 * silently maps it to the nearest in-FOV value -- fabricating a plausible field
+				 * for a sample that does not exist, and biasing the last voxel or two of every
+				 * column along the phase-encode axis, precisely where large displacements push
+				 * data off the edge.  Reading zero there says "no data" instead, which is what
+				 * padding achieves and why it degrades gracefully. */
+				oob[o] = (uint8_t)(pos < 0.0 || pos > (double)(len - 1));
+				if (pos <= -1.0 || pos >= (double)len) { nv = 0.0; }
+				else {
+					lo = (int)floor(pos);        /* floor, NOT a cast: (int)(-0.3) is 0, not -1 */
+					frac = pos - (double)lo;
+					a = (lo < 0) ? 0.0 : (double)fn[base + (int64_t)lo * stride];
+					b = (lo + 1 >= len) ? 0.0 : (double)fn[base + (int64_t)(lo + 1) * stride];
+					nv = a * (1.0 - frac) + b * frac;
+				}
 				delta = fabs(nv - (double)fu[o]);
 				if (delta > worst) worst = delta;
 				if (last && delta > (double)MD_INVERT_TOL) slow++;
@@ -938,14 +1888,18 @@ static int md_invert(const md_ctx *c, const float *fn, float *fu, int64_t *nfold
 				int idx = (m == 0) ? x : ((m == 1) ? y : z);
 				double dd;
 				if (idx + 1 >= len) continue;
+				if (oob[o] || oob[o + stride2]) continue;   /* out of FOV, not a fold */
 				dd = (double)c->pe_sign *
 					((double)fu[o + stride2] - (double)fu[o]) * c->trt;
 				if (dd <= -1.0) folds++;
 			}
 		}
 	}
+	for (i = 0; i < n3; i++) if (oob[i]) oobn++;
+	free(oob);
 	if (nfold) *nfold = folds;
 	if (nunconv) *nunconv = converged ? 0 : slow;
+	if (noob) *noob = oobn;
 	return converged ? 0 : 1;
 }
 
@@ -1002,6 +1956,112 @@ static int md_write(const md_ctx *c, const char *suffix, const float *vol, int n
 	return rc;
 }
 
+/* Run an external executable with an argv vector.  execvp/_spawnvp rather than system(), so the
+   output prefix -- which is user text -- never reaches a shell.  Returns 0 only on exit 0. */
+static int md_spawn(const char *const argv[]) {
+#ifdef _MSC_VER
+	intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+	return (rc == 0) ? 0 : 1;
+#else
+	pid_t pid = fork();
+	int st = 0;
+	if (pid < 0) return 1;
+	if (pid == 0) {
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (waitpid(pid, &st, 0) < 0) return 1;
+	return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+#endif
+}
+
+/* --mask-mode mindgrab: build the tiers from the external brainchop-mindgrab executable.
+ *
+ * `brainchop-mindgrab in.nii --mask m.nii --border MM` already exposes exactly what this stage
+ * needs -- a brain mask, and the same mask grown by a stated distance -- so two invocations
+ * differenced give the core and ring tiers directly, with no Otsu, no morphology chain, no
+ * connected-component pass and no voxel-quality union.  `--border MM` IS the author's "a bit
+ * extra outside the brain".
+ *
+ * ONE mask for the whole run, from the temporal mean of the shortest echo's magnitude, not one
+ * per frame: mindgrab is a neural network and 2*T invocations would dominate the run by two
+ * orders of magnitude.  That matches --mask, which is also a single 3D volume.
+ *
+ * This is a NEW EXTERNAL DEPENDENCY and --medic has none, so it is never a silent fallback: if
+ * the executable is missing the run fails with an explanation, and it is not the default. */
+static int md_mindgrab_mask(md_ctx *c, const float *mag, int64_t n3, int T, uint8_t *masks) {
+	char pre[MD_PATH_MAX], fmag[MD_PATH_MAX], fcore[MD_PATH_MAX], fring[MD_PATH_MAX], border[32];
+	float *mean = NULL;
+	nifti_image *mc = NULL, *mr = NULL;
+	md_ctx tc = *c;
+	double mm;
+	int64_t i;
+	int t, rc = 1;
+
+	/* Ring width: Gap 2 grows the core by 3 voxels with a 6-connected element, so the closest
+	   millimetre equivalent is three of the SMALLEST voxel dimension. */
+	mm = c->tmpl->dx;
+	if (c->tmpl->dy > 0.0 && c->tmpl->dy < mm) mm = c->tmpl->dy;
+	if (c->tmpl->dz > 0.0 && c->tmpl->dz < mm) mm = c->tmpl->dz;
+	if (!(mm > 0.0)) mm = 1.0;
+	snprintf(border, sizeof border, "%g", 3.0 * mm);
+
+	snprintf(pre, sizeof pre, "%s_mindgrab%d", c->prefix, (int)getpid());
+	snprintf(fmag, sizeof fmag, "%s_mag.nii", pre);
+	snprintf(fcore, sizeof fcore, "%s_core.nii", pre);
+	snprintf(fring, sizeof fring, "%s_ring.nii", pre);
+
+	mean = (float *)calloc((size_t)n3, sizeof(float));
+	if (!mean) { MD_ERR("out of memory for the mindgrab input\n"); return 1; }
+	for (t = 0; t < T; t++)
+		for (i = 0; i < n3; i++) mean[i] += mag[(int64_t)t * c->neco * n3 + i];
+	for (i = 0; i < n3; i++) mean[i] /= (float)T;
+
+	tc.prefix = pre;
+	if (md_write(&tc, "_mag", mean, 1, GZ_FALSE)) {
+		MD_ERR("could not write the temporary magnitude '%s' for mindgrab\n", fmag);
+		goto done;
+	}
+	{	/* --border 0 gives the core tier */
+		const char *av[8] = { "brainchop-mindgrab", fmag, "--mask", fcore, "--border", "0", NULL, NULL };
+		if (md_spawn(av)) {
+			MD_ERR("brainchop-mindgrab failed or is not on PATH.  --mask-mode mindgrab needs it "
+				"(see https://github.com/neuroneural/brainchop-mindgrab); use --mask-mode tiered, "
+				"or run mindgrab yourself and pass the result with --mask.\n");
+			goto done;
+		}
+	}
+	{
+		const char *av[8] = { "brainchop-mindgrab", fmag, "--mask", fring, "--border", border, NULL, NULL };
+		if (md_spawn(av)) { MD_ERR("brainchop-mindgrab failed while growing the border ring\n"); goto done; }
+	}
+	mc = md_read_f32(fcore, "mindgrab core mask");
+	if (!mc) goto done;
+	mr = md_read_f32(fring, "mindgrab border mask");
+	if (!mr) goto done;
+	if (!md_same_grid(c->tmpl, mc) || !md_same_grid(c->tmpl, mr) ||
+		(int64_t)mc->nvox != n3 || (int64_t)mr->nvox != n3) {
+		MD_ERR("mindgrab returned a mask off the input grid\n");
+		goto done;
+	}
+	for (i = 0; i < n3; i++) {
+		const float *vc = (const float *)mc->data, *vr = (const float *)mr->data;
+		masks[i] = (uint8_t)(vc[i] >= 0.5f ? 2 : (vr[i] >= 0.5f ? 1 : 0));
+	}
+	{
+		int64_t ncore = 0;
+		for (i = 0; i < n3; i++) if (masks[i] == 2) ncore++;
+		if (!ncore) { MD_ERR("mindgrab returned an empty brain mask\n"); goto done; }
+	}
+	for (t = 1; t < T; t++) memcpy(masks + (int64_t)t * n3, masks, (size_t)n3);
+	rc = 0;
+done:
+	nifti_image_free(mc); nifti_image_free(mr);
+	free(mean);
+	remove(fmag); remove(fcore); remove(fring);
+	return rc;
+}
+
 static const char *const MD_EXT[3] = { ".nii.gz", ".nii.zst", ".nii" };
 
 /* Write one output under the temporary prefix and report the path actually produced.
@@ -1051,24 +2111,43 @@ static void md_usage(void) {
 	printf("phase and converts it to an EPI displacement map.\n\n");
 	printf("Options:\n");
 	printf("  --rank <N>              low-rank truncation of the field-map series (default %d; 0 disables)\n", MD_RANK_DEFAULT);
-	printf("                          EXPERIMENTAL: rank 10 is what the paper specifies, but the\n");
-	printf("                          reference's own output retains a broadband residual past\n");
-	printf("                          component 10 whose origin is unresolved, so this stage is the\n");
-	printf("                          least reference-faithful part of the pipeline (--rank 0 skips it)\n");
+	printf("                          Applies to the brain INTERIOR; the border ring is smoothed and\n");
+	printf("                          rebuilt from far fewer components (--border-regularization)\n");
 	printf("  --temporal-correction <0|1>  temporal 2*pi consistency correction (default 1)\n");
 	printf("  --phase-offset <mcpc|none>   MCPC-3D-S phase-offset correction (default mcpc)\n");
 	printf("  --noise-frames <N>, -f  drop N trailing frames from the outputs (default 0)\n");
 	printf("  --n-cpus <N>, -n        OpenMP threads\n");
 	printf("  --gz <0|1>              output compression (default: the FSLOUTPUTTYPE environment)\n");
 	printf("  --weights <sel>         ROMEO weight preset: romeo|romeo2|romeo3|romeo4|romeo6 (default romeo4)\n");
-	printf("  --mask <file>           use this mask verbatim for both unwrapping stages\n");
-	printf("                          (default: ROMEO robustmask of the first echo's magnitude)\n");
+	printf("  --mask-mode <sel>       brain mask: tiered|robustmask|mindgrab (default tiered)\n");
+	printf("                          tiered     Otsu magnitude mask unioned with ROMEO's phase\n");
+	printf("                                     voxel quality, encoded as 2 core / 1 border ring\n");
+	printf("                                     / 0 outside; every stage tests > 0\n");
+	printf("                          robustmask ROMEO's robustmask of the first echo's magnitude,\n");
+	printf("                                     the pre-tier behaviour, kept for bisection\n");
+	printf("                          mindgrab   two calls to the external brainchop-mindgrab, one\n");
+	printf("                                     per tier; needs it on PATH and fails if absent\n");
+	printf("  --branch-correction <0|1>  global 2*pi handling (default 1): ROMEO's own global\n");
+	printf("                          correction at both unwrap stages, plus MCPC-3D-S branch\n");
+	printf("                          selection\n");
+	printf("  --echo-offset <0|1>     intra-frame per-echo 2*pi offset (default 1): one integer\n");
+	printf("                          per echo per frame, from the echoes already corrected\n");
+	printf("  --border-regularization <0|1>  graded regularisation at the brain border\n");
+	printf("                          (default 1): the border ring is smoothed spatially and\n");
+	printf("                          reconstructed from far fewer temporal components than the\n");
+	printf("                          interior, and no voxel outside its own frame's mask is\n");
+	printf("                          projected.  0 gives the plain global truncation\n");
+	printf("  --mask <file>           use this mask verbatim for both unwrapping stages.  A supplied\n");
+	printf("                          mask is binary, so it becomes the core tier with no border\n");
+	printf("                          ring and --border-regularization has nothing to do.\n");
+	printf("                          Mutually exclusive with --mask-mode\n");
 	printf("  --save-intermediates    also write per-echo unwrapped phase, the masks, and (when\n");
 	printf("                          MCPC-3D-S runs) the estimated phase offset\n\n");
 	printf("Outputs: <prefix>_fieldmaps_native (Hz, distorted grid), <prefix>_fieldmaps (Hz,\n");
 	printf("undistorted grid), <prefix>_displacementmaps (mm, pull map), all float32.\n\n");
 	printf("Emulates the MEDIC workflow of Van et al., Imaging Neuroscience 4 (2026),\n");
-	printf("doi:10.1162/IMAG.a.1262. Phase unwrapping is the MIT ROMEO port (Dymerska et al. 2020,\n");
+	printf("doi:10.1162/IMAG.a.1262. PLEASE CITE THAT PAPER if you use this implementation --\n");
+	printf("the method is theirs. Phase unwrapping is the MIT ROMEO port (Dymerska et al. 2020,\n");
 	printf("doi:10.1002/mrm.28563). Clean-room: developed from the paper and black-box measurement,\n");
 	printf("see test/medic_reference_manifest.md in the medic_bench repository.\n");
 }
@@ -1122,9 +2201,24 @@ int nii_medic(int argc, char *argv[]) {
 	int nTE = 0, have_trt = 0, have_pe = 0;
 	nifti_image *ph[MD_MAX_ECHO], *mg[MD_MAX_ECHO];
 	float *phase = NULL, *mag = NULL, *fields = NULL, *fu = NULL, *disp = NULL;
+	double phmin[MD_MAX_ECHO], phmax[MD_MAX_ECHO];   /* frame-0 extrema, per echo */
 	int *frc = NULL;
-	uint8_t *maskbuf = NULL;   /* per-frame masks, retained through the temporal correction */
+	/* EVERY heap pointer the per-frame block owns is declared HERE, at function scope, and freed
+	   exactly once at `done`.  Two reasons, and the second is the one that bites: a pointer
+	   declared below a `goto` that targets a label which frees it is indeterminate, and clang
+	   deletes the guards (the nifti_bptf incident in AGENTS.md); and with seven owned pointers
+	   the per-exit free litany had reached seventeen sites, four of which differed only by which
+	   pointer did not exist yet when they were written.  A bare `goto done` cannot get that
+	   wrong.  `masks` and `magm` outlive the block -- the temporal correction and the border
+	   filter both read them -- which is why they live here rather than being adopted afterwards. */
+	float *offs = NULL;        /* phase offset, only when MCPC actually runs */
+	float *qual = NULL;        /* ROMEO voxel quality, one of the two mask ingredients */
+	uint8_t *masks = NULL;     /* per-frame tiers: 2 core, 1 border ring, 0 outside */
+	uint8_t *magm = NULL;      /* per-frame magnitude brain mask; the derived masks erode it */
+	double *blog = NULL;       /* per-frame branch decision and its three intercepts */
+	int *eoff = NULL;          /* per-frame count of echoes the Gap 4 stage actually moved */
 	romeo_opts ro = romeo_opts_default();
+	int mask_mode_set = 0;   /* was --mask-mode given explicitly?  See the --mask conflict below. */
 	gzModes gz = GZ_ENVIRONMENT;
 	/* MEASURED default (manifest section 4): the reference unwraps with romeo4 weights at BOTH
 	   stages.  Against its own intermediates, romeo4 puts 99.76 % of in-mask voxels on the same
@@ -1147,6 +2241,9 @@ int nii_medic(int argc, char *argv[]) {
 	memset(mg, 0, sizeof mg);
 	c.rank = MD_RANK_DEFAULT;
 	c.temporal = 1;
+	c.branch = 1;
+	c.echo_offset = 1;
+	c.border_reg = 1;
 	c.mcpc = 1;
 	c.pe_axis = -1;
 	c.pe_sign = 1;
@@ -1213,6 +2310,25 @@ int nii_medic(int argc, char *argv[]) {
 			else { MD_ERR("--weights must be one of romeo romeo2 romeo3 romeo4 romeo6\n"); goto done; }
 		} else if (!strcmp(a, "--mask") && ac + 1 < argc) {
 			c.maskfile = argv[++ac];
+		} else if (!strcmp(a, "--branch-correction") && ac + 1 < argc) {
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--branch-correction must be 0 or 1\n"); goto done; }
+			c.branch = (int)v;
+		} else if (!strcmp(a, "--echo-offset") && ac + 1 < argc) {
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--echo-offset must be 0 or 1\n"); goto done; }
+			c.echo_offset = (int)v;
+		} else if (!strcmp(a, "--border-regularization") && ac + 1 < argc) {
+			long v;
+			if (md_parse_int(argv[++ac], &v) || (v != 0 && v != 1)) { MD_ERR("--border-regularization must be 0 or 1\n"); goto done; }
+			c.border_reg = (int)v;
+		} else if (!strcmp(a, "--mask-mode") && ac + 1 < argc) {
+			const char *v = argv[++ac];
+			mask_mode_set = 1;
+			if (!strcmp(v, "tiered")) c.mask_mode = MD_MASK_TIERED;
+			else if (!strcmp(v, "robustmask")) c.mask_mode = MD_MASK_ROBUST;
+			else if (!strcmp(v, "mindgrab")) c.mask_mode = MD_MASK_MINDGRAB;
+			else { MD_ERR("--mask-mode must be tiered, robustmask or mindgrab\n"); goto done; }
 		} else if (!strcmp(a, "--save-intermediates")) {
 			c.save_intermediates = 1;
 		} else if (!strcmp(a, "--gz") && ac + 1 < argc) {
@@ -1228,6 +2344,14 @@ int nii_medic(int argc, char *argv[]) {
 	if (!nmag || !npha || !nTE || !have_trt || !have_pe || !c.prefix) {
 		MD_ERR("missing a required option\n\n");
 		md_usage();
+		goto done;
+	}
+	if (c.maskfile && mask_mode_set) {
+		/* Ambiguous rather than merely redundant: --mask supplies a BINARY mask, which maps to the
+		   core tier and has no border ring, so it cannot express what --mask-mode selects.  Naming
+		   both asks for two different masks. */
+		MD_ERR("--mask and --mask-mode are mutually exclusive: --mask supplies the mask itself, "
+			"and being binary it has no border ring for --border-regularization to use\n");
 		goto done;
 	}
 	if (nmag != npha) { MD_ERR("%d magnitude file(s) but %d phase file(s); one of each per echo is required\n", nmag, npha); goto done; }
@@ -1276,6 +2400,10 @@ int nii_medic(int argc, char *argv[]) {
 	T = Tin - c.noiseframes;
 	if (T < 1) { MD_ERR("--noise-frames %d leaves no frames (input has %d)\n", c.noiseframes, Tin); goto done; }
 	c.nframe = T;
+	/* Gap 3(a): ROMEO's global correction is ON for the multi-echo unwrap too, not just for the
+	   MCPC-3D-S phase difference.  romeo_opts_default() leaves it off, which is right for the
+	   `-romeo` chain op and wrong here. */
+	ro.correctglobal = c.branch ? 1 : 0;
 #ifdef _OPENMP
 	/* Parallelise the per-frame loops whenever there is more than one frame.
 	 *
@@ -1340,7 +2468,7 @@ int nii_medic(int argc, char *argv[]) {
 		mi = md_read_f32(magf[e], "magnitude");
 		if (!mi) { nifti_image_free(pi); goto done; }
 		pe = (float *)pi->data;
-		md_rescale_phase(pe, (int64_t)n3 * Tin);
+		md_frame0_range(pe, n3, &phmin[e], &phmax[e]);   /* rescale happens after the loop */
 		for (t = 0; t < T; t++) {
 			memcpy(phase + ((int64_t)t * c.neco + e) * n3, pe + (int64_t)t * n3, (size_t)n3 * sizeof(float));
 			memcpy(mag + ((int64_t)t * c.neco + e) * n3, ((float *)mi->data) + (int64_t)t * n3, (size_t)n3 * sizeof(float));
@@ -1350,27 +2478,73 @@ int nii_medic(int argc, char *argv[]) {
 		else nifti_image_free(pi);
 	}
 
+	/* One range for the whole run: the mode across echoes of frame 0's extrema.  Applied here
+	   rather than per echo above, because the mode cannot be taken until every echo has been
+	   seen -- see md_mode / md_frame0_range. */
+	{
+		double mn = md_mode(phmin, c.neco), mx = md_mode(phmax, c.neco);
+		if (!(mx > mn)) {
+			MD_ERR("frame 0 of the phase data has no usable range (mode across echoes gave "
+				"[%g, %g]); a constant or all-NaN first frame cannot be rescaled\n", mn, mx);
+			goto done;
+		}
+		md_apply_phase_scale(phase, (int64_t)n3 * c.neco * T, mn, mx);
+		/* Provenance, and the only direct read-out of the rule: the reference prints the same
+		   thing.  Stderr, never stdout -- the output image may be going to stdout. */
+		fprintf(stderr, "--medic: phase rescale range [%g, %g] (frame 0, mode across echoes)\n", mn, mx);
+	}
+
 	/* ---- per-frame: MCPC-3D-S -> ROMEO -> weighted regression ------------------------------- */
 	{
 		int failed = 0;
-		/* Only when MCPC RUNS: with --phase-offset none nothing fills this, and writing it would
-		   emit uninitialised heap as if it were an image. */
-		float *offs = (c.save_intermediates && c.mcpc) ? (float *)calloc((size_t)n3 * T, sizeof(float)) : NULL;
-		if (c.save_intermediates && c.mcpc && !offs) { MD_ERR("out of memory for the phase-offset intermediate\n"); goto done; }
-		uint8_t *masks = (uint8_t *)malloc((size_t)n3 * T);
-		if (!masks) { free(offs); MD_ERR("out of memory allocating the per-frame masks\n"); goto done; }
+		int want_qual = c.save_intermediates && !c.maskfile && c.mask_mode == MD_MASK_TIERED;
+		if (c.save_intermediates && c.mcpc) {
+			/* Only when MCPC RUNS: with --phase-offset none nothing fills this, and writing it
+			   would emit uninitialised heap as if it were an image. */
+			offs = (float *)calloc((size_t)n3 * T, sizeof(float));
+			if (!offs) { MD_ERR("out of memory for the phase-offset intermediate\n"); goto done; }
+		}
+		if (want_qual) {
+			/* The voxel-quality map is one of the two mask ingredients, so it belongs with the
+			   mask in the intermediates: it is the only way to see WHICH ingredient moved a
+			   boundary. */
+			qual = (float *)calloc((size_t)n3 * T, sizeof(float));
+			if (!qual) { MD_ERR("out of memory for the voxel-quality intermediate\n"); goto done; }
+		}
+		masks = (uint8_t *)malloc((size_t)n3 * T);
+		if (!masks) { MD_ERR("out of memory allocating the per-frame masks\n"); goto done; }
+		eoff = (int *)calloc((size_t)T, sizeof(int));
+		if (!eoff) { MD_ERR("out of memory\n"); goto done; }
+		if (((c.branch || c.echo_offset) && c.neco > 1) || c.temporal) {
+			magm = (uint8_t *)malloc((size_t)n3 * T);
+			if (!magm) { MD_ERR("out of memory allocating the magnitude brain masks\n"); goto done; }
+			if (c.save_intermediates) {
+				/* Diagnostic only, and COLLECTED rather than printed from inside the frame loop:
+				   printing there would interleave across threads and reorder run to run.  It is
+				   read nowhere -- a flag must never gate work that reaches a voxel. */
+				blog = (double *)calloc((size_t)4 * T, sizeof(double));
+				if (!blog) { MD_ERR("out of memory\n"); goto done; }
+			}
+		}
 		/* ONE mask per frame, shared by the MCPC-3D-S phase-difference unwrap and the multi-echo
-		   unwrap, as the reference does (manifest section 4).  Either the user's --mask, used
-		   verbatim, or ROMEO's robustmask of that frame's first-echo magnitude. */
+		   unwrap, as the reference does (manifest section 4).
+		 *
+		 * The values are TIERS -- 2 core, 1 border ring, 0 outside (Gap 2).  Everything that asks
+		 * "is this voxel valid" tests `> 0`; only the border filter distinguishes 1 from 2.  A
+		 * user's --mask is binary and maps to the CORE tier, since a supplied mask has no border
+		 * ring, so the border filter has nothing to do on that path.
+		 *
+		 * ROMEO must be handed a BINARY mask: rm_build_ctx forms `magnitude * (float)mask[i]`, so
+		 * a tier of 2 would double the magnitude weights over the core. */
 		frc = (int *)calloc((size_t)T, sizeof(int));
-		if (!frc) { free(offs); free(masks); MD_ERR("out of memory\n"); goto done; }
+		if (!frc) { MD_ERR("out of memory\n"); goto done; }
 		if (c.maskfile) {
 			nifti_image *mk = md_read_f32(c.maskfile, "mask");
 			int64_t q;
-			if (!mk) { free(offs); free(masks); goto done; }
+			if (!mk) { goto done; }
 			if (!md_same_grid(ph[0], mk) || (int64_t)mk->nvox != n3) {
 				MD_ERR("--mask must be a single 3D volume on the input grid\n");
-				nifti_image_free(mk); free(offs); free(masks); goto done;
+				nifti_image_free(mk); goto done;
 			}
 			/* MEASURED contract (manifest 3.7): in-mask is `>= 1`, not merely nonzero.  A
 			   fractional probability map is therefore NOT a mask -- threshold it first
@@ -1378,7 +2552,7 @@ int nii_medic(int argc, char *argv[]) {
 			   which is the safe direction. */
 			for (t = 0; t < T; t++)
 				for (q = 0; q < n3; q++)
-					masks[(int64_t)t * n3 + q] = (((const float *)mk->data)[q] >= 1.0f) ? 1 : 0;
+					masks[(int64_t)t * n3 + q] = (((const float *)mk->data)[q] >= 1.0f) ? 2 : 0;
 			nifti_image_free(mk);
 			{	/* An all-fractional or empty mask would silently zero every voxel downstream. */
 				int64_t nz = 0;
@@ -1387,10 +2561,10 @@ int nii_medic(int argc, char *argv[]) {
 					MD_ERR("--mask '%s' has no voxel >= 1 (MEDIC's in-mask test is `>= 1`; "
 						"threshold a probability map first, e.g. niimath m.nii -thr 0.5 -bin m_bin.nii)\n",
 						c.maskfile);
-					free(offs); free(masks); free(frc); frc = NULL; goto done;
+					goto done;
 				}
 			}
-		} else {
+		} else if (c.mask_mode == MD_MASK_ROBUST) {
 #ifdef _OPENMP
 			#pragma omp parallel for schedule(dynamic) if (frame_parallel)
 #endif
@@ -1400,8 +2574,54 @@ int nii_medic(int argc, char *argv[]) {
 			for (t = 0; t < T; t++) if (frc[t]) { failed = 1; break; }   /* leaves t = FIRST failure */
 			if (failed) {
 				MD_ERR("robustmask failed for frame %d\n", t);
-				free(offs); free(masks); free(frc); frc = NULL; goto done;
+				goto done;
 			}
+			/* Binary robustmask, promoted to the core tier: --mask-mode robustmask exists to
+			   bisect against the pre-Gap-2 behaviour, and it has no border ring either. */
+			{
+				int64_t q;
+				for (q = 0; q < (int64_t)n3 * T; q++) masks[q] = (uint8_t)(masks[q] ? 2 : 0);
+			}
+		} else if (c.mask_mode == MD_MASK_MINDGRAB) {
+			if (md_mindgrab_mask(&c, mag, n3, T, masks)) {
+				goto done;
+			}
+		} else {
+#ifdef _OPENMP
+			#pragma omp parallel
+#endif
+			{
+				md_maskwork w;
+				int tt;
+				int oom = md_maskwork_alloc(&w, n3);
+#ifdef _OPENMP
+				#pragma omp for schedule(dynamic)
+#endif
+				for (tt = 0; tt < T; tt++) {
+					if (oom) { frc[tt] = 1; continue; }
+					frc[tt] = md_tiered_mask(phase + (int64_t)tt * c.neco * n3,
+							mag + (int64_t)tt * c.neco * n3, c.neco,
+							c.nx, c.ny, c.nz, c.TEs, &ro, &w,
+							masks + (int64_t)tt * n3,
+							magm ? magm + (int64_t)tt * n3 : NULL,
+							qual ? qual + (int64_t)tt * n3 : NULL) ? 1 : 0;
+				}
+				md_maskwork_free(&w);
+			}
+			for (t = 0; t < T; t++) if (frc[t]) { failed = 1; break; }
+			if (failed) {
+				MD_ERR("the tiered brain mask failed for frame %d (out of memory, or the frame "
+					"has no usable brain component)\n", t);
+				goto done;
+			}
+		}
+		if (magm && (c.maskfile || c.mask_mode != MD_MASK_TIERED)) {
+			/* The other mask modes build no magnitude brain mask of their own, so the supplied
+			   mask stands in for it and each caller erodes that instead.  The specification asks
+			   only that the conservative mask sit well inside the unwrapping mask and exclude edge
+			   and low-signal voxels -- nothing depends on how either is built. */
+			int64_t q;
+			for (q = 0; q < (int64_t)n3 * T; q++) magm[q] = masks[q] ? 1 : 0;
 		}
 #ifdef _OPENMP
 		#pragma omp parallel for schedule(dynamic) if (frame_parallel)
@@ -1415,13 +2635,52 @@ int nii_medic(int argc, char *argv[]) {
 			/* Each frame records its own status: a shared `failed` flag written from several
 			   threads is a data race, and reading it to skip work makes the result
 			   thread-count-dependent. */
-			if (c.mcpc && md_mcpc3ds(&c, p, m, &ro, mk, offs ? offs + (int64_t)t * n3 : NULL)) { frc[t] = 1; continue; }
-			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro, mk, NULL)) frc[t] = 1;
+			/* ROMEO gets a BINARY mask: rm_build_ctx forms `magnitude * (float)mask[i]`, so a
+			   core tier of 2 would silently double the magnitude weights inside the brain.
+			   `scr` holds the derived masks (Gap 2's three erosion counts) and md_morph's
+			   scratch; one allocation per frame rather than per pass. */
+			uint8_t *mkb = (uint8_t *)malloc((size_t)3 * n3);
+			uint8_t *der = NULL, *scr = NULL;
+			const uint8_t *bm = magm ? magm + (int64_t)t * n3 : NULL;
+			int64_t q;
+			if (!mkb) { frc[t] = 1; continue; }
+			der = mkb + n3; scr = mkb + 2 * n3;
+			for (q = 0; q < n3; q++) mkb[q] = (uint8_t)(mk[q] ? 1 : 0);
+			if (c.mcpc) {
+				const uint8_t *omc = NULL;
+				if (bm) {
+					memcpy(der, bm, (size_t)n3);
+					md_morph(der, c.nx, c.ny, c.nz, MD_ERODE_BRANCH, 0, scr);
+					omc = der;
+				}
+				if (md_mcpc3ds(&c, p, m, &ro, mkb, omc, blog ? blog + (size_t)4 * t : NULL,
+						offs ? offs + (int64_t)t * n3 : NULL)) { free(mkb); frc[t] = 1; continue; }
+			}
+			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro, mkb, NULL)) { free(mkb); frc[t] = 1; continue; }   /* ro.correctglobal set from --branch-correction above */
+			/* Gap 4: the per-echo intra-frame offset, between the unwrap and the mask gating.
+			   This one uses the magnitude brain mask as it stands, with no extra erosion. */
+			if (bm && c.echo_offset) eoff[t] = md_echo_offset(&c, p, m, bm);
+			free(mkb);
+		}
+		{	/* A whole-echo 2*pi offset is a real event and rare on well-conditioned data, so it
+			   is reported rather than left silent -- but counted in the loop and printed after
+			   it, never printed from inside a parallel region. */
+			int nfr = 0, nech = 0;
+			for (t = 0; t < T; t++) if (eoff[t]) { nfr++; nech += eoff[t]; }
+			if (nfr)
+				fprintf(stderr, "--medic: intra-frame echo offset moved %d echo(es) across %d of "
+					"%d frame(s) by a whole 2*pi\n", nech, nfr, T);
+		}
+		if (blog) {
+			for (t = 0; t < T; t++)
+				fprintf(stderr, "--medic: frame %d branch selection: n=%+d (intercepts "
+					"{-1: %.4e, 0: %.4e, +1: %.4e})\n", t, (int)blog[(size_t)4 * t],
+					blog[(size_t)4 * t + 1], blog[(size_t)4 * t + 2], blog[(size_t)4 * t + 3]);
 		}
 		for (t = 0; t < T; t++) if (frc[t]) { failed = 1; break; }
 		if (failed) {
 			MD_ERR("phase unwrapping failed for frame %d\n", t);
-			free(offs); free(masks); free(frc); frc = NULL; goto done;
+			goto done;
 		}
 		/* Restrict the unwrapped phase to the mask BEFORE anything reads or writes it.
 		 *
@@ -1445,7 +2704,7 @@ int nii_medic(int argc, char *argv[]) {
 			float *tmp = (float *)malloc((size_t)n3 * T * sizeof(float));
 			int wrc = 0;
 			int64_t q;
-			if (!tmp) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("out of memory writing intermediates\n"); goto done; }
+			if (!tmp) { MD_ERR("out of memory writing intermediates\n"); goto done; }
 			for (e = 0; e < c.neco; e++) {
 				char sfx[64];
 				for (t = 0; t < T; t++)
@@ -1455,18 +2714,18 @@ int nii_medic(int argc, char *argv[]) {
 			}
 			for (q = 0; q < (int64_t)n3 * T; q++) tmp[q] = (float)masks[q];
 			wrc |= md_write(&c, "_masks", tmp, T, gz);
+			if (qual) wrc |= md_write(&c, "_voxelquality", qual, T, gz);
 			if (offs) wrc |= md_write(&c, "_phase_offset", offs, T, gz);
 			free(tmp);
 			/* --save-intermediates is an explicit request; a failure to honour it is an error. */
-			if (wrc) { free(offs); free(masks); free(frc); frc = NULL; MD_ERR("failed to write an intermediate\n"); goto done; }
+			if (wrc) { MD_ERR("failed to write an intermediate\n"); goto done; }
 		}
-		free(offs); free(frc); frc = NULL;
-		maskbuf = masks;   /* retained: md_temporal must know which samples are valid */
+		free(frc); frc = NULL;
 	}
 
 	/* ---- temporal 2*pi correction ------------------------------------------------------------ */
 	if (c.temporal) {
-		if (md_temporal(&c, phase, mag, maskbuf)) goto done;
+		if (md_temporal(&c, phase, mag, masks, magm)) goto done;
 	}
 
 	/* ---- regression -> raw native field ------------------------------------------------------ */
@@ -1489,12 +2748,23 @@ int nii_medic(int argc, char *argv[]) {
 	}
 
 	/* ---- rank-10 truncation ------------------------------------------------------------------ */
-	if (c.rank > 0 && T > 1 && md_lowrank(fields, n3, T, c.rank)) goto done;
+	/* Gap 1: with the border filter on, the low-rank stage treats tier 1 and tier 2 differently
+	   and gates its write-back per frame.  --border-regularization 0 takes the plain global
+	   projection, which is exactly the pre-Gap-1 behaviour.  A user --mask has no border ring, so
+	   there is nothing for the border filter to do and it is skipped. */
+	if (c.rank > 0 && T > 1) {
+		int has_border = c.border_reg && masks && !c.maskfile;
+		if (has_border) {
+			if (md_lowrank_border(&c, fields, n3, T, c.rank, masks, MD_BORDER_RANK, MD_BORDER_FWHM))
+				goto done;
+		} else if (md_lowrank(fields, n3, T, c.rank)) goto done;
+	}
 
 	/* ---- inversion and displacement ---------------------------------------------------------- */
 	{
 		double vox;
-		int64_t inv_folds = 0, inv_unconv = 0;
+		int64_t inv_folds = 0, inv_unconv = 0, inv_oob = 0;
+		int inv_fail = 0;
 #ifdef _OPENMP
 		const int outer_par = frame_parallel;
 #else
@@ -1520,26 +2790,30 @@ int nii_medic(int argc, char *argv[]) {
 		 * accumulators use reductions either way, so diagnostics are exact and thread-count
 		 * independent. */
 #ifdef _OPENMP
-		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) if (outer_par)
+		#pragma omp parallel for schedule(static) reduction(+:inv_folds) reduction(+:inv_unconv) reduction(+:inv_oob) reduction(| : inv_fail) if (outer_par)
 #endif
 		for (t = 0; t < T; t++) {
-			int64_t q, nf = 0, nu = 0;
-			md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu, !outer_par);
-			inv_folds += nf; inv_unconv += nu;
+			int64_t q, nf = 0, nu = 0, no = 0;
+			if (md_invert(&c, fields + (int64_t)t * n3, fu + (int64_t)t * n3, &nf, &nu, &no,
+					!outer_par) < 0) { inv_fail = 1; continue; }
+			inv_folds += nf; inv_unconv += nu; inv_oob += no;
 			for (q = 0; q < n3; q++)
 				disp[(int64_t)t * n3 + q] =
 					(float)(-(double)c.pe_sign * (double)fu[(int64_t)t * n3 + q] * c.trt * vox);
 		}
+		if (inv_fail) { MD_ERR("the displacement inversion ran out of memory\n"); goto done; }
 		/* Report, do not hide: an unconverged frame or a folded region is exactly where this
 		   implementation and the reference disagree most. */
-		if (inv_unconv || inv_folds) {
+		if (inv_unconv || inv_folds || inv_oob) {
 			double tot = (double)n3 * T;
 			fprintf(stderr, "--medic: displacement inversion: %lld voxel(s) (%.3f%%) still moving "
 				"by >%g Hz after %d iterations; %lld folded adjacent pair(s) (%.3f%% of voxels) "
 				"mark columns where the forward map is not monotone, so the inverse is "
-				"multi-valued and the branch chosen is arbitrary\n",
+				"multi-valued and the branch chosen is arbitrary; %lld voxel(s) (%.3f%%) are the "
+				"image of a source position outside the field of view and read the zero pad\n",
 				(long long)inv_unconv, 100.0 * (double)inv_unconv / tot, (double)MD_INVERT_TOL,
-				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot);
+				MD_INVERT_ITERS, (long long)inv_folds, 100.0 * (double)inv_folds / tot,
+				(long long)inv_oob, 100.0 * (double)inv_oob / tot);
 		}
 	}
 
@@ -1635,7 +2909,8 @@ int nii_medic(int argc, char *argv[]) {
 	}
 	rc = EXIT_SUCCESS;
 done:
-	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc); free(maskbuf);
+	free(phase); free(mag); free(fields); free(fu); free(disp); free(frc);
+	free(offs); free(qual); free(masks); free(magm); free(blog); free(eoff);
 	for (e = 0; e < MD_MAX_ECHO; e++) { if (ph[e]) nifti_image_free(ph[e]); if (mg[e]) nifti_image_free(mg[e]); }
 	return rc;
 }

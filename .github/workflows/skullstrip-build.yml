@@ -1,0 +1,89 @@
+name: Skullstrip build & smoke
+
+# Build the OPTIONAL -skullstrip feature ON and actually exercise it.
+#
+# Why this job exists: -skullstrip is OFF by default, and EVERY other workflow builds it off.
+# release_smoke.py's exercise_skullstrip() therefore only ever took its disabled-dispatch
+# branch ("not built (SKULLSTRIP=0) - contract checked"), and the CTest targets that
+# src/CMakeLists.txt registers under ENABLE_SKULLSTRIP were never invoked by any workflow.
+# That is the same condition under which two required pipeline stages once stayed unexecuted
+# with the whole suite green -- so the checks below assert the ENABLED path was taken, not
+# merely that the commands exited 0.
+#
+# The Makefile and inner CMake project are covered on purpose: the feature source/define inventory
+# is duplicated across src/Makefile, src/CMakeLists.txt, SuperBuild.cmake and notarize.sh
+# (AGENTS.md known issue 2, "build feature-list drift"), so a Makefile-only build cannot catch a
+# CMake-side drop. SuperBuild changes trigger this workflow but its forwarding is not built here.
+#
+# This is an ADDITIONAL check, deliberately not a required gate, and it produces no release
+# artifact: -skullstrip stays off by default and absent from released binaries.
+on:
+  push:
+    branches: [master]
+    paths: ['src/**', 'SuperBuild/**', 'skullstrip_plan.md', 'README.md', 'AGENTS.md', '.github/workflows/skullstrip-build.yml', '.github/scripts/release_smoke.py']
+  pull_request:
+    paths: ['src/**', 'SuperBuild/**', 'skullstrip_plan.md', 'README.md', 'AGENTS.md', '.github/workflows/skullstrip-build.yml', '.github/scripts/release_smoke.py']
+  workflow_dispatch:
+
+jobs:
+  skullstrip:
+    runs-on: ubuntu-latest   # -skullstrip is 64-bit native only; Linux is the cheapest such runner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # -skullstrip is BSD; the GPL submodule is irrelevant here
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev
+
+      - name: Makefile SKULLSTRIP=1 + release smoke
+        run: |
+          set -euo pipefail
+          make -C src SKULLSTRIP=1
+          python3 .github/scripts/release_smoke.py ./src/niimath 2>&1 | tee smoke.txt
+          # Assert the smoke took the ENABLED branch. Without this the job would still pass if
+          # SKULLSTRIP=1 stopped reaching the compiler -- exactly the gap being closed.
+          grep -q 'voxels kept' smoke.txt || {
+            echo 'release_smoke.py did not exercise an ENABLED -skullstrip'; exit 1; }
+
+      - name: CMake ENABLE_SKULLSTRIP=ON + ctest
+        run: |
+          set -euo pipefail
+          cmake -S src -B build-ss -DBUILD_FLAVOR=all -DENABLE_SKULLSTRIP=ON
+          cmake --build build-ss -j 4
+          ctest --test-dir build-ss --output-on-failure 2>&1 | tee ctest.txt
+          # ctest exits 0 if no test registered at all, so name the test explicitly.
+          grep -q 'skullstrip_selftest .* Passed' ctest.txt || {
+            echo 'skullstrip_selftest was not registered or did not pass'; exit 1; }
+          python3 .github/scripts/release_smoke.py ./build-ss/niimath 2>&1 | tee cmake_smoke.txt
+          grep -q 'voxels kept' cmake_smoke.txt || {
+            echo 'CMake niimath did not exercise an ENABLED -skullstrip'; exit 1; }
+
+  skullstrip-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: MSVC ENABLE_SKULLSTRIP=ON + release smoke
+        shell: pwsh
+        run: |
+          # TOP-LEVEL SuperBuild, not `cmake -S src`. The inner project does an unconditional
+          # find_package(ZLIB REQUIRED) (src/CMakeLists.txt), and windows-latest ships no zlib
+          # that CMake will find on its own -- the Linux job in this file apt-installs
+          # zlib1g-dev for exactly that reason. Every other Windows build in this repo goes
+          # through the SuperBuild, which builds zlib-ng from source; .appveyor.yml does the
+          # same and then smokes `.\build\bin\niimath.exe`, which is why the binary path
+          # below has no per-config subdirectory (SuperBuild.cmake:35 sets
+          # CMAKE_RUNTIME_OUTPUT_DIRECTORY to ${CMAKE_BINARY_DIR}/bin). SuperBuild forwards
+          # ENABLE_SKULLSTRIP as an explicit cache entry (SuperBuild.cmake:163).
+          cmake -B build-ss -DENABLE_SKULLSTRIP=ON -DENABLE_ZSTD=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-ss --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .github\scripts\release_smoke.py .\build-ss\bin\niimath.exe 2>&1 |
+            Tee-Object -FilePath smoke.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path smoke.txt -Pattern 'voxels kept' -Quiet)) {
+            Write-Error 'release_smoke.py did not exercise an ENABLED -skullstrip'
+            exit 1
+          }

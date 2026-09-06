@@ -44,6 +44,8 @@ _skbuild/niimath/_dist_ver.py
 /dwi/
 /qc/
 audit_*.md
+plan_*.md
+*_plan.md
 
 
 # allineate object-flag signature stamp (Makefile flag-change detection)
@@ -52,3 +54,7 @@ audit_*.md
 
 # ROMEO parity oracle: large derived goldens, regenerate with test/romeo_oracle.sh
 /src/.romeo_obj_flags
+
+# Copyrighted reference article - never distribute
+fugue.pdf
+*.pdf

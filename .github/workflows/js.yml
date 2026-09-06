@@ -28,6 +28,17 @@ jobs:
         run: bun run prebuild
       - name: Type-check generated definitions
         run: ./node_modules/.bin/tsc --noEmit
+      # SCOPE, precisely: this step is a PARSE/TYPE check only. It does NOT execute the WASI
+      # behavioural suite -- `bun run test` below is `bun test ./tests`, and running src/wasi
+      # needs Zig >= 0.16, which AGENTS.md deliberately keeps out of CI so contributors without
+      # Zig stay green. What it closes is a real hole with a real history: tsconfig.json
+      # excludes src/**/*.test.ts (so tests cannot emit .d.ts into dist/), an unbalanced brace
+      # once made featureParity.test.ts fail to LOAD, ~40 assertions vanished, and nothing
+      # noticed. Verified by injecting a type error: zero tsc errors before this step, one
+      # after. Behavioural WASI coverage remains MANUAL (`bun run test:wasi`); do not describe
+      # this step as providing it.
+      - name: Type-check test sources (PARSE/TYPE ONLY -- covers src/wasi, not its behaviour)
+        run: ./node_modules/.bin/tsc -p tsconfig.tests.json
       # prebuild builds the WASM into src/ but not the dist bundles the runtime
       # tests load. Build dist via esbuild DIRECTLY (not `bun run build`, which would
       # re-trigger the prebuild lifecycle hook), then run the WASM runtime tests so

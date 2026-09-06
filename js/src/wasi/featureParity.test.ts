@@ -182,18 +182,6 @@ describe("local non-finite filter semantics", () => {
   }
 });
 
-describe("temporal filter (bandpass)", () => {
-  test("-bandpass runs on a 4D input and matches native within tolerance", async () => {
-    const bold = rd(`${FX}/bold_4x4x4x20.nii`); // 20 timepoints (>= 12 the filter needs)
-    const ref = tmp("parity_bandpass.nii");
-    nativeRaw([`${FX}/bold_4x4x4x20.nii`, "-bandpass", "0.01", "0.1", "2", ref]);
-    const r = await runner.runFiles({ argv: ["in.nii", "-bandpass", "0.01", "0.1", "2", "out.nii"], inputs: { "in.nii": bold }, outputs: ["out.nii"] });
-    expect(r.exitCode).toBe(0);
-    const d = maxAbsDiff(payloadFloat(r.files["out.nii"]), payloadFloat(rd(ref)));
-    expect(d).toBeLessThanOrEqual(1e-2);
-  });
-});
-
 describe("NIfTI formats", () => {
   test("NIfTI-1 single-file (covered above)", () => { expect(true).toBe(true); });
   test("NIfTI-2 single-file reads and processes", async () => {

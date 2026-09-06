@@ -5,7 +5,7 @@
 //   Magn Reson Med 42:1014-1018 (1999).
 // The paper supplies the objective function, the repeated-linearization optimizer, the
 // four-shear factorization and its Appendix proof, and the translation folding.  AFNI's
-// 3dvolreg implementation is GPL-2 and was NOT read, translated or paraphrased; it was used
+// 3dvolreg implementation (MCW; GPL-2 when this was written, CC BY 4.0 since the 2026-05-12 relicense) was NOT read, translated or paraphrased; it was used
 // only as a black-box oracle.  Every convention the paper does not fix was measured through
 // the public 3dvolreg/3drotate executables and is recorded in the moco_bench repository's test/moco_reference_manifest.md.
 //

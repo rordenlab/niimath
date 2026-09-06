@@ -1,7 +1,7 @@
 # WASI-C niimath backend
 
 A lean, zlib-free, single-threaded WASI reactor of niimath's **computational BSD** feature set
-(core math, multi-image ops, allineate/deface, dtifit, QC, conform, butterworth). It is the
+(core math, multi-image ops, allineate/deface, dtifit, QC, conform). It is the
 experimental WASI-C backend; the shipped default backend remains the Emscripten build
 (`../niimath.js`/`.wasm`).
 

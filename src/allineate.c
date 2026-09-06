@@ -4280,6 +4280,13 @@ static int al_register(nifti_image *source, nifti_image *base,
            so the shared write is race-free (AFNI refreshes on candidate 0, whose refinement it
            runs first). */
         if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr_ref, cand_wpar[0]);
+        /* al_scalar_setup() above DESTROYED the BLOK set, and lpc/lpa are not histogram costs,
+           so need_hist_setup is 0 and the warm-up eval on the line above did not run. Without
+           this hoist, N workers race to rebuild stup.blokset inside GA_pearson_local: an
+           unsynchronised check-then-write that leaks every loser's set and, if a losing
+           create_GA_BLOK_set() fails, publishes NULL so every later eval returns AL_BIGVAL.
+           Same hoist as the coarse pass already does before its parallel regions. */
+        al_ensure_blokset(&stup);
 
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic)
@@ -4402,6 +4409,9 @@ static int al_register(nifti_image *source, nifti_image *base,
            eval at candidate 0 — refresh the sample-based clips before the parallel region so the
            shared write stays race-free and p1==pN bit-identical. */
         if (tfdone > 0 && stup.need_hist_setup) (void)GA_scalar_fitter(nfr, cand_wpar[0]);
+        /* Same BLOK-set hoist as the reference-pass loop above: the fine-pass al_scalar_setup
+           destroyed the set, and for lpc/lpa no warm-up eval rebuilt it serially. */
+        al_ensure_blokset(&stup);
         /* re-apply the main thread's thread-local sampling factors per worker */
         float fc_mfac, fc_afac; powell_get_mfac(&fc_mfac, &fc_afac);
 #ifdef _OPENMP
