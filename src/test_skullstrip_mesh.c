@@ -4,6 +4,9 @@
 //   cc -O2 -DHAVE_ZLIB -o t test_skullstrip_mesh.c skullstrip.c nifti_io.c -lz -lm
 
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327   /* MSVC: not in math.h without _USE_MATH_DEFINES */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
