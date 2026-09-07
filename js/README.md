@@ -1,184 +1,125 @@
 # @niivue/niimath
 
-`@niivue/niimath` is a JavaScript + WASM library for performing mathemetical operations on NIFTI files. This library is intended to be **used in the browser**, not in a Node.js environment.
+`@niivue/niimath` is a JavaScript and WASM library for mathematical operations on NIfTI files. It is intended for use **in the browser**, not in Node.js.
 
-> All image processing operations are performed using the WASM build of [niimath](https://github.com/rordenlab/niimath), making it much faster than a pure JavaScript implementation. The image processing takes place in a separate worker thread, so it won't block the main thread in your application.
+All image processing runs in the WASM build of [niimath](https://github.com/rordenlab/niimath), which is much faster than a pure JavaScript implementation. The processing runs in a separate worker thread, so it does not block the main thread of your application.
+
+## Installation
+
+```bash
+npm install @niivue/niimath # or bun install @niivue/niimath
+```
+
+### Install a local build
+
+Build the library, pack it, and install the package in your application:
+
+```bash
+# from the niimath root directory
+cd js
+bun run build
+npm pack   # creates a .tgz file in the current directory
+npm install /path/to/niivue-niimath.tgz
+```
 
 ## Usage
 
-The `@niivue/niimath` JavaScript library offers an object oriented API for working with the `niimath` CLI. Since `niimath` is a CLI tool, the API implemented in `@niivue/niimath` is just a wrapper around the CLI options and arguments. 
+The library offers an object-oriented API over the `niimath` CLI. Because `niimath` is a command-line tool, the API is a wrapper around the CLI options and arguments.
 
-### Example: volumes
+### Process a volume
 
-For example, the [difference of gaussian](https://www.biorxiv.org/content/biorxiv/early/2022/09/17/2022.09.14.507937.full.pdf) command `niimath input.nii -dog 2 3.2 output.nii` can be executed using the following `@niivue/niimath` JavaScript code:
+The [difference of Gaussians](https://www.biorxiv.org/content/biorxiv/early/2022/09/17/2022.09.14.507937.full.pdf) command `niimath input.nii -dog 2 3.2 output.nii` becomes:
 
 ```javascript
 import { Niimath } from '@niivue/niimath';
 
 const niimath = new Niimath();
-// call the init() method to load the wasm before processing images
+// call init() to load the WASM before you process images
 await niimath.init();
 
-// 1. selectedFile is a browser File object
-// 2. note the use of the final run() method to execute the command. 
-// 3. note the use of await. The run method returns a promise that resolves to the output file if the command is successful.
+// selectedFile is a browser File object.
+// run() executes the command. It returns a promise that resolves to the output file when the command succeeds.
 const outFile = await niimath.image(selectedFile).dog(2, 3.2).run();
 ```
 
-### Registration & defacing
+### Register and deface
 
-The default (BSD-2-Clause) build includes the affine registration and defacing operations `-allineate` and `-deface` (adapted from AFNI 3dAllineate, public domain). These take other browser `File` objects as arguments:
+The default (BSD-2-Clause) build includes the affine registration and defacing operations `-allineate` and `-deface`, adapted from AFNI 3dAllineate (public domain). They take other browser `File` objects as arguments:
 
 ```javascript
 import { Niimath } from '@niivue/niimath';
 const niimath = new Niimath();
 await niimath.init();
 
-// affine-register `selectedFile` onto a base volume
+// affine-register selectedFile onto a base volume
 const registered = await niimath.image(selectedFile).allineate(baseFile).run();
 
-// deface using a template + mask pair
+// deface with a template and mask pair
 const defaced = await niimath.image(selectedFile).deface(templateFile, maskFile).run();
 ```
 
-`allineate(base, opts?, weight?)` accepts an optional third `File`: a graded weight in the base's space (dims and world frame must match `base`). Values are normalized to `[0, 1]`; zero excludes a voxel and larger values contribute more. Both registration engines honor it (the fast engine at its finest stage). Keep the outer head attenuated but nonzero so the whole-head boundary still anchors scale.
+`allineate(base, opts?, weight?)` accepts an optional third `File`: a graded weight in the base's space. Its dimensions and world frame must match `base`. Values are normalized to `[0, 1]`. Zero excludes a voxel, and larger values contribute more. Both registration engines honor the weight (the fast engine at its finest stage). Keep the outer head attenuated but nonzero, so the whole-head boundary still anchors the scale.
 
 ```javascript
-// register `selectedFile` onto `baseFile`, focusing the fit with a graded whole-head weight
+// register selectedFile onto baseFile, with a graded whole-head weight
 const registered = await niimath.image(selectedFile).allineate(baseFile, [], weightFile).run();
 ```
 
-**Worker lifecycle.** `await niimath.init()` once before processing; it spawns a single persistent Web Worker. `init()` returns a promise that rejects if the worker fails to load or instantiate (e.g. the WASM cannot be fetched). **Single-flight:** one `.run()` is in flight per instance at a time — a second overlapping `run()` (or a `run()` before `init()` has resolved) rejects immediately rather than interleaving, so serialize calls (await the previous `run()`) or use a separate instance per concurrent stream. Call `niimath.dispose()` to terminate the worker and release its WASM heap; it is idempotent and rejects any in-flight `init()`/`run()`. A worker crash during a `run()` rejects that run and invalidates the worker — a subsequent `image(...).run()` rejects with "Worker not initialized" until you `init()` again.
+### Use an image as an operand
 
-Two more operations take a `File` operand: `resliceNN(refFile)` reslices the current image onto another image's grid (nearest-neighbour), and `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` only takes a scalar). These let you, e.g., reslice a brain mask onto a native grid and apply it:
+Two more operations take a `File` operand. `resliceNN(refFile)` reslices the current image onto another image's grid with nearest-neighbor interpolation. `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` takes only a scalar). For example, to reslice a brain mask onto a native grid and apply it:
 
 ```javascript
-// reslice `maskFile` (conformed space) onto `nativeFile`'s grid, binarize, save
+// reslice maskFile (conformed space) onto nativeFile's grid, binarize, save
 const maskBlob = await niimath.image(maskFile).resliceNN(nativeFile).bin().run();
-// run() returns a Blob; wrap it in a File so it can be re-fed as an operand
+// run() returns a Blob; wrap it in a File so it can be used as an operand
 const nativeMask = new File([maskBlob], 'nativeMask.nii.gz');
 // keep only the masked region of the native image (now on the same grid)
 const brain = await niimath.image(nativeFile).mulImage(nativeMask).run();
 ```
 
-### SPM coregistration (`-spm_coreg`, `-spm_deface`)
+### Create a mesh
 
-The published `@niivue/niimath` package is **BSD-2-Clause only** and no longer ships the optional GPL-2 SPM coregistration WASM module — the permissively licensed `-allineate`/`-deface` engine supersedes it. The `-spm_coreg`/`-spm_deface` C sources remain in the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule and can still be built from source for local/historical use (`GPL=1 make`, or `bun run makeWasmGpl` to produce a GPL WASM), but they are not part of the npm package or its exports.
-
-### Example: meshes
-
-The `@niivue/niimath` library also supports the `-mesh` options available in the `niimath` CLI. However, the JavaScript API is slightly different from the volume processing due to the use of the `-mesh` suboptions. 
+The library supports the `-mesh` options of the `niimath` CLI. The JavaScript API differs slightly from volume processing, because `-mesh` has sub-options. Pass them as an object whose keys are the CLI sub-option letters: `i` (isosurface), `a` (atlas file), `b` (fill bubbles), `l` (only largest), `o` (original marching cubes), `q` (quality), `s` (post smooth), `r` (reduce fraction) and `v` (verbose). See the `-mesh` reference in the [niimath README](https://github.com/rordenlab/niimath#-mesh-opts-output).
 
 ```javascript
 import { Niimath } from '@niivue/niimath';
 const niimath = new Niimath();
 await niimath.init();
-const outName = 'out.mz3'; // outname must be a mesh format!
+const outName = 'out.mz3'; // the output name must use a mesh format
 const outMesh = await niimath.image(selectedFile)
   .mesh({
     i: 'm', // 'd'ark, 'm'edium, 'b'right or numeric (e.g. 128) isosurface
     b: 1, // fill bubbles
   })
   .run(outName);
-/*
-Here's the help from the niimath CLI program
-The mesh option has multiple sub-options:
- -mesh                    : meshify requires 'd'ark, 'm'edium, 'b'right or numeric isosurface ('niimath bet -mesh -i d mesh.gii')
-        -i <isovalue>            : 'd'ark, 'm'edium, 'b'right or numeric isosurface
-        -a <atlasFile>           : roi based atlas to mesh
-        -b <fillBubbles>         : fill bubbles
-        -l <onlyLargest>         : only largest
-        -o <originalMC>          : original marching cubes
-        -q <quality>             : quality
-        -s <postSmooth>          : post smooth
-        -r <reduceFraction>      : reduce fraction
-        -v <verbose>             : verbose
-*/
 ```
 
-## Installation
+## Worker lifecycle
 
-To install `@niivue/niimath` in your project, run the following command:
+- Call `await niimath.init()` once before you process images. It spawns one persistent Web Worker. The promise rejects if the worker fails to load or instantiate, for example when the WASM cannot be fetched.
+- One `.run()` is in flight per instance at a time. A second overlapping `run()`, or a `run()` before `init()` has resolved, rejects immediately instead of interleaving. Serialize calls (await the previous `run()`), or use a separate instance for each concurrent stream.
+- `niimath.dispose()` terminates the worker and releases its WASM heap. It is idempotent, and it rejects any in-flight `init()` or `run()`.
+- A worker crash during a `run()` rejects that run and invalidates the worker. A later `image(...).run()` rejects with "Worker not initialized" until you call `init()` again.
 
-```bash
-npm install @niivue/niimath # or bun install @niivue/niimath
-```
+## SPM coregistration
 
-### To install a local build of the library
-
-Fist, `cd` into the `js` directory of the `niimath` repository.
-
-```bash
-# from niimath root directory
-cd js
-```
-
-To install a local build of the library, run the following command:
-
-```bash
-bun run build
-```
-
-Then, install the library using the following command:
-
-```bash
-npm pack # will create a .tgz file in the root directory
-```
-
-Then, install the `@niivue/niimath` library in your application locally using the following command:
-
-```bash
-npm install /path/to/niivue-niimath.tgz
-```
+The published `@niivue/niimath` package is **BSD-2-Clause only**. It no longer ships the optional GPL-2 SPM coregistration WASM module, because the permissively licensed `-allineate` and `-deface` engine supersedes it. The `-spm_coreg` and `-spm_deface` C sources remain in the [`niimath_gpl`](https://github.com/rordenlab/niimath_gpl) submodule. You can still build them from source for local or historical use (`GPL=1 make`, or `bun run makeWasmGpl` to produce a GPL WASM), but they are not part of the npm package or its exports.
 
 ## Development
 
-Install [Bun](https://bun.com/docs/installation)
-
-First `cd` into the `js` directory of the `niimath` repository.
+Install [Bun](https://bun.com/docs/installation). Then, from the `js` directory of the `niimath` repository:
 
 ```bash
-# from niimath root directory
 cd js
+bun install      # install the dependencies
+bun run build    # build the library
+bun run test     # run the tests
+bun run dev      # start the development server
 ```
 
-To install the dependencies, run the following command:
+`src/niimathOperators.json` and `src/types.ts` are **generated** from the niimath CLI help text and are not checked into git. `bun run build` regenerates them in its `prebuild` step (`parseHelpText` + `generateTypes`). On a fresh clone, run `bun run prebuild` (or `bun run parseHelpText && bun run generateTypes`) once before you use your editor or `tsc`. Otherwise the imports in `src/index.ts` appear missing.
 
-```bash
-bun install
-```
+The tests in `tests/` load the built WASM module from `dist/` directly, through the in-memory filesystem and without a browser Worker, so run `bun run build` first. The package is BSD-only. The historical GPL binding and test are kept under `gpl-historical/` and are not part of the default suite.
 
-To build the library, run the following command
-
-```bash
-bun run build
-```
-
-> **Note:** `src/niimathOperators.json` and `src/types.ts` are **generated** from the
-> niimath CLI help text and are not checked into git. `bun run build` regenerates them
-> via its `prebuild` step (`parseHelpText` + `generateTypes`). On a fresh clone, run
-> `bun run prebuild` (or `bun run parseHelpText && bun run generateTypes`) once before
-> using your editor / `tsc`, otherwise the imports in `src/index.ts` will appear missing.
-
-To run the tests, run the following command:
-
-```bash
-bun run test
-```
-
-The tests in `tests/` load the built WASM module from `dist/` directly (via the
-in-memory filesystem, no browser Worker), so run `bun run build` first. The package
-is BSD-only; the historical GPL binding/test is kept under `gpl-historical/` and is
-not part of the default suite.
-
-### Development server with Hot Module Reloading
-
-To start the development server with hot module reloading:
-
-```bash
-bun run dev
-```
-
-This will start a development server at `http://localhost:3000` with automatic page reloading when source files change.
-
-
+`bun run dev` starts a development server at `http://localhost:3000` with automatic page reloading when source files change.
