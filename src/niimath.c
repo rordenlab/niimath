@@ -451,6 +451,20 @@ int show_help( void ) {
 	printf(" -skullstrip              : surface skull stripping — NOT in this build (rebuild a 64-bit native target with SKULLSTRIP=1 or -DENABLE_SKULLSTRIP=ON; wasm/tiny/nano cannot enable it)\n");
 	printf("                            NOTE: this name previously aliased -deface; that operation is still -deface\n");
 #endif
+#ifdef HAVE_REFILL
+	printf(" -refill-gefm <phase> <mask> <te1_ms> <te2_ms> [opts] : REFILL static field map (rad/s) from a multi-echo FLASH magnitude (input) and phase\n");
+	printf("                            echoes 1 and 3 by default (-echoes a,b); <mask> = brain mask (e.g. bet -m, then -ero); output is masked, filled and smoothed\n");
+	printf(" -refill-epifm <phase> <refill_phase> <te_ms> [opts] : REFILL dynamic field maps (rad/s, one per volume) from an EPI magnitude series (input) and phase\n");
+	printf("                            <refill_phase> is the readout-reversed first volume's phase; side outputs <out>_quality and <out>_mask (ROMEO)\n");
+	printf("                            opts: -clip <lo> <hi> (both; default -600 2000 rad/s), -s <smoothness> (both; default 2, 0 = none), -echoes a,b (gefm), -qthresh <t> (epifm; default 0.5)\n");
+	printf("                            -ramp-fix (epifm): remove the readout ramp with the paper's sign (Eq. 7); the default reproduces the reference code, whose sign doubles the ramp\n");
+	printf("                            -steps <dir> (all four): write every MATLAB-named intermediate; put -gz/-p BEFORE the op, side outputs and steps are written during it\n");
+	printf(" -refill-centre <mask> <dwell_s> <y|y-> [-steps <dir>] : subtract the median of the unwarped dynamic field maps (input = -refill-epifm output; mask voxels == 1 count)\n");
+	printf(" -refill-unwarp <fm> <dwell_s> <y|y-> [-steps <dir>] : forward-resample the input along y through the (demedianed) field maps; dwell = effective echo spacing\n");
+	printf("                            port of the MATLAB reference (Robinson et al., HBM 2023, doi:10.1002/hbm.26440); phase-encoding axis y only, as the reference\n");
+#else
+	printf(" -refill-gefm/-refill-epifm/-refill-centre/-refill-unwarp : REFILL dynamic distortion correction — NOT in this build (rebuild with REFILL=1 or -DENABLE_REFILL=ON; needs ROMEO)\n");
+#endif
 #ifdef HAVE_MOCO
 	printf(" -moco [opts]             : rigid-body motion correction of a 4D series onto volume 0\n");
 	printf("                            -ref <n|img> registers onto volume <n> of the series instead, or onto an\n");

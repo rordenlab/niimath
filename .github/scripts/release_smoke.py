@@ -3929,6 +3929,234 @@ def exercise_mesh_report(exe: str, tmp: Path, help_text: str) -> None:
           + (" (-n 1 half-edge engine exercised)" if "1" in engines else " (-n 1 not built: rejection checked)"))
 
 
+def exercise_refill(exe: str, tmp: Path, help_text: str) -> None:
+    """-refill-gefm/-epifm/-centre/-unwarp: closed-form contract checks, no MATLAB dependency.
+
+    The numerics are validated against the MATLAB oracle in test/refill_reference_manifest.md;
+    this pins what is derivable analytically: the forward-map kernel (identity at zero shift, an
+    exact two-tap split at half a voxel, the y/y- sign rule), the median centring, a known field
+    recovered through rescale + ROMEO + (uw2-uw1)/dTE with smoothing off, the readout-ramp sign
+    through -refill-epifm, and the parser/rejection contract (a trailing sub-option must not
+    become the output name).
+    """
+    line = _help_line(help_text, "-refill-unwarp")
+    if not line:
+        line = _help_line(help_text, "-refill-gefm")
+    if not line:
+        raise AssertionError("-refill-* help line missing entirely (it must be #ifdef-paired)")
+    if "NOT in this build" in line:
+        if "REFILL=1" not in line:
+            raise AssertionError("disabled -refill-* help must name REFILL=1")
+        src = tmp / "rf_disabled_in.nii"
+        out = tmp / "rf_disabled.nii"
+        write_float32_nifti(src, (6, 6, 6), [float(i % 7) for i in range(216)])
+        result = run_niimath(exe, [str(src), "-refill-unwarp", str(src), "0.001", "y", str(out)])
+        if result.returncode == 0 or out.exists():
+            raise AssertionError("-refill-unwarp must fail in a build without REFILL")
+        if "REFILL=1" not in (result.stdout + result.stderr):
+            raise AssertionError("disabled -refill-* must say how to enable it")
+        print("  -refill-*: not built (REFILL=0) - contract checked")
+        return
+
+    nx, ny, nz = 8, 8, 8
+    n3 = nx * ny * nz
+    dwell = 0.001
+    two_pi = 2.0 * math.pi
+
+    def field_for_shift(shift_vox: float) -> Path:
+        # vsm = fm/(2pi)*dwell*ny (then negated for "y"); a field of this value shifts by |shift_vox|
+        p = tmp / ("rf_f_%g.nii" % shift_vox)
+        write_float32_nifti(p, (nx, ny, nz), [shift_vox * two_pi / (dwell * ny)] * n3)
+        return p
+
+    impulse = [0.0] * n3
+    impulse[3 + 3 * nx + 3 * nx * ny] = 1000.0
+    src = tmp / "rf_impulse.nii"
+    write_float32_nifti(src, (nx, ny, nz), impulse)
+
+    def unwarp(field: Path, direction: str, inp: Path = src) -> list[float]:
+        out = tmp / "rf_out.nii"
+        require_success(run_niimath(exe, [str(inp), "-refill-unwarp", str(field), repr(dwell),
+                                          direction, "-gz", "0", str(out)]), "-refill-unwarp")
+        return read_float32_nifti(out)
+
+    # Zero shift is the identity, byte for byte.
+    if unwarp(field_for_shift(0.0), "y") != impulse:
+        raise AssertionError("-refill-unwarp: a zero field map must be the identity")
+    # A FORWARD map: sample k sits at k + vsm, so a positive field moves the impulse toward -y for
+    # "y" (vsm = -field) and toward +y for "y-".  Whole-voxel shift lands on exactly one voxel.
+    for direction, dj in (("y", -2), ("y-", 2)):
+        vals = unwarp(field_for_shift(2.0), direction)
+        want = 3 + (3 + dj) * nx + 3 * nx * ny
+        hot = [i for i, v in enumerate(vals) if abs(v) > 1e-3]
+        if hot != [want] or abs(vals[want] - 1000.0) > 1e-3:
+            raise AssertionError("-refill-unwarp: direction %s put the impulse at %s (expected [%d])" % (direction, hot, want))
+    # Half a voxel splits EXACTLY 500/500 -- interp1 'linear' on the shifted grid, nothing wider.
+    vals = unwarp(field_for_shift(1.5), "y-")
+    hot = sorted(i for i, v in enumerate(vals) if abs(v) > 1e-3)
+    want = sorted([3 + 4 * nx + 3 * nx * ny, 3 + 5 * nx + 3 * nx * ny])
+    if hot != want or any(abs(vals[i] - 500.0) > 1e-3 for i in hot):
+        raise AssertionError("-refill-unwarp: a 1.5-voxel shift did not split 500/500; got %s at %s" % ([vals[i] for i in hot], hot))
+    # A 4D field map must match a 4D input's volume count (a 3D input takes volume 1, as the
+    # reference unwarps its 3D quality map with the 4D shift map); x/z directions are unsupported.
+    fm4 = tmp / "rf_f4.nii"
+    write_float32_nifti(fm4, (nx, ny, nz), [0.0] * (n3 * 3), nt=3)
+    src2 = tmp / "rf_impulse2.nii"
+    write_float32_nifti(src2, (nx, ny, nz), impulse * 2, nt=2)
+    if run_niimath(exe, [str(src2), "-refill-unwarp", str(fm4), repr(dwell), "y", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-unwarp must reject a 3-volume field map for a 2-volume input")
+    if unwarp(fm4, "y") != impulse:
+        raise AssertionError("-refill-unwarp: a 3D input must take volume 1 of a 4D field map")
+    if run_niimath(exe, [str(src), "-refill-unwarp", str(field_for_shift(1.0)), repr(dwell), "x", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-unwarp must reject a phase-encoding axis other than y")
+    # an option another -refill op owns is handed back to the op loop: niimath's own -s (Gaussian
+    # smooth) may follow -refill-unwarp, and a -refill-only option there fails as an unknown op
+    require_success(run_niimath(exe, [str(src), "-refill-unwarp", str(field_for_shift(1.0)), repr(dwell), "y", "-s", "2", "-gz", "0", str(tmp / "rf_chain.nii")]), "-refill-unwarp then -s")
+    if run_niimath(exe, [str(src), "-refill-unwarp", str(field_for_shift(1.0)), repr(dwell), "y", "-qthresh", "0.5", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-qthresh after -refill-unwarp must fail (not a -refill-unwarp option, not a niimath op)")
+
+    # -refill-centre: a constant field inside a full mask has itself as median, so the output is 0.
+    cval = 37.5
+    fmc = tmp / "rf_const.nii"
+    write_float32_nifti(fmc, (nx, ny, nz), [cval] * (n3 * 2), nt=2)
+    ones = tmp / "rf_ones.nii"
+    write_float32_nifti(ones, (nx, ny, nz), [1.0] * n3)
+    outc = tmp / "rf_centred.nii"
+    res = run_niimath(exe, [str(fmc), "-refill-centre", str(ones), repr(dwell), "y", "-gz", "0", str(outc)])
+    require_success(res, "-refill-centre")
+    if ("EPI-FM=%4.2f" % cval) not in (res.stdout + res.stderr):
+        raise AssertionError("-refill-centre must print the median in the reference's format")
+    if any(abs(v) > 1e-4 for v in read_float32_nifti(outc)):
+        raise AssertionError("-refill-centre: a constant field must centre to zero")
+
+    # -refill-gefm with smoothing off: a known field is recovered from wrapped two-echo phase.
+    # Stored as int16-range integers so the rescale path is exercised; the field is small enough
+    # that neither echo wraps inside the object and ROMEO has nothing to undo.
+    gx, gy, gz = 16, 16, 8
+    g3 = gx * gy * gz
+    tes = (2.5, 5.0, 7.5)
+    field = [0.0] * g3
+    mask = [0.0] * g3
+    for z in range(gz):
+        for y in range(gy):
+            for x in range(gx):
+                i = x + gx * (y + gy * z)
+                r2 = (x - 7.5) ** 2 + (y - 7.5) ** 2 + 4 * (z - 3.5) ** 2
+                if r2 < 36:
+                    mask[i] = 1.0
+                    field[i] = 40.0 + 10.0 * (x - 7.5) / 7.5  # rad/s, a gentle ramp
+    # Integer phase codes, as a scanner stores them: the op rescales the ATTAINED code range to
+    # [-pi, pi] (rescale.m), so the background carries noise spanning the whole +-4096 range the
+    # way real data does -- an object-only fixture would be stretched to +-pi and mean nothing.
+    def code(w: float, i: int, inside: bool) -> float:
+        if not inside:
+            # pin both extremes so the attained range is exactly [-4096, 4095]
+            return -4096.0 if i == 0 else 4095.0 if i == 1 else float(((i * 7919) % 8192) - 4096)
+        w = w - two_pi * math.floor((w + math.pi) / two_pi)
+        return float(round(w / math.pi * 4096.0))
+    mag = []
+    ph = []
+    for te in tes:
+        for i in range(g3):
+            mag.append(300.0 if mask[i] else 5.0)
+            ph.append(code(field[i] * te * 1e-3, i, bool(mask[i])))
+    magf = tmp / "rf_ge_m.nii"; phf = tmp / "rf_ge_p.nii"; mkf = tmp / "rf_ge_mask.nii"
+    write_float32_nifti(magf, (gx, gy, gz), mag, nt=3)
+    write_float32_nifti(phf, (gx, gy, gz), ph, nt=3)
+    write_float32_nifti(mkf, (gx, gy, gz), mask)
+    outg = tmp / "rf_ge_fm.nii"
+    require_success(run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "7.5", "-s", "0", "-gz", "0", str(outg)]), "-refill-gefm")
+    got = read_float32_nifti(outg)
+    if len(got) != g3:
+        raise AssertionError("-refill-gefm must return one 3D field map")
+    # the integer coding quantises the phase to pi/4096 per echo (0.15 rad/s over 5 ms) and
+    # rescale.m maps codes -4096..4095 onto [-pi, pi] (a 1/8191 scale); both are in the exact
+    # expectation, and the loose check against the true field guards the whole convention.
+    def rescaled(c: float) -> float:
+        return (two_pi * (c + 4096.0)) / 8191.0 - math.pi
+    exact = [(rescaled(ph[i + 2 * g3]) - rescaled(ph[i])) / 5e-3 for i in range(g3)]
+    bad = [i for i in range(g3) if mask[i] and (abs(got[i] - field[i]) > 0.5 or abs(got[i] - exact[i]) > 1e-2)]
+    if bad:
+        raise AssertionError("-refill-gefm: field not recovered inside the mask at %d voxels (e.g. %g vs %g)" % (len(bad), got[bad[0]], field[bad[0]]))
+    if any(got[i] == got[i] for i in range(g3) if not mask[i]):  # NaN != NaN
+        raise AssertionError("-refill-gefm -s 0: outside the mask must be NaN (missing), not filled")
+    # -echoes must name two distinct existing volumes; -steps in the output slot is refused.
+    if run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "7.5", "-echoes", "1,4", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-gefm must reject an echo beyond the input")
+    before = sorted(p.name for p in tmp.iterdir())
+    if run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "7.5", "-steps"]).returncode == 0:
+        raise AssertionError("-refill-gefm must refuse a sub-option sitting in the output-name slot")
+    if sorted(p.name for p in tmp.iterdir()) != before:
+        raise AssertionError("a refused -refill-gefm command must create no files")
+    if run_niimath(exe, ["-dt", "double", str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "7.5", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-gefm must reject -dt double")
+    # an option belonging to another op is refused, not silently ignored; a non-finite TE too
+    if run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "7.5", "-qthresh", "0.5", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-qthresh after -refill-gefm must fail (an -epifm option is not a niimath op)")
+    if run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(mkf), "2.5", "abc", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-gefm must reject a non-numeric echo time")
+    # a mask selecting nothing must fail, not fill the volume from masked-out data
+    zeros = tmp / "rf_ge_zeros.nii"
+    write_float32_nifti(zeros, (gx, gy, gz), [0.0] * g3)
+    if run_niimath(exe, [str(magf), "-refill-gefm", str(phf), str(zeros), "2.5", "7.5", str(tmp / "rf_bad.nii")]).returncode == 0:
+        raise AssertionError("-refill-gefm must reject a mask with no valid voxel")
+
+    # -refill-epifm: the same object over 5 volumes at TE 22 ms, plus a readout-reversed volume whose
+    # phase differs by -2*g*x, so the op must report the gradient g and remove the ramp.
+    te = 22.0
+    g_rad = 0.02  # rad/voxel; ramp over +-8 voxels stays far from a wrap
+    nt = 5
+    # The gradient is the angle of a magnitude-weighted complex sum over EVERY voxel pair along x,
+    # so a noisy background next to a 16-voxel object would bias it (real data averages 650k
+    # voxels).  The background therefore carries the same clean ramp at low magnitude, with the
+    # two code extremes pinned at i = 0, 1 in every volume so each per-volume rescale is exact.
+    def code_clean(w: float, i: int) -> float:
+        return -4096.0 if i == 0 else 4095.0 if i == 1 else code(w, i, True)
+    magt = []; pht = []
+    for t in range(nt):
+        for i in range(g3):
+            x = i % gx
+            magt.append(300.0 if mask[i] else 5.0)
+            pht.append(code_clean(field[i] * te * 1e-3 + g_rad * (x - gx / 2), i))
+    phr = [code_clean(field[i] * te * 1e-3 - g_rad * (i % gx - gx / 2), i) for i in range(g3)]
+    magtf = tmp / "rf_epi_m.nii"; phtf = tmp / "rf_epi_p.nii"; phrf = tmp / "rf_refill_p.nii"
+    write_float32_nifti(magtf, (gx, gy, gz), magt, nt=nt)
+    write_float32_nifti(phtf, (gx, gy, gz), pht, nt=nt)
+    write_float32_nifti(phrf, (gx, gy, gz), phr)
+    oute = tmp / "rf_epi_fm.nii"
+    # -gz before the op: side outputs are written DURING it (same rule as -romeo)
+    res = run_niimath(exe, [str(magtf), "-gz", "0", "-refill-epifm", str(phtf), str(phrf), repr(te), "-s", "0", str(oute)])
+    require_success(res, "-refill-epifm")
+    log = res.stdout + res.stderr
+    m = re.search(r"readout direction of (-?[0-9.]+) Hz/voxel", log)
+    # p2 - p1 = -2*g*x, and the op halves that slope: it reports -g.
+    if not m or abs(float(m.group(1)) + g_rad / two_pi) > 2e-4:
+        raise AssertionError("-refill-epifm must report the readout gradient %.6f Hz/voxel; log:\n%s" % (-g_rad / two_pi, log))
+    got = read_float32_nifti(oute)
+    if len(got) != g3 * nt:
+        raise AssertionError("-refill-epifm must return one field map per volume")
+    for side in ("_quality", "_mask"):
+        if not (tmp / ("rf_epi_fm%s.nii" % side)).exists():
+            raise AssertionError("-refill-epifm must write the %s side output" % side)
+    # The reference code SUBTRACTS a ramp built from angle(p_REFILL - p_1)/2, which has the opposite
+    # sign to the paper's Eq. 7, so by default the readout ramp is DOUBLED rather than removed:
+    # expect field + 2*g*(x - gx/2)/TE.  -ramp-fix applies the paper's sign and recovers the field.
+    # (Quantisation is ~pi/4096 per code over 22 ms = 0.035 rad/s.)
+    def expect(i: int, k: float) -> float:
+        return field[i % g3] + k * g_rad * (i % gx - gx / 2) / (te * 1e-3)
+    bad = [i for i in range(g3 * nt) if mask[i % g3] and got[i] == got[i] and abs(got[i] - expect(i, 2.0)) > 0.5]
+    if bad:
+        raise AssertionError("-refill-epifm: default must reproduce the reference's doubled ramp; off at %d voxels (e.g. %g vs %g)" % (len(bad), got[bad[0]], expect(bad[0], 2.0)))
+    res = run_niimath(exe, [str(magtf), "-gz", "0", "-refill-epifm", str(phtf), str(phrf), repr(te), "-s", "0", "-ramp-fix", str(oute)])
+    require_success(res, "-refill-epifm -ramp-fix")
+    got = read_float32_nifti(oute)
+    bad = [i for i in range(g3 * nt) if mask[i % g3] and got[i] == got[i] and abs(got[i] - expect(i, 0.0)) > 0.5]
+    if bad:
+        raise AssertionError("-refill-epifm -ramp-fix: ramp not removed at %d voxels (e.g. %g vs %g)" % (len(bad), got[bad[0]], field[bad[0] % g3]))
+    print("  -refill-*: forward-map identity/two-tap/sign, centre median, GE and EPI field recovery, reference ramp sign and -ramp-fix,"
+          " side outputs and parser rejections OK")
+
+
 def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
     """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
     hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
@@ -4533,6 +4761,7 @@ def main() -> int:
         exercise_fmap(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
         exercise_skullstrip(exe, tmp, help_text)
+        exercise_refill(exe, tmp, help_text)
         exercise_openmp_scratch_ops(exe, tmp)
         exercise_mesh_report(exe, tmp, help_text)
 

@@ -76,6 +76,7 @@ make ubsan             # Lightweight undefined-behavior checks (OpenMP-safe on m
 make sanitize          # AddressSanitizer build
 AL=0 make              # Disable allineate registration
 SKULLSTRIP=1 make      # Enable surface skull stripping (-skullstrip); off by default, 64-bit native only
+REFILL=1 make          # Enable REFILL dynamic distortion correction (-refill-*); off by default, native only, needs ROMEO
 ZSTD=0 make            # Disable zstd compression support
 make wasm              # Emscripten/WebAssembly target
 make wasm-wasi         # Experimental zlib-free WASI compute backend (needs Zig)
@@ -413,6 +414,70 @@ Constraints:
 - `-fmapprep` needs ROMEO. `ROMEO=0` drops `-fmapprep` and keeps `-fugue`.
 - Enabled by default. `FMAP=0 make` or `-DENABLE_FMAP=OFF` omits both commands.
 
+### `-refill-gefm`, `-refill-epifm`, `-refill-centre`, `-refill-unwarp`
+
+REFILL dynamic distortion correction for fMRI (Robinson et al., *Human Brain Mapping* 2023, [doi:10.1002/hbm.26440](https://doi.org/10.1002/hbm.26440)). REFILL estimates a field map from the phase of every single-echo EPI volume. The correction therefore follows breathing, motion and shim drift. One readout-reversed EPI volume supplies the readout phase gradient. A 3-echo bipolar FLASH scan gives a static field map for comparison. Optional: build with `REFILL=1 make` or `-DENABLE_REFILL=ON`. Needs ROMEO.
+
+The four operations reproduce the stages of the authors' MATLAB reference. Each stage is validated against that code's own intermediates on the three subjects it ships with. The contract, the oracle and every tolerance are in [test/refill_reference_manifest.md](test/refill_reference_manifest.md).
+
+Static field map from the FLASH scan (the input is the multi-echo magnitude):
+
+```
+niimath flash_mag.nii -gz 0 -refill-gefm flash_phase.nii flash_mask.nii 2.5 7.5 ge_fm.nii
+```
+
+- `flash_phase.nii`: the matching phase, stored as the scanner wrote it. Its minimum and maximum are rescaled to [-π, π], whatever the units.
+- `flash_mask.nii`: a brain mask on the FLASH grid, for example `bet flash_mag out -m` followed by `niimath out_mask -ero mask`. Any non-zero voxel counts.
+- `2.5 7.5`: the echo times of echoes 1 and 3 in milliseconds. `-echoes a,b` picks other echoes. The magnitude needs at least two echoes.
+- Output: a 3D field map in rad/s, masked, filled and smoothed.
+
+Dynamic field maps from the EPI series (the input is the magnitude time series):
+
+```
+niimath epi_mag.nii -gz 0 -refill-epifm epi_phase.nii refill_phase.nii 22 epi_fm.nii
+```
+
+- `refill_phase.nii`: the phase of the readout-reversed volume acquired before the series. A 4D file contributes its first volume.
+- `22`: the EPI echo time in milliseconds.
+- Output: one field map per volume in rad/s, plus `epi_fm_quality.nii` (ROMEO's quality map) and `epi_fm_mask.nii` (ROMEO's robust mask).
+
+Put `-gz` before any `-refill-*` operation, as above. The side outputs and the `-steps` files are written during the operation. A `-gz` placed after it affects only the main output.
+
+Centre the dynamic maps and correct the series. `dwell` is the effective echo spacing in seconds. `y` or `y-` is the phase-encoding direction; `j` and `j-` are accepted too:
+
+```
+niimath epi_fm.nii -gz 0 -refill-centre median_mask.nii 0.000383 y epi_fm_c.nii
+niimath epi_mag.nii -gz 0 -refill-unwarp epi_fm_c.nii 0.000383 y epi_mag_ddc.nii
+```
+
+`-refill-centre` unwarps the field maps, takes their median inside `median_mask.nii` and subtracts it. That removes the global frequency offset between the EPI and the reference scan. The mask must be a single volume on the EPI grid and only voxels equal to 1 count. The reference uses the FLASH brain mask here when it has one, and ROMEO's robust mask (`epi_fm_mask.nii`) otherwise. Non-finite field values become 0.
+
+`-refill-unwarp` resamples the input along the phase-encoding axis through the field maps. It works on any image on that grid. The same call unwarps the field maps or the quality map for inspection. A 4D input needs a field map with one volume or the same number of volumes. A 3D input takes field-map volume 1. A non-finite field value means no shift. The reference uses a forward map with linear interpolation, not FSL `fugue`, and the two are not interchangeable. The static arm of the paper is `-fugue` with the FLASH map.
+
+Options. `-steps` applies to all four operations; the others belong to the operation named:
+
+- `-clip <lo> <hi>` (`-refill-gefm`, `-refill-epifm`): field values outside this range count as missing. Default `-600 2000` rad/s, the 7 T setting of the reference. Adjust for other field strengths.
+- `-s <smoothness>` (`-refill-gefm`, `-refill-epifm`): the smoothness of the DCT-based fill and smoothing (Garcia's `smoothn`). Default 2. `0` skips it and leaves missing voxels as NaN.
+- `-echoes <a,b>` (`-refill-gefm`): the two echoes to use. Default `1,3`.
+- `-qthresh <t>` (`-refill-epifm`): mask with ROMEO's quality map above this value. Default 0.5.
+- `-ramp-fix` (`-refill-epifm`): see below.
+- `-steps <dir>` (all four): write every intermediate under the names the MATLAB reference uses, for stage-by-stage comparison.
+
+An option that belongs to another `-refill-*` operation is handed back to niimath as the next operation, so it fails as an unknown operation unless niimath has one of that name.
+
+Two behaviours of the reference code are bugs relative to the paper. niimath reproduces both on purpose, because the goal is equivalence with the code as it runs. Both are documented in the manifest and were reported to the authors.
+
+- The reference removes the readout phase ramp with the sign opposite to the paper's Eq. 7. It therefore doubles the residual gradient instead of removing it. On subject 1 of the validation set, the x-slope of the EPI minus FLASH field map is 0.78 rad/s per voxel with the reference sign. With the paper's sign it is 0.009. `-ramp-fix` applies the paper's sign.
+- The reference intends an in-mask median over all volumes. Its MATLAB indexing masks only the first volume and pools every voxel of the others. `-refill-centre` does the same.
+
+Later work, not validated here: `EffectiveEchoSpacing` from a BIDS sidecar instead of the reference's `1.2/(bandwidth × acceleration)`. Also `-moco` in place of mcflirt, and mindgrab in place of bet. Each changes the numerical inputs and needs its own oracle.
+
+Constraints:
+
+- Float32 only, 3D or 4D inputs. The phase-encoding axis must be `y`, as in the reference. Images must share a voxel grid. A differing world transform only warns, since the reference works in voxel space.
+- Thread-count invariant: output is byte-identical at any `-p`.
+- The unwrapping is niimath's float32 ROMEO port, while the reference runs ROMEO in float64. Inside the masks the pipeline consumes the two agree to float32 rounding. Outside them they can differ by 2π, and that never reaches the output.
+
 ### `-moco [-ref <n|image>] [-1Dfile <path.1D>] [-relative]`
 
 Rigid-body motion correction. Registers every volume of a 4D series onto a reference and replaces the image with the corrected series. A clean-room BSD-2 implementation of the method of Cox & Jesmanowicz (*Magnetic Resonance in Medicine* 42:1014-1018, 1999), the algorithm behind AFNI `3dvolreg`. Further operations may follow.
@@ -736,6 +801,8 @@ The `--medic` and `-unwarp` commands (`src/medic.c`) are original BSD-2-Clause c
 The `-moco` and `-stc` commands (`src/moco.c`, `src/stc.c`) are original BSD-2-Clause code by the niimath authors. Both emulate a published AFNI method whose reference implementation is copyrighted by the Medical College of Wisconsin: `3dvolreg`, `mri_3dalign`, `thd_rot3d` and `thd_shear3d` for `-moco`, and `3dTshift` and its FFT for `-stc`. Those files were **GPL-2** when this code was written. On 12 May 2026 MCW relicensed its 1994-2000 AFNI code to **CC BY 4.0**, which removes the copyleft bar but adds attribution and change-notice duties. Those sources were **not** read, translated or paraphrased. They served only as black-box oracles. The clean-room specification is the published method (Cox & Jesmanowicz 1999 for `-moco`; AFNI's published `3dTshift -help` and `-verbose` output for `-stc`) together with measured inputs and outputs, recorded in the `moco_bench` repository (`test/moco_reference_manifest.md` and `test/stc_reference_manifest.md`). The FFT in `stc.c` is original niimath code, a batched Stockham autosort kernel. No FFT implementation was read or adapted. Neither command carries any attribution obligation as a result. A binary containing these commands remains BSD-2-Clause.
 
 The `-fugue` and `-fmapprep` commands (`src/fmap.c`) are original BSD-2-Clause code by the niimath authors. They are a clean-room implementation of the observable behavior of FSL's `fugue` and of `fsl_prepare_fieldmap SIEMENS`. FSL is licensed under the University of Oxford's non-commercial licence, which is incompatible with BSD-2-Clause. FSL's sources for fugue, prelude and `fsl_prepare_fieldmap` were not read, grepped, translated or paraphrased. The executables served only as black-box oracles, driven with synthetic inputs built to isolate one convention at a time. The published basis is Jezzard & Balaban, *Magnetic Resonance in Medicine* 34:65-73 (1995), and Jenkinson, *Magnetic Resonance in Medicine* 49:193-197 (2003) for PRELUDE. Phase unwrapping in `-fmapprep` uses the MIT-licensed `-romeo` port described above, so `ROMEO=0` drops `-fmapprep` while keeping `-fugue`. `FMAP=0 make` or `-DENABLE_FMAP=OFF` omits both.
+
+The optional `-refill-*` commands (`src/refill.c`) are a C port of the MATLAB reference implementation of REFILL by Simon Robinson ([simon-mri/REFILL-Dynamic-Distortion-Correction](https://github.com/simon-mri/REFILL-Dynamic-Distortion-Correction), MIT). They also port Damien Garcia's `smoothn`, `dctn` and `idctn` (BSD). The upstream notices are preserved verbatim in `src/refill.LICENSE`. Phase unwrapping uses the `-romeo` port. Both licenses are compatible with BSD-2-Clause, so a `REFILL=1` binary remains BSD-2-Clause. The commands are off by default.
 
 The optional `-skullstrip` command (`src/skullstrip.c`) adapts public-domain AFNI code by Robert W. Cox and colleagues (NIMH): spatial normalization from `thd_brainormalize.c` and `thd_automask.c`, and the surface deformation and touchup stages from `SUMA_BrainWrap.c`. That file carries no copyright notice, so it falls under AFNI's US-Government-work clause, and a US Government work is not copyrightable (17 U.S.C. §105). AFNI states this affirmatively rather than by implication. Its `LICENSE.txt` declares the tree a "United States Government Work" apart from a listed set of exceptions. It also states that "contributions without explicit licensing will be assumed to be entered into the public domain". Its `README.copyright` dates the rule to work after 15 January 2001, and the adapted files' first commits are 2001-2004, by NIH authors. AFNI's `SUMA_3dedge3`, which wraps Malandain's GPL-3.0 `Extract_Gradient_Maxima_3D`, is deliberately out of scope, which is why niimath implements only the `-no_use_edge` behavior. One item was resolved rather than argued. The nearest-neighbor index conversion was originally written after reading `THD_3dmm_to_3dind_warn` in AFNI's `thd_coords.c`, which carries an MCW copyright header and predates the public-domain cutoff. It has been replaced by a clean-room reimplementation, `ss_world_to_index`. An implementer who had read neither AFNI nor niimath reproduced a 19,139-row table of measured input and output behavior. Working only from that table, they produced masks that are byte-identical. The protocol, the table, the sufficiency check and the implementer's derivation account are in the `skullstrip_bench` repository's `clean_room/` directory. The relicense has not changed this: a clean-room result carries no attribution duty, where adapting the CC BY original would. The surface primitives (icosphere, adjacency, intersection testing, rasterization) are original BSD-2-Clause code. A binary containing this command remains BSD-2-Clause. `-skullstrip` is off by default (`SKULLSTRIP=1 make`, `cmake -DENABLE_SKULLSTRIP=ON`) and is absent from every released binary.
 

@@ -75,6 +75,10 @@ endif()
 if(ENABLE_SKULLSTRIP AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
   message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON is not supported for WebAssembly targets.")
 endif()
+option(ENABLE_REFILL "Enable REFILL dynamic distortion correction (-refill-*)" OFF)
+if(ENABLE_REFILL AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR NOT BUILD_FLAVOR STREQUAL "all"))
+  message(FATAL_ERROR "ENABLE_REFILL=ON requires a native BUILD_FLAVOR=all build (not WebAssembly).")
+endif()
 option(ENABLE_ROMEO "Enable ROMEO phase unwrapping (-romeo)" ON)
 option(ENABLE_ALLINEATE "Enable allineate affine registration" ON)
 option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
@@ -147,6 +151,7 @@ ExternalProject_Add(src
         -DENABLE_STC:BOOL=${ENABLE_STC}
         -DENABLE_FMAP:BOOL=${ENABLE_FMAP}
         -DENABLE_SKULLSTRIP:BOOL=${ENABLE_SKULLSTRIP}
+        -DENABLE_REFILL:BOOL=${ENABLE_REFILL}
         -DENABLE_ROMEO:BOOL=${ENABLE_ROMEO}
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL=${CMAKE_INTERPROCEDURAL_OPTIMIZATION}
         -DENABLE_ALLINEATE:BOOL=${ENABLE_ALLINEATE}

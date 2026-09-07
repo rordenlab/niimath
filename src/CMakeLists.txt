@@ -46,6 +46,9 @@ endif()
 if(ENABLE_SKULLSTRIP AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
     message(FATAL_ERROR "ENABLE_SKULLSTRIP=ON is not supported for WebAssembly targets.")
 endif()
+if(ENABLE_REFILL AND (EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR NOT BUILD_FLAVOR STREQUAL "all"))
+    message(FATAL_ERROR "ENABLE_REFILL=ON requires a native BUILD_FLAVOR=all build (not WebAssembly).")
+endif()
 # ...and the DEFAULT is ON only where the feature can actually run: a 32-bit "all" build would
 
 # ENABLE_QWARP is only meaningful for the full "all" flavor (tiny/nano omit the allineate engine
@@ -154,6 +157,17 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     if(ENABLE_SKULLSTRIP)
         ADD_DEFINITIONS(-DHAVE_SKULLSTRIP)
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} skullstrip.c)
+    endif()
+    # REFILL dynamic distortion correction (-refill-gefm/-epifm/-centre/-unwarp): port of the MIT
+    # MATLAB reference (simon-mri/REFILL-Dynamic-Distortion-Correction). OFF by default until the
+    # three-subject validation gate in plan_refill.md is green; needs the ROMEO frame API.
+    option(ENABLE_REFILL "Enable REFILL dynamic distortion correction (-refill-*)" OFF)
+    if(ENABLE_REFILL AND NOT ENABLE_ROMEO)
+        message(FATAL_ERROR "ENABLE_REFILL=ON requires ENABLE_ROMEO=ON (refill.c calls the ROMEO frame API).")
+    endif()
+    if(ENABLE_REFILL)
+        ADD_DEFINITIONS(-DHAVE_REFILL)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} refill.c)
     endif()
     ADD_DEFINITIONS(-DNII2MESH)
     set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} bwlabel.c fdr.c meshify.c quadric.c radixsort.c)

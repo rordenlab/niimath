@@ -535,7 +535,7 @@ int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int 
 	o.no_phase_rescale = 1;   /* already in radians, above */
 	/* mask_in is supplied, so ROMEO's own robustmask is bypassed entirely and the mask stays
 	   byte-identical to the caller's brain extraction -- the point of taking a magnitude at all. */
-	if (romeo_unwrap_frame(ph, mag, 1, (int)nx, (int)ny, (int)nz, 1, o.TEs, &o, mask, NULL)) {
+	if (romeo_unwrap_frame(ph, mag, 1, (int)nx, (int)ny, (int)nz, 1, o.TEs, &o, mask, NULL, NULL)) {
 		printfx("-fmapprep: ROMEO failed to unwrap the phase difference\n");
 		goto done;
 	}

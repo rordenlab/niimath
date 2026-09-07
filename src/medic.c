@@ -1330,7 +1330,7 @@ static int md_branch_select(const md_ctx *c, const float *phase, const float *ma
 			psi[i] = md_wrapf((double)phase[i] - (double)off);
 			psi[n3 + i] = md_wrapf((double)phase[n3 + i] - (double)off);
 		}
-		if (romeo_unwrap_frame(psi, mag, 2, c->nx, c->ny, c->nz, 2, TEs2, &o, omega, NULL))
+		if (romeo_unwrap_frame(psi, mag, 2, c->nx, c->ny, c->nz, 2, TEs2, &o, omega, NULL, NULL))
 			goto done;
 		for (i = 0, j = 0; i < n3; i++) {
 			if (!omegac[i]) continue;
@@ -1423,7 +1423,7 @@ static int md_mcpc3ds(const md_ctx *c, float *phase, const float *mag, const rom
 		   wherever the region growing happens to seed, which makes the field's absolute level
 		   depend on the mask.  --branch-correction 0 restores the previous behaviour. */
 		o.correctglobal = c->branch ? 1 : 0;
-		if (romeo_unwrap_frame(hipp, hipm, 1, c->nx, c->ny, c->nz, 1, &te1, &o, mask, NULL)) {
+		if (romeo_unwrap_frame(hipp, hipm, 1, c->nx, c->ny, c->nz, 1, &te1, &o, mask, NULL, NULL)) {
 			MD_ERR("ROMEO failed while unwrapping the MCPC-3D-S phase difference\n");
 			goto done;
 		}
@@ -2656,7 +2656,7 @@ int nii_medic(int argc, char *argv[]) {
 				if (md_mcpc3ds(&c, p, m, &ro, mkb, omc, blog ? blog + (size_t)4 * t : NULL,
 						offs ? offs + (int64_t)t * n3 : NULL)) { free(mkb); frc[t] = 1; continue; }
 			}
-			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro, mkb, NULL)) { free(mkb); frc[t] = 1; continue; }   /* ro.correctglobal set from --branch-correction above */
+			if (romeo_unwrap_frame(p, m, c.neco, c.nx, c.ny, c.nz, c.neco, c.TEs, &ro, mkb, NULL, NULL)) { free(mkb); frc[t] = 1; continue; }   /* ro.correctglobal set from --branch-correction above */
 			/* Gap 4: the per-echo intra-frame offset, between the unwrap and the mask gating.
 			   This one uses the magnitude brain mask as it stands, with no extra erosion. */
 			if (bm && c.echo_offset) eoff[t] = md_echo_offset(&c, p, m, bm);

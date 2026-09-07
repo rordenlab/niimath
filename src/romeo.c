@@ -2200,7 +2200,7 @@ static int rm_core_run(rm_core *c) {
  */
 int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	int nx, int ny, int nz, int neco, const double *TEs,
-	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out) {
+	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out, float *qmap_out) {
 	rm_core c;
 	int rc;
 	if (!phase || !o || nx < 1 || ny < 1 || nz < 1 || neco < 1 || !TEs) return 1;
@@ -2218,6 +2218,15 @@ int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	if (mask_out) {
 		if (!rc && c.mask) memcpy(mask_out, c.mask, (size_t)c.n3);
 		else memset(mask_out, 0, (size_t)c.n3);
+	}
+	if (!rc && qmap_out) {
+		/* The `-q` side output of romeo_run: write_qualitymap runs AFTER unwrapping, on the
+		   unwrapped phase, and voxelquality's own 4D overload fixes p2ref = 2 regardless of the
+		   template (same ctx as the romeo_run site; kept in step with it). */
+		rm_wctx qc;
+		if (rm_build_ctx(&qc, phase, c.have_mag ? mag : NULL, c.magvol, c.mask, c.magmasked, TEs, neco,
+				o->template_echo, 2, nx, ny, nz, c.flags)) rc = 1;
+		else if (rm_voxelquality(&qc, qmap_out)) rc = 1;
 	}
 	rm_core_free(&c);
 	return rc;

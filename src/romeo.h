@@ -105,12 +105,15 @@ int romeo_run(nifti_image *nim, const char *magfile, const char *phasefile,
 //             pass NULL for the ordinary -k behaviour.
 //   mask_out  optional caller-owned n3 bytes; receives the mask, or all zeros when the options
 //             select no mask or the call fails.
+//   qmap_out  optional caller-owned n3 floats; receives the combined quality map that `-q`
+//             writes (voxelquality of the UNWRAPPED phase, magnitude weights, p2ref = 2), or is
+//             left untouched when the call fails.  NULL skips the computation.
 //
 // Performs no file I/O and writes no side outputs; the dump, rescale and side-output fields of
 // `o` are ignored.  Returns 0 on success.
 int romeo_unwrap_frame(float *phase, const float *mag, int magvol,
 	int nx, int ny, int nz, int neco, const double *TEs,
-	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out);
+	const romeo_opts *o, const uint8_t *mask_in, uint8_t *mask_out, float *qmap_out);
 
 // ROMEO's voxel-quality map from WRAPPED phase alone (all-ones magnitude weights), for callers
 // that need phase coherence as a mask ingredient.  qmap is caller-owned, nx*ny*nz floats.

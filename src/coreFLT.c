@@ -108,6 +108,9 @@
 // the -skullstrip dispatch keyed to the same single flag.
 #include "skullstrip.h" // AFNI-style surface skull stripping (-skullstrip)
 #endif
+#ifdef HAVE_REFILL
+#include "refill.h" // REFILL dynamic distortion correction (-refill-gefm/-epifm/-centre/-unwarp)
+#endif
 #ifdef HAVE_GPL
 #include "GPL/spmcoreg_niimath.h" // optional GPL spm_coreg module (niimath_gpl)
 #endif
@@ -7154,6 +7157,72 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+#ifdef HAVE_REFILL
+/* -refill-gefm <phase> <mask> <te1_ms> <te2_ms> [opts], -refill-epifm <phase> <refill_phase> <te_ms> [opts],
+   -refill-centre <mask> <dwell_s> <y|y-> [opts], -refill-unwarp <fm> <dwell_s> <y|y-> [opts].
+   Positionals sit strictly before the output name (`ac + npos - 1 >= argc` rejects a short
+   command line); the optional sub-options after them use the `ac + 1 <= argc` peek, so one
+   sitting in the output-name slot is refused rather than becoming the output name.  Each op
+   accepts only its own options (`caps`), the al_parse_subopts convention. */
+enum { RF_CAP_CLIP = 1, RF_CAP_S = 2, RF_CAP_QTHRESH = 4, RF_CAP_ECHOES = 8, RF_CAP_RAMPFIX = 16 };
+static int rf_num(const char *s, double *v) {   /* whole token, finite */
+	char *end = NULL;
+	*v = strtod(s, &end);
+	return (end == s || *end != '\0' || !(*v >= -DBL_MAX && *v <= DBL_MAX)) ? 1 : 0;
+}
+staticx int nifti_refill_wrap(nifti_image *nim, const char *cmd, int *pac, int argc, char *argv[], gzModes gzMode) {
+#ifdef DT32
+	refill_opts o = refill_opts_default();
+	int ac = *pac, npos, gefm = !strcmp(cmd, "-refill-gefm"), epifm = !strcmp(cmd, "-refill-epifm");
+	unsigned caps = gefm ? (RF_CAP_CLIP | RF_CAP_S | RF_CAP_ECHOES) : epifm ? (RF_CAP_CLIP | RF_CAP_S | RF_CAP_QTHRESH | RF_CAP_RAMPFIX) : 0;
+	double a = 0.0, b = 0.0;
+	const char *p1, *p2, *p3;
+	npos = gefm ? 4 : 3;
+	if (ac + npos - 1 >= argc) { printfx("%s requires %d arguments before the output name (see -h)\n", cmd, npos); return 1; }
+	p1 = argv[ac]; p2 = argv[ac + 1]; p3 = argv[ac + 2];
+	if (gefm) { if (rf_num(p3, &a) || rf_num(argv[ac + 3], &b) || a <= 0.0 || b <= 0.0 || a == b) { printfx("%s: echo times must be two different positive numbers in ms\n", cmd); return 1; } }
+	else if (epifm) { if (rf_num(p3, &a) || a <= 0.0) { printfx("%s: the echo time must be a positive number in ms\n", cmd); return 1; } }
+	else {
+		if (rf_num(p2, &a) || a <= 0.0) { printfx("%s: dwell must be a positive number (the effective echo spacing in seconds); got '%s'\n", cmd, p2); return 1; }
+		if (strcmp(p3, "y") && strcmp(p3, "y-") && strcmp(p3, "j") && strcmp(p3, "j-")) { printfx("%s: phase-encoding direction must be y or y- (the reference supports no other axis); got '%s'\n", cmd, p3); return 1; }
+	}
+	ac += npos;
+	while (ac <= argc) {   /* argv[argc] is the output name, still a valid pointer: peek it */
+		const char *t = argv[ac];
+		int need = !strcmp(t, "-clip") ? 2 : !strcmp(t, "-ramp-fix") ? 0 :
+			(!strcmp(t, "-s") || !strcmp(t, "-qthresh") || !strcmp(t, "-echoes") || !strcmp(t, "-steps")) ? 1 : -1;
+		unsigned cap = !strcmp(t, "-clip") ? RF_CAP_CLIP : !strcmp(t, "-s") ? RF_CAP_S : !strcmp(t, "-qthresh") ? RF_CAP_QTHRESH :
+			!strcmp(t, "-echoes") ? RF_CAP_ECHOES : !strcmp(t, "-ramp-fix") ? RF_CAP_RAMPFIX : 0;
+		if (need < 0 || (cap && !(caps & cap))) break;   /* not ours: the op loop takes it (e.g. its own -s after -refill-unwarp) */
+		if (ac + need >= argc) { printfx("%s: '%s' is in the output-filename slot or lacks its argument(s)\n", cmd, t); return 1; }
+		if (need == 2) { if (rf_num(argv[ac + 1], &o.clip_lo) || rf_num(argv[ac + 2], &o.clip_hi) || !(o.clip_lo < o.clip_hi)) { printfx("%s: -clip requires <lo> <hi> in rad/s with lo < hi\n", cmd); return 1; } }
+		else if (!strcmp(t, "-s")) { if (rf_num(argv[ac + 1], &o.s) || o.s < 0.0) { printfx("%s: -s requires a smoothness >= 0 (0 disables smoothn)\n", cmd); return 1; } }
+		else if (!strcmp(t, "-qthresh")) { if (rf_num(argv[ac + 1], &o.qthresh)) { printfx("%s: -qthresh requires a number\n", cmd); return 1; } }
+		else if (!strcmp(t, "-echoes")) {
+			char *end = NULL;
+			long e1 = strtol(argv[ac + 1], &end, 10), e2 = (end && *end == ',') ? strtol(end + 1, &end, 10) : 0;
+			if (*end != '\0' || e1 < 1 || e2 < 1 || e1 == e2 || e1 > INT_MAX || e2 > INT_MAX) { printfx("%s: -echoes requires two distinct 1-based echoes, e.g. 1,3\n", cmd); return 1; }
+			o.echo1 = (int)e1; o.echo2 = (int)e2;
+		}
+		else if (!strcmp(t, "-ramp-fix")) o.ramp_fix = 1;
+		else o.steps = argv[ac + 1];
+		ac += need + 1;
+	}
+	*pac = ac;
+	if (nii_reject_oversize_aux(p1, "refill input")) return 1;
+	if ((gefm || epifm) && nii_reject_oversize_aux(p2, "refill input")) return 1;
+	if (gefm) return refill_gefm(nim, p1, p2, a, b, &o, gzMode);
+	if (epifm) return refill_epifm(nim, p1, p2, a, &o, gzMode);
+	if (!strcmp(cmd, "-refill-centre")) return refill_centre(nim, p1, a, p3, &o, gzMode);
+	return refill_unwarp(nim, p1, a, p3, &o, gzMode);
+#else
+	(void)nim; (void)pac; (void)argc; (void)argv; (void)gzMode;
+	printfx("'-dt double' does not support %s (REFILL is float32 only)\n", cmd);
+	return 1;
+#endif
+}
+#endif // HAVE_REFILL
+
 #ifdef HAVE_FMAP
 /* -fugue <fieldmap> <dwell> <unwarpdir>: correct susceptibility distortion in an EPI using a B0
    fieldmap in rad/s.  An ordinary chain operation, DT32 only.  All three arguments are positional
@@ -8562,6 +8631,20 @@ int main64(int argc, char *argv[]) {
 			continue; // ac already advanced past the fieldmap, dwell and direction
 		}
 #endif
+		else if (!strcmp(argv[ac], "-refill-gefm") || !strcmp(argv[ac], "-refill-epifm") ||
+			!strcmp(argv[ac], "-refill-centre") || !strcmp(argv[ac], "-refill-unwarp")) {
+#ifdef HAVE_REFILL
+			const char *cmd = argv[ac];
+			ac++;
+			ok = nifti_refill_wrap(nim, cmd, &ac, argc, argv, gzMode);
+			if (ok)
+				goto fail;
+			continue; // ac already advanced past the positionals and sub-options
+#else
+			printfx("'%s' requires a build with REFILL=1 (or -DENABLE_REFILL=ON; needs ROMEO)\n", argv[ac]);
+			goto fail;
+#endif
+		}
 #ifdef HAVE_MOCO
 		else if (!strcmp(argv[ac], "-moco")) {
 			ac++;
