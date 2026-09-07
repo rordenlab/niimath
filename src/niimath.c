@@ -452,12 +452,19 @@ int show_help( void ) {
 	printf("                            NOTE: this name previously aliased -deface; that operation is still -deface\n");
 #endif
 #ifdef HAVE_MOCO
-	printf(" -moco [-1Dfile <p.1D>]   : rigid-body motion correction of a 4D series onto volume 0\n");
-	printf("                            optional -1Dfile writes six columns per volume: roll pitch yaw dS dL dP\n");
+	printf(" -moco [opts]             : rigid-body motion correction of a 4D series onto volume 0\n");
+	printf("                            -ref <n|img> registers onto volume <n> of the series instead, or onto an\n");
+	printf("                            external reference image (all-digit argument = volume number; use './7' for a\n");
+	printf("                            file named 7); an external reference must be on the input's voxel grid\n");
+	printf("                            -1Dfile <p.1D> writes six columns per volume: roll pitch yaw dS dL dP\n");
+	printf("                            -relative measures each volume against the PREVIOUS one instead (QC):\n");
+	printf("                            nothing is registered and NO image is written, so the output name is the\n");
+	printf("                            parameter file itself and must end in '.1D' (niimath bold -moco -relative rel.1D);\n");
+	printf("                            written at %%12.8f, plus a float64 companion at <out>.bin (nt*6 doubles, row-major)\n");
 	printf("                            the parameter filename must end in '.1D'\n");
 	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
 #else
-	printf(" -moco [-1Dfile <path>]   : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
+	printf(" -moco [opts]             : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
 #endif
 #ifdef HAVE_STC
 	printf(" -stc --slicetiming <t>   : slice-time correction of a 4D series (Fourier, detrend/interpolate/retrend)\n");
