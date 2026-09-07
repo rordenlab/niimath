@@ -1,12 +1,29 @@
 name: Release
-on: {push: {branches: [master], tags: [v*.*.*]}}
+# Two shapes of the same job, so the wheel build cannot drift between them:
+#   * push to master / v*.*.* tag: the full five-runner matrix, and the PyPI upload on a tag;
+#   * pull_request / weekly schedule: ONLY the oldest two CPythons on ubuntu-latest.
+# The reduced shape exists because the wheel build used to run only after a merge to master, so
+# a failure surfaced at release time, and twice it was pure build-dependency drift (an upstream
+# release changing what pip could resolve under cibuildwheel's per-Python constraint pins) that
+# no PR had touched. The oldest Pythons are where that drift bites -- their constraint files are
+# the most aged -- and the constraints are per-Python, not per-OS, so one Linux runner reproduces
+# the resolver failure the whole matrix would hit. The weekly run catches drift with no PR open.
+on:
+  push: {branches: [master], tags: [v*.*.*]}
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+env:
+  REDUCED: ${{ github.event_name == 'pull_request' || github.event_name == 'schedule' }}
 jobs:
   wheels:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false   # a release wants every failing leg reported, not the first one
       matrix:
-        # macos-15-intel is an intel runner, macos-14 is apple silicon
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-14]
+        # macos-15-intel is an intel runner, macos-14 is apple silicon. The reduced shape
+        # provisions only the Linux runner rather than five runners that skip every step.
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15-intel", "macos-14"]' || '["ubuntu-latest"]') }}
     steps:
     - uses: actions/checkout@v4
       with: {fetch-depth: 0, submodules: false}
@@ -22,6 +39,9 @@ jobs:
       env:
         CIBW_ARCHS: auto64
         CIBW_SKIP: pp*  # skip 32bit & PyPy
+        # Reduced shape: the two oldest CPythons only -- the package minimum (pyproject.toml
+        # requires-python) and the next. Empty means every CPython.
+        CIBW_BUILD: ${{ env.REDUCED == 'true' && 'cp37-* cp38-*' || '' }}
         CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON cmake.define.OPENMP_XCODE=ON
         CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
         CIBW_BEFORE_ALL_LINUX: >
@@ -35,11 +55,13 @@ jobs:
           cp /tmp/zstd-1.5.6/lib/zstd.h /tmp/zstd-1.5.6/lib/zdict.h /tmp/zstd-1.5.6/lib/zstd_errors.h /usr/local/include/
         CIBW_ENVIRONMENT_WINDOWS: CMAKE_PREFIX_PATH='C:/vcpkg/installed/x64-windows-static'
     - uses: actions/upload-artifact@v4
+      if: env.REDUCED != 'true'
       with:
         name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
         path: ./dist/*.whl
   pypi:
     needs: wheels
+    if: github.event_name == 'push'
     permissions: {id-token: write}
     runs-on: ubuntu-latest
     steps:
