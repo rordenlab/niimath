@@ -28,6 +28,9 @@
 #include <string.h>
 #include <fcntl.h>
 #ifdef _WIN32
+	#define WIN32_LEAN_AND_MEAN
+	#define NOMINMAX
+	#include <windows.h>   /* MoveFileExA */
 	#include <io.h>
 	#include <process.h>
 	#define getpid _getpid
@@ -585,37 +588,15 @@ static int moco_geom_init(const nifti_image *nim, moco_geom *g) {
    a resampling step whose interpolation is not part of the measured contract, and would leave the
    .1D parameters referring to a grid the caller never supplied; reject instead of resampling. */
 static nifti_image *moco_read_ref(const char *fn, nifti_image *nim) {
-	{	/* Header-only preflight: reject a malformed or oversized reference BEFORE its payload is
-		   decompressed and allocated. */
-		nifti_image *h = nifti_image_read(fn, 0);
-		int bad = 0;
-		if (!h) {
-			printfx("-moco: failed to read the header of reference image '%s'\n", fn);
-			return NULL;
-		}
-		if (h->nvox < 1 || h->nx < 1 || h->ny < 1 || h->nz < 1) {
-			printfx("-moco: reference image '%s' has invalid dimensions\n", fn);
-			bad = 1;
-		} else if (h->nu > 1 || h->nv > 1 || h->nw > 1) {
-			printfx("-moco: reference image '%s' has more than 4 dimensions\n", fn);
-			bad = 1;
-		} else if ((int64_t)h->nvox > INT_MAX) {
-			printfx("-moco: reference image '%s' exceeds INT_MAX voxels; -moco is not a huge-image-safe operation\n", fn);
-			bad = 1;
-		}
-		nifti_image_free(h);
-		if (bad) return NULL;
-	}
+	/* Oversize is header-rejected by the caller's nii_reject_oversize_aux(); the shared aux gate
+	   deliberately does not preflight .nii.zst, and per-op guards are not added for it. */
 	nifti_image *ref = nifti_image_read(fn, 1);
 	if (!ref) {
 		printfx("-moco: failed to read reference image '%s'\n", fn);
 		return NULL;
 	}
-	/* Re-check after the load as well as before it: the preflight is what avoids decompressing a
-	   huge payload, this is the fail-closed guarantee if the file changed between the two reads. */
-	if (ref->nvox < 1 || ref->nx < 1 || ref->ny < 1 || ref->nz < 1 ||
-	    ref->nu > 1 || ref->nv > 1 || ref->nw > 1 || (int64_t)ref->nvox > INT_MAX) {
-		printfx("-moco: reference image '%s' changed on disk or has unusable dimensions\n", fn);
+	if (ref->nu > 1 || ref->nv > 1 || ref->nw > 1 || (int64_t)ref->nvox > INT_MAX) {
+		printfx("-moco: reference image '%s' is more than 4D or exceeds INT_MAX voxels\n", fn);
 		nifti_image_free(ref);
 		return NULL;
 	}
@@ -704,69 +685,36 @@ static FILE *moco_open_tmp(const char *path, char **tmpname) {
 /* Rename a temporary over its final name.  Returns 0 on success. */
 static int moco_publish_tmp(const char *tmpname, const char *path) {
 #ifdef _WIN32
-	/* The Windows CRT's rename() fails when the destination exists, which would break every
-	   re-run that overwrites an existing output file. */
-	remove(path);
-#endif
+	/* The CRT's rename() fails when the destination exists, and remove-then-rename would destroy
+	   the user's file if the rename then failed; MoveFileEx replaces atomically. */
+	return !MoveFileExA(tmpname, path, MOVEFILE_REPLACE_EXISTING);
+#else
 	return rename(tmpname, path) != 0;
+#endif
 }
 
 /* Write `nt` rows of six parameters to `path` through an exclusive sibling temporary, renamed only
-   on success, so a failed run cannot truncate or delete a file the user already had there.  When
-   `also_binary` is set a float64 companion is written to "<path>.bin" as well: nt*6 raw
-   little-endian doubles, row-major, no header (np.fromfile(...).reshape(-1, 6)).  Both temporaries
-   are written and closed before either is renamed, so a failure while writing publishes neither;
-   only a failure BETWEEN the two renames can leave the text file without its companion.
+   on success, so a failed run cannot truncate or delete a file the user already had there.
    Returns 0 on success, non-zero after printing a diagnostic. */
-static int moco_write_par(const char *path, const double *par, int nt, const char *fmt,
-                          int also_binary) {
-	char *tn = NULL, *bn = NULL, *btn = NULL;
-	FILE *f = moco_open_tmp(path, &tn), *bf = NULL;
+static int moco_write_par(const char *path, const double *par, int nt, const char *fmt) {
+	char *tn = NULL;
+	FILE *f = moco_open_tmp(path, &tn);
 	int bad = 0;
 	if (!f) {
 		printfx("-moco: cannot write '%s'\n", path);
 		return 1;
 	}
-	if (also_binary) {
-		size_t plen = strlen(path);
-		if (plen > SIZE_MAX - 5 || !(bn = (char *)malloc(plen + 5))) {
-			printfx("-moco: out of memory\n");
-			bad = 1;
-		} else {
-			memcpy(bn, path, plen);
-			memcpy(bn + plen, ".bin", 5);
-			bf = moco_open_tmp(bn, &btn);
-			if (!bf) {
-				printfx("-moco: cannot write '%s'\n", bn);
-				bad = 1;
-			}
-		}
-	}
 	for (int t = 0; t < nt && !bad; t++) {
 		const double *p = par + (size_t)t * 6;
 		if (fprintf(f, fmt, p[0], p[1], p[2], p[3], p[4], p[5]) < 0) bad = 1;
-		if (bf) {
-			/* Serialize each double little-endian by hand rather than fwrite'ing the array, so
-			   the file has ONE documented byte order on every platform niimath builds for. */
-			unsigned char buf[48];
-			for (int k = 0; k < 6; k++) {
-				uint64_t bits;
-				memcpy(&bits, &p[k], sizeof(bits));
-				for (int b = 0; b < 8; b++) buf[k * 8 + b] = (unsigned char)((bits >> (8 * b)) & 0xFF);
-			}
-			if (fwrite(buf, 1, sizeof(buf), bf) != sizeof(buf)) bad = 1;
-		}
 	}
 	if (fclose(f) != 0) bad = 1;
-	if (bf && fclose(bf) != 0) bad = 1;
 	if (!bad && moco_publish_tmp(tn, path)) bad = 1;
-	if (!bad && btn && moco_publish_tmp(btn, bn)) bad = 1;
 	if (bad) {
 		remove(tn);
-		if (btn) remove(btn);
 		printfx("-moco: failed writing '%s'\n", path);
 	}
-	free(tn); free(bn); free(btn);
+	free(tn);
 	return bad;
 }
 
@@ -858,18 +806,11 @@ static int moco_base_setup(const float *base, const moco_geom *g, const double v
 			}
 			NE[p][q] = NE[q][p] = s;
 		}
-	/* NE does NOT depend on the moving volume: it is built once per base, here, from the base
-	   geometry alone. So if it cannot be factored, EVERY fit against this base fails on iteration 0
-	   -- and the callers' per-frame "no step for N of N volumes" warning is the wrong response,
-	   because that path is designed for per-frame data problems (a non-finite voxel, an empty
-	   frame) and it FAILS OPEN: an all-zero .1D at exit 0, so a pipeline regressing those six
-	   columns as nuisance silently gets six zero regressors. The reachable degenerate case is a
-	   singleton spatial dimension. With nz==1 (or nx/ny==1) one translation derivative is
-	   IDENTICALLY zero -- shift_row's +/-MOCO_DELTA warps land on mirror-image Lagrange taps whose
-	   weights are bit-identical, so the central difference is exactly 0.0 -- and NE gets an exact
-	   zero pivot. MEASURED on a 40x40x1x8 phantom with a known 1.47-voxel shift: output
-	   bit-identical to input, .1D all zeros, exit 0; the SAME phantom at nz==2 recovers it. Probe
-	   once here, for both the ordinary and the -relative caller, and fail closed instead. */
+	/* NE is built once per base, so a singular NE fails EVERY fit against it on iteration 0. The
+	   callers' per-frame "no step" warning would then fail OPEN (an all-zero .1D at exit 0), so
+	   probe here, in the setup shared by the ordinary and -relative modes, and fail closed. The
+	   reachable case is a singleton spatial dimension, where one translation derivative is
+	   identically zero (measured; pinned by release_smoke.py). */
 	{
 		double probe_b[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}, probe_x[6];
 		if (chol6(NE, probe_b, probe_x)) return 3;
@@ -1021,9 +962,6 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		        ref_vol, (long long)nt, (long long)(nt - 1));
 		return 1;
 	}
-	/* wasm32 is a 32-bit size_t and the huge gate only bounds the VOXEL count, so these
-	   products must be checked before they reach malloc (AGENTS.md: callers pre-compute
-	   overflow-prone products with nii_mul_size). */
 	size_t nb_out, nb_vol, nb_deriv, nb_pad;
 	if (nii_mul_size(nvol, (size_t)nt * sizeof(float), &nb_out) ||
 	    nii_mul_size(nvol, sizeof(float), &nb_vol) ||
@@ -1034,8 +972,6 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 	}
 	const float *img = (const float *)nim->data;
 
-	/* Every cleanup-owned pointer is declared and NULLed here, before any `goto done`, so the
-	   single cleanup block can never free an indeterminate pointer. */
 	int rc = 0;
 	nifti_image *ref = NULL;
 	float *wt = NULL, *out = NULL, *deriv = NULL, *pad = NULL;
@@ -1061,8 +997,7 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		base = img + (size_t)base_idx * nvol;
 	}
 	wt = (float *)malloc(nb_vol);
-	out = (float *)malloc(nb_out);          /* every voxel is written below; see the memcpy of the
-	                                           base sub-brick and the per-volume writes */
+	out = (float *)malloc(nb_out);          /* fully overwritten below */
 	par = (double *)calloc((size_t)nt * 6, sizeof(double));
 	deriv = (float *)malloc(nb_deriv);
 	pad = (float *)malloc(nb_pad);
@@ -1081,8 +1016,8 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		if (src) {
 			printfx(src == 1 ? "-moco: out of memory building the registration weight\n"
 			      : src == 2 ? "-moco: shear factorization failed while building derivatives\n"
-			                 : "-moco: the registration problem is degenerate for every volume (a singleton "
-			                   "spatial dimension leaves one translation unidentifiable); no volume can be fit\n");
+			                 : "-moco: the normal equations are singular (an empty, featureless or non-finite base, "
+			                   "or a singleton spatial dimension), so no volume can be fit\n");
 			rc = 1;
 			goto done;
 		}
@@ -1183,7 +1118,7 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		        "non-finite voxel or an empty frame is the usual cause.\n",
 		        nfit_failed, (long long)(nt - (base_idx >= 0 ? 1 : 0)), first_failed);
 	}
-	if (par_path && moco_write_par(par_path, par, nt, MOCO_PAR_FMT, 0)) {
+	if (par_path && moco_write_par(par_path, par, nt, MOCO_PAR_FMT)) {
 		rc = 1;
 		goto done;
 	}
@@ -1316,8 +1251,8 @@ int nii_moco_relative(nifti_image *nim, const char *rel_path) {
 		printfx("-moco -relative: shear factorization failed while building derivatives\n");
 		rc = 1;
 	} else if (worker_degen) {
-		printfx("-moco -relative: the registration problem is degenerate (a singleton spatial "
-		        "dimension leaves one translation unidentifiable); no volume pair can be fit\n");
+		printfx("-moco -relative: the normal equations are singular (an empty, featureless or non-finite "
+		        "volume, or a singleton spatial dimension), so no volume pair can be fit\n");
 		rc = 1;
 	}
 	if (!rc && nfit_failed > 0) {
@@ -1330,7 +1265,7 @@ int nii_moco_relative(nifti_image *nim, const char *rel_path) {
 	}
 	/* The image is deliberately untouched: -relative is a measurement pass, so `nim` passes through
 	   to niimath's output stage exactly as it arrived. */
-	if (!rc && moco_write_par(rel_path, par, nt, MOCO_REL_FMT, 1)) rc = 1;
+	if (!rc && moco_write_par(rel_path, par, nt, MOCO_REL_FMT)) rc = 1;
 	free(par);
 	return rc;
 }

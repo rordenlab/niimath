@@ -3006,13 +3006,23 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     if read_float32_nifti(ref0_written) != vals:
         raise AssertionError("-moco -ref 0 does not reproduce the default image")
 
-    # Volume 2 of the fixture is a second copy of volume 0, so "-ref 2" registers exactly what
-    # the default run did, from a different base index: volume 1 must get the SAME parameter row,
-    # volume 0 (identical data to the base) must get zeros, and volume 2 -- not volume 0 -- must
-    # be the one copied through.
+    # "-ref 2" gets its OWN fixture: volume 0 unshifted, volume 1 shifted +2, volume 2 shifted +1.
+    # In the main fixture volume 2 is a copy of volume 0, so a build that ignored -ref and used
+    # volume 0 would pass every assertion (measured: byte-identical output). Here the base differs
+    # from volume 0, so volume 0 must report dS = +1, volume 1 dS = -1, and volume 2 the zero row.
+    ref_src = tmp / "moco_ref_in.nii"
+    ref_data = list(vol0)
+    for sh in (2, 1):
+        for z in range(nz):
+            for y in range(ny):
+                for x in range(nx):
+                    src = z - sh
+                    ref_data.append(vol0[x + y * nx + src * nx * ny] if 0 <= src < nz else 0.0)
+    write_float32_nifti(ref_src, (nx, ny, nz), ref_data, nt=nt)
+    ref_vals = read_float32_nifti(ref_src)
     ref2_par, ref2_out = tmp / "moco_ref2.1D", tmp / "moco_ref2.nii"
     require_success(
-        run_niimath(exe, [str(src_path), "-moco", "-ref", "2", "-1Dfile", str(ref2_par), str(ref2_out)]),
+        run_niimath(exe, [str(ref_src), "-moco", "-ref", "2", "-1Dfile", str(ref2_par), str(ref2_out)]),
         "-moco -ref 2",
     )
     r2 = moco_rows(ref2_par)
@@ -3021,17 +3031,12 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     for k, v in enumerate(r2[2]):
         if abs(v) > 1e-4:
             raise AssertionError("-moco -ref 2: base row must be zeros, column %d is %g" % (k, v))
-    for k, v in enumerate(r2[0]):
-        if abs(v) > 1e-3:
-            raise AssertionError(
-                "-moco -ref 2: volume 0 duplicates the base, so it must report no motion; column %d is %g" % (k, v)
-            )
-    for k in range(6):
-        if abs(r2[1][k] - rows[1][k]) > 1e-3:
-            raise AssertionError(
-                "-moco -ref 2: volume 1 registered onto identical base data must match the default "
-                "run, column %d: %.4f vs %.4f" % (k, r2[1][k], rows[1][k])
-            )
+    for t, want in ((0, 1.0), (1, -1.0)):
+        if abs(r2[t][3] - want) > 0.20:
+            raise AssertionError("-moco -ref 2: volume %d dS should be %.1f, got %.4f" % (t, want, r2[t][3]))
+        for k in (0, 1, 2, 4, 5):
+            if abs(r2[t][k]) > 0.05:
+                raise AssertionError("-moco -ref 2: volume %d column %d should be ~0, got %.4f" % (t, k, r2[t][k]))
     ref2_written = ref2_out if ref2_out.exists() else Path(str(ref2_out) + ".gz")
     if ref2_written.suffix == ".gz":
         ref2_plain = tmp / "moco_ref2_plain.nii"
@@ -3039,7 +3044,7 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
         ref2_written = ref2_plain
     ref2_vals = read_float32_nifti(ref2_written)
     for i in range(n3):
-        if ref2_vals[2 * n3 + i] != src_vals[2 * n3 + i]:
+        if ref2_vals[2 * n3 + i] != ref_vals[2 * n3 + i]:
             raise AssertionError(
                 "-moco -ref 2: the chosen base volume must be copied through unchanged (voxel %d)" % i
             )
@@ -3049,7 +3054,7 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
         for y in range(4, ny - 4):
             for x in range(4, nx - 4):
                 i = x + y * nx + z * nx * ny
-                before += (src_vals[n3 + i] - src_vals[2 * n3 + i]) ** 2
+                before += (ref_vals[n3 + i] - ref_vals[2 * n3 + i]) ** 2
                 after += (ref2_vals[n3 + i] - ref2_vals[2 * n3 + i]) ** 2
     if not (after < before * 0.01):
         raise AssertionError("-moco -ref 2: volume 1 was not aligned onto the chosen base")
@@ -3057,10 +3062,10 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     # An external reference holding a copy of that base must behave the same way -- except that no
     # sub-brick is special-cased, so every volume is registered and volume 2 gets a fitted row too.
     ext_ref = tmp / "moco_ref_ext.nii"
-    write_float32_nifti(ext_ref, (nx, ny, nz), [float(v) for v in src_vals[2 * n3 : 3 * n3]])
+    write_float32_nifti(ext_ref, (nx, ny, nz), [float(v) for v in ref_vals[2 * n3 : 3 * n3]])
     ext_par, ext_out = tmp / "moco_ext.1D", tmp / "moco_ext.nii"
     require_success(
-        run_niimath(exe, [str(src_path), "-moco", "-ref", str(ext_ref), "-1Dfile", str(ext_par), str(ext_out)]),
+        run_niimath(exe, [str(ref_src), "-moco", "-ref", str(ext_ref), "-1Dfile", str(ext_par), str(ext_out)]),
         "-moco -ref <image>",
     )
     rext = moco_rows(ext_par)
@@ -3139,25 +3144,10 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
             if "." not in body or len(body.split(".")[1]) != 8:
                 raise AssertionError("-moco -relative: field %d is not %%12.8f: %r" % (f, row))
             float(body)
-    # the float64 companion: nt*6 raw little-endian doubles, row-major, no header
-    rel_bin = Path(str(rel_par) + ".bin")
-    if not rel_bin.exists():
-        raise AssertionError("-moco -relative did not write the .bin companion")
-    raw = rel_bin.read_bytes()
-    if len(raw) != nt * 6 * 8:
-        raise AssertionError("-moco -relative: .bin is %d bytes, expected %d" % (len(raw), nt * 6 * 8))
-    packed = struct.unpack("<%dd" % (nt * 6), raw)
-    for t in range(nt):
-        for k in range(6):
-            if abs(packed[t * 6 + k] - rrel[t][k]) > 5e-9:
-                raise AssertionError(
-                    "-moco -relative: .bin disagrees with the text at row %d column %d: %r vs %r"
-                    % (t, k, packed[t * 6 + k], rrel[t][k])
-                )
-    # measurement only: no image may be produced at all, and the input must be untouched
-    for stray in (Path(str(rel_par) + ".nii"), Path(str(rel_par) + ".nii.gz")):
+    # measurement only: no image and no sidecar beyond the .1D may be produced, and the input must be untouched
+    for stray in (Path(str(rel_par) + ".nii"), Path(str(rel_par) + ".nii.gz"), Path(str(rel_par) + ".bin")):
         if stray.exists():
-            raise AssertionError("-moco -relative wrote an image (%s); it must write parameters only" % stray)
+            raise AssertionError("-moco -relative wrote %s; it must write the .1D only" % stray)
     if read_float32_nifti(rel_src) != rel_src_vals:
         raise AssertionError("-moco -relative modified its input")
     # options that presuppose a reference are refused rather than ignored, and because the trailing
@@ -3167,11 +3157,22 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
         (["-1Dfile", str(tmp / "moco_rel_x.1D")], "moco_rel_z.1D", "-1Dfile"),
         (["-relative"], "moco_rel_z.1D", "a repeated -relative"),
         ([], "moco_bad8.nii", "an image output name"),
+        (["-save"], "moco_rel_z.1D", "a later operation (-save would defeat the no-image contract)"),
     ):
         if run_niimath(
             exe, [str(rel_src), "-moco", "-relative"] + extra + [str(tmp / out_name)]
         ).returncode == 0:
             raise AssertionError("-moco -relative accepted %s" % what)
+    # a sub-option in the output-name slot is a mistake, not a filename: the loop that consumes
+    # sub-options stops one short of argv[argc], so without the peek "-moco -relative" alone ran a
+    # full correction and wrote a file called "-relative" at exit 0 (the AGENTS.md op-loop gotcha)
+    for flag in ("-relative", "-ref", "-1Dfile"):
+        if run_niimath(exe, [str(rel_src), "-moco", flag]).returncode == 0:
+            raise AssertionError("-moco accepted a trailing %s as the output name" % flag)
+        for stray in (Path(flag + ".nii"), Path(flag + ".nii.gz"), tmp / (flag + ".nii"), tmp / (flag + ".nii.gz")):
+            if stray.exists():
+                stray.unlink()
+                raise AssertionError("-moco wrote an image named after its own %s flag" % flag)
 
     # ---- degenerate geometry must fail CLOSED in every mode ------------------------------------
     # A singleton spatial dimension makes one translation derivative identically zero, so the 6x6
@@ -3202,8 +3203,8 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
             raise AssertionError("-moco wrote %s for a degenerate geometry it rejected" % stray)
 
     print("  -moco: parameter sign/axis/format, base passthrough, alignment, rotation+clipping,")
-    print("         -ref volume/external image + grid rejection, -relative pairwise QC +")
-    print("         float64 companion + passthrough, output separation,")
+    print("         -ref volume/external image + grid rejection, -relative pairwise QC + passthrough,")
+    print("         output separation,")
     print("         existing-file preservation, 3D rejection and singleton-dimension fail-closed OK")
 
 

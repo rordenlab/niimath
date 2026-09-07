@@ -460,7 +460,7 @@ int show_help( void ) {
 	printf("                            -relative measures each volume against the PREVIOUS one instead (QC):\n");
 	printf("                            nothing is registered and NO image is written, so the output name is the\n");
 	printf("                            parameter file itself and must end in '.1D' (niimath bold -moco -relative rel.1D);\n");
-	printf("                            written at %%12.8f, plus a float64 companion at <out>.bin (nt*6 doubles, row-major)\n");
+	printf("                            written at %%12.8f\n");
 	printf("                            the parameter filename must end in '.1D'\n");
 	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
 #else
@@ -683,7 +683,7 @@ int show_help( void ) {
 	printf("     niimath 4D_inputVolume -Tmean -mul -1 -add 4D_inputVolume demeaned_4D_inputVolume\n");
 	printf("\n");
 	printf("Threading: OpenMP is enabled by default. Control threads with:\n");
-	printf("     niimath -p 4 in.nii -add 1 out.nii    (use 4 threads)\n");
+	printf("     niimath in.nii -p 4 -add 1 out.nii    (use 4 threads; -p is an operation, so it follows the input)\n");
 	printf("     export OMP_NUM_THREADS=4               (environment variable, applies to all OpenMP programs)\n");
     return 0;
 }

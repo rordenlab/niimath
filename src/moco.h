@@ -60,14 +60,10 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 // the loop is parallel and thread-count invariant) and makes the numbers raw frame-to-frame motion
 // rather than residual drift after correction.  Row 0 is all zeros: volume 0 has no predecessor.
 //
-// Two files are published, both through exclusive sibling temporaries renamed on success:
-//   * `path` -- text, nt rows of six %12.8f fields (roll pitch yaw dS dL dP), the same convention
-//     and column order as -1Dfile but at the precision the estimator actually carries;
-//   * `path` + ".bin" -- the same numbers as nt*6 raw little-endian float64, row-major, no header,
-//     so a reader is np.fromfile(path + ".bin").reshape(-1, 6).
-// Neither is published if writing fails; only a failure BETWEEN the two renames can leave the text
-// file without its companion.  Because the estimator is shared with nii_moco (moco_base_setup +
-// moco_fit_one), the two modes cannot drift apart.
+// `rel_path` is written through an exclusive sibling temporary renamed on success: nt rows of six
+// %12.8f fields (roll pitch yaw dS dL dP), the same convention and column order as -1Dfile but at
+// the precision the estimator actually carries.  Because the estimator is shared with nii_moco
+// (moco_base_setup + moco_fit_one), the two modes cannot drift apart.
 //
 // Rebuilding the weight, the six derivative images and the normal equations for every pair makes
 // this roughly an order of magnitude more work per volume than the ordinary mode.

@@ -15,7 +15,7 @@ fslmaths is one of the foundations of the FSL pipelines, such as [FEAT](https://
 5. Most programs grow organically as needs arise. A clone starts with a full specification, which permits optimization. niimath uses explicit single and double precision pipelines, so the compiler can use the SIMD instructions that every x86_64 CPU provides but that high-level code rarely exploits. Modern compilers make these operations limited by memory bandwidth, so no [hand tuning](https://github.com/neurolabusc/simd) is needed.
 6. A robust regression test set has found edge cases where fslmaths gives anomalous or unexpected answers. See [Compatibility with fslmaths](#compatibility-with-fslmaths). This feedback benefits fslmaths too.
 7. The code is fully reverse engineered, but the FSL team allowed us to copy their error messages and help text. This gives true plug-in compatibility. They also supplied pseudo code for poorly documented routines, so the community can understand the actual algorithms.
-8. niimath is an open-source base for features that fill gaps in FSL, such as `-unsharp`, `-sobel` and `-resize`. Bob Cox gave permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools, which give performance that [FSL](https://neurostars.org/t/bandpass-filtering-different-outputs-from-fsl-and-nipype-custom-function/824) does not. Including them in this project makes them work like the other FSL tools and use the same environment variables. The slice-timing command that niimath ships, `-stc`, does **not** use that permission. It is a clean-room BSD-2 implementation with no AFNI code, written when `3dTshift.c` and its FFT were GPL-2. MCW relicensed its 1994-2000 AFNI code to CC BY 4.0 on 12 May 2026, so that bar is gone. CC BY still asks for attribution and a statement of changes, which original code does not, so `-stc` stays as it is. See [License](#license).
+8. niimath is an open-source base for features that fill gaps in FSL, such as `-unsharp`, `-sobel` and `-resize`. Bob Cox once gave permission to use code from [AFNI's](https://afni.nimh.nih.gov) 3dTshift and 3dBandpass tools, but niimath ships no code from either. The slice-timing command that niimath ships, `-stc`, is a clean-room BSD-2 implementation with no AFNI code, written when `3dTshift.c` and its FFT were GPL-2. Temporal filtering is `-bptf` and `-bptfm`, which are fslmaths-compatible. MCW relicensed its 1994-2000 AFNI code to CC BY 4.0 on 12 May 2026, so that bar is gone. CC BY still asks for attribution and a statement of changes, which original code does not, so `-stc` stays as it is. See [License](#license).
 
 There is one reason to use fslmaths instead of niimath. niimath is newer and less tested, so unknown corner cases may give poor results. fslmaths has been in use for years. In the few cases where fslmaths differs from its own documentation (described below), you can argue that its result is the `correct` one, because it agrees with itself. Other tools may have been built to expect that behavior, such as the loss of high frequency signal, and may perform worse when given the documented result.
 
@@ -248,7 +248,7 @@ Constraints:
 
 ### `-deface <tmpl> <mask> [opts]`
 
-Removes voxels with a template-space mask. niimath registers the input to `tmpl` (affine), inverts the transform, warps `mask` onto the input's native grid, and sets the voxels where the warped mask is below 0.5 to the image's finite minimum (about 0 for typical MRI). The input itself is never resampled.
+Removes voxels with a template-space mask. niimath registers the input to `tmpl` (affine), inverts the transform, and warps `mask` onto the input's native grid. Voxels where the warped mask is below 0.5 are set to the image's finite minimum, which is about 0 for typical MRI. The input itself is never resampled.
 
 Arguments:
 
@@ -425,13 +425,13 @@ niimath bold -moco -ref ref.nii out
 niimath bold -moco -relative rel.1D
 ```
 
-Options:
+Options, which may appear in any order:
 
 - `-ref <n>`: register onto volume `n` of the series. `-ref 0` is the default. That volume is copied through unchanged, and its parameter row is all zeros.
 - `-ref <image>`: register onto an external reference image instead. It must sit on the input's voxel grid: the same dimensions, and a voxel-to-world transform agreeing within 0.001 mm. A reference on any other grid is rejected, not resliced. A 4D reference contributes its volume 0. With an external reference no volume is copied through: every volume is registered and gets a non-zero parameter row.
 - An all-digit argument to `-ref` is a volume number. To name a file called `7`, write `./7`.
 - `-1Dfile <path.1D>`: also write the six motion parameters per volume. The filename must end in `.1D`. The file is compatible with AFNI's `-1Dfile`: six columns `roll pitch yaw dS dL dP`, one row per volume. Rotations are in degrees counter-clockwise about the I-S, R-L and A-P axes. Shifts are in mm toward Superior, Left and Posterior. The values record the correction that was applied, not the estimated motion.
-- `-relative`: measure each volume against the original previous volume, as a quality-control statistic. niimath registers nothing and writes no image, so the trailing output name is the parameter file itself and must end in `.1D`. `-ref` and `-1Dfile` are rejected with it. Rows are written at `%12.8f`. A float64 companion `<name>.1D.bin` is written beside it: `nt × 6` little-endian doubles, row-major, with no header, so a reader is `np.fromfile(path).reshape(-1, 6)`. Row 0 is all zeros, because volume 0 has no predecessor. This costs about ten times the work per volume that ordinary correction does.
+- `-relative`: measure each volume against the original previous volume, as a quality-control statistic. niimath registers nothing and writes no image, so the trailing output name is the parameter file itself and must end in `.1D`. `-ref` and `-1Dfile` are rejected with it, and it must be the last operation. Rows are written at `%12.8f`, so `numpy.loadtxt` reads the file. Row 0 is all zeros, because volume 0 has no predecessor. This costs about ten times the work per volume that ordinary correction does.
 
 Constraints:
 
@@ -462,7 +462,7 @@ Constraints:
 - This version corrects along storage axis `k` only.
 - Enabled by default on every platform, including WebAssembly. `STC=0 make` or `-DENABLE_STC=OFF` omits it.
 
-BIDS helper: `test/stc_slicetiming.py` (standard library only) reads a BIDS sidecar and prints the `--slicetiming` argument. It honors `SliceEncodingDirection` (`k` passes through, `k-` is reversed into slice-index order, `i` and `j` are rejected) and stops with an error if the sidecar's `RepetitionTime` disagrees with the unit-normalized header TR:
+BIDS helper: `test/stc_slicetiming.py` (standard library only) reads a BIDS sidecar and prints the `--slicetiming` argument. It honors `SliceEncodingDirection`: `k` passes through, `k-` is reversed into slice-index order, and `i` and `j` are rejected. It stops with an error if the sidecar's `RepetitionTime` disagrees with the unit-normalized header TR:
 
 ```
 niimath bold.nii.gz -stc --slicetiming "$(python3 test/stc_slicetiming.py bold.nii.gz)" out.nii.gz
@@ -661,7 +661,7 @@ niimath in.mz3 -s 10 -r 0.5 out.mz3
 
 ## Creating bitmaps
 
-Use `-bitmap` to visualize the result of any chain of operations. Its arguments are inspired by FSL `slicer`, with new features. See the [`-bitmap` reference](#-bitmap-overlay-opts-outputpng) above and the [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap) repository for examples and documentation.
+Use `-bitmap` to visualize the result of any chain of operations. See the [`-bitmap` reference](#-bitmap-overlay-opts-outputpng) above and the [niimath-bitmap](https://github.com/rordenlab/niimath-bitmap) repository for examples and documentation.
 
 ## Compatibility with fslmaths
 

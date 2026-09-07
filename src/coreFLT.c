@@ -7248,8 +7248,8 @@ staticx int nifti_fmapprep_wrap(nifti_image *nim, int *pac, int argc, char *argv
    decimal digit: that keeps the test decidable without touching the filesystem, so "-ref 7" never
    means one thing on a machine where a file called "7" exists and another where it does not.  A
    file whose name IS all digits can still be passed as "./7".  Returns 1 and sets *out on a
-   digits-only string that fits an int, 0 for a filename, -1 for digits that overflow.  Parsed by
-   hand rather than with strtol so this needs no errno.h in a header-sensitive translation unit. */
+   digits-only string that fits an int, 0 for a filename, -1 for digits that overflow.  Not strtol:
+   that accepts a sign and leading whitespace, so a file named "+7" would stop being a filename. */
 staticx int moco_volume_index(const char *s, int *out) {
 	if (!s || !*s) return 0;
 	long long v = 0;
@@ -7261,6 +7261,13 @@ staticx int moco_volume_index(const char *s, int *out) {
 	}
 	*out = (int)v;
 	return 1;
+}
+
+/* Supported NIfTI outputs never end in .1D, so requiring the suffix keeps the parameter-file and
+   image namespaces disjoint. */
+staticx int moco_not_1d(const char *s) {
+	size_t n = s ? strlen(s) : 0;
+	return n < 3 || strcmp(s + n - 3, ".1D");
 }
 #endif // DT32
 
@@ -7295,10 +7302,7 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 				return 1;
 			}
 			par = argv[ac + 1];
-			size_t n = strlen(par);
-			/* Supported NIfTI outputs never end in .1D. Keeping the namespaces disjoint is clearer
-			   than guessing the writer's eventual extension, compression, or paired member here. */
-			if (n < 3 || strcmp(par + n - 3, ".1D")) {
+			if (moco_not_1d(par)) {
 				printfx("-moco -1Dfile requires a filename ending in '.1D'\n");
 				return 1;
 			}
@@ -7328,11 +7332,23 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 		}
 		break;
 	}
+	/* The loop stops at argc, and argv[argc] is the output name: a sub-option there would
+	   otherwise become the output filename and a full correction would run at exit 0 (the op-loop
+	   gotcha in AGENTS.md). Peek one past. */
+	if (ac == argc && (!strcmp(argv[argc], "-relative") || !strcmp(argv[argc], "-ref") ||
+	                   !strcmp(argv[argc], "-1Dfile"))) {
+		printfx("-moco: '%s' is in the output-name position; it is an option, not a filename\n", argv[argc]);
+		return 1;
+	}
 	*pac = ac;
-	/* -relative is a measurement-only mode that registers each volume onto its PREDECESSOR, so
-	   there is no base and no base-relative fit: rejecting the options that presuppose one is
-	   clearer than silently ignoring them (the project's parse-time rejection rule). */
+	/* -relative registers each volume onto its PREDECESSOR, so the options that presuppose a base
+	   are rejected rather than ignored, and it must be the LAST operation: nothing is written
+	   afterwards, so a later op is wasted work and a later -save would defeat the no-image contract. */
 	if (rel) {
+		if (ac != argc) {
+			printfx("-moco -relative writes no image, so it must be the last operation (found '%s' after it)\n", argv[ac]);
+			return 1;
+		}
 		if (seen_ref) {
 			printfx("-moco -relative registers each volume onto the previous one, so -ref does not apply\n");
 			return 1;
@@ -7342,12 +7358,9 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 			        "run them as two separate -moco commands if you want both\n");
 			return 1;
 		}
-		/* The measurement is the whole point of this run, so the trailing name is the parameter
-		   file and no image is written.  Requiring the .1D suffix keeps that unambiguous: it is
-		   the one extension niimath never writes an image to, so a user who typed an image name
-		   by mistake is told rather than handed a .1D called out.nii.gz. */
-		size_t n = fout ? strlen(fout) : 0;
-		if (n < 3 || strcmp(fout + n - 3, ".1D")) {
+		/* The trailing name is the parameter file and no image is written; the .1D suffix means a
+		   user who typed an image name by mistake is told rather than handed a .1D called out.nii.gz. */
+		if (moco_not_1d(fout)) {
 			printfx("-moco -relative measures motion and writes no image, so the output name is its "
 			        "parameter file and must end in '.1D' (got '%s')\n", fout ? fout : "");
 			return 1;
@@ -7359,15 +7372,7 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 	if (ref_file && nii_reject_oversize_aux(ref_file, "moco reference")) return 1;
 	return nii_moco(nim, par, ref_vol, ref_file);
 #else
-	(void)nim;
-	(void)fout; (void)no_image_out;
-	int ac = *pac;
-	while (ac < argc) {
-		if (!strcmp(argv[ac], "-relative")) { ac += 1; continue; }
-		if (ac + 1 < argc && (!strcmp(argv[ac], "-1Dfile") || !strcmp(argv[ac], "-ref"))) { ac += 2; continue; }
-		break;
-	}
-	*pac = ac;
+	(void)nim; (void)pac; (void)argc; (void)argv; (void)fout; (void)no_image_out;
 	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
 	return 1;
 #endif
@@ -7891,10 +7896,7 @@ int main64(int argc, char *argv[]) {
 	   are execution/output modifiers that leave the voxels untouched, yet they became first_op
 	   and wrongly disqualified the rescale (reproduced with `-gz 0` before -romeo). */
 	int nmutating = 0;
-	/* Set by an operation whose whole product is a sidecar file rather than an image (-moco
-	   -relative), so the trailing positional names that sidecar and the final image write is
-	   skipped instead of duplicating the input to disk. */
-	int no_image_out = 0;
+	int no_image_out = 0;   /* set by an op whose product is a sidecar, not an image (-moco -relative) */
 	int nkernel = 0; // number of voxels in kernel
 	int *kernel = NULL; // default 3x3x3 kernel is created lazily by the first kernel op
 	char *end = NULL;
@@ -8905,14 +8907,14 @@ int main64(int argc, char *argv[]) {
 			goto fail;  /* fail: frees nim + kernel; every error site sets ok=1 */
 		ac++;
 	}
-	// convert data to output type (-odt)
-	if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
-		goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
-	// if we get here, write the output dataset
-	/* An operation may have declared that this run produces no image (-moco -relative); its
-	   sidecar is already published, so writing a copy of the untouched input here would be pure
-	   waste -- gigabytes for a real 4D series. */
-	int save_rc = no_image_out ? 0 : nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
+	int save_rc = 0;
+	if (!no_image_out) {   /* -moco -relative published its sidecar; converting and saving the untouched 4D input would be waste */
+		// convert data to output type (-odt)
+		if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
+			goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
+		// if we get here, write the output dataset
+		save_rc = nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
+	}
 	// and clean up memory
 	nifti_image_free(nim);
 	if (kernel != NULL)

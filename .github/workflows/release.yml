@@ -21,26 +21,26 @@ jobs:
     strategy:
       fail-fast: false   # a release wants every failing leg reported, not the first one
       matrix:
-        # macos-15-intel is an intel runner, macos-14 is apple silicon
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-14]
+        # macos-15-intel is an intel runner, macos-14 is apple silicon. The reduced shape
+        # provisions only the Linux runner rather than five runners that skip every step.
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15-intel", "macos-14"]' || '["ubuntu-latest"]') }}
     steps:
     - uses: actions/checkout@v4
-      if: env.REDUCED != 'true' || matrix.os == 'ubuntu-latest'
       with: {fetch-depth: 0, submodules: false}
     - name: Install macOS build deps
-      if: env.REDUCED != 'true' && startsWith(matrix.os, 'macos')
+      if: startsWith(matrix.os, 'macos')
       run: brew install libomp zstd
     - name: Install Windows zstd
-      if: env.REDUCED != 'true' && matrix.os == 'windows-latest'
+      if: matrix.os == 'windows-latest'
       shell: pwsh
       run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install zstd:x64-windows-static'
     - uses: pypa/cibuildwheel@2.x
-      if: env.REDUCED != 'true' || matrix.os == 'ubuntu-latest'
       with: {output-dir: dist}
       env:
         CIBW_ARCHS: auto64
         CIBW_SKIP: pp*  # skip 32bit & PyPy
-        # Reduced shape: the two oldest CPythons only (the package minimum and the next).
+        # Reduced shape: the two oldest CPythons only -- the package minimum (pyproject.toml
+        # requires-python) and the next. Empty means every CPython.
         CIBW_BUILD: ${{ env.REDUCED == 'true' && 'cp37-* cp38-*' || '' }}
         CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON cmake.define.OPENMP_XCODE=ON
         CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
