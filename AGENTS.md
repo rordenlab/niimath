@@ -344,6 +344,13 @@ See **`RELEASING.md`** — wheel/PyPI, GitHub binary assets, npm, and the macOS 
 - Error returns: `EXIT_SUCCESS`/`EXIT_FAILURE`.
 
 ## Documentation style
-- Do not add artificial end-of-line characters to Markdown/text prose. Let the renderer word-wrap — one paragraph (or list item) is one physical line; do not hard-wrap at a fixed column.
-- Use newlines only for genuine structure: between paragraphs, headings, list items, table rows, code-fence boundaries, and for new lines of code inside fences.
+
+Applies to every README and any future `docs/` page. Structure comes from the Diataxis framework (the `diataxis-docs` skill, if installed): explanation, how-to, reference and tutorial sections are kept separate and typed. `AGENTS.md`, `CLAUDE.md` and `noncompliant.md` are agent-facing and exempt from the prose rules below, but not from the line-wrapping rules.
+
+- Short sentences, 20 words or fewer. Active voice, present tense.
+- Plain words: use, start, help, before.
+- One paragraph per line. No hard wrapping, no em dashes. Use newlines only for genuine structure: between paragraphs, headings, list items, table rows and code-fence boundaries, and for new lines of code inside fences.
+- Cut "simply", "just", "note that", "it is important to".
 - When editing an existing `.md` file with hard-wrapped paragraphs, unwrap them to one line per paragraph.
+- Before delivering, list any sentence you left over 25 words.
+- CLI strings inside code spans keep their original spelling; American spelling in prose.
