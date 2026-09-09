@@ -555,7 +555,7 @@ int show_help( void ) {
 	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
 #endif
 #ifdef HAVE_QC
-	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv] : MRIQC-style hard-mask QC (CJV, CNR-noair, SNR, WM2MAX, EFC-brain, ICV) to TSV\n");
+	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json] : MRIQC-style hard-mask QC (CJV, CNR, SNR, WM2MAX, EFC-brain, ICV; --air adds SNRd, FBER, QI1 and the background stats) to TSV/JSON\n");
 #endif
 #ifdef HAVE_MEDIC
 	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");

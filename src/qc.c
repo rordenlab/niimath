@@ -37,6 +37,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "core.h" // set_input_hdr, nifti_image_change_datatype
+#ifdef HAVE_ALLINEATE
+#include "core32.h" // nii_qc_air_masks_f32
+#endif
 
 // statsmodels.robust.scale.mad default Gaussian-consistency constant: the
 // normalised MAD is median(|x-center|) / MAD_C (== 1.4826 * raw MAD).
@@ -251,25 +254,217 @@ static void qc_tissue(const char *name, const float *t1, const uint8_t *classes,
 		printf("qc: %s has %d usable voxels (< %d); its metrics reported as nan\n", name, n, QC_MIN_VOX);
 }
 
-// Emit a tab then the value (or "nan" for non-finite), for the single wide data row.
-static void qc_fmt(FILE *f, double v) {
-	fputc('\t', f);
-	if (qc_finite(v)) fprintf(f, "%.6g", v);
-	else fputs("nan", f);
+// ---- air ("hat") metrics: MRIQC's ArtifactMask, on the RAS-canonical image ----
+// The hat is the head-free air superior to MRIQC's landmark plane: its glabella
+// [0,90,-14] and inion [0,-120,-14] share template z = -14, so the two axis-aligned
+// slab fills MRIQC uses approximate that one plane, tested here directly (exact under
+// pitch, roll and yaw). Artifacts are hat voxels brighter than QC_AIR_ZSCORE MADs of
+// the full hat, outside the 10 % shell nearest the head, after a 6-connected opening;
+// the background statistics are taken over air = hat - artifacts.
+#define QC_LANDMARK_PLANE_Z (-14.0)
+// 1 / sqrt(2 / (4 - pi)): Dietrich's Rayleigh correction (mriqc DIETRICH_FACTOR).
+#define QC_DIETRICH 0.6551364
+#define QC_AIR_ZSCORE 10.0
+
+typedef struct {
+	int present;
+	double qi_1, fber, cnr, snrd_csf, snrd_gm, snrd_wm, snrd_total;
+	TissueStats bg;
+} AirMetrics;
+
+#ifdef HAVE_ALLINEATE
+static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
+                  const TissueStats *scsf, const TissueStats *sgm, const TissueStats *swm,
+                  AirMetrics *am) {
+	nifti_image *ras = NULL, *head = NULL, *dist = NULL;
+	mat44 v2t;
+	memset(am, 0, sizeof(*am));
+	am->qi_1 = am->fber = am->cnr = am->snrd_csf = am->snrd_gm = am->snrd_wm = am->snrd_total = NAN;
+	if (nii_qc_air_masks_f32(nt1, ftmpl, ft1, &ras, &head, &dist, &v2t)) {
+		printf("qc: air mask pipeline failed (RAS / registration to '%s' / head mask)\n", ftmpl);
+		return 1;
+	}
+	int rc = 1;
+	int nx = (int)ras->nx, ny = (int)ras->ny, nz = (int)ras->nz;
+	size_t nxy = (size_t)nx * ny, nvox = ras->nvox;
+	const float *img = (const float *)ras->data, *hd = (const float *)head->data,
+	            *ds = (const float *)dist->data;
+	uint8_t *hat = (uint8_t *)calloc(nvox, 1), *art = (uint8_t *)calloc(nvox, 1),
+	        *tmp = (uint8_t *)calloc(nvox, 1);
+	float *vals = (float *)malloc(nvox * sizeof(float)), *scratch = (float *)malloc(nvox * sizeof(float));
+	if (!hat || !art || !tmp || !vals || !scratch) {
+		printf("qc: out of memory allocating air masks\n");
+		goto done;
+	}
+	// 1. the hat. Only the z row of voxel->template matters: a plane equation in (i,j,k).
+	long nHat = 0;
+	float distMax = 0;
+	for (int k = 0; k < nz; k++)
+		for (int j = 0; j < ny; j++) {
+			double zjk = v2t.m[2][1] * j + v2t.m[2][2] * k + v2t.m[2][3];
+			size_t base = (size_t)j * nx + (size_t)k * nxy;
+			for (int i = 0; i < nx; i++) {
+				if (v2t.m[2][0] * i + zjk < QC_LANDMARK_PLANE_Z) continue;
+				size_t o = base + i;
+				if (hd[o] > 0) continue;
+				hat[o] = 1;
+				nHat++;
+				if (ds[o] > distMax) distMax = ds[o];
+			}
+		}
+	if (nHat < 10) { // e.g. skull-stripped input: no usable background
+		printf("qc: fewer than 10 air voxels above the landmark plane; air metrics omitted\n");
+		rc = 0;
+		goto done;
+	}
+	am->present = 1;
+	// 2. artifacts, flagged against the MAD of the FULL hat.
+	int n = qc_gather(img, hat, 1, nvox, vals);
+	TissueStats s0;
+	qc_stats(vals, n, n, scratch, &s0);
+	if (s0.mad > 0 && distMax > 0)
+		for (size_t o = 0; o < nvox; o++)
+			if (hat[o] && img[o] > 0 && ds[o] / distMax >= 0.1f && img[o] / s0.mad > QC_AIR_ZSCORE)
+				art[o] = 1;
+	qc_erode6(art, 1, tmp, nx, ny, nz);
+	memset(art, 0, nvox);
+	for (int k = 1; k < nz - 1; k++)
+		for (int j = 1; j < ny - 1; j++)
+			for (int i = 1; i < nx - 1; i++) {
+				size_t o = (size_t)k * nxy + (size_t)j * nx + i;
+				if (!tmp[o]) continue;
+				art[o] = art[o - 1] = art[o + 1] = art[o - nx] = art[o + nx] = art[o - nxy] = art[o + nxy] = 1;
+			}
+	long nArt = 0;
+	for (size_t o = 0; o < nvox; o++)
+		if (art[o] && hat[o]) { hat[o] = 0; nArt++; }
+	am->qi_1 = (double)nArt / nHat;
+	// 3. background statistics over the pruned air.
+	n = qc_gather(img, hat, 1, nvox, vals);
+	qc_stats(vals, n, n, scratch, &am->bg);
+	if (n < 1) { rc = 0; goto done; }
+	// 4. Dietrich SNR: median over the air MAD (stdv when the MAD is degenerate).
+	double sigma = am->bg.mad > 1.0 ? am->bg.mad : am->bg.stdv;
+	if (sigma > 1e-3) {
+		const TissueStats *ts[3] = {scsf, sgm, swm};
+		double *out[3] = {&am->snrd_csf, &am->snrd_gm, &am->snrd_wm};
+		double sum = 0;
+		int cnt = 0;
+		for (int t = 0; t < 3; t++) {
+			if (!qc_finite(ts[t]->median)) continue;
+			*out[t] = QC_DIETRICH * ts[t]->median / sigma;
+			sum += *out[t];
+			cnt++;
+		}
+		if (cnt) am->snrd_total = sum / cnt;
+	}
+	// 5. FBER: median squared intensity inside the head over the same in the air.
+	int nFg = 0;
+	for (size_t o = 0; o < nvox; o++)
+		if (hd[o] > 0) scratch[nFg++] = img[o] * img[o];
+	if (nFg) {
+		double fg = qc_pctl_inplace(scratch, nFg, 0.5);
+		for (int i = 0; i < n; i++) vals[i] *= vals[i];
+		double bg = qc_pctl_inplace(vals, n, 0.5);
+		am->fber = bg < 1e-3 ? -1.0 : fg / bg;
+	}
+	// 6. CNR with the air term (MRIQC's definition; sigma_air is <1 % of it in practice).
+	if (swm->ok && sgm->ok && qc_finite(am->bg.stdv))
+		am->cnr = fabs(swm->median - sgm->median) /
+		          sqrt(am->bg.stdv * am->bg.stdv + sgm->stdv * sgm->stdv + swm->stdv * swm->stdv);
+	rc = 0;
+done:
+	free(hat); free(art); free(tmp); free(vals); free(scratch);
+	nifti_image_free(ras); nifti_image_free(head); nifti_image_free(dist);
+	return rc;
+}
+#endif // HAVE_ALLINEATE
+
+// ---- output: one ordered value table feeds both the TSV and the JSON ----
+typedef struct { const char *key; double v; int is_count; } QcVal;
+#define QC_MAX_VALS 96
+
+static void qc_push(QcVal *vals, int *n, const char *key, double v) {
+	if (*n < QC_MAX_VALS) { vals[*n].key = key; vals[*n].v = v; vals[*n].is_count = 0; (*n)++; }
+}
+static void qc_push_count(QcVal *vals, int *n, const char *key, long v) {
+	if (*n < QC_MAX_VALS) { vals[*n].key = key; vals[*n].v = (double)v; vals[*n].is_count = 1; (*n)++; }
 }
 
-// Emit a tab then an exact integer count. summary_*_n is a voxel count, so it
-// must NOT go through %.6g (which rounds e.g. 1030101 to 1.0301e+06).
-static void qc_fmt_long(FILE *f, long v) {
-	fprintf(f, "\t%ld", v);
+// summary_<tissue>_* in MRIQC's order. The key strings must outlive the table, so
+// they are formatted into caller-owned storage.
+static void qc_push_tissue(QcVal *vals, int *n, const char *tn, const TissueStats *st, char keys[8][32]) {
+	const char *suf[8] = {"mean", "stdv", "median", "mad", "p05", "p95", "k", "n"};
+	double v[7] = {st->mean, st->stdv, st->median, st->mad, st->p05, st->p95, st->kurt};
+	for (int i = 0; i < 8; i++) snprintf(keys[i], 32, "summary_%s_%s", tn, suf[i]);
+	for (int i = 0; i < 7; i++) qc_push(vals, n, keys[i], v[i]);
+	qc_push_count(vals, n, keys[7], st->n);
+}
+
+static int qc_write_tsv(const char *fout, const QcVal *vals, int n) {
+	FILE *f = fopen(fout, "w");
+	if (!f) { printf("qc: cannot open output '%s'\n", fout); return 1; }
+	for (int i = 0; i < n; i++) fprintf(f, "%s%s", i ? "\t" : "", vals[i].key);
+	fputc('\n', f);
+	for (int i = 0; i < n; i++) {
+		if (i) fputc('\t', f);
+		// counts print exactly: %.6g would round 1030101 to 1.0301e+06
+		if (vals[i].is_count) fprintf(f, "%ld", (long)vals[i].v);
+		else if (qc_finite(vals[i].v)) fprintf(f, "%.6g", vals[i].v);
+		else fputs("nan", f);
+	}
+	fputc('\n', f);
+	int bad = ferror(f) | fclose(f);
+	if (bad) printf("qc: failed while writing output '%s'\n", fout);
+	return bad;
+}
+
+// Print a string as a JSON literal; the values here are file names from argv.
+static void qc_json_str(FILE *f, const char *s) {
+	fputc('"', f);
+	for (; *s; s++) {
+		if (*s == '"' || *s == '\\') fputc('\\', f);
+		fputc(*s, f);
+	}
+	fputc('"', f);
+}
+
+// MRIQC-style report: metrics flat at the top level (JSON has no NaN, so non-finite
+// values are null), image geometry, and provenance. Mirrors MRIQC's <sub>_T1w.json.
+static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti_image *nt1,
+                         const int *csf, int ncsf, const int *wm, int nwm, const char *ftmpl) {
+	FILE *f = fopen(fout, "w");
+	if (!f) { printf("qc: cannot open output '%s'\n", fout); return 1; }
+	fputs("{\n", f);
+	for (int i = 0; i < n; i++) {
+		fprintf(f, "  \"%s\": ", vals[i].key);
+		if (vals[i].is_count) fprintf(f, "%ld", (long)vals[i].v);
+		else if (qc_finite(vals[i].v)) fprintf(f, "%.15g", vals[i].v);
+		else fputs("null", f);
+		fputs(",\n", f);
+	}
+	fprintf(f, "  \"size_x\": %lld,\n  \"size_y\": %lld,\n  \"size_z\": %lld,\n",
+	        (long long)nt1->nx, (long long)nt1->ny, (long long)nt1->nz);
+	fprintf(f, "  \"spacing_x\": %.15g,\n  \"spacing_y\": %.15g,\n  \"spacing_z\": %.15g,\n",
+	        (double)nt1->dx, (double)nt1->dy, (double)nt1->dz);
+	fputs("  \"provenance\": {\n    \"software\": \"niimath --qc\",\n    \"csf_labels\": [", f);
+	for (int i = 0; i < ncsf; i++) fprintf(f, "%s%d", i ? ", " : "", csf[i]);
+	fputs("],\n    \"wm_labels\": [", f);
+	for (int i = 0; i < nwm; i++) fprintf(f, "%s%d", i ? ", " : "", wm[i]);
+	fputs("]", f);
+	if (ftmpl) { fputs(",\n    \"air_template\": ", f); qc_json_str(f, ftmpl); }
+	fputs("\n  }\n}\n", f);
+	int bad = ferror(f) | fclose(f);
+	if (bad) printf("qc: failed while writing output '%s'\n", fout);
+	return bad;
 }
 
 int nii_qc(int argc, char *argv[]) {
-	const char *ft1 = NULL, *fseg = NULL, *csfstr = NULL, *wmstr = NULL, *fout = "qc.tsv";
+	const char *ft1 = NULL, *fseg = NULL, *csfstr = NULL, *wmstr = NULL;
+	const char *fout = NULL, *fjson = NULL, *ftmpl = NULL;
 	nifti_image *nt1 = NULL, *nseg = NULL;
 	uint8_t *classes = NULL, *eroded = NULL;
 	float *vals = NULL, *scratch = NULL;
-	FILE *f = NULL;
 	int rc = EXIT_FAILURE;
 	int do_erode = 1;
 	for (int i = 2; i < argc; i++) {
@@ -285,19 +480,28 @@ int nii_qc(int argc, char *argv[]) {
 			else { printf("qc: --erode must be 0 or 1 (got '%s')\n", v); return EXIT_FAILURE; }
 		}
 		else if ((!strcmp(a, "-o") || !strcmp(a, "-out") || !strcmp(a, "--out")) && i + 1 < argc) fout = argv[++i];
+		else if ((!strcmp(a, "-json") || !strcmp(a, "--json")) && i + 1 < argc) fjson = argv[++i];
+		else if ((!strcmp(a, "-air") || !strcmp(a, "--air")) && i + 1 < argc) ftmpl = argv[++i];
 		else if (a[0] != '-' && !ft1) ft1 = a; // positional T1
 		else {
 			printf("qc: unsupported option '%s'\n", a);
-			printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv]\n");
+			printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
 			return EXIT_FAILURE;
 		}
 	}
 	if (!ft1 || !fseg || !csfstr || !wmstr) {
 		printf("qc: missing required arguments.\n");
-		printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv]\n");
+		printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
 		printf("  labels: 0 = non-brain (excluded); --csf/--wm list the CSF/WM label values; every other non-zero label is GM.\n");
 		return EXIT_FAILURE;
 	}
+	if (!fout && !fjson) fout = "qc.tsv";
+#ifndef HAVE_ALLINEATE
+	if (ftmpl) {
+		printf("qc: --air needs a build with allineate (the head-to-template registration)\n");
+		return EXIT_FAILURE;
+	}
+#endif
 	int csfset[64], wmset[64];
 	int ncsf = qc_parse_labels(csfstr, csfset, 64);
 	int nwm = qc_parse_labels(wmstr, wmset, 64);
@@ -464,50 +668,50 @@ int nii_qc(int argc, char *argv[]) {
 	if (!(vvol > 0.0 && qc_finite(vvol))) vvol = NAN;
 	double vol_csf = scsf.nraw * vvol, vol_gm = sgm.nraw * vvol, vol_wm = swm.nraw * vvol;
 
-	// ---- write wide TSV ----
-	f = fopen(fout, "w");
-	if (!f) {
-		printf("qc: cannot open output '%s'\n", fout);
-		goto cleanup;
-	}
-	fputs("cjv\tcnr_noair\tsnr_csf\tsnr_wm\tsnr_gm\tsnr_total\twm2max\tefc_brain"
-	      "\ticvs_csf\ticvs_gm\ticvs_wm\tvol_csf_mm3\tvol_gm_mm3\tvol_wm_mm3", f);
-	const char *tn[3] = {"csf", "gm", "wm"};
-	for (int t = 0; t < 3; t++)
-		fprintf(f, "\tsummary_%s_mean\tsummary_%s_stdv\tsummary_%s_median\tsummary_%s_mad"
-		           "\tsummary_%s_p05\tsummary_%s_p95\tsummary_%s_k\tsummary_%s_n",
-		        tn[t], tn[t], tn[t], tn[t], tn[t], tn[t], tn[t], tn[t]);
-	fputc('\n', f);
-	// first value has no leading tab
-	if (qc_finite(cjv)) fprintf(f, "%.6g", cjv); else fputs("nan", f);
-	qc_fmt(f, cnr);
-	qc_fmt(f, snr_csf); qc_fmt(f, snr_wm); qc_fmt(f, snr_gm); qc_fmt(f, snr_total);
-	qc_fmt(f, wm2max); qc_fmt(f, efc);
-	qc_fmt(f, icvs_csf); qc_fmt(f, icvs_gm); qc_fmt(f, icvs_wm);
-	qc_fmt(f, vol_csf); qc_fmt(f, vol_gm); qc_fmt(f, vol_wm);
-	TissueStats *ts[3] = {&scsf, &sgm, &swm};
-	for (int t = 0; t < 3; t++) {
-		qc_fmt(f, ts[t]->mean); qc_fmt(f, ts[t]->stdv); qc_fmt(f, ts[t]->median);
-		qc_fmt(f, ts[t]->mad); qc_fmt(f, ts[t]->p05); qc_fmt(f, ts[t]->p95);
-		qc_fmt(f, ts[t]->kurt); qc_fmt_long(f, ts[t]->n);
-	}
-	fputc('\n', f);
-	int write_failed = ferror(f);
-	int close_failed = fclose(f);
-	f = NULL;
-	if (write_failed || close_failed) {
-		printf("qc: failed while writing output '%s'\n", fout);
-		goto cleanup;
-	}
+	AirMetrics air = {0};
+#ifdef HAVE_ALLINEATE
+	if (ftmpl && qc_air(nt1, ftmpl, ft1, &scsf, &sgm, &swm, &air)) goto cleanup;
+#endif
 
-	printf("qc: wrote %s\n", fout);
+	// ---- collect, then write ----
+	QcVal tab[QC_MAX_VALS];
+	int nvals = 0;
+	qc_push(tab, &nvals, "cjv", cjv);
+	qc_push(tab, &nvals, "cnr_noair", cnr);
+	if (air.present) qc_push(tab, &nvals, "cnr", air.cnr);
+	qc_push(tab, &nvals, "snr_csf", snr_csf); qc_push(tab, &nvals, "snr_wm", snr_wm);
+	qc_push(tab, &nvals, "snr_gm", snr_gm); qc_push(tab, &nvals, "snr_total", snr_total);
+	if (air.present) {
+		qc_push(tab, &nvals, "snrd_csf", air.snrd_csf); qc_push(tab, &nvals, "snrd_wm", air.snrd_wm);
+		qc_push(tab, &nvals, "snrd_gm", air.snrd_gm); qc_push(tab, &nvals, "snrd_total", air.snrd_total);
+		qc_push(tab, &nvals, "fber", air.fber); qc_push(tab, &nvals, "qi_1", air.qi_1);
+	}
+	qc_push(tab, &nvals, "wm2max", wm2max); qc_push(tab, &nvals, "efc_brain", efc);
+	qc_push(tab, &nvals, "icvs_csf", icvs_csf); qc_push(tab, &nvals, "icvs_gm", icvs_gm);
+	qc_push(tab, &nvals, "icvs_wm", icvs_wm);
+	qc_push(tab, &nvals, "vol_csf_mm3", vol_csf); qc_push(tab, &nvals, "vol_gm_mm3", vol_gm);
+	qc_push(tab, &nvals, "vol_wm_mm3", vol_wm);
+	char keys[4][8][32];
+	qc_push_tissue(tab, &nvals, "csf", &scsf, keys[0]);
+	qc_push_tissue(tab, &nvals, "gm", &sgm, keys[1]);
+	qc_push_tissue(tab, &nvals, "wm", &swm, keys[2]);
+	if (air.present) qc_push_tissue(tab, &nvals, "bg", &air.bg, keys[3]);
+
+	if (fout && qc_write_tsv(fout, tab, nvals)) goto cleanup;
+	if (fjson && qc_write_json(fjson, tab, nvals, nt1, csfset, ncsf, wmset, nwm,
+	                           air.present ? ftmpl : NULL)) goto cleanup;
+
+	if (fout) printf("qc: wrote %s\n", fout);
+	if (fjson) printf("qc: wrote %s\n", fjson);
 	printf("qc: CJV=%.4g  CNR(noair)=%.4g  SNR(total)=%.4g  WM2MAX=%.4g  EFC=%.4g\n",
 	       cjv, cnr, snr_total, wm2max, efc);
+	if (air.present)
+		printf("qc: SNRd(total)=%.4g  FBER=%.4g  QI1=%.4g  CNR=%.4g\n",
+		       air.snrd_total, air.fber, air.qi_1, air.cnr);
 	printf("qc: voxels CSF=%ld GM=%ld WM=%ld (erode=%d)\n", scsf.nraw, sgm.nraw, swm.nraw, do_erode);
 	rc = EXIT_SUCCESS;
 
 cleanup:
-	if (f) fclose(f);
 	free(classes);
 	free(eroded);
 	free(vals);

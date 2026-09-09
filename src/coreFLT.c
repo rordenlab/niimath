@@ -6584,8 +6584,17 @@ static int al_read_affine_json(const char *path, mat44 *out) {
 }
 #endif
 
+#ifdef DT32
+/* The world-space FIXED->MOVING affine of the last successful nifti_allineate_wrap fit,
+   exactly what -savemat writes (seed-composed). Lets --qc --air take the transform
+   without a JSON round trip through the filesystem. */
+static mat44 al_wrap_last_fit;
+static int al_wrap_last_fit_valid = 0;
+#endif
+
 staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingfile, al_opts opts) {
 #ifdef DT32
+	al_wrap_last_fit_valid = 0;
 	int interp = (opts.final_interp == AL_INTERP_DEFAULT) ? AL_INTERP_CUBIC : opts.final_interp;
 	/* Use the ORIGINAL input filename for -savemat provenance, not nim->fname — the latter was
 	   already overwritten with the OUTPUT path by nifti_set_filenames before the op loop. */
@@ -6783,12 +6792,17 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 		else {
 			ok = nii_apply_affine(nim, master ? master : base, res.fixed_to_moving, interp,
 			                      al_image_fillv(opts.fillmode, nim));
-			if (!ok && opts.savemat) {
+			if (!ok) {
 				mat44 save_mat = res.fixed_to_moving;
 				if (seeded) {
 					mat44 seeded_to_original = nifti_mat44_mul(S_orig, nifti_mat44_inverse(S_seed));
 					save_mat = nifti_mat44_mul(seeded_to_original, save_mat);
 				}
+				al_wrap_last_fit = save_mat;
+				al_wrap_last_fit_valid = 1;
+			}
+			if (!ok && opts.savemat) {
+				mat44 save_mat = al_wrap_last_fit;
 				const char *fc = (res.resolved_cost == CF_COST_LS) ? "ls" :
 				                 (res.resolved_cost == CF_COST_HEL) ? "hel" :
 				                 (res.resolved_cost == CF_COST_CR) ? "cr" : "hel+cr";
@@ -6820,22 +6834,22 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 			ok = nii_allineate(nim, base, opts);
 			if (!ok) have_fit = (nii_last_affine(&fitmat) == 0);
 		}
-		if (!ok && opts.savemat) {
-			if (!have_fit)   /* guard the fitmat read: never serialize an unfitted matrix */
-				ok = 1;
-			else {
-				/* Compose a header-mutating seed back out so the saved matrix is relative to
-				   the ORIGINAL moving frame: M' = S_orig * inv(S_seed) * M (identity if unseeded). */
-				mat44 outmat = seeded
-				    ? nifti_mat44_mul(S_orig, nifti_mat44_mul(nifti_mat44_inverse(S_seed), fitmat))
-				    : fitmat;
-				if (al_write_affine_json(opts.savemat, outmat, "allineate", opts.warp,
+		if (!ok && have_fit) {
+			/* Compose a header-mutating seed back out so the saved matrix is relative to
+			   the ORIGINAL moving frame: M' = S_orig * inv(S_seed) * M (identity if unseeded). */
+			al_wrap_last_fit = seeded
+			    ? nifti_mat44_mul(S_orig, nifti_mat44_mul(nifti_mat44_inverse(S_seed), fitmat))
+			    : fitmat;
+			al_wrap_last_fit_valid = 1;
+			if (opts.savemat) {
+				if (al_write_affine_json(opts.savemat, al_wrap_last_fit, "allineate", opts.warp,
 				                         al_cost_name(opts.cost), basefile, moving_name, opts.weight))
 					ok = 1;
 				else
 					fprintf(stderr, " + Saved affine to '%s'\n", opts.savemat);
 			}
-		}
+		} else if (!ok && opts.savemat)
+			ok = 1;   /* guard the fitmat read: never serialize an unfitted matrix */
 	}
 	if (master) nifti_image_free(master);
 	nifti_image_free(base);
@@ -6846,6 +6860,58 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	return 1;
 #endif
 }
+
+#if defined(DT32) && defined(HAVE_QC)
+static nifti_image *nii_dup(const nifti_image *src) {
+	nifti_image *d = (nifti_image *)malloc(sizeof(nifti_image));
+	if (!d) return NULL;
+	*d = *src;
+	d->fname = d->iname = NULL;
+	d->num_ext = 0;
+	d->ext_list = NULL;
+	size_t nbytes = (size_t)src->nvox * src->nbyper;
+	d->data = malloc(nbytes);
+	if (!d->data) { free(d); return NULL; }
+	memcpy(d->data, src->data, nbytes);
+	return d;
+}
+
+/* --qc --air: the masks the air metrics need, built here because the ops are static to
+   this templated core. `t1` (float32, 3D) is left untouched. On success *ras is its
+   RAS-canonical copy, *head the Otsu head mask and *dist the distance from the head
+   boundary into the air (all float32 on the RAS grid), and *vox2tmpl maps RAS voxel
+   indices to template mm. Equivalent to the chain
+     -ras | -allineate <template> -savemat | -otsu 5 -fillh -close 0.5 3 3 | -binv -edt
+   with moving_to_fixed composed onto the RAS voxel->mm affine. Returns 0 on success. */
+int nii_qc_air_masks_f32(const nifti_image *t1, const char *template, const char *t1name,
+                         nifti_image **ras, nifti_image **head, nifti_image **dist, mat44 *vox2tmpl) {
+	*ras = *head = *dist = NULL;
+	nifti_image *reg = NULL;
+	int fail = 1;
+	if (!(*ras = nii_dup(t1)) || nifti_ras(*ras)) goto done;
+	/* The registration reslices its input, so fit a throwaway copy; only the affine is kept. */
+	if (!(reg = nii_dup(*ras))) goto done;
+	al_opts opts = al_opts_default();
+	if (nifti_allineate_wrap(reg, (char *)template, (char *)t1name, opts) || !al_wrap_last_fit_valid) goto done;
+	*vox2tmpl = nifti_mat44_mul(nifti_mat44_inverse(al_wrap_last_fit), xform(*ras));
+	if (!(*head = nii_dup(*ras)) || nifti_otsu(*head, 5, 1) || nifti_fillh(*head, 0) ||
+	    nifti_close(*head, (flt)0.5, (flt)3, (flt)3)) goto done;
+	if (!(*dist = nii_dup(*head))) goto done;
+	flt *d = (flt *)(*dist)->data;
+	for (size_t i = 0; i < (*dist)->nvox; i++) d[i] = (d[i] > 0) ? 0 : 1; /* -binv */
+	if (nifti_edt(*dist)) goto done;
+	fail = 0;
+done:
+	if (reg) nifti_image_free(reg);
+	if (fail) {
+		if (*ras) nifti_image_free(*ras);
+		if (*head) nifti_image_free(*head);
+		if (*dist) nifti_image_free(*dist);
+		*ras = *head = *dist = NULL;
+	}
+	return fail;
+}
+#endif
 
 staticx int nifti_deface_wrap(nifti_image *nim, char *tmplfile, char *maskfile, al_opts opts) {
 #ifdef DT32
