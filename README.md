@@ -562,15 +562,21 @@ Options:
 - `-m <mask>`: restrict the fit to a mask.
 - `-xflip auto` (default) flips the bvec X component when the spatial transform determinant is positive, which matches FSL. `0` never flips. `1` always flips.
 
-### `--qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--out qc.tsv]`
+### `--qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]`
 
 MRIQC-style anatomical quality metrics from a T1 image and an integer segmentation. This is a self-contained command with its own arguments.
 
-Output: a wide TSV (default `qc.tsv`) with CJV, cnr_noair, per-tissue and total SNR, WM2MAX, efc_brain, ICV fractions with mm³ volumes, and per-tissue summary statistics.
+Output: a wide TSV (`--out`, the default `qc.tsv` when neither output is named) and/or an MRIQC-style JSON (`--json`: the same metrics flat at the top level, plus `size_*`, `spacing_*` and `provenance`; non-finite values are `null`). Metrics: CJV, cnr_noair, per-tissue and total SNR, WM2MAX, efc_brain, ICV fractions with mm³ volumes, and per-tissue summary statistics.
 
 Labels: `0` is non-brain and is excluded. `--csf` and `--wm` give disjoint sets of CSF and WM label values. Every other non-zero label is GM.
 
-Constraints: only air-free metrics are computed. This hard-segmentation variant uses unrounded intensities and NumPy-linear percentiles, so its values are not numerically interchangeable with MRIQC's soft partial-volume summaries. The names `cnr_noair` and `efc_brain` flag their deviation from the MRIQC norms.
+`--air <template>` adds the background metrics, which need an air region: `summary_bg_*`, Dietrich SNR (`snrd_*`), `fber`, `qi_1`, and `cnr` with its air term (`cnr_noair` stays for comparison). The method follows MRIQC's `ArtifactMask`: the image is made RAS-canonical, registered to the template (`-allineate`, transform only), and the air is the head-free region (Otsu head mask, filled and closed) superior to MRIQC's landmark plane at template z = −14. Voxels brighter than 10 MADs of that region, outside the 10 % shell nearest the head and surviving a 6-connected opening, are artifacts (`qi_1` is their fraction) and are pruned from the background before its statistics. Any T1 template in the MNI frame works; MRIQC's landmarks were placed on `avg152T1`. Needs a build with allineate.
+
+```
+niimath --qc T1.nii.gz --seg seg.nii.gz --csf 3,4,11,12 --wm 1,5 --air avg152T1.nii.gz --json qc.json
+```
+
+Constraints: this hard-segmentation variant uses unrounded intensities and NumPy-linear percentiles, so its values are not numerically interchangeable with MRIQC's soft partial-volume summaries; the head mask is Otsu-based where MRIQC's is gradient-based. The names `cnr_noair` and `efc_brain` flag their deviation from the MRIQC norms.
 
 ### `--medic --magnitude <e1> [<e2> ...] --phase <e1> [<e2> ...] --te-ms <t1,t2,...> --total-readout-time <sec> --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> [options]`
 
