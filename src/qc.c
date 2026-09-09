@@ -28,6 +28,7 @@
 
 #ifdef HAVE_QC
 
+#include <assert.h>
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
@@ -37,7 +38,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "core.h" // set_input_hdr, nifti_image_change_datatype
-#ifdef HAVE_ALLINEATE
+#if defined(HAVE_ALLINEATE) && defined(HAVE_CONFORM)
+#define QC_HAVE_AIR
 #include "core32.h" // nii_qc_air_masks_f32
 #endif
 
@@ -205,22 +207,21 @@ static int qc_in_set(int v, const int *set, int n) {
 	return 0;
 }
 
-// One-voxel 6-connected erosion of one class in the compact class map.
-static void qc_erode6(const uint8_t *classes, uint8_t tissue, uint8_t *out,
-                      int nx, int ny, int nz) {
+// One-voxel 6-connected erosion (erode=1) or dilation (erode=0) of one class in the
+// compact class map, into a binary mask. Border voxels erode away.
+static void qc_morph6(const uint8_t *classes, uint8_t tissue, uint8_t *out,
+                      int nx, int ny, int nz, int erode) {
 	size_t nxy = (size_t)nx * ny;
 	for (int z = 0; z < nz; z++)
 		for (int y = 0; y < ny; y++)
 			for (int x = 0; x < nx; x++) {
 				size_t idx = (size_t)z * nxy + (size_t)y * nx + x;
-				if (classes[idx] != tissue) { out[idx] = 0; continue; }
-				int keep = (x > 0 && classes[idx - 1] == tissue) &&
-				           (x < nx - 1 && classes[idx + 1] == tissue) &&
-				           (y > 0 && classes[idx - nx] == tissue) &&
-				           (y < ny - 1 && classes[idx + nx] == tissue) &&
-				           (z > 0 && classes[idx - nxy] == tissue) &&
-				           (z < nz - 1 && classes[idx + nxy] == tissue);
-				out[idx] = keep ? 1 : 0;
+				int self = classes[idx] == tissue;
+				if (erode && !self) { out[idx] = 0; continue; }
+				int xm = x > 0 && classes[idx - 1] == tissue, xp = x < nx - 1 && classes[idx + 1] == tissue;
+				int ym = y > 0 && classes[idx - nx] == tissue, yp = y < ny - 1 && classes[idx + nx] == tissue;
+				int zm = z > 0 && classes[idx - nxy] == tissue, zp = z < nz - 1 && classes[idx + nxy] == tissue;
+				out[idx] = erode ? (xm && xp && ym && yp && zm && zp) : (self || xm || xp || ym || yp || zm || zp);
 			}
 }
 
@@ -242,7 +243,7 @@ static void qc_tissue(const char *name, const float *t1, const uint8_t *classes,
 	uint8_t selected = tissue;
 	int n = 0;
 	if (do_erode) {
-		qc_erode6(classes, tissue, eroded, nx, ny, nz);
+		qc_morph6(classes, tissue, eroded, nx, ny, nz, 1);
 		n = qc_gather(t1, eroded, 1, nvox, vals);
 		if (n >= QC_MIN_VOX) { use = eroded; selected = 1; }
 		else printf("qc: %s has %d voxels after erosion (< %d); using un-eroded mask for its stats\n",
@@ -272,15 +273,16 @@ typedef struct {
 	TissueStats bg;
 } AirMetrics;
 
-#ifdef HAVE_ALLINEATE
-static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
+#ifdef QC_HAVE_AIR
+// `scratch` is the caller's nvox-float buffer (the RAS permutation keeps the count).
+static int qc_air(const nifti_image *nt1, const char *ftmpl,
                   const TissueStats *scsf, const TissueStats *sgm, const TissueStats *swm,
-                  AirMetrics *am) {
+                  float *scratch, AirMetrics *am) {
 	nifti_image *ras = NULL, *head = NULL, *dist = NULL;
 	mat44 v2t;
 	memset(am, 0, sizeof(*am));
 	am->qi_1 = am->fber = am->cnr = am->snrd_csf = am->snrd_gm = am->snrd_wm = am->snrd_total = NAN;
-	if (nii_qc_air_masks_f32(nt1, ftmpl, ft1, &ras, &head, &dist, &v2t)) {
+	if (nii_qc_air_masks_f32(nt1, ftmpl, &ras, &head, &dist, &v2t)) {
 		printf("qc: air mask pipeline failed (RAS / registration to '%s' / head mask)\n", ftmpl);
 		return 1;
 	}
@@ -291,8 +293,8 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
 	            *ds = (const float *)dist->data;
 	uint8_t *hat = (uint8_t *)calloc(nvox, 1), *art = (uint8_t *)calloc(nvox, 1),
 	        *tmp = (uint8_t *)calloc(nvox, 1);
-	float *vals = (float *)malloc(nvox * sizeof(float)), *scratch = (float *)malloc(nvox * sizeof(float));
-	if (!hat || !art || !tmp || !vals || !scratch) {
+	float *vals = (float *)malloc(nvox * sizeof(float));
+	if (!hat || !art || !tmp || !vals) {
 		printf("qc: out of memory allocating air masks\n");
 		goto done;
 	}
@@ -312,8 +314,8 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
 				if (ds[o] > distMax) distMax = ds[o];
 			}
 		}
-	if (nHat < 10) { // e.g. skull-stripped input: no usable background
-		printf("qc: fewer than 10 air voxels above the landmark plane; air metrics omitted\n");
+	if (nHat < QC_MIN_VOX) { // e.g. skull-stripped input: no usable background
+		printf("qc: fewer than %d air voxels above the landmark plane; air metrics omitted\n", QC_MIN_VOX);
 		rc = 0;
 		goto done;
 	}
@@ -326,15 +328,8 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
 		for (size_t o = 0; o < nvox; o++)
 			if (hat[o] && img[o] > 0 && ds[o] / distMax >= 0.1f && img[o] / s0.mad > QC_AIR_ZSCORE)
 				art[o] = 1;
-	qc_erode6(art, 1, tmp, nx, ny, nz);
-	memset(art, 0, nvox);
-	for (int k = 1; k < nz - 1; k++)
-		for (int j = 1; j < ny - 1; j++)
-			for (int i = 1; i < nx - 1; i++) {
-				size_t o = (size_t)k * nxy + (size_t)j * nx + i;
-				if (!tmp[o]) continue;
-				art[o] = art[o - 1] = art[o + 1] = art[o - nx] = art[o + nx] = art[o - nxy] = art[o + nxy] = 1;
-			}
+	qc_morph6(art, 1, tmp, nx, ny, nz, 1); // open: erode, then dilate
+	qc_morph6(tmp, 1, art, nx, ny, nz, 0);
 	long nArt = 0;
 	for (size_t o = 0; o < nvox; o++)
 		if (art[o] && hat[o]) { hat[o] = 0; nArt++; }
@@ -374,31 +369,39 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl, const char *ft1,
 		          sqrt(am->bg.stdv * am->bg.stdv + sgm->stdv * sgm->stdv + swm->stdv * swm->stdv);
 	rc = 0;
 done:
-	free(hat); free(art); free(tmp); free(vals); free(scratch);
+	free(hat); free(art); free(tmp); free(vals);
 	nifti_image_free(ras); nifti_image_free(head); nifti_image_free(dist);
 	return rc;
 }
-#endif // HAVE_ALLINEATE
+#endif // QC_HAVE_AIR
 
 // ---- output: one ordered value table feeds both the TSV and the JSON ----
-typedef struct { const char *key; double v; int is_count; } QcVal;
-#define QC_MAX_VALS 96
+typedef struct { char key[32]; double v; int is_count; } QcVal;
+#define QC_MAX_VALS 64 // 53 with --air; the count is fixed at compile time
 
-static void qc_push(QcVal *vals, int *n, const char *key, double v) {
-	if (*n < QC_MAX_VALS) { vals[*n].key = key; vals[*n].v = v; vals[*n].is_count = 0; (*n)++; }
+static void qc_push(QcVal *tab, int *n, const char *key, double v) {
+	assert(*n < QC_MAX_VALS);
+	snprintf(tab[*n].key, sizeof tab->key, "%s", key);
+	tab[*n].v = v;
+	tab[*n].is_count = 0;
+	(*n)++;
 }
-static void qc_push_count(QcVal *vals, int *n, const char *key, long v) {
-	if (*n < QC_MAX_VALS) { vals[*n].key = key; vals[*n].v = (double)v; vals[*n].is_count = 1; (*n)++; }
+static void qc_push_count(QcVal *tab, int *n, const char *key, long v) {
+	qc_push(tab, n, key, (double)v);
+	tab[*n - 1].is_count = 1;
 }
 
-// summary_<tissue>_* in MRIQC's order. The key strings must outlive the table, so
-// they are formatted into caller-owned storage.
-static void qc_push_tissue(QcVal *vals, int *n, const char *tn, const TissueStats *st, char keys[8][32]) {
-	const char *suf[8] = {"mean", "stdv", "median", "mad", "p05", "p95", "k", "n"};
+// summary_<tissue>_* in MRIQC's order.
+static void qc_push_tissue(QcVal *tab, int *n, const char *tn, const TissueStats *st) {
+	const char *suf[7] = {"mean", "stdv", "median", "mad", "p05", "p95", "k"};
 	double v[7] = {st->mean, st->stdv, st->median, st->mad, st->p05, st->p95, st->kurt};
-	for (int i = 0; i < 8; i++) snprintf(keys[i], 32, "summary_%s_%s", tn, suf[i]);
-	for (int i = 0; i < 7; i++) qc_push(vals, n, keys[i], v[i]);
-	qc_push_count(vals, n, keys[7], st->n);
+	char key[32];
+	for (int i = 0; i < 7; i++) {
+		snprintf(key, sizeof key, "summary_%s_%s", tn, suf[i]);
+		qc_push(tab, n, key, v[i]);
+	}
+	snprintf(key, sizeof key, "summary_%s_n", tn);
+	qc_push_count(tab, n, key, st->n);
 }
 
 static int qc_write_tsv(const char *fout, const QcVal *vals, int n) {
@@ -414,7 +417,8 @@ static int qc_write_tsv(const char *fout, const QcVal *vals, int n) {
 		else fputs("nan", f);
 	}
 	fputc('\n', f);
-	int bad = ferror(f) | fclose(f);
+	int bad = ferror(f);
+	bad |= fclose(f);
 	if (bad) printf("qc: failed while writing output '%s'\n", fout);
 	return bad;
 }
@@ -423,6 +427,7 @@ static int qc_write_tsv(const char *fout, const QcVal *vals, int n) {
 static void qc_json_str(FILE *f, const char *s) {
 	fputc('"', f);
 	for (; *s; s++) {
+		if ((unsigned char)*s < 0x20) { fprintf(f, "\\u%04x", (unsigned char)*s); continue; }
 		if (*s == '"' || *s == '\\') fputc('\\', f);
 		fputc(*s, f);
 	}
@@ -454,7 +459,8 @@ static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti
 	fputs("]", f);
 	if (ftmpl) { fputs(",\n    \"air_template\": ", f); qc_json_str(f, ftmpl); }
 	fputs("\n  }\n}\n", f);
-	int bad = ferror(f) | fclose(f);
+	int bad = ferror(f);
+	bad |= fclose(f);
 	if (bad) printf("qc: failed while writing output '%s'\n", fout);
 	return bad;
 }
@@ -496,9 +502,9 @@ int nii_qc(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 	if (!fout && !fjson) fout = "qc.tsv";
-#ifndef HAVE_ALLINEATE
+#ifndef QC_HAVE_AIR
 	if (ftmpl) {
-		printf("qc: --air needs a build with allineate (the head-to-template registration)\n");
+		printf("qc: --air needs a build with allineate and conform (registration and -ras)\n");
 		return EXIT_FAILURE;
 	}
 #endif
@@ -669,8 +675,8 @@ int nii_qc(int argc, char *argv[]) {
 	double vol_csf = scsf.nraw * vvol, vol_gm = sgm.nraw * vvol, vol_wm = swm.nraw * vvol;
 
 	AirMetrics air = {0};
-#ifdef HAVE_ALLINEATE
-	if (ftmpl && qc_air(nt1, ftmpl, ft1, &scsf, &sgm, &swm, &air)) goto cleanup;
+#ifdef QC_HAVE_AIR
+	if (ftmpl && qc_air(nt1, ftmpl, &scsf, &sgm, &swm, scratch, &air)) goto cleanup;
 #endif
 
 	// ---- collect, then write ----
@@ -691,11 +697,10 @@ int nii_qc(int argc, char *argv[]) {
 	qc_push(tab, &nvals, "icvs_wm", icvs_wm);
 	qc_push(tab, &nvals, "vol_csf_mm3", vol_csf); qc_push(tab, &nvals, "vol_gm_mm3", vol_gm);
 	qc_push(tab, &nvals, "vol_wm_mm3", vol_wm);
-	char keys[4][8][32];
-	qc_push_tissue(tab, &nvals, "csf", &scsf, keys[0]);
-	qc_push_tissue(tab, &nvals, "gm", &sgm, keys[1]);
-	qc_push_tissue(tab, &nvals, "wm", &swm, keys[2]);
-	if (air.present) qc_push_tissue(tab, &nvals, "bg", &air.bg, keys[3]);
+	qc_push_tissue(tab, &nvals, "csf", &scsf);
+	qc_push_tissue(tab, &nvals, "gm", &sgm);
+	qc_push_tissue(tab, &nvals, "wm", &swm);
+	if (air.present) qc_push_tissue(tab, &nvals, "bg", &air.bg);
 
 	if (fout && qc_write_tsv(fout, tab, nvals)) goto cleanup;
 	if (fjson && qc_write_json(fjson, tab, nvals, nt1, csfset, ncsf, wmset, nwm,

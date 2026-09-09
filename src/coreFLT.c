@@ -6586,7 +6586,7 @@ static int al_read_affine_json(const char *path, mat44 *out) {
 
 #ifdef DT32
 /* The world-space FIXED->MOVING affine of the last successful nifti_allineate_wrap fit,
-   exactly what -savemat writes (seed-composed). Lets --qc --air take the transform
+   relative to the ORIGINAL moving frame (seed-composed), exactly what -savemat writes. Lets --qc --air take the transform
    without a JSON round trip through the filesystem. */
 static mat44 al_wrap_last_fit;
 static int al_wrap_last_fit_valid = 0;
@@ -6703,7 +6703,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 	   for -savemat we capture the original frame first and compose the saved matrix back to it
 	   (M' = S_orig*inv(S_seed)*M, identity if unseeded) so -applymat reproduces on the ORIGINAL
 	   un-seeded input. */
-	int seeded = opts.savemat && (opts.com || opts.sym);
+	int seeded = opts.com || opts.sym; /* header-only reads; needed by -savemat and al_wrap_last_fit */
 	mat44 S_orig, S_seed;
 	if (seeded) al_image_xform_or_pixdim(nim, &S_orig, NULL);
 	if (opts.com && nii_center_of_mass(nim)) {
@@ -6861,7 +6861,7 @@ staticx int nifti_allineate_wrap(nifti_image *nim, char *basefile, char *movingf
 #endif
 }
 
-#if defined(DT32) && defined(HAVE_QC)
+#if defined(DT32) && defined(HAVE_QC) && defined(HAVE_CONFORM) /* nifti_ras */
 static nifti_image *nii_dup(const nifti_image *src) {
 	nifti_image *d = (nifti_image *)malloc(sizeof(nifti_image));
 	if (!d) return NULL;
@@ -6883,7 +6883,7 @@ static nifti_image *nii_dup(const nifti_image *src) {
    indices to template mm. Equivalent to the chain
      -ras | -allineate <template> -savemat | -otsu 5 -fillh -close 0.5 3 3 | -binv -edt
    with moving_to_fixed composed onto the RAS voxel->mm affine. Returns 0 on success. */
-int nii_qc_air_masks_f32(const nifti_image *t1, const char *template, const char *t1name,
+int nii_qc_air_masks_f32(const nifti_image *t1, const char *template,
                          nifti_image **ras, nifti_image **head, nifti_image **dist, mat44 *vox2tmpl) {
 	*ras = *head = *dist = NULL;
 	nifti_image *reg = NULL;
@@ -6892,7 +6892,7 @@ int nii_qc_air_masks_f32(const nifti_image *t1, const char *template, const char
 	/* The registration reslices its input, so fit a throwaway copy; only the affine is kept. */
 	if (!(reg = nii_dup(*ras))) goto done;
 	al_opts opts = al_opts_default();
-	if (nifti_allineate_wrap(reg, (char *)template, (char *)t1name, opts) || !al_wrap_last_fit_valid) goto done;
+	if (nifti_allineate_wrap(reg, (char *)template, "", opts) || !al_wrap_last_fit_valid) goto done;
 	*vox2tmpl = nifti_mat44_mul(nifti_mat44_inverse(al_wrap_last_fit), xform(*ras));
 	if (!(*head = nii_dup(*ras)) || nifti_otsu(*head, 5, 1) || nifti_fillh(*head, 0) ||
 	    nifti_close(*head, (flt)0.5, (flt)3, (flt)3)) goto done;

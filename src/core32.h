@@ -9,10 +9,9 @@ extern "C" {
 
 int main32(int argc, char *argv[]);
 
-#if defined(HAVE_QC) && defined(HAVE_ALLINEATE)
-/* --qc --air helper: RAS T1, head mask, air distance field and the RAS-voxel -> template-mm
-   affine, from a float32 3D image. Defined in coreFLT.c (DT32); see the comment there. */
-int nii_qc_air_masks_f32(const nifti_image *t1, const char *template, const char *t1name,
+#if defined(HAVE_QC) && defined(HAVE_ALLINEATE) && defined(HAVE_CONFORM)
+/* --qc --air masks; see coreFLT.c. */
+int nii_qc_air_masks_f32(const nifti_image *t1, const char *template,
                          nifti_image **ras, nifti_image **head, nifti_image **dist, mat44 *vox2tmpl);
 #endif
 

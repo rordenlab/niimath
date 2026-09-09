@@ -220,6 +220,22 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     if len(names) != len(values) or len(set(names)) != len(names):
         raise AssertionError("QC TSV columns are missing, duplicated, or misaligned")
     observed = {name: float(value) for name, value in zip(names, values)}
+    # --json: the same metrics flat at the top level, counts as ints, plus geometry and provenance.
+    json_out = tmp / "qc.json"
+    require_success(
+        run_niimath(exe, ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--json", str(json_out)]),
+        "anatomical QC --json",
+    )
+    report = json.loads(json_out.read_text(encoding="utf-8"))
+    for name in names:
+        if name not in report:
+            raise AssertionError(f"--json is missing TSV column {name}")
+        if abs(report[name] - observed[name]) > 1e-5 * max(1.0, abs(observed[name])):  # TSV is %.6g
+            raise AssertionError(f"--json {name}={report[name]} disagrees with TSV {observed[name]}")
+    if report["summary_wm_n"] != int(report["summary_wm_n"]) or report["size_x"] != dims[0]:
+        raise AssertionError("--json counts/geometry wrong")
+    if report["provenance"]["csf_labels"] != [1] or report["provenance"]["wm_labels"] != [3]:
+        raise AssertionError("--json provenance label sets wrong")
 
     stats = {name: qc_stats(data) for name, data in tissues.items()}
     delta = abs(stats["wm"]["median"] - stats["gm"]["median"])
