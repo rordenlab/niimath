@@ -1283,19 +1283,51 @@ int *make_kernel(nifti_image *nim, int *nkernel, int x, int y, int z) {
 	z = MAX(1, z);
 	if (((x % 2) == 0) || ((y % 2) == 0) || ((z % 2) == 0))
 		printfx("Off-center kernel due to even dimensions.\n");
-	int n = x * y * z;
+	size_t nxyKernel;
+	size_t nKernel;
+	if (nii_mul_size((size_t)x, (size_t)y, &nxyKernel) ||
+		nii_mul_size(nxyKernel, (size_t)z, &nKernel) || nKernel > INT_MAX) {
+		printfx("Kernel dimensions are too large.\n");
+		*nkernel = 0;
+		return NULL;
+	}
+	int n = (int)nKernel;
 	*nkernel = n;
-	int *kernel = (int *)malloc((n * 4) * sizeof(int)); //4 values: offset, xpos, ypos, weight
+	size_t bytes;
+	if (nii_mul_size((size_t)n, 4 * sizeof(int), &bytes)) {
+		*nkernel = 0;
+		return NULL;
+	}
+	int *kernel = (int *)malloc(bytes); //4 values: offset, xpos, ypos, weight
+	if (!kernel) {
+		*nkernel = 0;
+		return NULL;
+	}
 	int xlo = (int)(-x / 2);
 	int ylo = (int)(-y / 2);
 	int zlo = (int)(-z / 2);
 	int i = 0;
 	int kernelWeight = (int)((double)INT_MAX / (double)n); //requires <limits.h>
+	int64_t imageNxy = (int64_t)nim->nx * nim->ny;
 	for (int zi = zlo; zi < (zlo + z); zi++)
 		for (int yi = ylo; yi < (ylo + y); yi++)
 			for (int xi = xlo; xi < (xlo + x); xi++) {
 				//printf("%d %d %d\n", xi,yi,zi);
-				kernel[i] = xi + (yi * nim->nx) + (zi * nim->nx * nim->ny);
+				if (zi != 0 && imageNxy > INT_MAX) {
+					printfx("Kernel offset exceeds the supported range.\n");
+					free(kernel);
+					*nkernel = 0;
+					return NULL;
+				}
+				int64_t offset = xi + (int64_t)yi * nim->nx +
+					(int64_t)zi * imageNxy;
+				if (offset < INT_MIN || offset > INT_MAX) {
+					printfx("Kernel offset exceeds the supported range.\n");
+					free(kernel);
+					*nkernel = 0;
+					return NULL;
+				}
+				kernel[i] = (int)offset;
 				kernel[i + n] = xi; //left-right wrap detection
 				kernel[i + n + n] = yi; //anterior-posterior wrap detection
 				kernel[i + n + n + n] = kernelWeight; //kernel height

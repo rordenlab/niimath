@@ -23,6 +23,8 @@ Cases (see the "Huge image support" section of AGENTS.md):
      before the huge payload is loaded.
   J. `small3d -add huge4d`, then `-otsu` -> rejected (re-admission after a binary op adopts a
      huge operand). D/E/G/H/I/J together cover both bypass classes and the parser grammar.
+  K. huge 4D `-ero -Tmean` -> every output voxel 0.0 (exercises erosion volume addressing
+     beyond INT_MAX without requiring a second huge output file).
 
 Usage: python3 test/huge_smoke.py /path/to/niimath  [--keep]
 """
@@ -191,6 +193,15 @@ def main():
         check_reject([small, '-restart', huge, '-otsu', outX], "I (-restart-to-huge then -otsu)")
         # J: image becomes huge via an image-image binary adopting a huge 4D operand.
         check_reject([small, '-add', huge, '-otsu', outX], "J (small -add huge4d then -otsu)")
+
+        # K: erosion is independently nvox_t-clean; later volumes start beyond INT_MAX.
+        outK = os.path.join(d, 'K.nii')
+        rc, log = run(niimath, [huge, '-ero', '-Tmean', outK], d)
+        if rc != 0:
+            fails.append(f"K exit {rc}: {log.strip()}")
+            print(f"  FAIL K exit {rc}: {log.strip()[:200]}")
+        else:
+            check_all(outK, 0.0, "K (-ero then -Tmean of zeros)")
 
     finally:
         if keep:

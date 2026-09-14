@@ -3513,8 +3513,8 @@ staticx void kernel3D_extreme(flt *f32, const flt *inf32, int nx, int ny, int nz
 	}
 }
 
-static inline flt kernel_ero_border(const flt *inf32, int i, int x, int y,
-								int nx, int ny, int nVox3D, const int *kernel, int nkernel) {
+static inline flt kernel_ero_border(const flt *inf32, nvox_t i, int x, int y,
+								int nx, int ny, nvox_t nVox3D, const int *kernel, int nkernel) {
 	if (inf32[i] == 0.0)
 		return 0.0;
 	for (int k = 0; k < nkernel; k++) {
@@ -3535,13 +3535,14 @@ static inline flt kernel_ero_border(const flt *inf32, int i, int x, int y,
    is exactly zero. NaN and infinities remain non-zero, matching the historical gather and FSL. */
 staticx void kernel3D_ero(flt *f32, const flt *inf32, int nx, int ny, int nz,
 						 const int *kernel, int nkernel) {
-	int nxy = nx * ny;
-	int nVox3D = nxy * nz;
+	nvox_t nxy = (nvox_t)nx * ny;
+	nvox_t nVox3D = nxy * nz;
 	kernel_extents3d e;
-	int have_extents = kernel_get_extents3d(kernel, nkernel, nx, nxy, &e) == 0;
+	int have_extents = nxy <= INT_MAX &&
+		kernel_get_extents3d(kernel, nkernel, nx, (int)nxy, &e) == 0;
 	for (int z = 0; z < nz; z++) {
 		for (int y = 0; y < ny; y++) {
-			int row = z * nxy + y * nx;
+			nvox_t row = (nvox_t)z * nxy + (nvox_t)y * nx;
 			int yz_interior = have_extents &&
 				((int64_t)y + e.ylo >= 0) && ((int64_t)y + e.yhi < ny) &&
 				((int64_t)z + e.zlo >= 0) && ((int64_t)z + e.zhi < nz);
@@ -3558,7 +3559,7 @@ staticx void kernel3D_ero(flt *f32, const flt *inf32, int nx, int ny, int nz,
 				f32[row + x] = kernel_ero_border(inf32, row + x, x, y, nx, ny,
 											 nVox3D, kernel, nkernel);
 			for (; (xhi - x) >= 8; x += 8) {
-				int i = row + x;
+				nvox_t i = row + x;
 				int keep0 = inf32[i] != 0.0, keep1 = inf32[i + 1] != 0.0;
 				int keep2 = inf32[i + 2] != 0.0, keep3 = inf32[i + 3] != 0.0;
 				int keep4 = inf32[i + 4] != 0.0, keep5 = inf32[i + 5] != 0.0;
@@ -3576,7 +3577,7 @@ staticx void kernel3D_ero(flt *f32, const flt *inf32, int nx, int ny, int nz,
 				f32[i + 6] = keep6 ? inf32[i + 6] : 0.0; f32[i + 7] = keep7 ? inf32[i + 7] : 0.0;
 			}
 			for (; x < xhi; x++) {
-				int i = row + x;
+				nvox_t i = row + x;
 				int keep = inf32[i] != 0.0;
 				for (int k = 0; k < nkernel; k++)
 					keep &= inf32[i + kernel[k]] != 0.0;
@@ -3589,13 +3590,26 @@ staticx void kernel3D_ero(flt *f32, const flt *inf32, int nx, int ny, int nz,
 	}
 }
 
-staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, int vol) {
-	int nVox3D = nim->nx * nim->ny * nim->nz;
+staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, nvox_t vol) {
+	nvox_t nVox3DWide;
+	if (nii_nvox3d(nim, &nVox3DWide))
+		return 1;
+	if (op != erok && (nVox3DWide > INT_MAX || vol > INT_MAX))
+		return 1;
 	flt *f32 = (flt *)nim->data;
-	f32 += (nVox3D * vol);
-	flt *inf32 = (flt *)malloc(nVox3D * sizeof(flt));
+	f32 += nVox3DWide * vol;
+	size_t bytes;
+	if (nii_mul_size((size_t)nVox3DWide, sizeof(flt), &bytes))
+		return 1;
+	flt *inf32 = (flt *)malloc(bytes);
 	if (!inf32) { printfx("** kernel3D: out of memory\n"); return 1; }
-	xmemcpy(inf32, f32, nVox3D * sizeof(flt));
+	xmemcpy(inf32, f32, bytes);
+	if (op == erok) {
+		kernel3D_ero(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel);
+		free(inf32);
+		return 0;
+	}
+	int nVox3D = (int)nVox3DWide;
 	int nxy = nim->nx * nim->ny;
 	if (op == fmediank) {
 		flt *vxls = (flt *)malloc((nkernel) * sizeof(flt));
@@ -3774,8 +3788,6 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, in
 			free(inf32);
 			return 1;
 		}
-	} else if (op == erok) {
-		kernel3D_ero(f32, inf32, nim->nx, nim->ny, nim->nz, kernel, nkernel);
 	} else {
 		printfx("kernel3D: Unsupported operation\n");
 		free(inf32);
@@ -3790,13 +3802,15 @@ staticx int nifti_kernel(nifti_image *nim, enum eOp op, int *kernel, int nkernel
 		return 1;
 	if (nim->datatype != DT_CALC)
 		return 1;
-	int nVox3D = nim->nx * nim->ny * nim->nz;
-	int nVol = (int)(nim->nvox / nVox3D);
+	nvox_t nVox3D;
+	if (nii_nvox3d(nim, &nVox3D))
+		return 1;
+	nvox_t nVol = (nvox_t)(nim->nvox / (size_t)nVox3D);
 	if (nVol < 1)
 		return 1;
 	if ((nkernel < 1) || (kernel == NULL))
 		return 1;
-	for (int v = 0; v < nVol; v++) {
+	for (nvox_t v = 0; v < nVol; v++) {
 		int ok = kernel3D(nim, op, kernel, nkernel, v);
 		if (ok != 0)
 			return ok;
@@ -7673,7 +7687,7 @@ staticx int nifti_stc_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
 static const char *const kHugeSafeOps[] = {
 	"-add", "-sub", "-mul", "-div", "-rem", "-mod", "-mas",
 	"-thr", "-uthr", "-thrp", "-thrP", "-uthrp", "-uthrP", "-clamp", "-uclamp",
-	"-max", "-min", "-inm", "-ing", "-power", "-s", "-seed",
+	"-max", "-min", "-inm", "-ing", "-power", "-s", "-ero", "-seed",
 	"-exp", "-log", "-floor", "-round", "-ceil", "-trunc",
 	"-sin", "-cos", "-tan", "-asin", "-acos", "-atan",
 	"-sqr", "-sqrt", "-recip", "-abs", "-bin", "-binv",
