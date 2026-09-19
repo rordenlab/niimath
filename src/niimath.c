@@ -256,8 +256,18 @@ int mainMz3(int argc,char **argv) {
 	int newSimplify = 0, postSmooth = 0;
 	float reduceFraction = 0.25;
 	bool verbose = true;
+	// A mesh has no output datatype, but callers that wrap niimath generically (the JavaScript
+	// package appends "-odt <type>" to every command) can still supply one: ignore a trailing pair
+	// so the output name is found, rather than saving to a file named after the datatype.
+	int out = argc - 1;
+	if ((out >= 3) && (strcmp(argv[out-1], "-odt") == 0))
+		out -= 2;
+	if (out < 2) {
+		fprintf(stderr,"Mesh input requires an output name: 'niimath in.mz3 -r 0.5 out.stl'\n");
+		return(EXIT_FAILURE);
+	}
 	if (argc > 3) {
-		for (int i=2;i<(argc-1);i++) {
+		for (int i=2;i<out;i++) {
 			if (strcmp(argv[i],"-n") == 0) {
 				newSimplify = atoi(argv[i+1]);
 				#ifndef HAVE_QUADRIC2
@@ -278,7 +288,7 @@ int mainMz3(int argc,char **argv) {
 		fprintf(stderr,"Mesh reduction factor should be > 0 and <= 1 (1 = no simplification).\n");
 		return(EXIT_FAILURE);
 	}
-	return simplify_mz3(argv[1], argv[argc-1], reduceFraction, postSmooth, verbose, quality, newSimplify);
+	return simplify_mz3(argv[1], argv[out], reduceFraction, postSmooth, verbose, quality, newSimplify);
 }
 #endif // NII2MESH
 
