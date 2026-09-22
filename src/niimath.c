@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260909"
+#define kMTHdate "v1.0.20260922"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
@@ -316,6 +316,8 @@ int show_help( void ) {
 	printf(" -odt sets the output datatype ( default is float )\n");
 	printf(" Possible datatypes are: char short int float double input input_force rgb rgba\n");
 	printf(" ""input"" will set the datatype to that of the original image\n");
+	printf(" A '+' suffix (char+ short+ ushort+ int+) keeps the data range: values are scaled to the\n");
+	printf("  integer type and scl_slope/scl_inter are set so readers recover the original values\n");
 	printf("\n");
 	printf("New operations: (not in fslmaths)\n");
 #ifdef HAVE_BMP

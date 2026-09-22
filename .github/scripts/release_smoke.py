@@ -3945,6 +3945,58 @@ def exercise_mesh_report(exe: str, tmp: Path, help_text: str) -> None:
           + (" (-n 1 half-edge engine exercised)" if "1" in engines else " (-n 1 not built: rejection checked)"))
 
 
+def exercise_odt_scaled(exe: str, tmp: Path) -> None:
+    """-odt <type>+: integer output whose scl_slope/scl_inter keep the data range (closed form)."""
+    dims = (6, 5, 4)
+    n = dims[0] * dims[1] * dims[2]
+    vals = [0.0] * n
+    for i in range(n):
+        vals[i] = 0.0 if i % 7 == 0 else 11.16 * (i / (n - 1))      # a z-map-like range with exact zeros
+    src = tmp / "odt_src.nii"
+    write_float32_nifti(src, dims, vals)
+
+    def stored(path: Path) -> tuple[list[float], float, float, int]:
+        blob = path.read_bytes()
+        dt = struct.unpack_from("<h", blob, 70)[0]
+        sl, it = struct.unpack_from("<2f", blob, 112)
+        off = int(struct.unpack_from("<f", blob, 108)[0])
+        fmt = {2: "B", 4: "h", 512: "H", 8: "i"}[dt]
+        raw = list(struct.unpack_from(f"<{n}{fmt}", blob, off))
+        return raw, sl, it, dt
+
+    vmax = max(vals)
+    out = tmp / "odt_char_plus.nii"
+    require_success(run_niimath(exe, [str(src), "-gz", "0", str(out), "-odt", "char+"]), "-odt char+")
+    raw, sl, it, dt = stored(out)
+    if dt != 2 or it != 0.0 or abs(sl - vmax / 255) > 1e-6:
+        raise AssertionError(f"-odt char+: expected uint8, slope max/255, inter 0; got dt {dt} slope {sl} inter {it}")
+    err = max(abs(r * sl + it - v) for r, v in zip(raw, vals))
+    if err > sl / 2 + 1e-6 or any(r != 0 for r, v in zip(raw, vals) if v == 0.0):
+        raise AssertionError(f"-odt char+: reconstruction error {err} exceeds slope/2 or a zero moved")
+    # signed type with negatives stays zero-preserving (inter 0); char with negatives uses an affine
+    neg = tmp / "odt_neg.nii"
+    write_float32_nifti(neg, dims, [v - 3.0 for v in vals])
+    require_success(run_niimath(exe, [str(neg), "-gz", "0", str(out), "-odt", "short+"]), "-odt short+")
+    raw, sl, it, dt = stored(out)
+    if dt != 4 or it != 0.0 or abs(sl - (vmax - 3.0) / 32767) > 1e-7:
+        raise AssertionError(f"-odt short+: expected int16, inter 0, slope max|v|/32767; got dt {dt} slope {sl} inter {it}")
+    require_success(run_niimath(exe, [str(neg), "-gz", "0", str(out), "-odt", "char+"]), "-odt char+ (negatives)")
+    raw, sl, it, dt = stored(out)
+    if abs(it + 3.0) > 1e-6 or abs(sl - vmax / 255) > 1e-6 or max(abs(r * sl + it - (v - 3.0)) for r, v in zip(raw, vals)) > sl / 2 + 1e-6:
+        raise AssertionError(f"-odt char+ with negatives: expected inter -3, slope range/255; got slope {sl} inter {it}")
+    # integer-valued data that fits is left unscaled: byte-identical to the plain type
+    ints = tmp / "odt_ints.nii"
+    write_float32_nifti(ints, dims, [float(i % 200) for i in range(n)])
+    plain = tmp / "odt_plain.nii"
+    require_success(run_niimath(exe, [str(ints), "-gz", "0", str(plain), "-odt", "char"]), "-odt char")
+    require_success(run_niimath(exe, [str(ints), "-gz", "0", str(out), "-odt", "char+"]), "-odt char+ (integral)")
+    if plain.read_bytes() != out.read_bytes():
+        raise AssertionError("-odt char+ on integer-valued data that fits must be byte-identical to -odt char")
+    if run_niimath(exe, [str(src), str(tmp / "odt_bad.nii"), "-odt", "float+"]).returncode == 0:
+        raise AssertionError("-odt float+ must be rejected (the suffix is for integer types)")
+    print("  -odt char+/short+: range-preserving scaling, zero preservation, affine fallback, lossless passthrough, float+ rejection OK")
+
+
 def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
     """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
     hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
@@ -4549,6 +4601,7 @@ def main() -> int:
         exercise_fmap(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)
         exercise_skullstrip(exe, tmp, help_text)
+        exercise_odt_scaled(exe, tmp)
         exercise_openmp_scratch_ops(exe, tmp)
         exercise_mesh_report(exe, tmp, help_text)
 

@@ -7234,6 +7234,53 @@ staticx int nifti_unwarp_wrap(nifti_image *nim, int *pac, int argc, char *argv[]
 }
 #endif // HAVE_MEDIC
 
+/* "-odt char+" and friends: rescale the working image in place so that plain integer conversion
+   keeps the data range, and return the scl_slope/scl_inter that undo it.  Zero-preserving when the
+   type allows it (inter = 0, slope = max|v|/typemax), so masks and thresholded maps keep exact zeros;
+   a char output with negatives falls back to the general affine.  Integer-valued data that already
+   fits stays unscaled (byte-identical to the plain type).  Non-finite voxels become 0, as they do in
+   the ordinary conversion. */
+staticx void nifti_odt_scale(nifti_image *nim, int dtOut, float *slope, float *inter) {
+	flt *img = (flt *)nim->data;
+	const nvox_t nvox = (nvox_t)nim->nvox;
+	double mn = DBL_MAX, mx = -DBL_MAX, tmin = 0.0, tmax = 255.0, s, b;
+	int integral = 1;
+	nvox_t i;
+	*slope = 1.0f; *inter = 0.0f;
+	for (i = 0; i < nvox; i++) {
+		double v = img[i];
+		if (!(v >= -DBL_MAX && v <= DBL_MAX)) { img[i] = 0; continue; }   /* magnitude guard: the TU is -ffast-math */
+		if (v < mn) mn = v;
+		if (v > mx) mx = v;
+		if (v != floor(v)) integral = 0;
+	}
+	if (mn > mx || mn == mx) return;   /* empty or constant: nothing to spread */
+	if (dtOut == DT_INT16) { tmin = INT16_MIN; tmax = INT16_MAX; }
+	else if (dtOut == DT_UINT16) { tmax = UINT16_MAX; }
+	else if (dtOut == DT_INT32) {
+		/* a float32 working image holds integers exactly only to 2^24; beyond that the stored code
+		   itself would be rounded, so cap the range to what is representable */
+		tmax = (sizeof(flt) == 4) ? 16777215.0 : INT32_MAX;
+		tmin = -tmax;
+	}
+	if (integral && mn >= tmin && mx <= tmax) return;   /* already fits: plain conversion is lossless */
+	if (tmin < 0.0 || mn >= 0.0) {   /* zero-preserving */
+		b = 0.0;
+		s = ((-mn > mx) ? -mn : mx) / ((tmin < 0.0 && -mn > mx) ? -tmin : tmax);
+	} else {                          /* unsigned type with negatives: general affine */
+		b = mn;
+		s = (mx - mn) / tmax;
+	}
+	for (i = 0; i < nvox; i++) {
+		double c = floor((img[i] - b) / s + 0.5);
+		if (c < tmin) c = tmin;
+		if (c > tmax) c = tmax;
+		img[i] = (flt)c;
+	}
+	*slope = (float)s;
+	*inter = (float)b;
+}
+
 #ifdef HAVE_FMAP
 /* -fugue <fieldmap> <dwell> <unwarpdir>: correct susceptibility distortion in an EPI using a B0
    fieldmap in rad/s.  An ordinary chain operation, DT32 only.  All three arguments are positional
@@ -7917,7 +7964,13 @@ int main64(int argc, char *argv[]) {
 	int current_in_datatype = ihdr.datatype;
 	(void)current_in_datatype;   // only -skullstrip reads it, and that is off by default
 	// check for "-odt" must be last couplet
+	int odtScaled = 0;   // "-odt char+" etc: integer output with scl_slope/scl_inter chosen to keep the data range
 	if (!strcmp(argv[argc - 2], "-odt")) {
+		size_t odtLen = strlen(argv[argc - 1]);
+		if (odtLen > 1 && argv[argc - 1][odtLen - 1] == '+') {
+			odtScaled = 1;
+			argv[argc - 1][odtLen - 1] = '\0';
+		}
 		if (!strcmp(argv[argc - 1], "double")) {
 			dtOut = DT_FLOAT64;
 		} else if (!strcmp(argv[argc - 1], "float")) {
@@ -7945,6 +7998,11 @@ int main64(int argc, char *argv[]) {
 				dtOut = nim->datatype; // ihdr.datatype; //!
 		} else {
 			printfx("Error: Unknown datatype '%s' - Possible datatypes are: char short ushort int float double input\n", argv[argc - 1]);
+			nifti_image_free(nim);
+			return 2;
+		}
+		if (odtScaled && dtOut != DT_UINT8 && dtOut != DT_INT16 && dtOut != DT_UINT16 && dtOut != DT_INT32) {
+			printfx("Error: the '+' (range-preserving scaling) suffix applies to integer datatypes only: char+ short+ ushort+ int+\n");
 			nifti_image_free(nim);
 			return 2;
 		}
@@ -8989,9 +9047,14 @@ int main64(int argc, char *argv[]) {
 	}
 	int save_rc = 0;
 	if (!no_image_out) {   /* -moco -relative published its sidecar; converting and saving the untouched 4D input would be waste */
+		float odtSlope = 1.0f, odtInter = 0.0f;
+		if (odtScaled)
+			nifti_odt_scale(nim, dtOut, &odtSlope, &odtInter);
 		// convert data to output type (-odt)
 		if (nifti_image_change_datatype(nim, dtOut, &ihdr) != 0)
 			goto fail;  /* free nim + kernel before bailing (long-lived WASM worker) */
+		nim->scl_slope = odtSlope;   // the conversion resets these; stamp the range-preserving scaling
+		nim->scl_inter = odtInter;
 		// if we get here, write the output dataset
 		save_rc = nifti_save(nim, "", gzMode); // propagate a failed write (bad dir/disk full)
 	}

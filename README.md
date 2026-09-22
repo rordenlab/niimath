@@ -128,6 +128,12 @@ niimath accepts the same commands as fslmaths, so you can use it as you would us
 niimath [-dt <datatype>] <first_input> [operations and inputs] <output> [-odt <datatype>]
 ```
 
+`-odt` accepts a `+` suffix on the integer types: `char+`, `short+`, `ushort+` and `int+`. Plain `-odt char` rounds and clips as fslmaths does, so a z map spanning 0 to 11 keeps twelve values. `-odt char+` spreads the data range over the integer type and sets `scl_slope` and `scl_inter` so every NIfTI reader recovers the original values within half a step. Zero stays exactly zero whenever the type allows it, so masks and thresholded maps survive. Integer-valued data that already fits is written unchanged, byte-identical to the plain type:
+
+```
+niimath zmap.nii.gz zmap8.nii.gz -odt char+
+```
+
 Two environment variables control the output:
 
 - `FSLOUTPUTTYPE` sets the output file format, as in [FSL](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslEnvironmentVariables). On Unix, run `export FSLOUTPUTTYPE=NIFTI_GZ`, `export FSLOUTPUTTYPE=NIFTI` or `export FSLOUTPUTTYPE=NIFTI_ZST` (zstd compressed; requires zstd support) on the command line or in your profile. On Windows, use `set` instead of `export`.
