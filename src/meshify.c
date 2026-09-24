@@ -1325,12 +1325,9 @@ void apply_sform(vec3i *t, vec3d *p, int nt, int np, float srow_x[4], float srow
 		p[i].y = sform(v, srow_y);
 		p[i].z = sform(v, srow_z);
 	}
-	// detect determinant
-	vec3d p0;
-	p0.x = srow_x[0] + srow_x[1] + srow_x[2];
-	p0.y = srow_y[0] + srow_y[1] + srow_y[2];
-	p0.z = srow_z[0] + srow_z[1] + srow_z[2];
-	float det = p0.x * p0.y * p0.z;
+	float det = srow_x[0] * (srow_y[1] * srow_z[2] - srow_y[2] * srow_z[1])
+		- srow_x[1] * (srow_y[0] * srow_z[2] - srow_y[2] * srow_z[0])
+		+ srow_x[2] * (srow_y[0] * srow_z[1] - srow_y[1] * srow_z[0]);
 	if (det >= 0.0)
 		return; // positive volume
 	// negative volume: we need to reverse the triangle winding
