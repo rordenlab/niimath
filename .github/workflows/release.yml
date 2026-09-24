@@ -50,9 +50,10 @@ jobs:
         CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON
         CIBW_CONFIG_SETTINGS_MACOS: cmake.define.ENABLE_ZSTD=ON cmake.define.OpenMP_libomp_LIBRARY=${{ steps.macos_deps.outputs.libomp_prefix }}/lib/libomp.a
         CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
+        # manylinux2014 ships curl 7.29: no --retry-connrefused (7.52+)
         CIBW_BEFORE_ALL_LINUX: >
           set -eux;
-          if command -v curl; then curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL -o /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz;
+          if command -v curl; then curl --retry 5 --retry-delay 2 -fsSL -o /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz;
           else wget --tries=5 --waitretry=2 -O /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz; fi;
           tar -xzf /tmp/zstd.tar.gz -C /tmp;
           make -C /tmp/zstd-1.5.6/lib -j2 libzstd.a;
