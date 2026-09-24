@@ -28,8 +28,13 @@ jobs:
     - uses: actions/checkout@v4
       with: {fetch-depth: 0, submodules: false}
     - name: Install macOS build deps
+      id: macos_deps
       if: startsWith(matrix.os, 'macos')
-      run: brew install libomp zstd
+      run: |
+        brew install libomp zstd
+        libomp_prefix="$(brew --prefix libomp)"
+        echo "CMAKE_PREFIX_PATH=$libomp_prefix" >> "$GITHUB_ENV"
+        echo "libomp_prefix=$libomp_prefix" >> "$GITHUB_OUTPUT"
     - name: Install Windows zstd
       if: matrix.os == 'windows-latest'
       shell: pwsh
@@ -42,12 +47,13 @@ jobs:
         # Reduced shape: the two oldest CPythons only -- the package minimum (pyproject.toml
         # requires-python) and the next. Empty means every CPython.
         CIBW_BUILD: ${{ env.REDUCED == 'true' && 'cp37-* cp38-*' || '' }}
-        CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON cmake.define.OPENMP_XCODE=ON
+        CIBW_CONFIG_SETTINGS: cmake.define.ENABLE_ZSTD=ON
+        CIBW_CONFIG_SETTINGS_MACOS: cmake.define.ENABLE_ZSTD=ON cmake.define.OpenMP_libomp_LIBRARY=${{ steps.macos_deps.outputs.libomp_prefix }}/lib/libomp.a
         CIBW_CONFIG_SETTINGS_WINDOWS: cmake.define.ENABLE_ZSTD=ON cmake.define.ZSTD_ROOT=C:/vcpkg/installed/x64-windows-static
         CIBW_BEFORE_ALL_LINUX: >
           set -eux;
-          if command -v curl; then curl -fsSL -o /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz;
-          else wget -O /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz; fi;
+          if command -v curl; then curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL -o /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz;
+          else wget --tries=5 --waitretry=2 -O /tmp/zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz; fi;
           tar -xzf /tmp/zstd.tar.gz -C /tmp;
           make -C /tmp/zstd-1.5.6/lib -j2 libzstd.a;
           mkdir -p /usr/local/lib /usr/local/include;

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
 
 project(console C)
 
@@ -229,36 +229,14 @@ ADD_DEFINITIONS(-DHAVE_CONFORM)
 set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} conform.c unifize.c)
 
 # One OpenMP switch for every compiler: `cmake -DUSE_OPENMP=OFF ..` builds single-threaded
-# (needed for predictable serial diagnostics and Make/CMake parity). Default ON. The legacy
-# AppleClang-only OPENMP_XCODE is kept as an alias but is subordinate to USE_OPENMP.
+# (needed for predictable serial diagnostics and Make/CMake parity). Default ON.
 option(USE_OPENMP "Build with OpenMP support" ON)
 
 if(${CMAKE_C_COMPILER_ID} STREQUAL "AppleClang")
-    #e.g.  cmake -DOPENMP_XCODE=ON ..  (legacy alias; -DUSE_OPENMP=OFF also disables)
-    option(OPENMP_XCODE "Build with OpenMP support (legacy alias of USE_OPENMP)" ON)
-    # using AppleClang
     add_definitions(-fno-caret-diagnostics)
-    if (USE_OPENMP AND OPENMP_XCODE)
-        execute_process(COMMAND brew --prefix OUTPUT_VARIABLE HOMEBREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(NOT EXISTS "${HOMEBREW_PREFIX}/opt/libomp/lib/libomp.a")
-            message(FATAL_ERROR "Install Homebrew and run 'brew install libomp' to enable OpenMP")
-        else()
-            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Xclang -fopenmp -I${HOMEBREW_PREFIX}/opt/libomp/include")
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${HOMEBREW_PREFIX}/opt/libomp/lib/libomp.a")
-            message(STATUS "OpenMP support enabled")
-        endif()
-    endif()
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 elseif(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
-    # using GCC
     set(CMAKE_C_STANDARD 11)
-    if (USE_OPENMP)
-        find_package(OpenMP)
-        if (OPENMP_FOUND)
-            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_C_FLAGS}")
-        endif()
-    endif()
 elseif(MSVC)
     # using Visual Studio C++
     add_definitions(-D_CRT_SECURE_NO_DEPRECATE)
@@ -275,6 +253,15 @@ elseif(MSVC)
     # its libomp runtime DLL with every Windows artifact. Leaving _OPENMP undefined
     # preserves the long-proven, self-contained single-threaded Windows release.
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")  # set "Stack Reserve Size" to 8MB (default value is 1MB)
+endif()
+
+if(USE_OPENMP AND NOT MSVC AND NOT EMSCRIPTEN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND USE_STATIC_RUNTIME)
+        execute_process(COMMAND ${CMAKE_C_COMPILER} "--print-file-name=libgomp.a"
+                        OUTPUT_VARIABLE OpenMP_gomp_LIBRARY OUTPUT_STRIP_TRAILING_WHITESPACE)
+        set(OpenMP_gomp_LIBRARY "${OpenMP_gomp_LIBRARY}" CACHE FILEPATH "Static GNU OpenMP runtime" FORCE)
+    endif()
+    find_package(OpenMP REQUIRED COMPONENTS C)
 endif()
 
 # Whole-program fast-math (non-MSVC), matching the Makefile release build so ALL artifacts
@@ -322,6 +309,17 @@ set(NIIMATH_SRCS
     ${BMP_SRCS}
 )
 add_executable(niimath ${NIIMATH_SRCS})
+
+if(USE_OPENMP AND NOT MSVC AND NOT EMSCRIPTEN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    target_link_libraries(niimath OpenMP::OpenMP_C)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND USE_STATIC_RUNTIME)
+        if(MINGW)
+            target_link_libraries(niimath "-Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive")
+        else()
+            target_link_libraries(niimath ${CMAKE_DL_LIBS})
+        endif()
+    endif()
+endif()
 
 # Default to System zlib for standalone `cmake -S src` builds: there is no bundled
 # miniz, and spng.c (bitmap support, on by default) needs zlib's deflate/inflate, so
@@ -407,19 +405,6 @@ if(ENABLE_ZSTD)
         message(STATUS "Zstd support: ON (${ZSTD_LINK})")
     else()
         message(STATUS "Zstd support: OFF (libzstd not found, install with: brew install zstd)")
-    endif()
-endif()
-
-if(${CMAKE_C_COMPILER_ID} STREQUAL "GNU")
-    if(USE_STATIC_RUNTIME)
-        execute_process(COMMAND ${CMAKE_C_COMPILER} "--print-file-name=libgomp.a"
-                        OUTPUT_VARIABLE OPENMP_LIBRARY OUTPUT_STRIP_TRAILING_WHITESPACE)
-        target_link_libraries(niimath ${OPENMP_LIBRARY})
-        if(MINGW)
-            target_link_libraries(niimath "-Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive")
-        else()
-            target_link_libraries(niimath ${CMAKE_DL_LIBS})
-        endif()
     endif()
 endif()
 

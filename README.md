@@ -39,7 +39,7 @@ curl -fLO https://github.com/rordenlab/niimath/releases/latest/download/niimath_
 
 ### CMake (recommended)
 
-On Linux and macOS, build with CMake. OpenMP is enabled by default. Affine registration uses it, and the core operations can use it:
+On Linux and macOS, build with CMake 3.16 or newer. OpenMP is enabled by default. Affine registration uses it, and the core operations can use it:
 
 ```
 git clone https://github.com/rordenlab/niimath.git
@@ -47,7 +47,7 @@ cd niimath; mkdir build; cd build; cmake ..
 make
 ```
 
-On macOS, OpenMP needs Homebrew's libomp. Install it with `brew install libomp`. To disable OpenMP, use `cmake -DUSE_OPENMP=OFF ..`. zstd compression support is detected automatically. To enable it, install zstd with `brew install zstd` (macOS) or `apt install libzstd-dev` (Linux).
+On macOS, OpenMP needs libomp. With Homebrew, install it with `brew install libomp` and add `-DCMAKE_PREFIX_PATH="$(brew --prefix libomp)"` to the CMake configure command. Other installations can expose libomp through the same standard CMake prefix. To disable OpenMP, use `cmake -DUSE_OPENMP=OFF ..`. zstd compression support is detected automatically. To enable it, install zstd with `brew install zstd` (macOS) or `apt install libzstd-dev` (Linux).
 
 On Windows:
 
@@ -67,7 +67,7 @@ cd niimath/src
 make
 ```
 
-The default build includes OpenMP for all operations. On macOS this requires `brew install libomp`. Plain `make` links the system zlib. CMake release builds default to zlib-ng (`ZLIB_IMPLEMENTATION`). Other Makefile options:
+The default build includes OpenMP for all operations. On macOS, `make` auto-detects `brew install libomp`; for another installation use `make LIBOMP_PREFIX=/path/to/libomp`. `OMPFLAGS` and `OMPLINK` remain available as explicit overrides. Plain `make` links the system zlib. CMake release builds default to zlib-ng (`ZLIB_IMPLEMENTATION`). Other Makefile options:
 
 ```
 OMP=0 make             # Disable OpenMP

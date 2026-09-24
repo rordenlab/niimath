@@ -11,11 +11,12 @@ UFLAGS64= -DHAVE_64BITS core64.c
 #OpenMP flags (platform-specific); used by both core ops and allineate
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-OMPFLAGS= -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
-OMPLINK= -L/opt/homebrew/opt/libomp/lib -lomp
+LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
+OMPFLAGS ?= -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
+OMPLINK ?= -L$(LIBOMP_PREFIX)/lib -lomp
 else
-OMPFLAGS= -fopenmp
-OMPLINK= -fopenmp
+OMPFLAGS ?= -fopenmp
+OMPLINK ?= -fopenmp
 endif
 
 #Affine registration (from AFNI 3dAllineate, public domain)

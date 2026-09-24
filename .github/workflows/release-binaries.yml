@@ -67,14 +67,14 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -eux
-          curl -sL -o zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+          curl --retry 5 --retry-delay 2 --retry-connrefused -fsSL -o zstd.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
           tar xzf zstd.tar.gz
           make -C zstd-1.5.6/lib -j libzstd.a CFLAGS="-O3 -fPIC -arch x86_64 -arch arm64"
           ZSTD="$PWD/zstd-univ"; mkdir -p "$ZSTD/lib" "$ZSTD/include"
           cp zstd-1.5.6/lib/libzstd.a "$ZSTD/lib/"
           cp zstd-1.5.6/lib/zstd.h zstd-1.5.6/lib/zdict.h zstd-1.5.6/lib/zstd_errors.h "$ZSTD/include/"
           for arch in x86_64 arm64; do
-            cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=$arch -DOPENMP_XCODE=OFF -DENABLE_ZSTD=ON \
+            cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=$arch -DUSE_OPENMP=OFF -DENABLE_ZSTD=ON \
               -DZSTD_ROOT="$ZSTD" -DCMAKE_PREFIX_PATH="$ZSTD" -B "build/$arch"
             cmake --build "build/$arch"
           done

@@ -81,16 +81,14 @@ option(ENABLE_QWARP "Enable -qwarp nonlinear (deformable) registration" OFF)
 if(ENABLE_QWARP AND NOT ENABLE_ALLINEATE)
   message(FATAL_ERROR "ENABLE_QWARP=ON requires ENABLE_ALLINEATE=ON (qwarp uses the allineate/NEWUOA optimizer).")
 endif()
-# OPENMP_XCODE is the AppleClang-only legacy alias (src/CMakeLists.txt gates OpenMP
-# on `USE_OPENMP AND OPENMP_XCODE`). Its DEFAULT follows USE_OPENMP so a plain
-# top-level build enables OpenMP on Apple (matching the docs), but it stays an
-# explicit, consumed override: the macOS universal-release scripts pass
-# `-DOPENMP_XCODE=OFF` to disable OpenMP for the cross-arch slices, where the
-# single-arch Homebrew libomp cannot link into a universal binary. Declared after
-# USE_OPENMP so its default can reference it; forwarded as ${OPENMP_XCODE} below.
-option(OPENMP_XCODE "AppleClang OpenMP (defaults to USE_OPENMP; set OFF for universal builds)" ${USE_OPENMP})
-
 include(ExternalProject)
+
+string(REPLACE ";" "|" NIIMATH_CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}")
+set(NIIMATH_OPENMP_CMAKE_ARGS)
+if(OpenMP_libomp_LIBRARY)
+    list(APPEND NIIMATH_OPENMP_CMAKE_ARGS
+        -DOpenMP_libomp_LIBRARY:FILEPATH=${OpenMP_libomp_LIBRARY})
+endif()
 
 set(DEPENDENCIES)
 
@@ -119,6 +117,7 @@ elseif(${ZLIB_IMPLEMENTATION} STREQUAL "Custom")
 endif()
 
 ExternalProject_Add(src
+    LIST_SEPARATOR "|"
     DEPENDS ${DEPENDENCIES}
     DOWNLOAD_COMMAND ""
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/src
@@ -132,13 +131,13 @@ ExternalProject_Add(src
         -DCMAKE_C_FLAGS:STRING=${CMAKE_C_FLAGS}
         -DCMAKE_VERBOSE_MAKEFILE:BOOL=${CMAKE_VERBOSE_MAKEFILE}
         -DBUILD_FLAVOR:STRING=${BUILD_FLAVOR}
-        -DOPENMP_XCODE:BOOL=${OPENMP_XCODE}
         -DUSE_STATIC_RUNTIME:BOOL=${USE_STATIC_RUNTIME}
         -DZLIB_IMPLEMENTATION:STRING=${ZLIB_IMPLEMENTATION}
         -DZLIB_ROOT:PATH=${ZLIB_ROOT}
         -DENABLE_ZSTD:BOOL=${ENABLE_ZSTD}
         -DZSTD_ROOT:PATH=${ZSTD_ROOT}
-        -DCMAKE_PREFIX_PATH:STRING=${CMAKE_PREFIX_PATH}
+        -DCMAKE_PREFIX_PATH:STRING=${NIIMATH_CMAKE_PREFIX_PATH}
+        ${NIIMATH_OPENMP_CMAKE_ARGS}
         -DENABLE_GPL:BOOL=${ENABLE_GPL}
         -DUSE_OPENMP:BOOL=${USE_OPENMP}
         -DENABLE_QC:BOOL=${ENABLE_QC}
@@ -159,4 +158,3 @@ ExternalProject_Add(src
 
 install(DIRECTORY ${CMAKE_BINARY_DIR}/bin/ DESTINATION ${SKBUILD_PROJECT_NAME}/bin
         USE_SOURCE_PERMISSIONS)
-

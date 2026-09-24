@@ -90,9 +90,9 @@ for:
       - sudo find /usr/local -name 'libzstd*.dylib' -delete
       - sudo cp zstd-1.5.6/lib/libzstd.a /usr/local/lib/libzstd.a
       - sudo cp zstd-1.5.6/lib/zstd.h /usr/local/include/zstd.h
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENMP_XCODE=OFF -B build/x86_64
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=x86_64 -DUSE_OPENMP=OFF -B build/x86_64
       - cmake --build build/x86_64
-      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENMP_XCODE=OFF -B build/arm64
+      - cmake -Wno-dev -DCMAKE_OSX_ARCHITECTURES=arm64 -DUSE_OPENMP=OFF -B build/arm64
       - cmake --build build/arm64
 
     after_build:
