@@ -8,7 +8,8 @@ export type {
   ImageProcessorMethods,
   MeshOptions,
   BitmapOptions,
-  DataType
+  DataType,
+  ImageSource
 } from './core';
 
 /**

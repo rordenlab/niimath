@@ -281,3 +281,21 @@ describe('allineate -weight binding', () => {
     await runP;
   });
 });
+
+describe('byte / Blob sources', () => {
+  test('raw bytes are named by gzip magic; name and Blob sources are honored', async () => {
+    const { fake, niimath } = await ready();
+    const gz = new Uint8Array([0x1f, 0x8b, 8, 0]);
+    const runP = niimath.image(gz).mulImage(new Uint8Array([1, 2]).buffer).resliceNN(new Blob([gz])).run('out.nii');
+    const { cmd, extraFiles } = fake.posted[0];
+    expect(cmd[0]).toBe('__nimi_input.nii.gz');
+    expect(extraFiles.map((f) => f.name)).toEqual(['__nimx0_input.nii', '__nimx1_input.nii.gz']);
+    fake.emit(okMsg());
+    await runP;
+
+    const runQ = niimath.image(new Blob([gz]), 'scan.nii.gz').run('out.nii');
+    expect(fake.posted[1].cmd[0]).toBe('__nimi_scan.nii.gz');
+    fake.emit(okMsg());
+    await runQ;
+  });
+});

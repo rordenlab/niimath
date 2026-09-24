@@ -15,6 +15,20 @@ export type {
   DataType
 } from './types';
 
+/** An image or file operand: a File keeps its name; bytes and Blobs are named 'input.nii[.gz]' unless `name` is given. */
+export type ImageSource = Blob | ArrayBuffer | ArrayBufferView<ArrayBuffer>;
+
+// niimath picks raw vs gzip reading from the MEMFS extension. Bytes are sniffed for the gzip
+// magic; a Blob can't be read synchronously, so it gets .gz, which zlib's gzread also reads raw.
+function asFile(src: ImageSource, name?: string): File {
+  if (src instanceof File && !name) return src;
+  if (!name && !(src instanceof Blob)) {
+    const u8 = ArrayBuffer.isView(src) ? new Uint8Array(src.buffer, src.byteOffset, src.byteLength) : new Uint8Array(src);
+    name = u8[0] === 0x1f && u8[1] === 0x8b ? 'input.nii.gz' : 'input.nii';
+  }
+  return new File([src], name ?? 'input.nii.gz');
+}
+
 export const dataTypes = {
   char: "char" as const,
   short: "short" as const,
@@ -189,10 +203,10 @@ export class NiimathBase {
     }
   }
 
-  image(file: File): ImageProcessor {
+  image(src: ImageSource, name?: string): ImageProcessor {
     return new ImageProcessor({
       handle: this._handle(),
-      file,
+      file: asFile(src, name),
       operators: this.operators,
       outputDataType: this.outputDataType
     });
@@ -252,7 +266,8 @@ class ImageProcessor {
   // a template/mask/ref whose File.name collides with the input, output, or
   // another staged file from shadowing or unlinking the wrong MEMFS entry.
   // Extra opts (e.g. '-cost', 'nmi') follow.
-  private _addFileCommand(flag: string, files: File[], opts: (string | number)[] = []): this {
+  private _addFileCommand(flag: string, srcs: ImageSource[], opts: (string | number)[] = []): this {
+    const files = srcs.map((s) => asFile(s));
     // The leading `__nimx<n>_` prefix makes the token unique and ensures it never
     // begins with '-' (which niimath's option parser would consume) nor with a
     // path separator; sanitizing the original to [A-Za-z0-9._-] strips embedded
@@ -268,7 +283,7 @@ class ImageProcessor {
   // Affine defacing (BSD allineate): -deface <tmpl> <mask> [opts]
   // Opts follow the template/mask argv tokens, e.g. ['-cost', 'hel'] to select the
   // ordinary AFNI-style engine; omit for the default fast (SPM/FLIRT-inspired) engine.
-  deface(tmpl: File, mask: File, opts: (string | number)[] = []): this {
+  deface(tmpl: ImageSource, mask: ImageSource, opts: (string | number)[] = []): this {
     return this._addFileCommand('-deface', [tmpl, mask], opts);
   }
 
@@ -286,7 +301,7 @@ class ImageProcessor {
   // the default fast engine falls back to the ordinary engine, the weight is still honored.
   // Emitted as `-weight <img>` after the base + opts and staged
   // into MEMFS like the other file operands.
-  allineate(base: File, opts: (string | number)[] = [], weight?: File): this {
+  allineate(base: ImageSource, opts: (string | number)[] = [], weight?: ImageSource): this {
     this._addFileCommand('-allineate', [base], opts);
     if (weight) this._addFileCommand('-weight', [weight]);
     return this;
@@ -297,19 +312,19 @@ class ImageProcessor {
   // subject grid, and composites an anonymized image. All three file operands are REQUIRED (the
   // `weight` is reused as the registration weight); opts are the `-cost` tuning as for `deface`.
   // For privacy the coverage diagnostic fails closed (<10% mapped → the run errors, no output).
-  reface(tmpl: File, shell: File, weight: File, opts: (string | number)[] = []): this {
+  reface(tmpl: ImageSource, shell: ImageSource, weight: ImageSource, opts: (string | number)[] = []): this {
     return this._addFileCommand('-reface', [tmpl, shell, weight], opts);
   }
 
   // Nearest-neighbour reslice of the current image onto another image's grid:
   // -reslice_nn <ref>. (e.g. bring a conformed-space mask back to a native grid.)
-  resliceNN(ref: File): this {
+  resliceNN(ref: ImageSource): this {
     return this._addFileCommand('-reslice_nn', [ref]);
   }
 
   // Multiply the current image by another image: -mul <img>. The generated `mul`
   // only handles a scalar token; this stages a File operand into MEMFS.
-  mulImage(img: File): this {
+  mulImage(img: ImageSource): this {
     return this._addFileCommand('-mul', [img]);
   }
 
@@ -488,11 +503,11 @@ class ImageProcessor {
 // so they are absent from the generated ImageProcessorMethods. Declare them here
 // (NOT in the regenerated types.ts) so consumers get a complete typed API.
 interface FileOperandMethods {
-  deface(tmpl: File, mask: File, opts?: (string | number)[]): this;
-  allineate(base: File, opts?: (string | number)[], weight?: File): this;
-  reface(tmpl: File, shell: File, weight: File, opts?: (string | number)[]): this;
-  resliceNN(ref: File): this;
-  mulImage(img: File): this;
+  deface(tmpl: ImageSource, mask: ImageSource, opts?: (string | number)[]): this;
+  allineate(base: ImageSource, opts?: (string | number)[], weight?: ImageSource): this;
+  reface(tmpl: ImageSource, shell: ImageSource, weight: ImageSource, opts?: (string | number)[]): this;
+  resliceNN(ref: ImageSource): this;
+  mulImage(img: ImageSource): this;
 }
 
 // Use interface merging to add method types to ImageProcessor

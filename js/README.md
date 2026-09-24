@@ -37,14 +37,15 @@ const niimath = new Niimath();
 // call init() to load the WASM before you process images
 await niimath.init();
 
-// selectedFile is a browser File object.
+// selectedFile is a browser File object. Raw bytes (ArrayBuffer/Uint8Array) or a Blob also work:
+// they are staged as input.nii or input.nii.gz (gzip is detected); image(src, name) overrides the name.
 // run() executes the command. It returns a promise that resolves to the output file when the command succeeds.
 const outFile = await niimath.image(selectedFile).dog(2, 3.2).run();
 ```
 
 ### Register and deface
 
-The default (BSD-2-Clause) build includes the affine registration and defacing operations `-allineate` and `-deface`, adapted from AFNI 3dAllineate (public domain). They take other browser `File` objects as arguments:
+The default (BSD-2-Clause) build includes the affine registration and defacing operations `-allineate` and `-deface`, adapted from AFNI 3dAllineate (public domain). Their image operands, like `image()`, accept a `File`, `Blob`, or raw bytes:
 
 ```javascript
 import { Niimath } from '@niivue/niimath';
@@ -67,15 +68,14 @@ const registered = await niimath.image(selectedFile).allineate(baseFile, [], wei
 
 ### Use an image as an operand
 
-Two more operations take a `File` operand. `resliceNN(refFile)` reslices the current image onto another image's grid with nearest-neighbor interpolation. `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` takes only a scalar). For example, to reslice a brain mask onto a native grid and apply it:
+Two more operations take an image operand. `resliceNN(refFile)` reslices the current image onto another image's grid with nearest-neighbor interpolation. `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` takes only a scalar). For example, to reslice a brain mask onto a native grid and apply it:
 
 ```javascript
 // reslice maskFile (conformed space) onto nativeFile's grid, binarize, save
 const maskBlob = await niimath.image(maskFile).resliceNN(nativeFile).bin().run();
-// run() returns a Blob; wrap it in a File so it can be used as an operand
-const nativeMask = new File([maskBlob], 'nativeMask.nii.gz');
+// run() returns a Blob, which can be passed straight back as an operand;
 // keep only the masked region of the native image (now on the same grid)
-const brain = await niimath.image(nativeFile).mulImage(nativeMask).run();
+const brain = await niimath.image(nativeFile).mulImage(maskBlob).run();
 ```
 
 ### Create a mesh
