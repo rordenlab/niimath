@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260924"
+#define kMTHdate "v1.0.20260926"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
@@ -567,7 +567,7 @@ int show_help( void ) {
 	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
 #endif
 #ifdef HAVE_QC
-	printf(" --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json] : MRIQC-style hard-mask QC (CJV, CNR, SNR, WM2MAX, EFC-brain, ICV; --air adds SNRd, FBER, QI1 and the background stats) to TSV/JSON\n");
+	printf(" --qc <t1> (--seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] | --pve <csf> <gm> <wm>) [--air <template>] [--out qc.tsv] [--json qc.json] : MRIQC-style QC from hard labels or partial-volume fractions (CJV, CNR, SNR, WM2MAX, EFC-brain, ICV; --air adds SNRd, FBER, QI1 and the background stats) to TSV/JSON\n");
 #endif
 #ifdef HAVE_MEDIC
 	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");

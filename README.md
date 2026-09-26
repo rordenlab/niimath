@@ -568,9 +568,9 @@ Options:
 - `-m <mask>`: restrict the fit to a mask.
 - `-xflip auto` (default) flips the bvec X component when the spatial transform determinant is positive, which matches FSL. `0` never flips. `1` always flips.
 
-### `--qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]`
+### `--qc <t1> (--seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] | --pve <csf> <gm> <wm>) [--air <template>] [--out qc.tsv] [--json qc.json]`
 
-MRIQC-style anatomical quality metrics from a T1 image and an integer segmentation. This is a self-contained command with its own arguments.
+MRIQC-style anatomical quality metrics from a T1 image and an integer segmentation or partial-volume maps. This is a self-contained command with its own arguments.
 
 Output: a wide TSV (`--out`, the default `qc.tsv` when neither output is named) and/or an MRIQC-style JSON (`--json`: the same metrics flat at the top level, plus `size_*`, `spacing_*` and `provenance`; non-finite values are `null`). Metrics: CJV, cnr_noair, per-tissue and total SNR, WM2MAX, efc_brain, ICV fractions with mm³ volumes, and per-tissue summary statistics.
 
@@ -580,6 +580,12 @@ Labels: `0` is non-brain and is excluded. `--csf` and `--wm` give disjoint sets 
 
 ```
 niimath --qc T1.nii.gz --seg seg.nii.gz --csf 3,4,11,12 --wm 1,5 --air avg152T1.nii.gz --json qc.json
+```
+
+`--pve <csf> <gm> <wm>` replaces `--seg/--csf/--wm/--erode` with partial-volume fraction maps (values in [0, 1], `scl_slope` honoured) on the T1's grid. Each voxel is weighted by its fraction, as MRIQC's `summary_stats` does: mean, stdv, p05, median and p95 are weighted, `n` is the summed fraction, and MAD and kurtosis use the voxels above half the tissue's peak fraction. ICV fractions and volumes use the summed fractions; there is no erosion. The weighted quantile keeps the NumPy-linear definition, so 0/1 fractions reproduce `--seg … --erode 0` exactly. `provenance` records `"pve": true` in place of the label sets.
+
+```
+niimath --qc T1.nii.gz --pve csf.nii gm.nii wm.nii --air avg152T1.nii.gz --json qc.json
 ```
 
 Constraints: this hard-segmentation variant uses unrounded intensities and NumPy-linear percentiles, so its values are not numerically interchangeable with MRIQC's soft partial-volume summaries; the head mask is Otsu-based where MRIQC's is gradient-based. The names `cnr_noair` and `efc_brain` flag their deviation from the MRIQC norms.

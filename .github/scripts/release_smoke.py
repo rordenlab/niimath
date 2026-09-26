@@ -398,6 +398,84 @@ def exercise_qc(exe: str, tmp: Path) -> None:
         raise AssertionError("QC should propagate an output-open failure")
 
 
+def weighted_percentile(values: list[float], weights: list[float], fraction: float) -> float:
+    """qc.c's weighted NumPy-linear quantile: element k at rank sum(w before k), target p*(W-1)."""
+    pairs = sorted(zip(values, weights))
+    target = fraction * (sum(weights) - 1.0)
+    rank = 0.0
+    for (v0, w0), (v1, _) in zip(pairs, pairs[1:]):
+        if target < rank + w0:
+            return v0 + max(0.0, target - rank) / w0 * (v1 - v0)
+        rank += w0
+    return pairs[-1][0]
+
+
+def exercise_qc_pve(exe: str, tmp: Path) -> None:
+    # The same three 4-wide x-slabs as exercise_qc, as fraction maps.
+    dims = (12, 12, 12)
+    n3 = dims[0] * dims[1] * dims[2]
+    xs = [index % dims[0] for index in range(n3)]
+    t1_values = [20.0 + 0.5 * (i % 7) if x < 4 else 80.0 + 0.75 * (i % 11) if x < 8 else 120.0 + 0.25 * (i % 13)
+                 for i, x in enumerate(xs)]
+    labels = [1 if x < 4 else 2 if x < 8 else 3 for x in xs]
+    t1, seg = tmp / "pve_t1.nii", tmp / "pve_seg.nii"
+    write_float32_nifti(t1, dims, t1_values)
+    seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8) + bytes(labels))
+
+    def maps(fractions: list[list[float]], tag: str) -> list[str]:
+        paths = []
+        for name, data in zip(("csf", "gm", "wm"), fractions):
+            path = tmp / f"pve_{tag}_{name}.nii"
+            write_float32_nifti(path, dims, data)
+            paths.append(str(path))
+        return paths
+
+    # 1. 0/1 fractions reproduce the hard-label path (--erode 0) exactly.
+    binary = maps([[float(label == t) for label in labels] for t in (1, 2, 3)], "bin")
+    hard, soft = tmp / "pve_hard.json", tmp / "pve_bin.json"
+    require_success(run_niimath(exe, ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3",
+                                      "--erode", "0", "--json", str(hard)]), "QC --seg for --pve parity")
+    require_success(run_niimath(exe, ["--qc", str(t1), "--pve", *binary, "--json", str(soft)]), "QC --pve binary")
+    hard_report = json.loads(hard.read_text(encoding="utf-8"))
+    soft_report = json.loads(soft.read_text(encoding="utf-8"))
+    if soft_report["provenance"].get("pve") is not True:
+        raise AssertionError("--pve provenance should record pve: true")
+    for key in hard_report.keys() - {"provenance"}:
+        if soft_report.get(key) != hard_report[key]:
+            raise AssertionError(f"--pve with 0/1 fractions: {key}={soft_report.get(key)} but --seg gives {hard_report[key]}")
+
+    # 2. Soft fractions: the x == 4 column is half CSF, half GM.
+    csf = [1.0 if x < 4 else 0.5 if x == 4 else 0.0 for x in xs]
+    gm = [0.5 if x == 4 else 1.0 if x < 8 and x > 4 else 0.0 for x in xs]
+    wm = [1.0 if x >= 8 else 0.0 for x in xs]
+    out = tmp / "pve_soft.json"
+    require_success(run_niimath(exe, ["--qc", str(t1), "--pve", *maps([csf, gm, wm], "soft"), "--json", str(out)]),
+                    "QC --pve soft")
+    report = json.loads(out.read_text(encoding="utf-8"))
+    total = sum(csf) + sum(gm) + sum(wm)
+    for name, w in (("csf", csf), ("gm", gm), ("wm", wm)):
+        vals = [v for v, f in zip(t1_values, w) if f > 0]
+        ws = [f for f in w if f > 0]
+        W = sum(ws)
+        mean = sum(v * f for v, f in zip(vals, ws)) / W
+        stdv = math.sqrt(sum(f * (v - mean) ** 2 for v, f in zip(vals, ws)) / W)
+        assert_close(report[f"summary_{name}_n"], W, f"QC --pve summary_{name}_n")
+        assert_close(report[f"icvs_{name}"], W / total, f"QC --pve icvs_{name}")
+        assert_close(report[f"summary_{name}_mean"], mean, f"QC --pve summary_{name}_mean")
+        assert_close(report[f"summary_{name}_stdv"], stdv, f"QC --pve summary_{name}_stdv")
+        for key, p in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+            assert_close(report[f"summary_{name}_{key}"], weighted_percentile(vals, ws, p), f"QC --pve summary_{name}_{key}")
+        core = [v for v, f in zip(vals, ws) if f > 0.5 * max(ws)]
+        med = report[f"summary_{name}_median"]
+        assert_close(report[f"summary_{name}_mad"], percentile([abs(v - med) for v in core], 0.5) / 0.6744897501960817,
+                     f"QC --pve summary_{name}_mad")
+
+    # 3. --pve replaces the label options.
+    mixed = run_niimath(exe, ["--qc", str(t1), "--pve", *binary, "--seg", str(seg), "--out", str(tmp / "mixed.tsv")])
+    if mixed.returncode == 0 or "--pve replaces" not in (mixed.stdout + mixed.stderr):
+        raise AssertionError("--pve with --seg should be rejected")
+
+
 def write_large_float_gz(path: Path) -> None:
     dims = (256, 256, 256)
     nvox = dims[0] * dims[1] * dims[2]
@@ -4591,6 +4669,7 @@ def main() -> int:
             raise AssertionError("binary operation failed to detect a y-axis spatial mismatch")
 
         exercise_qc(exe, tmp)
+        exercise_qc_pve(exe, tmp)
         exercise_fillh(exe, tmp)
 
         exercise_allineate(exe, tmp, help_text)

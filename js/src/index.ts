@@ -9,7 +9,8 @@ export type {
   MeshOptions,
   BitmapOptions,
   DataType,
-  ImageSource
+  ImageSource,
+  QcTissues
 } from './core';
 
 /**

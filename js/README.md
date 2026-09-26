@@ -66,6 +66,15 @@ const defaced = await niimath.image(selectedFile).deface(templateFile, maskFile)
 const registered = await niimath.image(selectedFile).allineate(baseFile, [], weightFile).run();
 ```
 
+### Anatomical QC
+
+`qc()` runs `--qc … --json` on the image and resolves to the parsed MRIQC-style report. Pass an integer segmentation with its CSF and WM label values (every other non-zero label is GM), or partial-volume fractions in CSF, GM, WM order; the optional second argument is the air template for the background metrics:
+
+```javascript
+const report = await niimath.image(t1).qc({ seg, csf: [3, 4, 11, 12], wm: [1, 5] }, avg152T1);
+const soft = await niimath.image(t1).qc({ pve: [csf, gm, wm] }, avg152T1);
+```
+
 ### Use an image as an operand
 
 Two more operations take an image operand. `resliceNN(refFile)` reslices the current image onto another image's grid with nearest-neighbor interpolation. `mulImage(imgFile)` multiplies the current image by another image (the generated `mul` takes only a scalar). For example, to reslice a brain mask onto a native grid and apply it:

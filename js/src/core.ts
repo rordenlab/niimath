@@ -15,6 +15,12 @@ export type {
   DataType
 } from './types';
 
+/** Tissues for `qc()`: an integer label map with its CSF and WM label values (every other
+ *  non-zero label is GM), or partial-volume fraction maps in CSF, GM, WM order. */
+export type QcTissues =
+  | { seg: ImageSource; csf: number[]; wm: number[] }
+  | { pve: [csf: ImageSource, gm: ImageSource, wm: ImageSource] };
+
 /** An image or file operand: a File keeps its name; bytes and Blobs are named 'input.nii[.gz]' unless `name` is given. */
 export type ImageSource = Blob | ArrayBuffer | ArrayBufferView<ArrayBuffer>;
 
@@ -241,6 +247,8 @@ class ImageProcessor {
   private extraFiles: { name: string; data: Blob }[] = [];
   // Monotonic counter for generated staging names (collision-proof argv tokens).
   private stagedCounter = 0;
+  // Set by qc(): run() then emits `--qc <input> ... --json <out>` instead of a chain.
+  private qcReport = false;
 
   // Index signature to allow dynamic method assignment from niimath operators
   [key: string]: unknown;
@@ -326,6 +334,20 @@ class ImageProcessor {
   // only handles a scalar token; this stages a File operand into MEMFS.
   mulImage(img: ImageSource): this {
     return this._addFileCommand('-mul', [img]);
+  }
+
+  // MRIQC-style anatomical QC of this image (`--qc ... --json`), a terminal op like run(): resolves
+  // to the parsed report. `air` is the template for the background metrics (`--air`).
+  async qc(tissues: QcTissues, air?: ImageSource): Promise<Record<string, unknown>> {
+    if (this.commands.length) throw new Error('qc() takes the image as is: no chain ops before it');
+    if ('pve' in tissues) this._addFileCommand('--pve', tissues.pve);
+    else this._addFileCommand('--seg', [tissues.seg])._addCommand('--csf', tissues.csf.join(','))._addCommand('--wm', tissues.wm.join(','));
+    if (air) this._addFileCommand('--air', [air]);
+    this.qcReport = true;
+    const report = JSON.parse(await (await this.run('qc.json')).text());
+    // Name the template as the caller did, not by its internal staging name.
+    if (air) report.provenance.air_template = asFile(air).name;
+    return report;
   }
 
   private _generateMethods(): void {
@@ -480,7 +502,9 @@ class ImageProcessor {
       try {
         const inName = `__nimi_${this.file.name.replace(/[^A-Za-z0-9._-]/g, '_')}`;
         const inputFile = new File([this.file], inName);
-        const args = [inName, ...this.commands, outName, '-odt', this.outputDataType];
+        const args = this.qcReport
+          ? ['--qc', inName, ...this.commands, '--json', outName]
+          : [inName, ...this.commands, outName, '-odt', this.outputDataType];
         const message: WorkerPostMessage = {
           blob: inputFile,
           cmd: args,
@@ -508,6 +532,7 @@ interface FileOperandMethods {
   reface(tmpl: ImageSource, shell: ImageSource, weight: ImageSource, opts?: (string | number)[]): this;
   resliceNN(ref: ImageSource): this;
   mulImage(img: ImageSource): this;
+  qc(tissues: QcTissues, air?: ImageSource): Promise<Record<string, unknown>>;
 }
 
 // Use interface merging to add method types to ImageProcessor

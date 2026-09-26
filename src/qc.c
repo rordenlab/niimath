@@ -1,10 +1,9 @@
 // niimath --qc : MRIQC-style anatomical quality metrics from a T1 image + segmentation.
 //
-// Given a T1-weighted intensity image, a matching integer tissue segmentation,
-// and the label values that denote CSF and white matter, this computes the
-// subset of MRIQC anatomical Image Quality Metrics (IQMs) that do NOT require a
-// background/air noise distribution (our backgrounds are masked to zero) and do
-// NOT require soft partial-volume maps (we have a hard label map). The AGENTS.md
+// Given a T1-weighted intensity image and a matching integer tissue segmentation
+// with the label values that denote CSF and white matter (or, with --pve, soft
+// partial-volume maps; below), this computes a subset of MRIQC's anatomical Image
+// Quality Metrics (IQMs); --air adds the background (air) metrics. The AGENTS.md
 // qc.c entry records the computable-vs-blocked categorisation and the gotchas.
 //
 // Metric formulas follow MRIQC (mriqc/qc/anatomical.py, mriqc/interfaces/
@@ -25,6 +24,14 @@
 // suppression MRIQC gets from soft pvms, tissue masks are eroded one voxel before
 // the intensity statistics (toggle with --erode 0). ICV fractions and absolute
 // volumes use the FULL (un-eroded) tissue extent.
+//
+// --pve <csf> <gm> <wm> takes partial-volume fraction maps instead and weights each
+// voxel by its fraction, as MRIQC's summary_stats does: mean, stdv and the
+// quantiles are weighted, n = sum of weights, and MAD and kurtosis use the voxels
+// above half the tissue's peak fraction. The weighted quantile keeps the hard path's
+// NumPy-linear definition (element k sits at rank sum(w before k), the target at
+// p*(W-1)), so 0/1 fractions reproduce --seg --erode 0 exactly. No erosion: the
+// fractions already model the boundary.
 
 #ifdef HAVE_QC
 
@@ -54,8 +61,8 @@
 
 typedef struct {
 	double mean, stdv, median, mad, p05, p95, kurt;
-	long n;    // voxels used for the statistics (post-erosion when eroded)
-	long nraw; // full (un-eroded) tissue voxel count, for ICV/volume
+	double n;    // voxels (or summed fractions) used for the statistics
+	double nraw; // full (un-eroded) tissue voxel count or summed fractions, for ICV/volume
 	int ok;    // 1 if n >= QC_MIN_VOX and stats are finite
 } TissueStats;
 
@@ -107,7 +114,7 @@ static double qc_pctl_inplace(float *a, int n, double p) {
 
 // Compute the per-tissue estimators selected by qc_plan.md. `vals` holds the
 // (post-erosion) intensities; `scratch` is reusable and at least `n` floats.
-static void qc_stats(const float *vals, int n, long nraw, float *scratch, TissueStats *st) {
+static void qc_stats(const float *vals, int n, double nraw, float *scratch, TissueStats *st) {
 	memset(st, 0, sizeof(*st));
 	st->n = n;
 	st->nraw = nraw;
@@ -140,6 +147,85 @@ static void qc_stats(const float *vals, int n, long nraw, float *scratch, Tissue
 	double rawmad = qc_pctl_inplace(scratch, n, 0.50);
 	st->mad = rawmad / MAD_C;
 	st->ok = qc_finite(st->median) && qc_finite(st->stdv) && st->stdv >= 0.0;
+}
+
+// IEEE bits of f, remapped so unsigned order is float order (memcpy: no aliasing UB).
+static uint32_t qc_sort_key(float f) {
+	uint32_t u;
+	memcpy(&u, &f, sizeof u);
+	return u ^ ((u >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+// Sort v[] ascending carrying w[] along: LSD radix on qc_sort_key (comparator-free, as
+// the quickselect above). tv/tw are n-float scratch.
+static void qc_sort_pairs(float *v, float *w, int n, float *tv, float *tw) {
+	for (int shift = 0; shift < 32; shift += 8) {
+		int count[257] = {0};
+		for (int i = 0; i < n; i++) count[((qc_sort_key(v[i]) >> shift) & 0xFF) + 1]++;
+		for (int b = 0; b < 256; b++) count[b + 1] += count[b];
+		for (int i = 0; i < n; i++) {
+			int o = count[(qc_sort_key(v[i]) >> shift) & 0xFF]++;
+			tv[o] = v[i];
+			tw[o] = w[i];
+		}
+		memcpy(v, tv, (size_t)n * sizeof(float));
+		memcpy(w, tw, (size_t)n * sizeof(float));
+	}
+}
+
+// Weighted NumPy-linear quantile of sorted v (weights w, total W); see the header.
+static double qc_wpctl(const float *v, const float *w, int n, double W, double p) {
+	double t = p * (W - 1.0), r = 0.0;
+	if (t <= 0.0) return v[0];
+	for (int k = 0; k < n - 1; k++) {
+		double r1 = r + w[k];
+		if (t < r1) return (double)v[k] + (t - r) / w[k] * ((double)v[k + 1] - (double)v[k]);
+		r = r1;
+	}
+	return v[n - 1];
+}
+
+// Fraction-weighted tissue statistics over the n voxels with w > 0 (vals/w in voxel
+// order, both reordered on return). Moments are summed in voxel order, as qc_stats
+// does, so the binary case matches it bit for bit.
+static void qc_wstats(float *vals, float *w, int n, float *tv, float *tw, TissueStats *st) {
+	memset(st, 0, sizeof(*st));
+	st->median = st->mad = st->mean = st->stdv = st->p05 = st->p95 = st->kurt = NAN;
+	double W = 0.0, sum = 0.0, wmax = 0.0;
+	for (int i = 0; i < n; i++) {
+		W += w[i];
+		sum += (double)w[i] * vals[i];
+		if (w[i] > wmax) wmax = w[i];
+	}
+	st->n = st->nraw = W;
+	if (W < QC_MIN_VOX) { st->ok = 0; return; }
+	double mean = sum / W, m2 = 0.0;
+	for (int i = 0; i < n; i++) {
+		double d = vals[i] - mean;
+		m2 += w[i] * d * d;
+	}
+	st->mean = mean;
+	st->stdv = sqrt(m2 / W);
+	// kurtosis and MAD: unweighted, over the core voxels (w > half the peak fraction)
+	int nc = 0;
+	double csum = 0.0;
+	for (int i = 0; i < n; i++)
+		if (w[i] > 0.5 * wmax) { tv[nc++] = vals[i]; csum += vals[i]; }
+	double cmean = csum / nc, c2 = 0.0, c4 = 0.0;
+	for (int i = 0; i < nc; i++) {
+		double d = tv[i] - cmean, d2 = d * d;
+		c2 += d2;
+		c4 += d2 * d2;
+	}
+	c2 /= nc; c4 /= nc;
+	st->kurt = (c2 > 0.0) ? (c4 / (c2 * c2) - 3.0) : NAN;
+	qc_sort_pairs(vals, w, n, tw + n, tw); // tw holds 2n floats: temp weights, then temp values
+	st->median = qc_wpctl(vals, w, n, W, 0.50);
+	st->p05 = qc_wpctl(vals, w, n, W, 0.05);
+	st->p95 = qc_wpctl(vals, w, n, W, 0.95);
+	for (int i = 0; i < nc; i++) tv[i] = (float)fabs(tv[i] - st->median);
+	st->mad = qc_pctl_inplace(tv, nc, 0.50) / MAD_C;
+	st->ok = qc_finite(st->median) && qc_finite(st->stdv);
 }
 
 // Load an image and convert in place while respecting scl_slope/scl_inter.
@@ -236,7 +322,7 @@ static int qc_gather(const float *t1, const uint8_t *map, uint8_t selected,
 
 // Fill one tissue, falling back to its raw class if erosion leaves too few voxels.
 static void qc_tissue(const char *name, const float *t1, const uint8_t *classes,
-                      uint8_t tissue, long nraw, uint8_t *eroded, size_t nvox,
+                      uint8_t tissue, double nraw, uint8_t *eroded, size_t nvox,
                       int nx, int ny, int nz, int do_erode, float *vals,
                       float *scratch, TissueStats *st) {
 	const uint8_t *use = classes;
@@ -253,6 +339,17 @@ static void qc_tissue(const char *name, const float *t1, const uint8_t *classes,
 	qc_stats(vals, n, nraw, scratch, st);
 	if (!st->ok)
 		printf("qc: %s has %d usable voxels (< %d); its metrics reported as nan\n", name, n, QC_MIN_VOX);
+}
+
+// Gather one fraction map's w > 0 voxels, then its weighted statistics.
+static void qc_pve_tissue(const char *name, const float *t1, const float *frac, size_t nvox,
+                          float *vals, float *w, float *tv, float *tw, TissueStats *st) {
+	int n = 0;
+	for (size_t i = 0; i < nvox; i++)
+		if (frac[i] > 0.0f) { vals[n] = t1[i]; w[n++] = frac[i]; }
+	qc_wstats(vals, w, n, tv, tw, st);
+	if (!st->ok)
+		printf("qc: %s fractions sum to %.1f (< %d); its metrics reported as nan\n", name, st->n, QC_MIN_VOX);
 }
 
 // ---- air ("hat") metrics: MRIQC's ArtifactMask, on the RAS-canonical image ----
@@ -392,7 +489,7 @@ static void qc_push_count(QcVal *tab, int *n, const char *key, long v) {
 }
 
 // summary_<tissue>_* in MRIQC's order.
-static void qc_push_tissue(QcVal *tab, int *n, const char *tn, const TissueStats *st) {
+static void qc_push_tissue(QcVal *tab, int *n, const char *tn, const TissueStats *st, int soft) {
 	const char *suf[7] = {"mean", "stdv", "median", "mad", "p05", "p95", "k"};
 	double v[7] = {st->mean, st->stdv, st->median, st->mad, st->p05, st->p95, st->kurt};
 	char key[32];
@@ -401,7 +498,8 @@ static void qc_push_tissue(QcVal *tab, int *n, const char *tn, const TissueStats
 		qc_push(tab, n, key, v[i]);
 	}
 	snprintf(key, sizeof key, "summary_%s_n", tn);
-	qc_push_count(tab, n, key, st->n);
+	if (soft) qc_push(tab, n, key, st->n);
+	else qc_push_count(tab, n, key, (long)st->n);
 }
 
 static int qc_write_tsv(const char *fout, const QcVal *vals, int n) {
@@ -437,7 +535,7 @@ static void qc_json_str(FILE *f, const char *s) {
 // MRIQC-style report: metrics flat at the top level (JSON has no NaN, so non-finite
 // values are null), image geometry, and provenance. Mirrors MRIQC's <sub>_T1w.json.
 static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti_image *nt1,
-                         const int *csf, int ncsf, const int *wm, int nwm, const char *ftmpl) {
+                         const int *csf, int ncsf, const int *wm, int nwm, int pve, const char *ftmpl) {
 	FILE *f = fopen(fout, "w");
 	if (!f) { printf("qc: cannot open output '%s'\n", fout); return 1; }
 	fputs("{\n", f);
@@ -452,11 +550,15 @@ static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti
 	        (long long)nt1->nx, (long long)nt1->ny, (long long)nt1->nz);
 	fprintf(f, "  \"spacing_x\": %.15g,\n  \"spacing_y\": %.15g,\n  \"spacing_z\": %.15g,\n",
 	        (double)nt1->dx, (double)nt1->dy, (double)nt1->dz);
-	fputs("  \"provenance\": {\n    \"software\": \"niimath --qc\",\n    \"csf_labels\": [", f);
-	for (int i = 0; i < ncsf; i++) fprintf(f, "%s%d", i ? ", " : "", csf[i]);
-	fputs("],\n    \"wm_labels\": [", f);
-	for (int i = 0; i < nwm; i++) fprintf(f, "%s%d", i ? ", " : "", wm[i]);
-	fputs("]", f);
+	fputs("  \"provenance\": {\n    \"software\": \"niimath --qc\",\n", f);
+	if (pve) fputs("    \"pve\": true", f);
+	else {
+		fputs("    \"csf_labels\": [", f);
+		for (int i = 0; i < ncsf; i++) fprintf(f, "%s%d", i ? ", " : "", csf[i]);
+		fputs("],\n    \"wm_labels\": [", f);
+		for (int i = 0; i < nwm; i++) fprintf(f, "%s%d", i ? ", " : "", wm[i]);
+		fputs("]", f);
+	}
 	if (ftmpl) { fputs(",\n    \"air_template\": ", f); qc_json_str(f, ftmpl); }
 	fputs("\n  }\n}\n", f);
 	int bad = ferror(f);
@@ -465,14 +567,46 @@ static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti
 	return bad;
 }
 
+static void qc_usage(void) {
+	printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
+	printf("     or: niimath --qc <t1> --pve <csf> <gm> <wm> [--air <template>] [--out qc.tsv] [--json qc.json]\n");
+}
+
+// `other` must be a single 3D image on the T1's voxel grid.
+static int qc_same_grid(const nifti_image *nt1, const nifti_image *other, const char *what) {
+	int nvox3d = 0;
+	if (nii_nvox3d_int(other, &nvox3d) || other->nvox != nvox3d) {
+		printf("qc: %s must be a single 3D image of at most INT_MAX voxels\n", what);
+		return 0;
+	}
+	if (other->nx != nt1->nx || other->ny != nt1->ny || other->nz != nt1->nz) {
+		printf("qc: %s %lldx%lldx%lld does not match image %lldx%lldx%lld\n", what,
+		       (long long)other->nx, (long long)other->ny, (long long)other->nz,
+		       (long long)nt1->nx, (long long)nt1->ny, (long long)nt1->nz);
+		return 0;
+	}
+	// No separate unit-code equality check: max_displacement_mm() normalises each
+	// transform to mm via its own xyz_units, so a physically identical grid stored
+	// with different but valid unit codes (e.g. an mm image and a 0.001 m image)
+	// yields ~0 displacement and must be accepted, not rejected.
+	float grid_mm = max_displacement_mm(nt1, other);
+	if (!(grid_mm >= 0.0f && grid_mm <= 0.001f)) {
+		printf("qc: %s spatial grid differs from image (maximum corner displacement %.6g mm)\n",
+		       what, grid_mm);
+		return 0;
+	}
+	return 1;
+}
+
 int nii_qc(int argc, char *argv[]) {
 	const char *ft1 = NULL, *fseg = NULL, *csfstr = NULL, *wmstr = NULL;
-	const char *fout = NULL, *fjson = NULL, *ftmpl = NULL;
-	nifti_image *nt1 = NULL, *nseg = NULL;
+	const char *fout = NULL, *fjson = NULL, *ftmpl = NULL, *fpve[3] = {NULL, NULL, NULL};
+	nifti_image *nt1 = NULL, *nseg = NULL, *npve[3] = {NULL, NULL, NULL};
+	float *wts = NULL, *tv = NULL, *tw = NULL;
 	uint8_t *classes = NULL, *eroded = NULL;
 	float *vals = NULL, *scratch = NULL;
 	int rc = EXIT_FAILURE;
-	int do_erode = 1;
+	int do_erode = 1, erode_set = 0;
 	for (int i = 2; i < argc; i++) {
 		const char *a = argv[i];
 		if ((!strcmp(a, "-i") || !strcmp(a, "--in")) && i + 1 < argc) ft1 = argv[++i];
@@ -484,6 +618,10 @@ int nii_qc(int argc, char *argv[]) {
 			if (!strcmp(v, "0")) do_erode = 0;
 			else if (!strcmp(v, "1")) do_erode = 1;
 			else { printf("qc: --erode must be 0 or 1 (got '%s')\n", v); return EXIT_FAILURE; }
+			erode_set = 1;
+		}
+		else if ((!strcmp(a, "-pve") || !strcmp(a, "--pve")) && i + 3 < argc) {
+			fpve[0] = argv[++i]; fpve[1] = argv[++i]; fpve[2] = argv[++i];
 		}
 		else if ((!strcmp(a, "-o") || !strcmp(a, "-out") || !strcmp(a, "--out")) && i + 1 < argc) fout = argv[++i];
 		else if ((!strcmp(a, "-json") || !strcmp(a, "--json")) && i + 1 < argc) fjson = argv[++i];
@@ -491,13 +629,18 @@ int nii_qc(int argc, char *argv[]) {
 		else if (a[0] != '-' && !ft1) ft1 = a; // positional T1
 		else {
 			printf("qc: unsupported option '%s'\n", a);
-			printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
+			qc_usage();
 			return EXIT_FAILURE;
 		}
 	}
-	if (!ft1 || !fseg || !csfstr || !wmstr) {
+	int pve = fpve[0] != NULL;
+	if (pve && (fseg || csfstr || wmstr || erode_set)) {
+		printf("qc: --pve replaces --seg/--csf/--wm/--erode\n");
+		return EXIT_FAILURE;
+	}
+	if (!ft1 || (!pve && (!fseg || !csfstr || !wmstr))) {
 		printf("qc: missing required arguments.\n");
-		printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
+		qc_usage();
 		printf("  labels: 0 = non-brain (excluded); --csf/--wm list the CSF/WM label values; every other non-zero label is GM.\n");
 		return EXIT_FAILURE;
 	}
@@ -508,10 +651,12 @@ int nii_qc(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 #endif
-	int csfset[64], wmset[64];
-	int ncsf = qc_parse_labels(csfstr, csfset, 64);
-	int nwm = qc_parse_labels(wmstr, wmset, 64);
-	if (ncsf < 0 || nwm < 0) return EXIT_FAILURE;
+	int csfset[64], wmset[64], ncsf = 0, nwm = 0;
+	if (!pve) {
+		ncsf = qc_parse_labels(csfstr, csfset, 64);
+		nwm = qc_parse_labels(wmstr, wmset, 64);
+		if (ncsf < 0 || nwm < 0) return EXIT_FAILURE;
+	}
 	for (int i = 0; i < ncsf; i++) {
 		if (qc_in_set(csfset[i], wmset, nwm)) {
 			printf("qc: label %d appears in both CSF and WM sets\n", csfset[i]);
@@ -521,42 +666,58 @@ int nii_qc(int argc, char *argv[]) {
 
 	nt1 = qc_read_as(ft1, DT_FLOAT32, "float32");
 	if (!nt1) goto cleanup;
+	TissueStats scsf, swm, sgm;
+	int nx = (int)nt1->nx, ny = (int)nt1->ny, nz = (int)nt1->nz;
+	int nvox3d = 0;
+	if (nii_nvox3d_int(nt1, &nvox3d) || nt1->nvox != nvox3d) {
+		printf("qc: only single 3D images of at most INT_MAX voxels are supported\n");
+		goto cleanup;
+	}
+	size_t nvox = (size_t)nvox3d;
+	const float *t1 = (const float *)nt1->data;
+	for (size_t i = 0; i < nvox; i++) {
+		if (!qc_finite(t1[i])) {
+			printf("qc: T1 contains a non-finite value at voxel %zu\n", i);
+			goto cleanup;
+		}
+	}
+	if (pve) {
+		size_t maxn = 1;
+		for (int t = 0; t < 3; t++) {
+			npve[t] = qc_read_as(fpve[t], DT_FLOAT32, "float32");
+			if (!npve[t] || !qc_same_grid(nt1, npve[t], "partial-volume map")) goto cleanup;
+			float *f = (float *)npve[t]->data;
+			size_t n = 0;
+			for (size_t i = 0; i < nvox; i++) {
+				if (!qc_finite(f[i])) {
+					printf("qc: partial-volume map '%s' has a non-finite value at voxel %zu\n", fpve[t], i);
+					goto cleanup;
+				}
+				f[i] = f[i] < 0.0f ? 0.0f : f[i] > 1.0f ? 1.0f : f[i];
+				n += f[i] > 0.0f;
+			}
+			if (n > maxn) maxn = n;
+		}
+		vals = (float *)malloc(maxn * sizeof(float));
+		wts = (float *)malloc(maxn * sizeof(float));
+		tv = (float *)malloc(maxn * sizeof(float));
+		tw = (float *)malloc(2 * maxn * sizeof(float));
+		scratch = (float *)malloc(nvox * sizeof(float));
+		if (!vals || !wts || !tv || !tw || !scratch) {
+			printf("qc: out of memory allocating tissue statistics buffers\n");
+			goto cleanup;
+		}
+		qc_pve_tissue("CSF", t1, (float *)npve[0]->data, nvox, vals, wts, tv, tw, &scsf);
+		qc_pve_tissue("GM", t1, (float *)npve[1]->data, nvox, vals, wts, tv, tw, &sgm);
+		qc_pve_tissue("WM", t1, (float *)npve[2]->data, nvox, vals, wts, tv, tw, &swm);
+		goto metrics;
+	}
 	// Keep labels in float64: converting an integer label map through float32
 	// aliases distinct labels above 2^24 and defeats the integer validation below.
 	nseg = qc_read_as(fseg, DT_FLOAT64, "float64");
 	if (!nseg) goto cleanup;
 
-	int nvox3d = 0, nvox3d_seg = 0;
-	if (nii_nvox3d_int(nt1, &nvox3d) || nii_nvox3d_int(nseg, &nvox3d_seg)) {
-		printf("qc: invalid or oversized image dimensions (QC requires at most INT_MAX voxels)\n");
-		goto cleanup;
-	}
-	if (nt1->nvox != nvox3d || nseg->nvox != nvox3d_seg) {
-		printf("qc: only single 3D images are supported (image nvox=%lld, seg nvox=%lld)\n",
-		       (long long)nt1->nvox, (long long)nseg->nvox);
-		goto cleanup;
-	}
-	if (nseg->nx != nt1->nx || nseg->ny != nt1->ny || nseg->nz != nt1->nz ||
-	    nvox3d_seg != nvox3d) {
-		printf("qc: segmentation %lldx%lldx%lld does not match image %lldx%lldx%lld\n",
-		       (long long)nseg->nx, (long long)nseg->ny, (long long)nseg->nz,
-		       (long long)nt1->nx, (long long)nt1->ny, (long long)nt1->nz);
-		goto cleanup;
-	}
-	// No separate unit-code equality check: max_displacement_mm() normalises each
-	// transform to mm via its own xyz_units, so a physically identical grid stored
-	// with different but valid unit codes (e.g. an mm image and a 0.001 m image)
-	// yields ~0 displacement and must be accepted, not rejected.
-	float grid_mm = max_displacement_mm(nt1, nseg);
-	if (!(grid_mm >= 0.0f && grid_mm <= 0.001f)) {
-		printf("qc: segmentation spatial grid differs from image (maximum corner displacement %.6g mm)\n",
-		       grid_mm);
-		goto cleanup;
-	}
-
-	int nx = (int)nt1->nx, ny = (int)nt1->ny, nz = (int)nt1->nz;
-	size_t nvox = (size_t)nvox3d;
-	const float *t1 = (const float *)nt1->data;
+	if (!qc_same_grid(nt1, nseg, "segmentation")) goto cleanup;
 	const double *seg = (const double *)nseg->data;
 
 	// Compact classification: 0 background, 1 CSF, 2 GM, 3 WM.
@@ -567,10 +728,6 @@ int nii_qc(int argc, char *argv[]) {
 	}
 	long nraw_csf = 0, nraw_gm = 0, nraw_wm = 0;
 	for (size_t i = 0; i < nvox; i++) {
-		if (!qc_finite(t1[i])) {
-			printf("qc: T1 contains a non-finite value at voxel %zu\n", i);
-			goto cleanup;
-		}
 		double sv = seg[i];
 		if (!(sv >= INT_MIN && sv <= INT_MAX) || sv != trunc(sv)) {
 			printf("qc: segmentation must contain finite integer labels (voxel %zu is %.17g)\n", i, sv);
@@ -606,7 +763,6 @@ int nii_qc(int argc, char *argv[]) {
 		goto cleanup;
 	}
 
-	TissueStats scsf, swm, sgm;
 	qc_tissue("CSF", t1, classes, 1, nraw_csf, eroded, nvox, nx, ny, nz,
 	          do_erode, vals, scratch, &scsf);
 	qc_tissue("WM", t1, classes, 3, nraw_wm, eroded, nvox, nx, ny, nz,
@@ -614,6 +770,7 @@ int nii_qc(int argc, char *argv[]) {
 	qc_tissue("GM", t1, classes, 2, nraw_gm, eroded, nvox, nx, ny, nz,
 	          do_erode, vals, scratch, &sgm);
 
+metrics:;
 	// ---- metrics ----
 	double cjv = NAN, cnr = NAN;
 	double dmu = fabs(swm.median - sgm.median);
@@ -697,13 +854,13 @@ int nii_qc(int argc, char *argv[]) {
 	qc_push(tab, &nvals, "icvs_wm", icvs_wm);
 	qc_push(tab, &nvals, "vol_csf_mm3", vol_csf); qc_push(tab, &nvals, "vol_gm_mm3", vol_gm);
 	qc_push(tab, &nvals, "vol_wm_mm3", vol_wm);
-	qc_push_tissue(tab, &nvals, "csf", &scsf);
-	qc_push_tissue(tab, &nvals, "gm", &sgm);
-	qc_push_tissue(tab, &nvals, "wm", &swm);
-	if (air.present) qc_push_tissue(tab, &nvals, "bg", &air.bg);
+	qc_push_tissue(tab, &nvals, "csf", &scsf, pve);
+	qc_push_tissue(tab, &nvals, "gm", &sgm, pve);
+	qc_push_tissue(tab, &nvals, "wm", &swm, pve);
+	if (air.present) qc_push_tissue(tab, &nvals, "bg", &air.bg, 0);
 
 	if (fout && qc_write_tsv(fout, tab, nvals)) goto cleanup;
-	if (fjson && qc_write_json(fjson, tab, nvals, nt1, csfset, ncsf, wmset, nwm,
+	if (fjson && qc_write_json(fjson, tab, nvals, nt1, csfset, ncsf, wmset, nwm, pve,
 	                           air.present ? ftmpl : NULL)) goto cleanup;
 
 	if (fout) printf("qc: wrote %s\n", fout);
@@ -713,7 +870,8 @@ int nii_qc(int argc, char *argv[]) {
 	if (air.present)
 		printf("qc: SNRd(total)=%.4g  FBER=%.4g  QI1=%.4g  CNR=%.4g\n",
 		       air.snrd_total, air.fber, air.qi_1, air.cnr);
-	printf("qc: voxels CSF=%ld GM=%ld WM=%ld (erode=%d)\n", scsf.nraw, sgm.nraw, swm.nraw, do_erode);
+	if (pve) printf("qc: summed fractions CSF=%.1f GM=%.1f WM=%.1f\n", scsf.nraw, sgm.nraw, swm.nraw);
+	else printf("qc: voxels CSF=%.0f GM=%.0f WM=%.0f (erode=%d)\n", scsf.nraw, sgm.nraw, swm.nraw, do_erode);
 	rc = EXIT_SUCCESS;
 
 cleanup:
@@ -721,6 +879,8 @@ cleanup:
 	free(eroded);
 	free(vals);
 	free(scratch);
+	free(wts); free(tv); free(tw);
+	for (int t = 0; t < 3; t++) if (npve[t]) nifti_image_free(npve[t]);
 	if (nt1) nifti_image_free(nt1);
 	if (nseg) nifti_image_free(nseg);
 	return rc;
