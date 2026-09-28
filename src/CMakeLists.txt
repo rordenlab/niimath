@@ -117,6 +117,14 @@ if(${BUILD_FLAVOR} STREQUAL "all")
         set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c)
     endif()
 
+    # N4 bias-field correction (-n4, and the --qc intensity pipeline): Apache-2.0 C port of
+    # ITK/ANTs N4 in n4/ (see n4/NOTICE; the rest of niimath is BSD-2). Ordinary FP.
+    option(ENABLE_N4 "Enable N4 bias-field correction (-n4)" ON)
+    if(ENABLE_N4)
+        ADD_DEFINITIONS(-DHAVE_N4)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} n4/n4.c n4/n4_bspline.c n4/n4_fft.c)
+    endif()
+
     # -stc: measured contract in moco_bench's test/stc_reference_manifest.md. See the MOCO note above.
     option(ENABLE_STC "Enable slice-time correction (-stc)" ON)
     if(ENABLE_STC)

@@ -20,10 +20,10 @@
 //
 // MRIQC computes per-tissue stats as partial-volume-WEIGHTED statistics over soft
 // pvms; with a hard label map the weights are 0/1, i.e. ordinary statistics over
-// the masked voxels (the binary special case). To emulate the boundary
-// suppression MRIQC gets from soft pvms, tissue masks are eroded one voxel before
-// the intensity statistics (toggle with --erode 0). ICV fractions and absolute
-// volumes use the FULL (un-eroded) tissue extent.
+// the masked voxels (the binary special case). --erode 1 erodes tissue masks one
+// voxel before the intensity statistics; off by default, as on ABIDE it moved WM/GM
+// stdv and MAD away from MRIQC (0.71x -> 1.0x without it). ICV fractions and absolute
+// volumes always use the FULL (un-eroded) tissue extent.
 //
 // --pve <csf> <gm> <wm> takes partial-volume fraction maps instead and weights each
 // voxel by its fraction, as MRIQC's summary_stats does: mean, stdv and the
@@ -32,6 +32,17 @@
 // NumPy-linear definition (element k sits at rank sum(w before k), the target at
 // p*(W-1)), so 0/1 fractions reproduce --seg --erode 0 exactly. No erosion: the
 // fractions already model the boundary.
+//
+// Intensities follow MRIQC unless --raw: IntensityClip (10th..99.9th percentiles of the
+// median-filtered positive voxels, shifted and scaled to 0..255, rounded), N4 weighted by the
+// brain (HAVE_N4; ANTs defaults), then Harmonize (x 1000 / median of the 18-connected-eroded
+// WM: label, or fraction >= 0.9). Raw voxels <= 0 are MRIQC's rotation mask: excluded from
+// EFC and from FBER's background.
+//
+// --mask <brain> (e.g. brainchop-mindgrab, a SynthStrip-like brain+CSF mask) counts every mask
+// voxel that is not GM or WM as CSF (label 0 -> CSF; with --pve the CSF fraction takes the
+// remainder 1 - csf - gm - wm). MRIQC segments inside SynthStrip's mask, so its CSF includes
+// the extra-cerebral CSF a brain parcellation leaves unlabeled (icvs_csf ~0.27 vs ~0.02).
 
 #ifdef HAVE_QC
 
@@ -45,6 +56,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "core.h" // set_input_hdr, nifti_image_change_datatype
+#ifdef HAVE_N4
+#include "n4/n4.h" // N4 bias correction in the MRIQC intensity pipeline
+#endif
 #if defined(HAVE_ALLINEATE) && defined(HAVE_CONFORM)
 #define QC_HAVE_AIR
 #include "core32.h" // nii_qc_air_masks_f32
@@ -320,6 +334,115 @@ static int qc_gather(const float *t1, const uint8_t *map, uint8_t selected,
 	return n;
 }
 
+// One-voxel erosion with the 18-connected element (scipy generate_binary_structure(3, 2)),
+// border voxels eroding away as in scipy's binary_erosion.
+static void qc_erode18(const uint8_t *m, uint8_t v, uint8_t *out, int nx, int ny, int nz) {
+	size_t nxy = (size_t)nx * ny;
+	memset(out, 0, (size_t)nx * ny * nz);
+	for (int z = 1; z < nz - 1; z++)
+		for (int y = 1; y < ny - 1; y++)
+			for (int x = 1; x < nx - 1; x++) {
+				size_t i = (size_t)z * nxy + (size_t)y * nx + x;
+				int keep = m[i] == v;
+				for (int dz = -1; keep && dz <= 1; dz++)
+					for (int dy = -1; keep && dy <= 1; dy++)
+						for (int dx = -1; keep && dx <= 1; dx++)
+							if (abs(dx) + abs(dy) + abs(dz) < 3 && m[i + dz * (long)nxy + dy * (long)nx + dx] != v) keep = 0;
+				out[i] = keep;
+			}
+}
+
+// niworkflows IntensityClip(p_min=10, p_max=99.9) as MRIQC applies it before N4.
+// Thresholds come from a radius-3 ball median filter of the positive voxels.
+// ponytail: filter sampled on every 2nd voxel per axis (percentiles only); full grid if it ever matters.
+static int qc_clip(float *t1, int nx, int ny, int nz, float *scratch, double *lo, double *hi) {
+	size_t nxy = (size_t)nx * ny, nvox = nxy * nz;
+	float ball[123];
+	int n = 0;
+	for (int z = 0; z < nz; z += 2)
+		for (int y = 0; y < ny; y += 2)
+			for (int x = 0; x < nx; x += 2) {
+				int k = 0;
+				for (int dz = -3; dz <= 3; dz++)
+					for (int dy = -3; dy <= 3; dy++)
+						for (int dx = -3; dx <= 3; dx++) {
+							if (dx * dx + dy * dy + dz * dz > 9) continue;
+							// scipy's default 'reflect' border mode
+							int xx = x + dx, yy = y + dy, zz = z + dz;
+							xx = xx < 0 ? -xx - 1 : xx >= nx ? 2 * nx - xx - 1 : xx;
+							yy = yy < 0 ? -yy - 1 : yy >= ny ? 2 * ny - yy - 1 : yy;
+							zz = zz < 0 ? -zz - 1 : zz >= nz ? 2 * nz - zz - 1 : zz;
+							ball[k++] = t1[(size_t)zz * nxy + (size_t)yy * nx + xx];
+						}
+				float med = qc_select_kth(ball, k, k / 2);
+				if (med > 0.0f) scratch[n++] = med;
+			}
+	if (n < 2) return 1;
+	*hi = qc_pctl_inplace(scratch, n, 0.999);
+	*lo = qc_pctl_inplace(scratch, n, 0.10);
+	if (!(*hi > *lo)) return 1;
+	double s = 255.0 / (*hi - *lo);
+	for (size_t i = 0; i < nvox; i++) {
+		double v = t1[i] < *lo ? *lo : t1[i] > *hi ? *hi : t1[i];
+		t1[i] = (float)round((v - *lo) * s);
+	}
+	return 0;
+}
+
+// MRIQC Harmonize: scale so the eroded WM median is 1000 (un-eroded WM below 30 voxels).
+static double qc_harmonize(float *t1, const uint8_t *map, uint8_t v, int nx, int ny, int nz, float *scratch) {
+	size_t nvox = (size_t)nx * ny * nz;
+	uint8_t *ero = (uint8_t *)malloc(nvox);
+	if (!ero) return NAN;
+	qc_erode18(map, v, ero, nx, ny, nz);
+	int n = qc_gather(t1, ero, 1, nvox, scratch);
+	free(ero);
+	if (n < 30) n = qc_gather(t1, map, v, nvox, scratch);
+	double med = qc_pctl_inplace(scratch, n, 0.5);
+	if (!(med > 0.0)) return NAN;
+	for (size_t i = 0; i < nvox; i++) t1[i] = (float)(t1[i] * (1000.0 / med));
+	return med;
+}
+
+typedef struct {
+	double lo, hi, wm_median; // clip range; WM median before harmonizing
+	int n4;                   // N4 ran
+} QcPrep;
+
+// MRIQC's intensity pipeline: clip, N4 (when built; weighted by the brain, map != 0, correcting the
+// whole image as MRIQC's weighted N4 does), harmonize on the voxels where map == wm.
+static int qc_prep(float *t1, const uint8_t *map, uint8_t wm, int nx, int ny, int nz, float dx, float dy,
+                   float dz, float *scratch, QcPrep *prep) {
+	if (qc_clip(t1, nx, ny, nz, scratch, &prep->lo, &prep->hi)) {
+		printf("qc: too few positive voxels to clip intensities (use --raw)\n");
+		return 1;
+	}
+	prep->n4 = 0;
+#ifdef HAVE_N4
+	N4Params n4p;
+	n4_default_params(&n4p); // ANTs defaults, shrink 4 (as MRIQC runs N4)
+	if (nx < 2 * n4p.shrink || ny < 2 * n4p.shrink || nz < 2 * n4p.shrink)
+		printf("qc: image too small for N4 at shrink %d; skipping bias correction\n", n4p.shrink);
+	else {
+		size_t nvox = (size_t)nx * ny * nz;
+		for (size_t i = 0; i < nvox; i++) scratch[i] = map[i] ? 1.0f : 0.0f; // N4 confidence
+		if (n4_correct(t1, NULL, scratch, nx, ny, nz, dx, dy, dz, &n4p, NULL)) {
+			printf("qc: N4 bias correction failed (use --raw)\n");
+			return 1;
+		}
+		prep->n4 = 1;
+	}
+#else
+	(void)dx; (void)dy; (void)dz;
+#endif
+	prep->wm_median = qc_harmonize(t1, map, wm, nx, ny, nz, scratch);
+	if (!qc_finite(prep->wm_median)) {
+		printf("qc: no white matter to harmonize on (no --wm label voxels, or no PVE WM fraction >= 0.9); use --raw\n");
+		return 1;
+	}
+	return 0;
+}
+
 // Fill one tissue, falling back to its raw class if erosion leaves too few voxels.
 static void qc_tissue(const char *name, const float *t1, const uint8_t *classes,
                       uint8_t tissue, double nraw, uint8_t *eroded, size_t nvox,
@@ -353,13 +476,17 @@ static void qc_pve_tissue(const char *name, const float *t1, const float *frac, 
 }
 
 // ---- air ("hat") metrics: MRIQC's ArtifactMask, on the RAS-canonical image ----
-// The hat is the head-free air superior to MRIQC's landmark plane: its glabella
-// [0,90,-14] and inion [0,-120,-14] share template z = -14, so the two axis-aligned
-// slab fills MRIQC uses approximate that one plane, tested here directly (exact under
-// pitch, roll and yaw). Artifacts are hat voxels brighter than QC_AIR_ZSCORE MADs of
-// the full hat, outside the 10 % shell nearest the head, after a 6-connected opening;
-// the background statistics are taken over air = hat - artifacts.
-#define QC_LANDMARK_PLANE_Z (-14.0)
+// The hat is the head-free air above MRIQC's landmarks, glabella [0,90,-14] and inion
+// [0,-120,-14] (template mm), mapped to voxels and applied as MRIQC's two axis-aligned slabs:
+// slices below the inion's, and the anterior half below the glabella's, count as head. (A
+// tilted plane through both landmarks seemed more exact but took 9 % more air, and brighter.)
+// Artifacts are hat voxels brighter than QC_AIR_ZSCORE MADs of the hat's positive voxels,
+// outside the 10 % shell nearest the head, after a 6-connected opening; the background
+// statistics are taken over air = hat - artifacts.
+// The Otsu head mask is dilated QC_HEAD_DILATE voxels to match MRIQC's gradient-based one
+// (sigma 4 smoothing puts a halo round the scalp): 0.86 -> 0.90 Dice, FBER 1.4x -> ~1.03x.
+// ponytail: dilation in voxels; MRIQC's sigma scales with zooms, so mm-scale it if anisotropic data matters.
+#define QC_HEAD_DILATE 4
 // 1 / sqrt(2 / (4 - pi)): Dietrich's Rayleigh correction (mriqc DIETRICH_FACTOR).
 #define QC_DIETRICH 0.6551364
 #define QC_AIR_ZSCORE 10.0
@@ -386,26 +513,37 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl,
 	int rc = 1;
 	int nx = (int)ras->nx, ny = (int)ras->ny, nz = (int)ras->nz;
 	size_t nxy = (size_t)nx * ny, nvox = ras->nvox;
-	const float *img = (const float *)ras->data, *hd = (const float *)head->data,
-	            *ds = (const float *)dist->data;
+	float *img = (float *)ras->data;
+	const float *ds = (const float *)dist->data;
 	uint8_t *hat = (uint8_t *)calloc(nvox, 1), *art = (uint8_t *)calloc(nvox, 1),
-	        *tmp = (uint8_t *)calloc(nvox, 1);
+	        *tmp = (uint8_t *)calloc(nvox, 1), *rot = (uint8_t *)calloc(nvox, 1),
+	        *hd = (uint8_t *)malloc(nvox);
 	float *vals = (float *)malloc(nvox * sizeof(float));
-	if (!hat || !art || !tmp || !vals) {
+	if (!hat || !art || !tmp || !rot || !hd || !vals) {
 		printf("qc: out of memory allocating air masks\n");
 		goto done;
 	}
-	// 1. the hat. Only the z row of voxel->template matters: a plane equation in (i,j,k).
+	for (size_t o = 0; o < nvox; o++) hd[o] = ((const float *)head->data)[o] > 0;
+	for (int d = 0; d < QC_HEAD_DILATE; d++) {
+		qc_morph6(hd, 1, tmp, nx, ny, nz, 0);
+		memcpy(hd, tmp, nvox);
+	}
+	// nii_qc sets raw voxels <= 0 to -1; -ras only permutes, so the flag survives
+	for (size_t o = 0; o < nvox; o++)
+		if (img[o] < 0.0f) { rot[o] = 1; img[o] = 0.0f; }
+	// 1. the hat: MRIQC's slabs, int() truncation included.
+	mat44 t2v = nifti_mat44_inverse(v2t);
+	int kInion = (int)(t2v.m[2][0] * 0 + t2v.m[2][1] * -120 + t2v.m[2][2] * -14 + t2v.m[2][3]);
+	int kGlabella = (int)(t2v.m[2][0] * 0 + t2v.m[2][1] * 90 + t2v.m[2][2] * -14 + t2v.m[2][3]);
 	long nHat = 0;
 	float distMax = 0;
 	for (int k = 0; k < nz; k++)
 		for (int j = 0; j < ny; j++) {
-			double zjk = v2t.m[2][1] * j + v2t.m[2][2] * k + v2t.m[2][3];
+			if (k < kInion || (j >= ny / 2 && k < kGlabella)) continue;
 			size_t base = (size_t)j * nx + (size_t)k * nxy;
 			for (int i = 0; i < nx; i++) {
-				if (v2t.m[2][0] * i + zjk < QC_LANDMARK_PLANE_Z) continue;
 				size_t o = base + i;
-				if (hd[o] > 0) continue;
+				if (hd[o]) continue;
 				hat[o] = 1;
 				nHat++;
 				if (ds[o] > distMax) distMax = ds[o];
@@ -417,8 +555,10 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl,
 		goto done;
 	}
 	am->present = 1;
-	// 2. artifacts, flagged against the MAD of the FULL hat.
-	int n = qc_gather(img, hat, 1, nvox, vals);
+	// 2. artifacts, flagged against the MAD of the hat's positive voxels.
+	int n = 0;
+	for (size_t o = 0; o < nvox; o++)
+		if (hat[o] && img[o] > 0) vals[n++] = img[o];
 	TissueStats s0;
 	qc_stats(vals, n, n, scratch, &s0);
 	if (s0.mad > 0 && distMax > 0)
@@ -450,14 +590,16 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl,
 		}
 		if (cnt) am->snrd_total = sum / cnt;
 	}
-	// 5. FBER: median squared intensity inside the head over the same in the air.
-	int nFg = 0;
-	for (size_t o = 0; o < nvox; o++)
-		if (hd[o] > 0) scratch[nFg++] = img[o] * img[o];
-	if (nFg) {
+	// 5. FBER: median squared intensity inside the head over the same in all the air
+	// outside the head (MRIQC: not the hat, but excluding the rotation mask).
+	int nFg = 0, nBg = 0;
+	for (size_t o = 0; o < nvox; o++) {
+		if (hd[o]) scratch[nFg++] = img[o] * img[o];
+		else if (!rot[o]) vals[nBg++] = img[o] * img[o];
+	}
+	if (nFg && nBg) {
 		double fg = qc_pctl_inplace(scratch, nFg, 0.5);
-		for (int i = 0; i < n; i++) vals[i] *= vals[i];
-		double bg = qc_pctl_inplace(vals, n, 0.5);
+		double bg = qc_pctl_inplace(vals, nBg, 0.5);
 		am->fber = bg < 1e-3 ? -1.0 : fg / bg;
 	}
 	// 6. CNR with the air term (MRIQC's definition; sigma_air is <1 % of it in practice).
@@ -466,7 +608,7 @@ static int qc_air(const nifti_image *nt1, const char *ftmpl,
 		          sqrt(am->bg.stdv * am->bg.stdv + sgm->stdv * sgm->stdv + swm->stdv * swm->stdv);
 	rc = 0;
 done:
-	free(hat); free(art); free(tmp); free(vals);
+	free(hat); free(art); free(tmp); free(rot); free(hd); free(vals);
 	nifti_image_free(ras); nifti_image_free(head); nifti_image_free(dist);
 	return rc;
 }
@@ -535,7 +677,8 @@ static void qc_json_str(FILE *f, const char *s) {
 // MRIQC-style report: metrics flat at the top level (JSON has no NaN, so non-finite
 // values are null), image geometry, and provenance. Mirrors MRIQC's <sub>_T1w.json.
 static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti_image *nt1,
-                         const int *csf, int ncsf, const int *wm, int nwm, int pve, const char *ftmpl) {
+                         const int *csf, int ncsf, const int *wm, int nwm, int pve, const char *ftmpl,
+                         const QcPrep *prep) {
 	FILE *f = fopen(fout, "w");
 	if (!f) { printf("qc: cannot open output '%s'\n", fout); return 1; }
 	fputs("{\n", f);
@@ -559,6 +702,9 @@ static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti
 		for (int i = 0; i < nwm; i++) fprintf(f, "%s%d", i ? ", " : "", wm[i]);
 		fputs("]", f);
 	}
+	if (prep) fprintf(f, ",\n    \"intensity\": {\"clip\": [%.15g, %.15g], \"n4\": %s, \"wm_median\": %.15g}",
+	                  prep->lo, prep->hi, prep->n4 ? "true" : "false", prep->wm_median);
+	else fputs(",\n    \"intensity\": \"raw\"", f);
 	if (ftmpl) { fputs(",\n    \"air_template\": ", f); qc_json_str(f, ftmpl); }
 	fputs("\n  }\n}\n", f);
 	int bad = ferror(f);
@@ -568,8 +714,10 @@ static int qc_write_json(const char *fout, const QcVal *vals, int n, const nifti
 }
 
 static void qc_usage(void) {
-	printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--air <template>] [--out qc.tsv] [--json qc.json]\n");
-	printf("     or: niimath --qc <t1> --pve <csf> <gm> <wm> [--air <template>] [--out qc.tsv] [--json qc.json]\n");
+	printf("  usage: niimath --qc <t1> --seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] [--mask <brain>] [--air <template>] [--raw] [--out qc.tsv] [--json qc.json]\n");
+	printf("     or: niimath --qc <t1> --pve <csf> <gm> <wm> [--mask <brain>] [--air <template>] [--raw] [--out qc.tsv] [--json qc.json]\n");
+	printf("  --mask: brain(+CSF) mask; its voxels not GM or WM count as CSF (MRIQC's extra-cerebral CSF)\n");
+	printf("  --raw: raw intensities instead of MRIQC's clip (0..255) + N4 + WM-median-1000 scaling\n");
 }
 
 // `other` must be a single 3D image on the T1's voxel grid.
@@ -600,13 +748,14 @@ static int qc_same_grid(const nifti_image *nt1, const nifti_image *other, const 
 
 int nii_qc(int argc, char *argv[]) {
 	const char *ft1 = NULL, *fseg = NULL, *csfstr = NULL, *wmstr = NULL;
-	const char *fout = NULL, *fjson = NULL, *ftmpl = NULL, *fpve[3] = {NULL, NULL, NULL};
-	nifti_image *nt1 = NULL, *nseg = NULL, *npve[3] = {NULL, NULL, NULL};
+	const char *fout = NULL, *fjson = NULL, *ftmpl = NULL, *fmask = NULL, *fpve[3] = {NULL, NULL, NULL};
+	nifti_image *nt1 = NULL, *nseg = NULL, *nmask = NULL, *npve[3] = {NULL, NULL, NULL};
 	float *wts = NULL, *tv = NULL, *tw = NULL;
-	uint8_t *classes = NULL, *eroded = NULL;
+	uint8_t *classes = NULL, *eroded = NULL, *rot = NULL;
 	float *vals = NULL, *scratch = NULL;
 	int rc = EXIT_FAILURE;
-	int do_erode = 1, erode_set = 0;
+	int do_erode = 0, erode_set = 0, raw = 0;
+	QcPrep prep = {NAN, NAN, NAN, 0};
 	for (int i = 2; i < argc; i++) {
 		const char *a = argv[i];
 		if ((!strcmp(a, "-i") || !strcmp(a, "--in")) && i + 1 < argc) ft1 = argv[++i];
@@ -626,6 +775,8 @@ int nii_qc(int argc, char *argv[]) {
 		else if ((!strcmp(a, "-o") || !strcmp(a, "-out") || !strcmp(a, "--out")) && i + 1 < argc) fout = argv[++i];
 		else if ((!strcmp(a, "-json") || !strcmp(a, "--json")) && i + 1 < argc) fjson = argv[++i];
 		else if ((!strcmp(a, "-air") || !strcmp(a, "--air")) && i + 1 < argc) ftmpl = argv[++i];
+		else if ((!strcmp(a, "-mask") || !strcmp(a, "--mask")) && i + 1 < argc) fmask = argv[++i];
+		else if (!strcmp(a, "-raw") || !strcmp(a, "--raw")) raw = 1;
 		else if (a[0] != '-' && !ft1) ft1 = a; // positional T1
 		else {
 			printf("qc: unsupported option '%s'\n", a);
@@ -673,29 +824,53 @@ int nii_qc(int argc, char *argv[]) {
 		printf("qc: only single 3D images of at most INT_MAX voxels are supported\n");
 		goto cleanup;
 	}
+	if (!raw && (nx < 3 || ny < 3 || nz < 3)) { // qc_clip's median filter reflects once at the borders
+		printf("qc: MRIQC intensity processing needs at least 3 voxels per axis (got %dx%dx%d); use --raw\n", nx, ny, nz);
+		goto cleanup;
+	}
 	size_t nvox = (size_t)nvox3d;
-	const float *t1 = (const float *)nt1->data;
+	float *t1 = (float *)nt1->data;
+	rot = (uint8_t *)malloc(nvox);
+	if (!rot) {
+		printf("qc: out of memory allocating masks\n");
+		goto cleanup;
+	}
 	for (size_t i = 0; i < nvox; i++) {
 		if (!qc_finite(t1[i])) {
 			printf("qc: T1 contains a non-finite value at voxel %zu\n", i);
 			goto cleanup;
 		}
+		rot[i] = t1[i] <= 0.0f;
 	}
+	if (fmask) {
+		nmask = qc_read_as(fmask, DT_FLOAT32, "float32");
+		if (!nmask || !qc_same_grid(nt1, nmask, "brain mask")) goto cleanup;
+	}
+	const float *brain = nmask ? (const float *)nmask->data : NULL;
 	if (pve) {
 		size_t maxn = 1;
 		for (int t = 0; t < 3; t++) {
 			npve[t] = qc_read_as(fpve[t], DT_FLOAT32, "float32");
 			if (!npve[t] || !qc_same_grid(nt1, npve[t], "partial-volume map")) goto cleanup;
 			float *f = (float *)npve[t]->data;
-			size_t n = 0;
 			for (size_t i = 0; i < nvox; i++) {
 				if (!qc_finite(f[i])) {
 					printf("qc: partial-volume map '%s' has a non-finite value at voxel %zu\n", fpve[t], i);
 					goto cleanup;
 				}
 				f[i] = f[i] < 0.0f ? 0.0f : f[i] > 1.0f ? 1.0f : f[i];
-				n += f[i] > 0.0f;
 			}
+		}
+		if (brain) {
+			float *fc = (float *)npve[0]->data;
+			const float *fg = (const float *)npve[1]->data, *fw = (const float *)npve[2]->data;
+			for (size_t i = 0; i < nvox; i++)
+				if (brain[i] > 0.0f && fc[i] + fg[i] + fw[i] < 1.0f) fc[i] = 1.0f - fg[i] - fw[i];
+		}
+		for (int t = 0; t < 3; t++) {
+			const float *f = (const float *)npve[t]->data;
+			size_t n = 0;
+			for (size_t i = 0; i < nvox; i++) n += f[i] > 0.0f;
 			if (n > maxn) maxn = n;
 		}
 		vals = (float *)malloc(maxn * sizeof(float));
@@ -706,6 +881,19 @@ int nii_qc(int argc, char *argv[]) {
 		if (!vals || !wts || !tv || !tw || !scratch) {
 			printf("qc: out of memory allocating tissue statistics buffers\n");
 			goto cleanup;
+		}
+		if (!raw) { // one map: 0 no tissue, 1 any fraction (N4's weight), 2 WM fraction >= 0.9 (harmonize)
+			const float *fc = (const float *)npve[0]->data, *fg = (const float *)npve[1]->data,
+			            *fwm = (const float *)npve[2]->data;
+			uint8_t *map = (uint8_t *)malloc(nvox);
+			if (!map) {
+				printf("qc: out of memory allocating masks\n");
+				goto cleanup;
+			}
+			for (size_t i = 0; i < nvox; i++) map[i] = fwm[i] >= 0.9f ? 2 : fc[i] + fg[i] + fwm[i] > 0.0f;
+			int bad = qc_prep(t1, map, 2, nx, ny, nz, nt1->dx, nt1->dy, nt1->dz, scratch, &prep);
+			free(map);
+			if (bad) goto cleanup;
 		}
 		qc_pve_tissue("CSF", t1, (float *)npve[0]->data, nvox, vals, wts, tv, tw, &scsf);
 		qc_pve_tissue("GM", t1, (float *)npve[1]->data, nvox, vals, wts, tv, tw, &sgm);
@@ -734,7 +922,10 @@ int nii_qc(int argc, char *argv[]) {
 			goto cleanup;
 		}
 		int lbl = (int)sv;
-		if (lbl == 0) continue;
+		if (lbl == 0) {
+			if (brain && brain[i] > 0.0f) { classes[i] = 1; nraw_csf++; }
+			continue;
+		}
 		if (qc_in_set(lbl, csfset, ncsf)) { classes[i] = 1; nraw_csf++; }
 		else if (qc_in_set(lbl, wmset, nwm)) { classes[i] = 3; nraw_wm++; }
 		else { classes[i] = 2; nraw_gm++; }
@@ -763,6 +954,7 @@ int nii_qc(int argc, char *argv[]) {
 		goto cleanup;
 	}
 
+	if (!raw && qc_prep(t1, classes, 3, nx, ny, nz, nt1->dx, nt1->dy, nt1->dz, scratch, &prep)) goto cleanup;
 	qc_tissue("CSF", t1, classes, 1, nraw_csf, eroded, nvox, nx, ny, nz,
 	          do_erode, vals, scratch, &scsf);
 	qc_tissue("WM", t1, classes, 3, nraw_wm, eroded, nvox, nx, ny, nz,
@@ -795,19 +987,18 @@ metrics:;
 			wm2max = swm.median / p9995;
 	}
 
-	// EFC over non-zero (in-brain-signal) voxels: framemask = (t1 == 0). The metric
-	// assumes non-negative intensities; a mean-centered/negative T1 reports nan.
+	// EFC over the voxels outside the rotation mask (raw > 0; MRIQC's framemask).
 	double efc = NAN;
 	{
 		long N = 0;
 		double sumsq = 0.0;
-		for (size_t i = 0; i < nvox; i++) if (t1[i] != 0.0f) { N++; sumsq += (double)t1[i] * t1[i]; }
+		for (size_t i = 0; i < nvox; i++) if (!rot[i]) { N++; sumsq += (double)t1[i] * t1[i]; }
 		double bmax = sqrt(sumsq);
 		if (N > 1 && bmax > 0.0) {
 			double efc_max = (double)N * (1.0 / sqrt((double)N)) * log(1.0 / sqrt((double)N));
 			double s = 0.0;
 			for (size_t i = 0; i < nvox; i++)
-				if (t1[i] != 0.0f) s += (t1[i] / bmax) * log(((double)t1[i] + 1e-16) / bmax);
+				if (!rot[i]) s += (t1[i] / bmax) * log(((double)t1[i] + 1e-16) / bmax);
 			if (efc_max != 0.0) efc = s / efc_max;
 		}
 	}
@@ -833,7 +1024,10 @@ metrics:;
 
 	AirMetrics air = {0};
 #ifdef QC_HAVE_AIR
-	if (ftmpl && qc_air(nt1, ftmpl, &scsf, &sgm, &swm, scratch, &air)) goto cleanup;
+	if (ftmpl) {
+		for (size_t i = 0; i < nvox; i++) if (rot[i]) t1[i] = -1.0f; // rotation-mask flag for qc_air
+		if (qc_air(nt1, ftmpl, &scsf, &sgm, &swm, scratch, &air)) goto cleanup;
+	}
 #endif
 
 	// ---- collect, then write ----
@@ -861,7 +1055,7 @@ metrics:;
 
 	if (fout && qc_write_tsv(fout, tab, nvals)) goto cleanup;
 	if (fjson && qc_write_json(fjson, tab, nvals, nt1, csfset, ncsf, wmset, nwm, pve,
-	                           air.present ? ftmpl : NULL)) goto cleanup;
+	                           air.present ? ftmpl : NULL, raw ? NULL : &prep)) goto cleanup;
 
 	if (fout) printf("qc: wrote %s\n", fout);
 	if (fjson) printf("qc: wrote %s\n", fjson);
@@ -877,10 +1071,12 @@ metrics:;
 cleanup:
 	free(classes);
 	free(eroded);
+	free(rot);
 	free(vals);
 	free(scratch);
 	free(wts); free(tv); free(tw);
 	for (int t = 0; t < 3; t++) if (npve[t]) nifti_image_free(npve[t]);
+	if (nmask) nifti_image_free(nmask);
 	if (nt1) nifti_image_free(nt1);
 	if (nseg) nifti_image_free(nseg);
 	return rc;

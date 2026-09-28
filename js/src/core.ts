@@ -16,10 +16,12 @@ export type {
 } from './types';
 
 /** Tissues for `qc()`: an integer label map with its CSF and WM label values (every other
- *  non-zero label is GM), or partial-volume fraction maps in CSF, GM, WM order. */
-export type QcTissues =
+ *  non-zero label is GM), or partial-volume fraction maps in CSF, GM, WM order. An optional
+ *  brain(+CSF) `mask` (`--mask`) counts its voxels that are neither GM nor WM as CSF. */
+export type QcTissues = (
   | { seg: ImageSource; csf: number[]; wm: number[] }
-  | { pve: [csf: ImageSource, gm: ImageSource, wm: ImageSource] };
+  | { pve: [csf: ImageSource, gm: ImageSource, wm: ImageSource] }
+) & { mask?: ImageSource };
 
 /** An image or file operand: a File keeps its name; bytes and Blobs are named 'input.nii[.gz]' unless `name` is given. */
 export type ImageSource = Blob | ArrayBuffer | ArrayBufferView<ArrayBuffer>;
@@ -342,6 +344,7 @@ class ImageProcessor {
     if (this.commands.length) throw new Error('qc() takes the image as is: no chain ops before it');
     if ('pve' in tissues) this._addFileCommand('--pve', tissues.pve);
     else this._addFileCommand('--seg', [tissues.seg])._addCommand('--csf', tissues.csf.join(','))._addCommand('--wm', tissues.wm.join(','));
+    if (tissues.mask) this._addFileCommand('--mask', [tissues.mask]);
     if (air) this._addFileCommand('--air', [air]);
     this.qcReport = true;
     const report = JSON.parse(await (await this.run('qc.json')).text());

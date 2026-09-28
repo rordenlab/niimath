@@ -1,0 +1,19 @@
+niimath -n4: N4 bias-field correction
+
+The files in this directory are a C port of Apache-2.0 licensed code:
+
+  Insight Toolkit (ITK): itk::N4BiasFieldCorrectionImageFilter,
+  itk::BSplineScatteredDataPointSetToImageFilter, itk::BSplineControlPointImageFilter,
+  itk::ShrinkImageFilter.
+    Copyright 1999-2019 Insight Software Consortium
+    Copyright 2020-present NumFOCUS
+
+  Advanced Normalization Tools (ANTs): N4BiasFieldCorrection command-line driver.
+    Copyright (c) the ANTs contributors (ConsortiumOfANTS)
+
+  Method: N.J. Tustison, B.B. Avants, P.A. Cook, Y. Zheng, A. Egan, P.A. Yushkevich,
+  J.C. Gee. N4ITK: Improved N3 Bias Correction. IEEE Trans Med Imaging 29(6):1310-1320, 2010.
+
+These files are distributed under the Apache License, Version 2.0 (see LICENSE in this
+directory). The rest of niimath is BSD-2-Clause; build with N4=0 (make) or -DENABLE_N4=OFF
+(CMake) to exclude this directory.

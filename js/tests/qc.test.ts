@@ -41,6 +41,14 @@ describe('qc()', () => {
     expect(job.cmd.slice(3, 6).map((n) => n.replace(/^__nimx\d+_/, ''))).toEqual(['c.nii', 'g.nii', 'w.nii']);
     expect(job.cmd).not.toContain('-odt');
   });
+
+  test('mask: --mask <brain> after the tissues, before --air', async () => {
+    const { job } = await qcArgv({ pve: [file('c.nii'), file('g.nii'), file('w.nii')], mask: file('m.nii') }, file('t.nii.gz'),
+      { provenance: {} });
+    expect(job.cmd[6]).toBe('--mask');
+    expect(job.cmd[7]).toMatch(/m\.nii$/);
+    expect(job.cmd[8]).toBe('--air');
+  });
 });
 
 test('qc() refuses chain ops before it', async () => {

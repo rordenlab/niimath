@@ -304,7 +304,14 @@ int show_help( void ) {
 	// only licence statement the binary itself prints -- keep it in step with license.txt,
 	// README.md and AGENTS.md, it is the most legally visible string in the build.
 	printf("    Built with the optional GPL module (-spm_coreg/-spm_deface):\n");
+#ifdef HAVE_N4
+	// Apache-2.0 (N4) is compatible with GPL-3 but not GPL-2, so the combination is GPL-3.
+	printf("    with Apache-2.0 N4 also compiled in, this executable is licensed GPL-3 (N4=0 for GPL-2 or later).\n\n");
+#else
 	printf("    this executable is licensed GPL-2 or later.\n\n");
+#endif
+#elif defined(HAVE_N4)
+	printf("    License: BSD-2-Clause; the N4 code (src/n4) is Apache-2.0 (see LICENSE).\n\n");
 #else
 	printf("    License: BSD-2-Clause.\n\n");
 #endif
@@ -557,6 +564,19 @@ int show_help( void ) {
 	printf(" -tensor_decomp_lower     : as tensor_decomp except input stores lower diagonal (AFNI, ANTS, Camino convention)\n");
 	printf(" -trunc                   : truncates the decimal value from floating point value and returns integer value\n");
 	printf(" -unifize [-GM]           : bias field correction (adapted from AFNI 3dUnifize); optional -GM also scales gray matter\n");
+#ifdef HAVE_N4
+	printf(" -n4 [opts]               : N4 bias-field correction of a 3D image (port of ITK/ANTs N4, Apache-2.0)\n");
+	printf("                            defaults match ANTs N4BiasFieldCorrection: -shrink 4 -iter 50x50x50x50\n");
+	printf("                            -convergence 0 -bspline 1x1x1 -bins 200 -fwhm 0.15 -wiener 0.01\n");
+	printf("                            -mask <img> estimate inside it; voxels outside keep the input (ANTs -x)\n");
+	printf("                            -weight <img> per-voxel confidence; > 0 takes part (ANTs -w)\n");
+	printf("                            -bspline <mm|AxBxC> knot spacing in mm (pads to whole spans) or mesh size\n");
+	printf("                            -rescale <0|1> with -mask, map the result to the input range inside it (1)\n");
+	printf("                            -field <img> also write the multiplicative bias field\n");
+#else
+	/* Paired with the #ifdef so a build without it still says how to get the feature back. */
+	printf(" -n4                      : N4 bias-field correction — NOT in this build (rebuild with N4=1 or -DENABLE_N4=ON)\n");
+#endif
 	printf(" -unsharp  <sigma> <scl>  : edge enhancing unsharp mask (sigma in mm, not voxels [1 is typical]; scl is amount [0.5 medium, 1.0 heavy])\n");
 	printf(" -dog <sPos> <sNeg>       : difference of gaussian with zero-crossing edges (positive and negative sigma mm)\n");
 	printf(" -dogr <sPos> <sNeg>      : as dog, without zero-crossing (raw rather than binarized data)\n");
@@ -567,7 +587,7 @@ int show_help( void ) {
 	printf(" --dtifit -k <dwi> -r <bvec> -b <bval> -o <base> [-m <mask>] [-xflip 0|1|auto] : linear diffusion tensor fit (emulates FSL dtifit), writes <base>_{FA,MD,L1..3,V1..3,S0,MO,tensor}\n");
 #endif
 #ifdef HAVE_QC
-	printf(" --qc <t1> (--seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] | --pve <csf> <gm> <wm>) [--air <template>] [--out qc.tsv] [--json qc.json] : MRIQC-style QC from hard labels or partial-volume fractions (CJV, CNR, SNR, WM2MAX, EFC-brain, ICV; --air adds SNRd, FBER, QI1 and the background stats) to TSV/JSON\n");
+	printf(" --qc <t1> (--seg <seg> --csf <i[,j..]> --wm <i[,j..]> [--erode 0|1] | --pve <csf> <gm> <wm>) [--mask <brain>] [--air <template>] [--raw] [--out qc.tsv] [--json qc.json] : MRIQC-style QC (MRIQC clip + N4 + WM-median-1000 intensities unless --raw) from hard labels or partial-volume fractions (CJV, CNR, SNR, WM2MAX, EFC-brain, ICV; --air adds SNRd, FBER, QI1 and the background stats) to TSV/JSON\n");
 #endif
 #ifdef HAVE_MEDIC
 	printf(" --medic --magnitude <e1..> --phase <e1..> --te-ms <t1,t2,..> --total-readout-time <s> --phase-encoding-direction <i|j|k|i-|j-|k-> --out-prefix <path> : MEDIC multi-echo distortion correction, writes <prefix>_{fieldmaps_native,fieldmaps,displacementmaps} (--medic --help for options)\n");

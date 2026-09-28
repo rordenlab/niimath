@@ -47,10 +47,17 @@ public-domain US Government Work, not the MCW-copyrighted portions.
 AFNI's src/3DEdge/ (Gregoire Malandain) is GPL-3.0 and was NOT relicensed. It is deliberately
 excluded, which is why -skullstrip implements only AFNI's -no_use_edge behaviour.
 
+The N4 bias-field correction in src/n4/ (-n4, and the N4 step of --qc) is a C port of the Insight
+Toolkit (Copyright Insight Software Consortium, NumFOCUS) and ANTs N4BiasFieldCorrection, under the
+Apache License 2.0: see src/n4/LICENSE and src/n4/NOTICE (also appended to the top-level LICENSE).
+It is compiled in by default; build with N4=0 (make) or -DENABLE_N4=OFF (CMake) to omit it.
+Apache-2.0 is compatible with GPL-3 but not GPL-2: a GPL=1 binary that also contains N4 is GPL-3.
+
 The optional copyleft payload is NOT part of a default build. Building with GPL=1 (make) or
 -DENABLE_GPL=ON (CMake) adds -spm_coreg/-spm_deface, which link SPM's spm_coreg module from the
 niimath_gpl submodule (src/GPL). That module is GNU GPL-2 or later, so a binary built that way
-is a combined copyleft work: distribute it under the GPL-2-or-later terms in src/GPL/LICENSE.
+is a combined copyleft work: distribute it under the GPL-2-or-later terms in src/GPL/LICENSE (GPL-3
+when N4 is also compiled in; see above).
 Its version string ends in " GPL" rather than " BSD". The default binary contains none of that
 code. (A third command, -bandpass, briefly rode the same switch on Exstrom Laboratories' LGPL-3
 bw.c; it was retired and that file deleted, so niimath contains no LGPL code.)

@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "1.4.20260926",
+  "version": "1.4.20260928",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -39,7 +39,7 @@
     "brain"
   ],
   "author": "NiiVue developers",
-  "license": "BSD-2-Clause",
+  "license": "BSD-2-Clause AND Apache-2.0",
   "description": "A javascript library to easily use the WASM build of Chris Rorden's niimath command line program written in C",
   "files": [
     "dist/",

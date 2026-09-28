@@ -209,7 +209,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8) + bytes(seg_values))
     result = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(out)],
+        ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(out)],
     )
     require_success(result, "anatomical QC")
     rows = out.read_text(encoding="utf-8").splitlines()
@@ -223,7 +223,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     # --json: the same metrics flat at the top level, counts as ints, plus geometry and provenance.
     json_out = tmp / "qc.json"
     require_success(
-        run_niimath(exe, ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--json", str(json_out)]),
+        run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--json", str(json_out)]),
         "anatomical QC --json",
     )
     report = json.loads(json_out.read_text(encoding="utf-8"))
@@ -236,6 +236,16 @@ def exercise_qc(exe: str, tmp: Path) -> None:
         raise AssertionError("--json counts/geometry wrong")
     if report["provenance"]["csf_labels"] != [1] or report["provenance"]["wm_labels"] != [3]:
         raise AssertionError("--json provenance label sets wrong")
+    # Default (no --raw): MRIQC clip + harmonize put the eroded-WM median at 1000; the stats
+    # here use the whole slab, so allow 1 %.
+    mriqc_out = tmp / "qc_mriqc.json"
+    require_success(run_niimath(exe, ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "0", "--json", str(mriqc_out)]),
+                    "anatomical QC MRIQC intensities")
+    mriqc = json.loads(mriqc_out.read_text(encoding="utf-8"))
+    if abs(mriqc["summary_wm_median"] - 1000.0) > 10.0:
+        raise AssertionError(f"QC harmonized summary_wm_median {mriqc['summary_wm_median']}, expected ~1000")
+    if "clip" not in mriqc["provenance"]["intensity"] or report["provenance"]["intensity"] != "raw":
+        raise AssertionError("--json provenance intensity wrong")
 
     stats = {name: qc_stats(data) for name, data in tissues.items()}
     delta = abs(stats["wm"]["median"] - stats["gm"]["median"])
@@ -263,7 +273,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     for name, value in expected.items():
         assert_close(observed[name], value, f"QC {name}")
 
-    # Exercise the DEFAULT six-neighbour erosion path (the run above uses --erode 0).
+    # Exercise the opt-in six-neighbour erosion path (the run above uses --erode 0).
     # Each tissue is a full 4-wide x-slab, so erosion keeps only its interior:
     # x in {1,2}/{5,6}/{9,10} and y,z in [1,10] -> exactly 2*10*10 = 200 voxels.
     # ICV fractions and mm3 volumes must still use the RAW 4*12*12 = 576 counts,
@@ -271,7 +281,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     eroded_out = tmp / "qc_erode.tsv"
     eroded_run = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(eroded_out)],
+        ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(eroded_out)],
     )
     require_success(eroded_run, "anatomical QC (erode)")
     erows = eroded_out.read_text(encoding="utf-8").splitlines()
@@ -291,13 +301,13 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     meter_seg = tmp / "qc_seg_meter.nii"
     meter_seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8, xyz_units=1, scale=0.001) + bytes(seg_values))
     require_success(
-        run_niimath(exe, ["--qc", str(t1), "--seg", str(meter_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "meter.tsv")]),
+        run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(meter_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "meter.tsv")]),
         "anatomical QC (mm image + same-grid metre segmentation)",
     )
     # ...but a genuine 5 mm shift expressed in metres (0.005 m) must still be REJECTED.
     meter_shift = tmp / "qc_seg_meter_shift.nii"
     meter_shift.write_bytes(nifti_header(dims, datatype=2, bitpix=8, offset=(0.005, 0.0, 0.0), xyz_units=1, scale=0.001) + bytes(seg_values))
-    shifted_meter = run_niimath(exe, ["--qc", str(t1), "--seg", str(meter_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "meter_shift.tsv")])
+    shifted_meter = run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(meter_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "meter_shift.tsv")])
     if shifted_meter.returncode == 0 or "spatial grid differs" not in (shifted_meter.stdout + shifted_meter.stderr):
         raise AssertionError("QC should reject a 5 mm shift expressed in metre units")
 
@@ -305,12 +315,12 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     micron_seg = tmp / "qc_seg_micron.nii"
     micron_seg.write_bytes(nifti_header(dims, datatype=2, bitpix=8, xyz_units=3, scale=1000.0) + bytes(seg_values))
     require_success(
-        run_niimath(exe, ["--qc", str(t1), "--seg", str(micron_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "micron.tsv")]),
+        run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(micron_seg), "--csf", "1", "--wm", "3", "--erode", "0", "--out", str(tmp / "micron.tsv")]),
         "anatomical QC (mm image + same-grid micron segmentation)",
     )
     micron_shift = tmp / "qc_seg_micron_shift.nii"
     micron_shift.write_bytes(nifti_header(dims, datatype=2, bitpix=8, offset=(5000.0, 0.0, 0.0), xyz_units=3, scale=1000.0) + bytes(seg_values))
-    shifted_micron = run_niimath(exe, ["--qc", str(t1), "--seg", str(micron_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "micron_shift.tsv")])
+    shifted_micron = run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(micron_shift), "--csf", "1", "--wm", "3", "--out", str(tmp / "micron_shift.tsv")])
     if shifted_micron.returncode == 0 or "spatial grid differs" not in (shifted_micron.stdout + shifted_micron.stderr):
         raise AssertionError("QC should reject a 5 mm shift expressed in micron units")
 
@@ -323,7 +333,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     big_t1.write_bytes(nifti_header(big_dims, datatype=16, bitpix=32) + struct.pack("<f", 100.0) * nbig)
     big_seg.write_bytes(nifti_header(big_dims, datatype=2, bitpix=8) + b"\x03" * nbig)
     require_success(
-        run_niimath(exe, ["--qc", str(big_t1), "--seg", str(big_seg), "--csf", "3", "--wm", "1", "--erode", "0", "--out", str(tmp / "big.tsv")]),
+        run_niimath(exe, ["--qc", "--raw", str(big_t1), "--seg", str(big_seg), "--csf", "3", "--wm", "1", "--erode", "0", "--out", str(tmp / "big.tsv")]),
         "anatomical QC (large exact count)",
     )
     big_rows = (tmp / "big.tsv").read_text(encoding="utf-8").splitlines()
@@ -342,7 +352,7 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     fb_seg = tmp / "qc_fb_seg.nii"
     fb_t1.write_bytes(nifti_header(fdims, datatype=16, bitpix=32) + b"".join(struct.pack("<f", 40.0 + (i % 7)) for i in range(fdims[0] * fdims[1] * fdims[2])))
     fb_seg.write_bytes(nifti_header(fdims, datatype=2, bitpix=8) + fseg_vals)
-    fb = run_niimath(exe, ["--qc", str(fb_t1), "--seg", str(fb_seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(tmp / "fb.tsv")])
+    fb = run_niimath(exe, ["--qc", "--raw", str(fb_t1), "--seg", str(fb_seg), "--csf", "1", "--wm", "3", "--erode", "1", "--out", str(tmp / "fb.tsv")])
     require_success(fb, "anatomical QC (erosion fallback)")
     if "using un-eroded mask" not in (fb.stdout + fb.stderr):
         raise AssertionError("QC should report the erosion fallback for a fully-eroded thin tissue")
@@ -350,13 +360,25 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     if fb_n != "128":
         raise AssertionError(f"erosion fallback: summary_csf_n should be the raw 128, saw {fb_n!r}")
 
+    # --mask: unlabeled voxels inside the brain mask count as CSF (MRIQC's extra-cerebral CSF).
+    # Clear the x == 7 WM face to label 0 under an all-ones mask: CSF grows from 128 to 128 + 64.
+    mk_seg, mk_mask = tmp / "qc_mk_seg.nii", tmp / "qc_mk_mask.nii"
+    mk_seg.write_bytes(nifti_header(fdims, datatype=2, bitpix=8) + bytes(0 if i % fdims[0] == 7 else v for i, v in enumerate(fseg_vals)))
+    mk_mask.write_bytes(nifti_header(fdims, datatype=2, bitpix=8) + bytes([1]) * len(fseg_vals))
+    mk = run_niimath(exe, ["--qc", "--raw", str(fb_t1), "--seg", str(mk_seg), "--csf", "1", "--wm", "3", "--mask", str(mk_mask), "--out", str(tmp / "mk.tsv")])
+    require_success(mk, "anatomical QC (--mask)")
+    mk_rows = (tmp / "mk.tsv").read_text().splitlines()
+    mk_n = dict(zip(mk_rows[0].split("\t"), mk_rows[1].split("\t")))["summary_csf_n"]
+    if mk_n != "192":
+        raise AssertionError(f"--mask: summary_csf_n should be 128 + 64 masked background, saw {mk_n!r}")
+
     shifted_seg = tmp / "qc_seg_shifted.nii"
     shifted_seg.write_bytes(
         nifti_header(dims, datatype=2, bitpix=8, offset=(0.0, 1.0, 0.0)) + bytes(seg_values)
     )
     shifted = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(shifted_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "shifted.tsv")],
+        ["--qc", "--raw", str(t1), "--seg", str(shifted_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "shifted.tsv")],
     )
     if shifted.returncode == 0 or "spatial grid differs" not in (shifted.stdout + shifted.stderr):
         raise AssertionError("QC should reject a segmentation translated along the y axis")
@@ -367,14 +389,14 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     write_float32_nifti(fractional_seg, dims, fractional)
     invalid = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(fractional_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "invalid.tsv")],
+        ["--qc", "--raw", str(t1), "--seg", str(fractional_seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "invalid.tsv")],
     )
     if invalid.returncode == 0 or "integer labels" not in (invalid.stdout + invalid.stderr):
         raise AssertionError("QC should reject a non-integer segmentation")
 
     overlap = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "1", "--out", str(tmp / "overlap.tsv")],
+        ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "1", "--out", str(tmp / "overlap.tsv")],
     )
     if overlap.returncode == 0 or "both CSF and WM" not in (overlap.stdout + overlap.stderr):
         raise AssertionError("QC should reject overlapping tissue label sets")
@@ -385,14 +407,14 @@ def exercise_qc(exe: str, tmp: Path) -> None:
     write_float32_nifti(nonfinite_t1, dims, with_nan)
     invalid = run_niimath(
         exe,
-        ["--qc", str(nonfinite_t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "nan.tsv")],
+        ["--qc", "--raw", str(nonfinite_t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "nan.tsv")],
     )
     if invalid.returncode == 0 or "non-finite" not in (invalid.stdout + invalid.stderr):
         raise AssertionError("QC should reject a non-finite T1")
 
     unwritable = run_niimath(
         exe,
-        ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "missing" / "qc.tsv")],
+        ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3", "--out", str(tmp / "missing" / "qc.tsv")],
     )
     if unwritable.returncode == 0 or "cannot open output" not in (unwritable.stdout + unwritable.stderr):
         raise AssertionError("QC should propagate an output-open failure")
@@ -433,9 +455,9 @@ def exercise_qc_pve(exe: str, tmp: Path) -> None:
     # 1. 0/1 fractions reproduce the hard-label path (--erode 0) exactly.
     binary = maps([[float(label == t) for label in labels] for t in (1, 2, 3)], "bin")
     hard, soft = tmp / "pve_hard.json", tmp / "pve_bin.json"
-    require_success(run_niimath(exe, ["--qc", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3",
+    require_success(run_niimath(exe, ["--qc", "--raw", str(t1), "--seg", str(seg), "--csf", "1", "--wm", "3",
                                       "--erode", "0", "--json", str(hard)]), "QC --seg for --pve parity")
-    require_success(run_niimath(exe, ["--qc", str(t1), "--pve", *binary, "--json", str(soft)]), "QC --pve binary")
+    require_success(run_niimath(exe, ["--qc", "--raw", str(t1), "--pve", *binary, "--json", str(soft)]), "QC --pve binary")
     hard_report = json.loads(hard.read_text(encoding="utf-8"))
     soft_report = json.loads(soft.read_text(encoding="utf-8"))
     if soft_report["provenance"].get("pve") is not True:
@@ -449,7 +471,7 @@ def exercise_qc_pve(exe: str, tmp: Path) -> None:
     gm = [0.5 if x == 4 else 1.0 if x < 8 and x > 4 else 0.0 for x in xs]
     wm = [1.0 if x >= 8 else 0.0 for x in xs]
     out = tmp / "pve_soft.json"
-    require_success(run_niimath(exe, ["--qc", str(t1), "--pve", *maps([csf, gm, wm], "soft"), "--json", str(out)]),
+    require_success(run_niimath(exe, ["--qc", "--raw", str(t1), "--pve", *maps([csf, gm, wm], "soft"), "--json", str(out)]),
                     "QC --pve soft")
     report = json.loads(out.read_text(encoding="utf-8"))
     total = sum(csf) + sum(gm) + sum(wm)
@@ -471,7 +493,7 @@ def exercise_qc_pve(exe: str, tmp: Path) -> None:
                      f"QC --pve summary_{name}_mad")
 
     # 3. --pve replaces the label options.
-    mixed = run_niimath(exe, ["--qc", str(t1), "--pve", *binary, "--seg", str(seg), "--out", str(tmp / "mixed.tsv")])
+    mixed = run_niimath(exe, ["--qc", "--raw", str(t1), "--pve", *binary, "--seg", str(seg), "--out", str(tmp / "mixed.tsv")])
     if mixed.returncode == 0 or "--pve replaces" not in (mixed.stdout + mixed.stderr):
         raise AssertionError("--pve with --seg should be rejected")
 
@@ -2836,6 +2858,77 @@ def exercise_allineate(exe: str, tmp: Path, help_text: str) -> None:
         raise AssertionError("-unifize -GM output identical to plain -unifize (GM scaling not applied)")
 
 
+def exercise_n4(exe: str, tmp: Path, help_text: str) -> None:
+    """-n4: recover a KNOWN multiplicative bias field from a synthetic object, plus the contracts.
+
+    The phantom is a piecewise-constant ellipsoid (so a flat image is the right answer) times
+    exp(0.3 x + 0.2 z) on normalised coordinates. Parity with ANTs itself is measured out of tree
+    (n4_bench, plan_n4.md); here the checks are closed-form: the -field output must match the true
+    field up to N4's arbitrary global scale, the within-object spread must collapse, the result
+    must not depend on -p, and malformed options and inputs must be refused.
+    """
+    if "-n4" not in help_text or "NOT in this build" in _help_line(help_text, "-n4"):
+        print("  -n4: not built (N4=0) - skipping")
+        return
+    nx, ny, nz = 28, 32, 24
+    img, wgt, logf = [], [], []
+    for z in range(nz):
+        for y in range(ny):
+            for x in range(nx):
+                u, v, w = (x - 13.5) / 12.0, (y - 15.5) / 14.0, (z - 11.5) / 10.0
+                r = u * u + v * v + w * w
+                inside = r < 1.0
+                truth = 0.3 * u + 0.2 * w
+                base = 100.0 if r < 0.35 else 70.0 if inside else 0.0
+                img.append(base * math.exp(truth))
+                wgt.append(1.0 if inside else 0.0)
+                logf.append(truth)
+    src, weight = tmp / "n4_in.nii", tmp / "n4_weight.nii"
+    write_float32_nifti(src, (nx, ny, nz), img, scale=4.0)
+    write_float32_nifti(weight, (nx, ny, nz), wgt, scale=4.0)
+    outs = {}
+    for p in ("1", "4"):
+        out, field = tmp / f"n4_out_p{p}.nii", tmp / f"n4_field_p{p}.nii"
+        require_success(run_niimath(exe, [str(src), "-p", p, "-gz", "0", "-n4", "-weight", str(weight), "-shrink", "1",
+                                          "-iter", "20x20", "-field", str(field), str(out)]), f"-n4 -p {p}")
+        outs[p] = (out.read_bytes(), field.read_bytes())
+    if outs["1"] != outs["4"]:
+        raise AssertionError("-n4: output or -field differs between -p 1 and -p 4 (must be thread-count invariant)")
+    corrected, field = read_float32_nifti(tmp / "n4_out_p1.nii"), read_float32_nifti(tmp / "n4_field_p1.nii")
+    inside = [i for i, w in enumerate(wgt) if w > 0]
+    est = [math.log(field[i]) for i in inside]
+    truth_vals = [logf[i] for i in inside]
+    me, mt = sum(est) / len(est), sum(truth_vals) / len(truth_vals)
+    cov = sum((a - me) * (b - mt) for a, b in zip(est, truth_vals))
+    corr = cov / math.sqrt(sum((a - me) ** 2 for a in est) * sum((b - mt) ** 2 for b in truth_vals))
+    if corr < 0.98:
+        raise AssertionError(f"-n4: recovered log field correlates {corr:.4f} with the true field (want >= 0.98)")
+
+    def cv(vals: list[float]) -> float:
+        m = sum(vals) / len(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals)) / m
+
+    core = [i for i in inside if img[i] > 0 and abs(math.log(img[i]) - logf[i] - math.log(100.0)) < 1e-6]
+    before, after = cv([img[i] for i in core]), cv([corrected[i] for i in core])
+    if not after < 0.25 * before:
+        raise AssertionError(f"-n4: bright-core CV {before:.4f} -> {after:.4f}; the bias was not removed")
+    # contracts: each must fail cleanly
+    write_float32_nifti(tmp / "n4_4d.nii", (4, 4, 4), [1.0] * 128, nt=2)
+    write_float32_nifti(tmp / "n4_small.nii", (nx - 1, ny, nz), [1.0] * ((nx - 1) * ny * nz), scale=4.0)
+    bad = [
+        ([str(tmp / "n4_4d.nii"), "-n4", str(tmp / "o.nii")], "a 4D input"),
+        ([str(src), "-n4", "-shrink", "0", str(tmp / "o.nii")], "-shrink 0"),
+        ([str(src), "-n4", "-iter", "5xq", str(tmp / "o.nii")], "a malformed -iter"),
+        ([str(src), "-n4", "-bspline", "-3", str(tmp / "o.nii")], "a negative -bspline"),
+        ([str(src), "-n4", "-weight", str(tmp / "n4_small.nii"), str(tmp / "o.nii")], "a -weight on another grid"),
+        ([str(src), "-n4", "-mask"], "an option in the output-name position"),
+    ]
+    for args, what in bad:
+        if run_niimath(exe, args).returncode == 0:
+            raise AssertionError(f"-n4 accepted {what}")
+    print(f"  -n4: field r={corr:.4f}, core CV {before:.4f} -> {after:.4f}, -p invariant, {len(bad)} rejections OK")
+
+
 def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     """-moco: analytic property check on a synthetic series with a KNOWN integer shift.
 
@@ -4676,6 +4769,7 @@ def main() -> int:
         exercise_romeo(exe, tmp, help_text)
         exercise_medic(exe, tmp, help_text)
         exercise_moco(exe, tmp, help_text)
+        exercise_n4(exe, tmp, help_text)
         exercise_stc(exe, tmp, help_text)
         exercise_fmap(exe, tmp, help_text)
         exercise_medic_regressions(exe, tmp, help_text)

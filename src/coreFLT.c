@@ -96,6 +96,9 @@
 #ifdef HAVE_MOCO
 #include "moco.h" // rigid-body motion correction (-moco)
 #endif
+#ifdef HAVE_N4
+#include "n4/n4.h" // N4 bias-field correction (-n4; Apache-2.0, see n4/NOTICE)
+#endif
 #ifdef HAVE_STC
 #include "stc.h" // slice-time correction (-stc)
 #endif
@@ -6464,6 +6467,177 @@ staticx int nifti_unifize(nifti_image *nim, int do_gm) {
 #endif
 }
 
+#ifdef HAVE_N4
+// A -mask/-weight image for -n4: same voxel grid as the input, returned as float32 voxels.
+static float *n4_read_aux(const char *fn, const nifti_image *nim, const char *what) {
+	nifti_image *im = nifti_image_read(fn, 1);
+	if (!im) {
+		printfx("-n4: failed to read %s image '%s'\n", what, fn);
+		return NULL;
+	}
+	float *out = NULL;
+	if (im->nx != nim->nx || im->ny != nim->ny || im->nz != nim->nz || im->nvox != (size_t)im->nx * im->ny * im->nz) {
+		printfx("-n4: %s image '%s' must be a 3D image on the input's grid (%lldx%lldx%lld)\n", what, fn,
+		        (long long)nim->nx, (long long)nim->ny, (long long)nim->nz);
+	} else if (!(max_displacement_mm(im, (nifti_image *)nim) <= 0.001f)) { // same gate as --qc and -moco
+		printfx("-n4: %s image '%s' has a different voxel-to-world transform; reslice it onto the input first\n", what, fn);
+	} else {
+		in_hdr ihdr = set_input_hdr(im);
+		if ((im->datatype == DT_FLOAT32 && (im->scl_slope == 0.0f || im->scl_slope == 1.0f) && im->scl_inter == 0.0f) ||
+		    !nifti_image_change_datatype(im, DT_FLOAT32, &ihdr)) {
+			out = (float *)im->data;
+			im->data = NULL; // keep the voxels, free the header
+		} else
+			printfx("-n4: failed to convert %s image '%s' to float32\n", what, fn);
+	}
+	nifti_image_free(im);
+	return out;
+}
+
+// "50x50x30" -> up to max positive integers; returns the count, 0 if malformed.
+static int n4_parse_list(const char *s, int *v, int max) {
+	int n = 0;
+	while (*s && n < max) {
+		char *end;
+		long x = strtol(s, &end, 10);
+		if (end == s || x < 0 || x > 100000) return 0;
+		v[n++] = (int)x;
+		if (*end == 'x' && end[1]) end++; // "50x" (trailing x) is malformed
+		else if (*end) return 0;
+		s = end;
+	}
+	return *s ? 0 : n;
+}
+
+static int n4_is_opt(const char *a) {
+	static const char *opts[] = {"-mask", "-weight", "-shrink", "-iter", "-convergence", "-bspline",
+	                             "-bins", "-fwhm", "-wiener", "-rescale", "-field", NULL};
+	for (int o = 0; opts[o]; o++)
+		if (!strcmp(a, opts[o])) return 1;
+	return 0;
+}
+
+// -n4 [options]: N4 bias-field correction of a 3D image (n4/, an Apache-2.0 port of ITK/ANTs N4).
+staticx int nifti_n4_wrap(nifti_image *nim, int *pac, int argc, char *argv[], const char *fout, gzModes gzMode) {
+	int ac = *pac, rc = 1;
+	const char *fmask = NULL, *fweight = NULL, *ffield = NULL;
+	N4Params p;
+	n4_default_params(&p);
+	while (ac < argc && n4_is_opt(argv[ac])) {
+		if (ac + 1 >= argc) {
+			printfx("-n4 %s requires a value\n", argv[ac]);
+			return 1;
+		}
+		const char *o = argv[ac], *v = argv[ac + 1];
+		char *end = NULL;
+		int bad = 0;
+		if (!strcmp(o, "-mask")) fmask = v;
+		else if (!strcmp(o, "-weight")) fweight = v;
+		else if (!strcmp(o, "-field")) ffield = v;
+		else if (!strcmp(o, "-shrink")) bad = n4_parse_list(v, &p.shrink, 1) != 1 || p.shrink < 1;
+		else if (!strcmp(o, "-bins")) bad = n4_parse_list(v, &p.bins, 1) != 1 || p.bins < 2;
+		else if (!strcmp(o, "-rescale")) bad = n4_parse_list(v, &p.rescale, 1) != 1 || p.rescale > 1;
+		else if (!strcmp(o, "-iter")) {
+			p.levels = n4_parse_list(v, p.iterations, N4_MAX_LEVELS);
+			bad = p.levels < 1;
+		} else if (!strcmp(o, "-bspline")) {
+			int mesh[3];
+			if (strchr(v, 'x')) { // mesh resolution per axis (ANTs -b AxBxC)
+				bad = n4_parse_list(v, mesh, 3) != 3 || !mesh[0] || !mesh[1] || !mesh[2];
+				for (int d = 0; d < 3 && !bad; d++) p.control_points[d] = mesh[d] + N4_SPLINE_ORDER;
+			} else { // knot spacing in mm (ANTs -b d)
+				p.spline_distance = strtod(v, &end);
+				bad = *end || !(p.spline_distance > 0.0);
+			}
+		} else {
+			double x = strtod(v, &end);
+			bad = *end || !isfinite((float)x) || x < 0.0; // N4 uses these as float, as ITK does
+			if (!strcmp(o, "-convergence")) p.convergence = x;
+			else if (!strcmp(o, "-fwhm")) { p.fwhm = x; bad |= !((float)x > 0.0f); }
+			else p.wiener = x;
+		}
+		if (bad) {
+			printfx("-n4 %s: invalid value '%s'\n", o, v);
+			return 1;
+		}
+		ac += 2;
+	}
+	// argv[argc] is the output name: an option there would silently become the filename (the peek rule)
+	if (ac == argc && n4_is_opt(argv[argc])) {
+		printfx("-n4: '%s' is in the output-name position; it is an option, not a filename\n", argv[argc]);
+		return 1;
+	}
+	*pac = ac - 1; // the op loop advances past the last consumed argument
+	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
+	size_t nvox = (size_t)nx * ny * nz;
+	if (nim->nvox != nvox) {
+		printfx("-n4: only 3D images are supported\n");
+		return 1;
+	}
+	float *data = NULL, *weight = NULL, *maskf = NULL, *field = NULL;
+	uint8_t *mask = NULL;
+#ifdef DT32
+	data = (float *)nim->data;
+#else
+	data = (float *)malloc(nvox * sizeof(float));
+	if (!data) return 1;
+	for (size_t i = 0; i < nvox; i++) data[i] = (float)((double *)nim->data)[i];
+#endif
+	for (size_t i = 0; i < nvox; i++)
+		if (!isfinite(data[i])) {
+			printfx("-n4: the input has a non-finite value at voxel %zu\n", i);
+			goto done;
+		}
+	if (fweight) {
+		if (!(weight = n4_read_aux(fweight, nim, "-weight"))) goto done;
+		for (size_t i = 0; i < nvox; i++)
+			if (!isfinite(weight[i])) {
+				printfx("-n4: -weight has a non-finite value at voxel %zu\n", i);
+				goto done;
+			}
+	}
+	if (fmask) {
+		if (!(maskf = n4_read_aux(fmask, nim, "-mask")) || !(mask = (uint8_t *)malloc(nvox))) goto done;
+		for (size_t i = 0; i < nvox; i++) mask[i] = maskf[i] != 0.0f;
+	}
+	if (ffield && !(field = (float *)malloc(nvox * sizeof(float)))) goto done;
+	if (n4_correct(data, mask, weight, nx, ny, nz, nim->dx, nim->dy, nim->dz, &p, field)) goto done;
+#ifndef DT32
+	for (size_t i = 0; i < nvox; i++) ((double *)nim->data)[i] = data[i];
+#endif
+	if (ffield) { // ANTs' bias-field output: exp(log field), written on the input's header
+		void *saved = nim->data;
+#ifdef DT32
+		for (size_t i = 0; i < nvox; i++) field[i] = expf(field[i]);
+		nim->data = field;
+#else
+		double *fd = (double *)malloc(nvox * sizeof(double));
+		if (!fd) goto done;
+		for (size_t i = 0; i < nvox; i++) fd[i] = exp(field[i]);
+		nim->data = fd;
+#endif
+		// check=0: overwrite like the main output; the restore below must not fail or fname is left NULL
+		int bad = nifti_set_filenames(nim, ffield, 0, 1) || nifti_save(nim, "", gzMode);
+#ifndef DT32
+		free(nim->data);
+#endif
+		nim->data = saved;
+		nifti_set_filenames(nim, fout, 0, 1);
+		if (bad) {
+			printfx("-n4: failed to write -field '%s'\n", ffield);
+			goto done;
+		}
+	}
+	rc = 0;
+done:
+#ifndef DT32
+	free(data);
+#endif
+	free(weight); free(maskf); free(mask); free(field);
+	return rc;
+}
+#endif // HAVE_N4
+
 #ifdef HAVE_ALLINEATE
 #ifdef DT32
 /* (al_nim_deep_copy removed: -master now estimates the affine once via
@@ -8590,6 +8764,14 @@ int main64(int argc, char *argv[]) {
 			int do_gm = 0;   /* optional trailing '-GM' (AFNI 3dUnifize): gray-matter global scaling */
 			if ((ac + 1) < argc && !strcmp(argv[ac + 1], "-GM")) { do_gm = 1; ac++; }
 			ok = nifti_unifize(nim, do_gm);
+		} else if (!strcmp(argv[ac], "-n4")) {
+#ifdef HAVE_N4
+			ac++;
+			ok = nifti_n4_wrap(nim, &ac, argc, argv, fout, gzMode);
+#else
+			printfx("-n4 requires a build with N4 bias-field correction (rebuild with N4=1 or -DENABLE_N4=ON)\n");
+			goto fail;
+#endif
 		}
 #ifdef HAVE_ALLINEATE
 		else if (!strcmp(argv[ac], "-allineate")) {
@@ -8873,7 +9055,7 @@ int main64(int argc, char *argv[]) {
 				ok = 1;
 			else {
 				ok = nifti_save(nim, "", gzMode); // propagate a failed intermediate -save
-				nifti_set_filenames(nim, fout, 1, 1);
+				nifti_set_filenames(nim, fout, 0, 1); // check=0: fout was validated at startup; a failed restore leaves fname NULL
 			}
 		} else if (!strcmp(argv[ac], "-restart")) {
 			ac++;

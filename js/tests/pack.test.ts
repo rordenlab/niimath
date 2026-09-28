@@ -35,7 +35,7 @@ describe('npm tarball is BSD-only', () => {
   test('ships NO GPL binaries, exports, or license material', () => {
     const gpl = files.filter((p) => /gpl|corresponding-source/i.test(p));
     expect(gpl).toEqual([]);
-    expect(packageJson.license).toBe('BSD-2-Clause');
+    expect(packageJson.license).toBe('BSD-2-Clause AND Apache-2.0'); // Apache-2.0: the N4 port in the WASM
     expect(Object.keys(packageJson.exports)).not.toContain('./gpl');
     expect(Object.keys(packageJson.exports)).not.toContain('./niimath-gpl.js');
   });

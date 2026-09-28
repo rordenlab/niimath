@@ -73,6 +73,8 @@ const registered = await niimath.image(selectedFile).allineate(baseFile, [], wei
 ```javascript
 const report = await niimath.image(t1).qc({ seg, csf: [3, 4, 11, 12], wm: [1, 5] }, avg152T1);
 const soft = await niimath.image(t1).qc({ pve: [csf, gm, wm] }, avg152T1);
+// a brain+CSF mask (e.g. mindgrab's) counts its non-GM/WM voxels as CSF, as MRIQC does
+const masked = await niimath.image(t1).qc({ pve: [csf, gm, wm], mask: brainMask }, avg152T1);
 ```
 
 ### Use an image as an operand
