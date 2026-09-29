@@ -34,7 +34,7 @@ if not bin_path.exists():
 bin = str(bin_path)
 
 # Make the binary executable on Unix systems
-if system != "Windows" and bin_path.exists():
+if system != "Windows" and bin_path.exists() and not os.access(bin, os.X_OK):
     os.chmod(bin, os.stat(bin).st_mode | 0o111)
 
 
