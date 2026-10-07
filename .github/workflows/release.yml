@@ -21,9 +21,9 @@ jobs:
     strategy:
       fail-fast: false   # a release wants every failing leg reported, not the first one
       matrix:
-        # macos-15-intel is an intel runner, macos-14 is apple silicon. The reduced shape
+        # macos-15-intel is an intel runner, macos-15 is apple silicon. The reduced shape
         # provisions only the Linux runner rather than five runners that skip every step.
-        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15-intel", "macos-14"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15-intel", "macos-15"]' || '["ubuntu-latest"]') }}
     steps:
     - uses: actions/checkout@v4
       with: {fetch-depth: 0, submodules: false}
