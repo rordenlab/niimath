@@ -114,7 +114,7 @@ if(${BUILD_FLAVOR} STREQUAL "all")
     option(ENABLE_MOCO "Enable rigid-body motion correction (-moco)" ON)
     if(ENABLE_MOCO)
         ADD_DEFINITIONS(-DHAVE_MOCO)
-        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c)
+        set(ADDITIONAL_SRCS ${ADDITIONAL_SRCS} moco.c resample.c confounds.c)
     endif()
 
     # N4 bias-field correction (-n4, and the --qc intensity pipeline): Apache-2.0 C port of

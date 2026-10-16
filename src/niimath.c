@@ -82,7 +82,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20260926"
+#define kMTHdate "v1.0.20261016"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
@@ -355,6 +355,7 @@ int show_help( void ) {
 	printf("       -b <R> <G> <B> <A>   : background RGBA color (values 0.0-1.0)\n");
 	printf("       -N [0|1]             : use negative colormap for overlay (blue-green for negative values)\n");
 	printf("       -e                   : apply edge detection to overlay\n");
+	printf("       -E                   : draw only the overlay's boundary: voxels that differ from an in-plane neighbour (masks, label maps)\n");
 	printf("    Available color lookup tables (LUTs): gray, red, green, blue, cyan, yellow,\n");
 	printf("                                          bluegreen, redyellow, viridis, inferno, magma, plasma\n");
 	printf("    Examples:\n");
@@ -480,8 +481,33 @@ int show_help( void ) {
 	printf("                            nothing is registered and NO image is written, so the output name is the\n");
 	printf("                            parameter file itself and must end in '.1D' (niimath bold -moco -relative rel.1D);\n");
 	printf("                            written at %%12.8f\n");
+	printf("                            -estimate fits onto the reference but writes NO image: the output name is the\n");
+	printf("                            %%12.8f parameter file (niimath bold -moco -ref ref.nii -estimate hmc.1D)\n");
 	printf("                            the parameter filename must end in '.1D'\n");
 	printf("                            (degrees CCW about I-S, R-L, A-P; mm toward Superior, Left, Posterior)\n");
+	printf(" -resample <grid> [opts] <out> : one-shot cubic B-spline resampling of the series onto <grid>, written to <out>\n");
+	printf("                            (series unchanged; repeat for several spaces; the last <out> may be the output name)\n");
+	printf("                            -res <mm> isotropic voxels over the grid FOV; -hmc <p.1D> per-volume -moco -estimate rows\n");
+	printf("                            -mat <xfm.json> allineate -savemat (grid world -> input world)\n");
+	printf("                            -warp <warp.nii.gz> <aff.mat> greedy chain applied first (fixed=grid)\n");
+	printf("                            -bwarp <warp.nii.gz> greedy field in input (BOLD) world, after -mat: undistorted -> distorted\n");
+	printf("                            -vsm <map> <i|j|k> [-jacobian] voxel-shift map (input grid, voxels, signed) added along PE after motion\n");
+	printf("                            (a 4D map has one volume per frame, e.g. MEDIC, sampled in that frame's native position)\n");
+	printf(" -confounds <tsv> [opts]  : fMRIPrep desc-confounds_timeseries.tsv from the motion-corrected series (side output;\n");
+	printf("                            further operations must follow): -tr <s> -hmc <p.1D> -ref <boldref> -brain <mask>\n");
+	printf("                            [-dummy <n>] [-anat <csf> <wm> <csf+wm> <t1mask> <xfm.json>] [-vsm <map> <axis> [-jacobian]] [-bwarp <warp>]\n");
+	printf("                            [-tsnr <map> <json>]: also write a tSNR map (mean / residual SD after intercept, Legendre trends\n");
+	printf("                            to degree 1+floor(duration/150 s) and 6 motion parameters; dummies dropped) and its brain median\n");
+	printf(" -optcom <te_ms,..> <e2> [<e3>..] : T2*-weighted multi-echo combination; the input is echo 1, the later echoes follow\n");
+	printf("                            (log-linear T2* fit of the echoes' time means, weights TE*exp(-TE/T2*), as tedana t2smap)\n");
+	printf(" -frisgo <spline|simple|runwise|lpass width> : fuzzy-ripple correction for dual-polarity 3D EPI (LAYNII LN2_FRISGO port)\n");
+	printf("                            spline: cubic between volumes, output moves -TR/2; simple: 1/4,1/2,1/4 smoothing;\n");
+	printf("                            runwise / lpass <sigma vols>: remove the voxel's mean / slowly varying odd-even alternation (no shift)\n");
+	printf(" -mp2rage <inv1> <inv2> <factor> : denoised MP2RAGE UNI (O'Brien 2014 robust combination); the input is the 0..4095 UNI,\n");
+	printf("                            beta = (factor * mean INV2 on the outer shell)^2; output on the UNI scale\n");
+	printf(" -boldref <ref> <json>    : fMRIPrep BOLD reference: detect non-steady-state volumes (written to <json>),\n");
+	printf("                            median of their drift-normalised, motion-corrected copies to <ref>; the series\n");
+	printf("                            is unchanged, so chain on: niimath bold -boldref ref nss.json -moco -ref ref.nii -estimate hmc.1D\n");
 #else
 	printf(" -moco [opts]             : motion correction — NOT in this build (rebuild with MOCO=1 or -DENABLE_MOCO=ON)\n");
 #endif

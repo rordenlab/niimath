@@ -95,6 +95,8 @@
 #endif
 #ifdef HAVE_MOCO
 #include "moco.h" // rigid-body motion correction (-moco)
+#include "resample.h" // one-shot resampling (-resample)
+#include "confounds.h" // fMRIPrep confounds (-confounds)
 #endif
 #ifdef HAVE_N4
 #include "n4/n4.h" // N4 bias-field correction (-n4; Apache-2.0, see n4/NOTICE)
@@ -6467,6 +6469,16 @@ staticx int nifti_unifize(nifti_image *nim, int do_gm) {
 #endif
 }
 
+/* argv[argc] is the output name (op-loop gotcha): a sub-option there would silently become the file name */
+staticx int subopt_as_output(const char *op, const char *name, const char *const *opts) {
+	for (; *opts; opts++)
+		if (!strcmp(name, *opts)) {
+			printfx("%s: '%s' is in the output-name position; it is an option, not a filename\n", op, name);
+			return 1;
+		}
+	return 0;
+}
+
 #ifdef HAVE_N4
 // A -mask/-weight image for -n4: same voxel grid as the input, returned as float32 voxels.
 static float *n4_read_aux(const char *fn, const nifti_image *nim, const char *what) {
@@ -6509,11 +6521,12 @@ static int n4_parse_list(const char *s, int *v, int max) {
 	return *s ? 0 : n;
 }
 
+static const char *const n4_opts[] = {"-mask", "-weight", "-shrink", "-iter", "-convergence", "-bspline",
+                                     "-bins", "-fwhm", "-wiener", "-rescale", "-field", NULL};
+
 static int n4_is_opt(const char *a) {
-	static const char *opts[] = {"-mask", "-weight", "-shrink", "-iter", "-convergence", "-bspline",
-	                             "-bins", "-fwhm", "-wiener", "-rescale", "-field", NULL};
-	for (int o = 0; opts[o]; o++)
-		if (!strcmp(a, opts[o])) return 1;
+	for (const char *const *o = n4_opts; *o; o++)
+		if (!strcmp(a, *o)) return 1;
 	return 0;
 }
 
@@ -6562,11 +6575,7 @@ staticx int nifti_n4_wrap(nifti_image *nim, int *pac, int argc, char *argv[], co
 		}
 		ac += 2;
 	}
-	// argv[argc] is the output name: an option there would silently become the filename (the peek rule)
-	if (ac == argc && n4_is_opt(argv[argc])) {
-		printfx("-n4: '%s' is in the output-name position; it is an option, not a filename\n", argv[argc]);
-		return 1;
-	}
+	if (ac == argc && subopt_as_output("-n4", argv[argc], n4_opts)) return 1;
 	*pac = ac - 1; // the op loop advances past the last consumed argument
 	int nx = (int)nim->nx, ny = (int)nim->ny, nz = (int)nim->nz;
 	size_t nvox = (size_t)nx * ny * nz;
@@ -6601,7 +6610,8 @@ staticx int nifti_n4_wrap(nifti_image *nim, int *pac, int argc, char *argv[], co
 		for (size_t i = 0; i < nvox; i++) mask[i] = maskf[i] != 0.0f;
 	}
 	if (ffield && !(field = (float *)malloc(nvox * sizeof(float)))) goto done;
-	if (n4_correct(data, mask, weight, nx, ny, nz, nim->dx, nim->dy, nim->dz, &p, field)) goto done;
+	float mm = (float)xyz_units_to_mm(nim->xyz_units);   // -bspline spacing is in mm
+	if (n4_correct(data, mask, weight, nx, ny, nz, nim->dx * mm, nim->dy * mm, nim->dz * mm, &p, field)) goto done;
 #ifndef DT32
 	for (size_t i = 0; i < nvox; i++) ((double *)nim->data)[i] = data[i];
 #endif
@@ -7572,6 +7582,392 @@ staticx int moco_not_1d(const char *s) {
 }
 #endif // DT32
 
+#ifdef DT32   /* float32-only helpers for -resample / -confounds */
+/* nt rows of six -moco -estimate parameters, or NULL after a diagnostic. */
+staticx double *read_hmc(const char *fn, int nt) {
+	FILE *f = fopen(fn, "r");
+	double *hmc = (double *)malloc((size_t)nt * 6 * sizeof(double));
+	int n = 0;
+	double extra;
+	if (f && hmc) {
+		while (n < nt * 6 && fscanf(f, "%lf", hmc + n) == 1 && isfinite(hmc[n])) n++;
+		if (n == nt * 6 && fscanf(f, "%lf", &extra) == 1) n++;   /* surplus rows: another run's file */
+	}
+	if (f) fclose(f);
+	if (n != nt * 6) { printfx("'%s' needs exactly %d rows of 6 finite motion parameters\n", fn, nt); free(hmc); return NULL; }
+	return hmc;
+}
+
+/* allineate -savemat "fixed_to_moving" as 16 row-major doubles. */
+staticx int read_ftm(const char *fn, double ftm[16]) {
+#ifdef HAVE_ALLINEATE
+	mat44 m;
+	if (al_read_affine_json(fn, &m)) return 1;
+	for (int i = 0; i < 16; i++) ftm[i] = m.m[i / 4][i % 4];
+	return 0;
+#else
+	(void)ftm;
+	printfx("reading '%s' requires a build with allineate\n", fn);
+	return 1;
+#endif
+}
+#endif // DT32
+
+#ifdef DT32
+/* -vsm <map> <axis>: voxel-shift map on nim's grid (voxels), axis i|j|k; NULL map after a diagnostic. */
+staticx nifti_image *read_vsm(const nifti_image *nim, const char *fn, const char *ax, int *axis) {
+	*axis = (ax[0] == 'i' || ax[0] == 'x') ? 0 : (ax[0] == 'j' || ax[0] == 'y') ? 1 : (ax[0] == 'k' || ax[0] == 'z') ? 2 : -1;
+	if (*axis < 0) { printfx("-vsm axis must be i, j or k (got '%s')\n", ax); return NULL; }
+	nifti_image *m = nii_read_float32(fn);
+	if (m && (!nii_same_grid(m, nim) || (m->nvox != m->nx * m->ny * m->nz && m->nvox != nim->nvox))) {
+		printfx("-vsm '%s' is not on the input grid (3D, or 4D with one volume per frame)\n", fn);
+		nifti_image_free(m);
+		return NULL;
+	}
+	return m;
+}
+#endif
+
+#ifdef DT32
+/* -optcom <te_ms,te_ms,..> <echo2> [<echo3> ..]: T2*-weighted multi-echo combination (Posse 1999; tedana
+   t2smap 'loglin' + 't2s' defaults). The current image is echo 1. Per voxel, T2* is the log-linear fit of the
+   echoes' time means; weights TE*exp(-TE/T2*) are fixed over time, so the echoes may be combined before
+   motion correction (they share each frame's head position and distortion). */
+staticx int nifti_optcom(nifti_image *nim, int *pac, int argc, char *argv[]) {
+	enum { MAXE = 16 };
+	int ac = *pac, ne = 0, rc = 1, badte = 0;
+	double te[MAXE];
+	if (ac < argc)
+		for (char *c = argv[ac], *e; ne < MAXE; c = e + 1) {
+			te[ne] = strtod(c, &e);
+			badte |= !(te[ne] > 0.0 && te[ne] <= DBL_MAX);
+			ne++;
+			if (*e != ',') break;
+		}
+	if (nii_reject_5d(nim, "-optcom")) return 1;
+	if (ne < 2 || badte || ac + ne > argc) {   /* the TE list plus ne-1 echoes, all before the output name */
+		printfx("-optcom requires positive finite <te_ms,te_ms,..> then one image per later echo\n");
+		return 1;
+	}
+	ac++;
+	nifti_image *ec[MAXE] = {nim};
+	for (int e = 1; e < ne; e++, ac++) {
+		ec[e] = nii_read_float32(argv[ac]);
+		if (!ec[e] || ec[e]->nvox != nim->nvox || !nii_same_grid(ec[e], nim) || nii_reject_5d(ec[e], "-optcom")) {
+			printfx("-optcom: '%s' does not match echo 1\n", argv[ac]);
+			goto done;
+		}
+	}
+	int64_t n3 = (int64_t)nim->nx * nim->ny * nim->nz, nt = nim->nvox / n3;
+	float *d[MAXE];
+	for (int e = 0; e < ne; e++) d[e] = (float *)ec[e]->data;
+#ifdef _OPENMP
+	#pragma omp parallel for
+#endif
+	for (int64_t v = 0; v < n3; v++) {
+		double sx = 0, sy = 0, sxx = 0, sxy = 0, w[MAXE], sw = 0;
+		int k = 0;
+		for (int e = 0; e < ne; e++) {
+			double m = 0;
+			for (int64_t t = 0; t < nt; t++) m += d[e][v + t * n3];
+			if (m <= 0) continue;
+			double y = log(m / nt);
+			sx += te[e]; sy += y; sxx += te[e] * te[e]; sxy += te[e] * y; k++;
+		}
+		double r2s = (k >= 2) ? -(k * sxy - sx * sy) / (k * sxx - sx * sx) : 0;
+		/* ponytail: clamp T2* to [5, 500] ms instead of tedana's adaptive echo mask */
+		r2s = fmin(fmax(r2s, 1.0 / 500), 1.0 / 5);
+		for (int e = 0; e < ne; e++) sw += (w[e] = te[e] * exp(-te[e] * r2s));
+		for (int64_t t = 0; t < nt; t++) {
+			double c = 0;
+			for (int e = 0; e < ne; e++) c += w[e] * d[e][v + t * n3];
+			d[0][v + t * n3] = (float)(c / sw);
+		}
+	}
+	rc = 0;
+done:
+	for (int e = 1; e < ne; e++)
+		if (ec[e]) nifti_image_free(ec[e]);
+	*pac = ac;
+	return rc;
+}
+#endif
+
+#ifdef DT32
+/* -mp2rage <inv1> <inv2> <factor>: denoised MP2RAGE uniform image (O'Brien 2014 robust combination, as Marques'
+   RobustCombination.m). The current image is the vendor UNI (Siemens 0..4095). INV1's sign comes from UNI: of the
+   two INV1 roots consistent with UNI and INV2, the one nearest sign(UNI)*|INV1| is kept. beta = (factor * noise)^2,
+   noise = mean INV2 on the volume's outer 8-voxel shell (air in a head FOV; Marques uses a corner block). */
+staticx int nifti_mp2rage(nifti_image *nim, int *pac, int argc, char *argv[]) {
+	int ac = *pac, rc = 1;
+	if (ac + 2 >= argc) {
+		printfx("-mp2rage requires <inv1> <inv2> <factor>\n");
+		return 1;
+	}
+	nifti_image *i1 = nii_read_float32(argv[ac]), *i2 = nii_read_float32(argv[ac + 1]);
+	double factor = atof(argv[ac + 2]);
+	*pac = ac + 3;
+	int64_t nx = nim->nx, ny = nim->ny, nz = nim->nz, n3 = nx * ny * nz, ns = 0;
+	if (!isfinite(factor) || factor < 0) {
+		printfx("-mp2rage: factor must be a finite number >= 0\n");
+		goto done;
+	}
+	if (!i1 || !i2 || i1->nvox != n3 || i2->nvox != n3 || nim->nvox != n3 || !nii_same_grid(i1, nim) || !nii_same_grid(i2, nim)) {
+		printfx("-mp2rage: UNI, INV1 and INV2 must be 3D images on one grid\n");
+		goto done;
+	}
+	const float *a = (const float *)i1->data, *b = (const float *)i2->data;
+	float *u = (float *)nim->data;
+	const int64_t e = 8;
+	double sum = 0;
+	for (int64_t z = 0; z < nz; z++)
+		for (int64_t y = 0; y < ny; y++)
+			for (int64_t x = 0; x < nx; x++)
+				if (x < e || y < e || z < e || x >= nx - e || y >= ny - e || z >= nz - e) {
+					sum += b[x + nx * (y + ny * z)];
+					ns++;
+				}
+	double noise = ns ? sum / ns : 0, beta = factor * noise * factor * noise;
+#ifdef _OPENMP
+	#pragma omp parallel for
+#endif
+	for (int64_t v = 0; v < n3; v++) {
+		double uni = u[v] / 4095.0 - 0.5, i2v = b[v], i1v = (uni < 0 ? -1.0 : 1.0) * fabs((double)a[v]);
+		if (fabs(uni) > 1e-6) {   /* uni*x^2 - i2*x + uni*i2^2 = 0 */
+			double q = sqrt(fmax(i2v * i2v - 4 * uni * uni * i2v * i2v, 0.0));
+			double rp = (i2v + q) / (2 * uni), rn = (i2v - q) / (2 * uni);
+			i1v = fabs(i1v - rp) <= fabs(i1v - rn) ? rp : rn;
+		}
+		double den = i1v * i1v + i2v * i2v + 2 * beta;
+		u[v] = (float)(4095.0 * ((den > 0 ? (i1v * i2v - beta) / den : 0.0) + 0.5));
+	}
+	printfx("-mp2rage: noise %g, beta %g\n", noise, beta);
+	rc = 0;
+done:
+	if (i1) nifti_image_free(i1);
+	if (i2) nifti_image_free(i2);
+	return rc;
+}
+#endif
+
+#ifdef DT32
+/* -frisgo <spline|simple|runwise|lpass width>: fuzzy-ripple mitigation for dual-polarity 3D EPI, whose read polarity
+   alternates every volume (port of LAYNII LN2_FRISGO, BSD-3; Huber 2021). spline/simple filter in time (spline also
+   moves each volume -TR/2, to the trigger); runwise/lpass remove only the voxel's odd/even alternation (no shift).
+   lpass width is the Gaussian sigma in volumes, as LN2_FRISGO uses its '-lpass FWHM' value; unlike LN2_FRISGO,
+   voxels whose first two volumes are equal (zero-filled background) are corrected like any other. */
+staticx int nifti_frisgo(nifti_image *nim, int *pac, int argc, char *argv[]) {
+	int ac = *pac;
+	if (ac >= argc) { printfx("-frisgo requires spline|simple|runwise|lpass <fwhm>\n"); return 1; }
+	const char *mode = argv[ac++];
+	double fwhm = 0;
+	int spline = !strcmp(mode, "spline"), simple = !strcmp(mode, "simple");
+	if (!strcmp(mode, "lpass")) {
+		if (ac >= argc || !((fwhm = atof(argv[ac++])) > 0) || !isfinite(fwhm)) { printfx("-frisgo lpass requires a width in volumes\n"); return 1; }
+	} else if (!spline && !simple && strcmp(mode, "runwise")) {
+		printfx("-frisgo: unknown mode '%s'\n", mode);
+		return 1;
+	}
+	*pac = ac;
+	if (nii_reject_5d(nim, "-frisgo")) return 1;
+	int64_t n3 = (int64_t)nim->nx * nim->ny * nim->nz, nt = nim->nvox / n3;
+	if (nt < 4) { printfx("-frisgo requires at least 4 volumes\n"); return 1; }
+	float *d = (float *)nim->data;
+	int oom = 0;
+#pragma omp parallel reduction(| : oom)
+	{
+		double *buf = (double *)malloc((size_t)nt * 3 * sizeof(double));
+		if (!buf) oom = 1;
+#pragma omp for
+		for (int64_t v = 0; v < n3; v++) {
+			if (!buf) continue;   // `continue`, never `break`: cannot branch out of a worksharing loop
+			double *x = buf, *y = buf + nt, *e = y + nt;
+			for (int64_t t = 0; t < nt; t++) x[t] = d[v + t * n3];
+			if (spline) {   /* cubic through t-2..t+1, evaluated midway between t-1 and t */
+				y[0] = 0.5 * (x[0] + x[1]);
+				y[1] = 0.5 * (x[0] + x[1]);
+				for (int64_t t = 2; t < nt - 2; t++) y[t] = 0.5625 * (x[t - 1] + x[t]) - 0.0625 * (x[t - 2] + x[t + 1]);
+				y[nt - 1] = 0.5 * (x[nt - 1] + x[nt - 2]);
+				y[nt - 2] = 0.5 * (x[nt - 2] + x[nt - 3]);
+			} else if (simple) {
+				y[0] = 0.5 * (x[0] + x[1]);
+				y[nt - 1] = 0.5 * (x[nt - 1] + x[nt - 2]);
+				for (int64_t t = 1; t < nt - 1; t++) y[t] = 0.5 * x[t] + 0.25 * (x[t - 1] + x[t + 1]);
+			} else {   /* alternating error e_t = (-1)^t (x_t - neighbour mean); remove its run mean or Gaussian average */
+				e[0] = x[0] - x[1];
+				e[nt - 1] = x[nt - 1] - x[nt - 2];
+				for (int64_t t = 1; t < nt - 1; t++) e[t] = x[t] - 0.5 * (x[t - 1] + x[t + 1]);
+				for (int64_t t = 1; t < nt; t += 2) e[t] = -e[t];
+				double mean = 0;
+				for (int64_t t = 0; t < nt; t++) mean += e[t] / nt;
+				int64_t w = (int64_t)fmin(fmax(1, 2 * fwhm), (double)nt);   /* LN2_FRISGO's window: +-2 FWHM; wider adds nothing */
+				for (int64_t t = 0; t < nt; t++) {
+					double err = mean;
+					if (fwhm > 0) {
+						double se = 0, sw = 0;
+						for (int64_t j = t - w < 0 ? 0 : t - w; j <= t + w && j < nt; j++) {
+							double g = exp(-0.5 * (j - t) * (j - t) / (fwhm * fwhm));
+							se += g * e[j]; sw += g;
+						}
+						err = se / sw;
+					}
+					y[t] = x[t] + ((t % 2) ? 0.5 : -0.5) * err;
+				}
+			}
+			for (int64_t t = 0; t < nt; t++) d[v + t * n3] = (float)y[t];
+		}
+		free(buf);
+	}
+	if (oom) { printfx("-frisgo: out of memory\n"); return 1; }
+	return 0;
+}
+#endif
+
+#ifdef DT32
+/* greedy -sv displacement field: 3 components, scaled to float32 */
+staticx nifti_image *read_warp(const char *fn) {
+	nifti_image *w = nii_read_float32(fn);
+	if (w && w->nx * w->ny * w->nz * 3 == w->nvox) return w;
+	printfx("cannot read '%s' as a 3-component warp field\n", fn);
+	if (w) nifti_image_free(w);
+	return NULL;
+}
+#endif
+
+/* -confounds <tsv> -tr s -hmc p.1D -ref boldref -brain mask [-dummy n] [-anat csf wm comb t1mask xfm.json]:
+   side output (the series is untouched), so further operations must follow. */
+staticx int nifti_confounds_wrap(nifti_image *nim, int *pac, int argc, char *argv[]) {
+#ifdef DT32
+	int ac = *pac, rc = 1;
+	int nt = (nim->ndim > 3 && nim->nt > 1) ? (int)nim->nt : 1;
+	confounds_opts o = {0};
+	double ftm[16], *hmc = NULL;
+	resample_vsm vsm = {0};
+	const char *vsmf = NULL, *vsmax = NULL;
+	if (ac >= argc) { printfx("-confounds requires <tsv> and options, followed by further operations\n"); return 1; }
+	const char *tsv = argv[ac++], *hmcf = NULL, *matf = NULL, *bwarpf = NULL;
+	while (ac < argc) {
+		if (!strcmp(argv[ac], "-tr") && ac + 1 < argc) { o.tr = atof(argv[ac + 1]); ac += 2; }
+		else if (!strcmp(argv[ac], "-dummy") && ac + 1 < argc) { o.dummy = atoi(argv[ac + 1]); ac += 2; }
+		else if (!strcmp(argv[ac], "-hmc") && ac + 1 < argc) { hmcf = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-ref") && ac + 1 < argc) { o.ref = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-brain") && ac + 1 < argc) { o.brain = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-vsm") && ac + 2 < argc) { vsmf = argv[ac + 1]; vsmax = argv[ac + 2]; ac += 3; }
+		else if (!strcmp(argv[ac], "-jacobian")) { vsm.jacobian = 1; ac++; }
+		else if (!strcmp(argv[ac], "-bwarp") && ac + 1 < argc) { bwarpf = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-tsnr") && ac + 2 < argc) { o.tsnr = argv[ac + 1]; o.tsnr_json = argv[ac + 2]; ac += 3; }
+		else if (!strcmp(argv[ac], "-anat") && ac + 5 < argc) {
+			for (int k = 0; k < 3; k++) o.acc[k] = argv[ac + 1 + k];
+			o.t1mask = argv[ac + 4];
+			matf = argv[ac + 5];
+			ac += 6;
+		} else break;
+	}
+	static const char *const subopts[] = {"-tr", "-dummy", "-hmc", "-ref", "-brain", "-vsm", "-jacobian", "-bwarp",
+	                                      "-tsnr", "-anat", NULL};
+	if (ac == argc && subopt_as_output("-confounds", argv[argc], subopts)) return 1;
+	*pac = ac;
+	if (nii_reject_5d(nim, "-confounds")) return 1;
+	if (!hmcf) { printfx("-confounds requires -hmc\n"); return 1; }
+	if (!(hmc = read_hmc(hmcf, nt))) return 1;
+	o.hmc = hmc;
+	if (matf) {
+		if (read_ftm(matf, ftm)) { free(hmc); return 1; }
+		o.ftm = ftm;
+	}
+	if (vsmf) {
+		if (!(vsm.map = read_vsm(nim, vsmf, vsmax, &vsm.axis))) { free(hmc); return 1; }
+		o.vsm = &vsm;
+	}
+	if (bwarpf && !(o.bwarp = read_warp(bwarpf))) { free(hmc); if (vsm.map) nifti_image_free((nifti_image *)vsm.map); return 1; }
+	rc = nii_confounds(nim, &o, tsv);
+	free(hmc);
+	if (vsm.map) nifti_image_free((nifti_image *)vsm.map);
+	if (o.bwarp) nifti_image_free((nifti_image *)o.bwarp);
+	return rc;
+#else
+	(void)nim; (void)pac; (void)argc; (void)argv;
+	printfx("'-dt double' does not support -confounds (float32 only)\n");
+	return 1;
+#endif
+}
+
+/* -resample <grid> [-res mm] [-hmc p.1D] [-mat xfm.json] [-warp warp.nii.gz aff.mat] <out>: side output,
+   the series is untouched.  When <out> is niimath's own trailing output name, nothing else is written. */
+staticx int nifti_resample_wrap(nifti_image *nim, int *pac, int argc, char *argv[], int *no_image_out, gzModes gzMode) {
+#ifdef DT32
+	int ac = *pac, rc = 1;
+	resample_opts o = {0};
+	double ftm[16], aff[16], *hmc = NULL;
+	nifti_image *grid = NULL, *warp = NULL, *bwarp = NULL;
+	const char *bwarpf = NULL, *hmcf = NULL, *matf = NULL, *warpf = NULL, *afff = NULL, *vsmf = NULL, *vsmax = NULL;
+	resample_vsm vsm = {0};
+	if (ac >= argc) { printfx("-resample requires <grid> ... <out>\n"); return 1; }
+	const char *gridf = argv[ac++];
+	while (ac < argc) {
+		if (!strcmp(argv[ac], "-res") && ac + 1 < argc) {
+			if (!((o.res = atof(argv[ac + 1])) > 0) || !isfinite(o.res)) { printfx("-resample: -res must be a positive size in mm\n"); return 1; }
+			ac += 2;
+		}
+		else if (!strcmp(argv[ac], "-hmc") && ac + 1 < argc) { hmcf = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-mat") && ac + 1 < argc) { matf = argv[ac + 1]; ac += 2; }
+		else if (!strcmp(argv[ac], "-warp") && ac + 2 < argc) { warpf = argv[ac + 1]; afff = argv[ac + 2]; ac += 3; }
+		else if (!strcmp(argv[ac], "-vsm") && ac + 2 < argc) { vsmf = argv[ac + 1]; vsmax = argv[ac + 2]; ac += 3; }
+		else if (!strcmp(argv[ac], "-jacobian")) { vsm.jacobian = 1; ac++; }
+		else if (!strcmp(argv[ac], "-bwarp") && ac + 1 < argc) { bwarpf = argv[ac + 1]; ac += 2; }
+		else break;
+	}
+	static const char *const subopts[] = {"-res", "-hmc", "-mat", "-warp", "-vsm", "-jacobian", "-bwarp", NULL};
+	if (ac == argc && subopt_as_output("-resample", argv[argc], subopts)) return 1;
+	const char *out = argv[ac];   /* argv[argc] is the trailing output name (op-loop gotcha) */
+	if (ac < argc && out[0] == '-') {   /* -resample can't chain: '-thr' here would become a file name */
+		printfx("-resample: expected an output name, got '%s'\n", out);
+		return 1;
+	}
+	if (ac == argc) *no_image_out = 1;
+	else ac++;
+	*pac = ac;
+	if (nii_reject_5d(nim, "-resample")) return 1;
+	int nt = (nim->ndim > 3 && nim->nt > 1) ? (int)nim->nt : 1;
+	grid = nifti_image_read(gridf, 0);
+	if (!grid) { printfx("-resample: cannot read grid '%s'\n", gridf); goto done; }
+	o.grid = grid;
+	if (hmcf) {
+		if (!(hmc = read_hmc(hmcf, nt))) goto done;
+		o.hmc = hmc;
+	}
+	if (matf) {
+		if (read_ftm(matf, ftm)) goto done;
+		o.ftm = ftm;
+	}
+	if (warpf) {
+		if (!(warp = read_warp(warpf))) goto done;
+		FILE *f = fopen(afff, "r");
+		int n = 0;
+		if (f) { while (n < 16 && fscanf(f, "%lf", aff + n) == 1 && isfinite(aff[n])) n++; fclose(f); }
+		if (n != 16) { printfx("-resample: -warp needs a 4x4 affine in '%s'\n", afff); goto done; }
+		o.warp = warp; o.aff = aff;
+	}
+	if (vsmf) {
+		if (!(vsm.map = read_vsm(nim, vsmf, vsmax, &vsm.axis))) goto done;
+		o.vsm = &vsm;
+	}
+	if (bwarpf && !(o.bwarp = bwarp = read_warp(bwarpf))) goto done;
+	rc = nii_resample(nim, &o, out, gzMode);
+done:
+	free(hmc);
+	if (vsm.map) nifti_image_free((nifti_image *)vsm.map);
+	if (grid) nifti_image_free(grid);
+	if (warp) nifti_image_free(warp);
+	if (bwarp) nifti_image_free(bwarp);
+	return rc;
+#else
+	(void)nim; (void)pac; (void)argc; (void)argv; (void)no_image_out; (void)gzMode;
+	printfx("'-dt double' does not support -resample (float32 only)\n");
+	return 1;
+#endif
+}
+
 /* -moco [-ref <n|image>] [-1Dfile <path>]: rigid-body motion correction of a 4D series.
    The optional "-ref <arg>" and "-1Dfile <path>" pairs are consumed here in either order; the
    trailing positional output name is left to niimath's normal output handling. */
@@ -7580,8 +7976,13 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 #ifdef DT32
 	int ac = *pac;
 	const char *par = NULL, *ref_file = NULL;
-	int ref_vol = 0, seen_par = 0, seen_ref = 0, rel = 0;
+	int ref_vol = 0, seen_par = 0, seen_ref = 0, rel = 0, est = 0;
 	while (ac < argc) {
+		if (!strcmp(argv[ac], "-estimate")) {
+			est = 1;
+			ac += 1;
+			continue;
+		}
 		if (!strcmp(argv[ac], "-relative")) {
 			/* A FLAG, not a path: -relative produces no image, so the trailing positional that
 			   niimath would otherwise write the corrected series to is its parameter file. */
@@ -7633,19 +8034,17 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 		}
 		break;
 	}
-	/* The loop stops at argc, and argv[argc] is the output name: a sub-option there would
-	   otherwise become the output filename and a full correction would run at exit 0 (the op-loop
-	   gotcha in AGENTS.md). Peek one past. */
-	if (ac == argc && (!strcmp(argv[argc], "-relative") || !strcmp(argv[argc], "-ref") ||
-	                   !strcmp(argv[argc], "-1Dfile"))) {
-		printfx("-moco: '%s' is in the output-name position; it is an option, not a filename\n", argv[argc]);
-		return 1;
-	}
+	static const char *const subopts[] = {"-relative", "-ref", "-1Dfile", "-estimate", NULL};
+	if (ac == argc && subopt_as_output("-moco", argv[argc], subopts)) return 1;
 	*pac = ac;
 	/* -relative registers each volume onto its PREDECESSOR, so the options that presuppose a base
 	   are rejected rather than ignored, and it must be the LAST operation: nothing is written
 	   afterwards, so a later op is wasted work and a later -save would defeat the no-image contract. */
 	if (rel) {
+		if (est) {
+			printfx("-moco -relative and -estimate are mutually exclusive (predecessor vs reference parameters)\n");
+			return 1;
+		}
 		if (ac != argc) {
 			printfx("-moco -relative writes no image, so it must be the last operation (found '%s' after it)\n", argv[ac]);
 			return 1;
@@ -7671,7 +8070,17 @@ staticx int nifti_moco_wrap(nifti_image *nim, int *pac, int argc, char *argv[],
 	}
 	/* Header-only rejection of an oversized reference, before its payload is read. */
 	if (ref_file && nii_reject_oversize_aux(ref_file, "moco reference")) return 1;
-	return nii_moco(nim, par, ref_vol, ref_file);
+	/* -estimate mirrors -relative: no image, so the trailing name is the parameter file. */
+	if (est) {
+		if (par || ac != argc || moco_not_1d(fout)) {
+			printfx("-moco -estimate must be the last operation, without -relative or -1Dfile; its output "
+			        "name is the parameter file and must end in '.1D'\n");
+			return 1;
+		}
+		*no_image_out = 1;
+		return nii_moco(nim, fout, ref_vol, ref_file, 1);
+	}
+	return nii_moco(nim, par, ref_vol, ref_file, 0);
 #else
 	(void)nim; (void)pac; (void)argc; (void)argv; (void)fout; (void)no_image_out;
 	printfx("'-dt double' does not support -moco (motion correction is float32 only)\n");
@@ -8890,6 +9299,54 @@ int main64(int argc, char *argv[]) {
 				goto fail;
 			continue; // ac already advanced past any -1Dfile pair
 		}
+		else if (!strcmp(argv[ac], "-confounds")) {
+			ac++;
+			if (nifti_confounds_wrap(nim, &ac, argc, argv))
+				goto fail;
+			continue;
+		}
+		else if (!strcmp(argv[ac], "-resample")) {
+			ac++;
+			if (nifti_resample_wrap(nim, &ac, argc, argv, &no_image_out, gzMode))
+				goto fail;
+			continue;
+		}
+#ifndef DT32
+		else if (!strcmp(argv[ac], "-frisgo") || !strcmp(argv[ac], "-mp2rage") || !strcmp(argv[ac], "-optcom") ||
+		         !strcmp(argv[ac], "-boldref")) {
+			printfx("'-dt double' does not support %s (float32 only)\n", argv[ac]);
+			goto fail;
+		}
+#else
+		else if (!strcmp(argv[ac], "-frisgo")) {
+			ac++;
+			if (nifti_frisgo(nim, &ac, argc, argv))
+				goto fail;
+			continue;
+		}
+		else if (!strcmp(argv[ac], "-mp2rage")) {
+			ac++;
+			if (nifti_mp2rage(nim, &ac, argc, argv))
+				goto fail;
+			continue;
+		}
+		else if (!strcmp(argv[ac], "-optcom")) {
+			ac++;
+			if (nifti_optcom(nim, &ac, argc, argv))
+				goto fail;
+			continue;
+		}
+		else if (!strcmp(argv[ac], "-boldref")) {
+			if (ac + 2 >= argc) {   /* both names must precede the output name (op-loop gotcha) */
+				printfx("-boldref requires <reference> <json> followed by further operations\n");
+				goto fail;
+			}
+			if (nii_boldref(nim, argv[ac + 1], argv[ac + 2], gzMode))
+				goto fail;
+			ac += 3;
+			continue;
+		}
+#endif
 #endif
 #ifdef HAVE_STC
 		else if (!strcmp(argv[ac], "-stc")) {

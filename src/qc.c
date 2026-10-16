@@ -819,6 +819,7 @@ int nii_qc(int argc, char *argv[]) {
 	if (!nt1) goto cleanup;
 	TissueStats scsf, swm, sgm;
 	int nx = (int)nt1->nx, ny = (int)nt1->ny, nz = (int)nt1->nz;
+	float mm = (float)xyz_units_to_mm(nt1->xyz_units); // N4's spacings are mm
 	int nvox3d = 0;
 	if (nii_nvox3d_int(nt1, &nvox3d) || nt1->nvox != nvox3d) {
 		printf("qc: only single 3D images of at most INT_MAX voxels are supported\n");
@@ -891,7 +892,7 @@ int nii_qc(int argc, char *argv[]) {
 				goto cleanup;
 			}
 			for (size_t i = 0; i < nvox; i++) map[i] = fwm[i] >= 0.9f ? 2 : fc[i] + fg[i] + fwm[i] > 0.0f;
-			int bad = qc_prep(t1, map, 2, nx, ny, nz, nt1->dx, nt1->dy, nt1->dz, scratch, &prep);
+			int bad = qc_prep(t1, map, 2, nx, ny, nz, nt1->dx * mm, nt1->dy * mm, nt1->dz * mm, scratch, &prep);
 			free(map);
 			if (bad) goto cleanup;
 		}
@@ -954,7 +955,7 @@ int nii_qc(int argc, char *argv[]) {
 		goto cleanup;
 	}
 
-	if (!raw && qc_prep(t1, classes, 3, nx, ny, nz, nt1->dx, nt1->dy, nt1->dz, scratch, &prep)) goto cleanup;
+	if (!raw && qc_prep(t1, classes, 3, nx, ny, nz, nt1->dx * mm, nt1->dy * mm, nt1->dz * mm, scratch, &prep)) goto cleanup;
 	qc_tissue("CSF", t1, classes, 1, nraw_csf, eroded, nvox, nx, ny, nz,
 	          do_erode, vals, scratch, &scsf);
 	qc_tissue("WM", t1, classes, 3, nraw_wm, eroded, nvox, nx, ny, nz,

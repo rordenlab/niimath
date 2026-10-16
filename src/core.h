@@ -158,9 +158,11 @@ int nii_nvox3d(const nifti_image *nim, nvox_t *out); // validates spatial+total 
 int nifti_save(nifti_image * nim, const char *postfix, gzModes gzMode);
 nifti_image *nifti_image_read2( const char *hname , int read_data );
 int * make_kernel_file(nifti_image * nim, int * nkernel,  char * fin);
-mat44 xform(nifti_image * nim);
+mat44 xform(const nifti_image * nim);
 int nifti_image_change_datatype ( nifti_image * nim, int dt , in_hdr * ihdr);
-float max_displacement_mm( nifti_image * nim,  nifti_image * nim2);
+float max_displacement_mm(const nifti_image * nim, const nifti_image * nim2);
+int nii_same_grid(const nifti_image *a, const nifti_image *b); // equal nx/ny/nz, corners within 0.001 mm
+int nii_reject_5d(const nifti_image *nim, const char *op); // prints and returns 1 if dim[0] > 4 or nu/nv/nw > 1
 double xyz_units_to_mm(int xyz_units); // NIfTI spatial-unit -> mm scale (m=1000, micron=0.001, else 1)
 vec4 setVec4(float x, float y, float z);
 vec4 nifti_vect44mat44_mul(vec4 v, mat44 m );

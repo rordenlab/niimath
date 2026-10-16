@@ -349,7 +349,7 @@ class ImageProcessor {
     this.qcReport = true;
     const report = JSON.parse(await (await this.run('qc.json')).text());
     // Name the template as the caller did, not by its internal staging name.
-    if (air) report.provenance.air_template = asFile(air).name;
+    if (air && report.provenance && 'air_template' in report.provenance) report.provenance.air_template = asFile(air).name;
     return report;
   }
 

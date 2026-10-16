@@ -90,7 +90,7 @@ MEDICFLAGS= -DHAVE_MEDIC medic.c
 #MOCO rigid-body motion correction (-moco). Clean-room implementation of Cox & Jesmanowicz
 #1999 (MRM 42:1014-1018); AFNI's 3dvolreg (MCW; GPL-2 when this was written, CC BY 4.0 since the 2026-05-12 relicense) was used only as a black-box oracle.
 #Ordinary FP, so it rides the normal source line (unlike romeo.o).
-MOCOFLAGS= -DHAVE_MOCO moco.c
+MOCOFLAGS= -DHAVE_MOCO moco.c resample.c confounds.c
 #STC slice-time correction (-stc). Clean-room implementation of AFNI 3dTshift's default Fourier
 #method; 3dTshift.c and its FFT (MCW; GPL-2 when this was written, CC BY 4.0 since the 2026-05-12 relicense) were used only as a black-box oracle. Every
 #measured convention is recorded in moco_bench's test/stc_reference_manifest.md. Ordinary FP, so it rides the
@@ -281,7 +281,7 @@ endif
 #must exist: niimath.c's help line tells an unsupported host to "rebuild with MOCO=1", and
 #without this branch that advice silently did nothing.
 ifeq "$(MOCO)" "1"
-	MOCOFLAGS= -DHAVE_MOCO moco.c
+	MOCOFLAGS= -DHAVE_MOCO moco.c resample.c confounds.c
 endif
 ifeq "$(MOCO)" "0"
 	MOCOFLAGS=
@@ -557,8 +557,10 @@ wasm_al_objs:
 # by side under separate package.json exports.
 WASM_OUT= ../js/src/niimath.js
 
+# FS and ENV let pipeline drivers stage nested paths, list side outputs and set FSLOUTPUTTYPE per call
+# (libc copies ENV in its startup constructors: set it in the module's preRun, one module per call).
 wasm: $(WASM_AL_PREREQ) $(WASM_ROMEO_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(GFILES) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(FMAP_WASM) $(N4_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(GFILES) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(FMAP_WASM) $(N4_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS", "ENV", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
 

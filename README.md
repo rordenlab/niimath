@@ -421,7 +421,7 @@ Constraints:
 - `-fmapprep` needs ROMEO. `ROMEO=0` drops `-fmapprep` and keeps `-fugue`.
 - Enabled by default. `FMAP=0 make` or `-DENABLE_FMAP=OFF` omits both commands.
 
-### `-moco [-ref <n|image>] [-1Dfile <path.1D>] [-relative]`
+### `-moco [-ref <n|image>] [-1Dfile <path.1D>] [-relative|-estimate]`
 
 Rigid-body motion correction. Registers every volume of a 4D series onto a reference and replaces the image with the corrected series. A clean-room BSD-2 implementation of the method of Cox & Jesmanowicz (*Magnetic Resonance in Medicine* 42:1014-1018, 1999), the algorithm behind AFNI `3dvolreg`. Further operations may follow.
 
@@ -431,6 +431,8 @@ niimath bold -moco -1Dfile out.1D out
 niimath bold -moco -ref 5 out
 niimath bold -moco -ref ref.nii out
 niimath bold -moco -relative rel.1D
+niimath bold -moco -ref ref.nii -estimate hmc.1D
+niimath bold -boldref ref.nii nss.json -moco -ref ref.nii -estimate hmc.1D
 ```
 
 Options, which may appear in any order:
@@ -440,6 +442,56 @@ Options, which may appear in any order:
 - An all-digit argument to `-ref` is a volume number. To name a file called `7`, write `./7`.
 - `-1Dfile <path.1D>`: also write the six motion parameters per volume. The filename must end in `.1D`. The file is compatible with AFNI's `-1Dfile`: six columns `roll pitch yaw dS dL dP`, one row per volume. Rotations are in degrees counter-clockwise about the I-S, R-L and A-P axes. Shifts are in mm toward Superior, Left and Posterior. The values record the correction that was applied, not the estimated motion.
 - `-relative`: measure each volume against the original previous volume, as a quality-control statistic. niimath registers nothing and writes no image, so the trailing output name is the parameter file itself and must end in `.1D`. `-ref` and `-1Dfile` are rejected with it, and it must be the last operation. Rows are written at `%12.8f`, so `numpy.loadtxt` reads the file. Row 0 is all zeros, because volume 0 has no predecessor. This costs about ten times the work per volume that ordinary correction does.
+- `-estimate`: fit onto the reference, but write neither a corrected series nor an image. The trailing output name is the parameter file, which must end in `.1D` and is written at `%12.8f`. Use it when a later resampler applies the motion together with other transforms. It must be the last operation, and `-relative` and `-1Dfile` are rejected with it.
+
+### Compressed output speed
+
+- `.nii.zst` output is compressed with as many zstd worker threads as `-p` allows.
+- `.nii.gz` output can use pigz (`AFNI_COMPRESSOR=PIGZ`), which also honours `-p`.
+- `NIIMATH_GZ_LEVEL=1` (default 6) trades about 7% more size for much faster gzip, and matches nibabel's default.
+
+### `-resample <grid> [-res mm] [-hmc p.1D] [-mat xfm.json] [-warp warp.nii.gz aff.mat] [-bwarp warp.nii.gz] [-vsm map axis [-jacobian]] <out>`
+
+One-shot resampling of a 3D or 4D series onto `<grid>`, for fastprep's "apply" stage. Each output voxel is pulled through the transforms in this order, then sampled once with a prefiltered cubic B-spline (the equivalent of scipy `map_coordinates` with `order=3`; 0 outside the field of view):
+
+1. An optional greedy chain (`-warp`), in greedy's `-r warp aff` order. The warp vectors are in LPS millimetres.
+2. An optional world-space pull matrix (`-mat`, the `fixed_to_moving` matrix that `-allineate -savemat` writes).
+3. An optional greedy field in the input's world (`-bwarp`). It maps undistorted to distorted positions.
+4. The input's voxel grid.
+5. An optional per-volume `-moco -estimate` row (`-hmc`).
+
+`-res` re-voxels the grid isotropically over the same field of view. `-vsm <map> <i|j|k> [-jacobian]` adds a susceptibility voxel-shift map along the phase-encoding axis after the motion step, as fMRIPrep's `resample_vol` does. The map is on the input grid, in voxels, with the sign already folded in (vsm = Hz × TotalReadoutTime, negated for a `-` direction). `-jacobian` scales the result by 1 + ∂vsm/∂axis. The map must share the input's voxel grid. `-res` must be a finite positive size. `-confounds` accepts `-vsm` and `-bwarp` too.
+
+The series itself is not changed, so you can repeat `-resample` to write several spaces from one read. If the last `<out>` is niimath's output name, nothing else is written:
+
+```
+niimath bold -stc --slicetiming @st.txt -resample T1w.nii -res 2.5 -hmc hmc.1D -mat coreg.json bold_T1w.nii.gz \
+  -resample MNI.nii -res 2.5 -hmc hmc.1D -mat coreg.json -warp warp.nii.gz aff.mat bold_MNI.nii.gz
+```
+
+### `-confounds <tsv> -tr s -hmc p.1D -ref boldref -brain mask [-dummy n] [-anat csf wm csfwm t1mask xfm.json] [-vsm map axis [-jacobian]] [-bwarp warp.nii.gz] [-tsnr map json]`
+
+Writes fMRIPrep's `desc-confounds_timeseries.tsv` from the motion-corrected series in boldref space. The series is corrected in memory, and the op is a side output, so further operations must follow it (for example `-resample`). `-tr` is in seconds and must be at most 60. The columns port nipype and fMRIPrep:
+
+- `global_signal`, `csf`, `white_matter` (each with `_derivative1`, `_power2` and `_derivative1_power2`), `csf_wm` and `tcompcor`
+- `dvars` and `std_dvars`
+- `framewise_displacement` and `rmsd`
+- `t_`, `c_`, `w_` and `a_comp_cor_XX`, and `edge_comp_XX`
+- `cosineXX` and `non_steady_state_outlierXX`
+- `trans_*` and `rot_*` in the FSL convention, each expanded the same way
+- `motion_outlierXX`
+
+On rhyming, DVARS, the tCompCor components, the cosine basis, the motion parameters, FD and RMSD agree with nipype, nitransforms and fMRIPrep's own code to 1e-7 or better. `-anat` takes T1w-space aCompCor probability maps (the GM exclusion is done by the caller) and the T1w brain mask for the crown. The `-brain` mask must share the boldref's voxel grid.
+
+`-tsnr <map> <json>` also writes a temporal SNR map. For each brain voxel it divides the mean by the residual SD. The regressors are an intercept, Legendre trends and the six motion parameters. The trend degree is 1 + floor(duration / 150 s), as AFNI `-polort A`. Dummy volumes are dropped. Constant regressors are dropped too, so motionless data works. The JSON records the brain median, the volume count, the degree and `regressors_used`. Exactly collinear regressors are an error.
+
+`-boldref <ref> <json>` builds fMRIPrep's BOLD reference (niworkflows `NonsteadyStatesDetector` plus `RobustAverage`):
+
+1. Among the first 40 volumes, it detects leading non-steady-state volumes: those whose clipped global mean has a modified z-score above 3.5.
+2. It averages those volumes, or volumes 20 to 39 if fewer than 2 are found. Each volume is drift-normalised and motion-corrected onto the first, and the reference is their voxelwise median.
+3. It writes the reference to `<ref>` and `{"dummy_scans", "reference_volumes"}` to `<json>`.
+
+The series passes through unchanged, so one read of the BOLD can also estimate motion against the new reference, as in the last example above. On a 260-volume run it matched niworkflows' dummy count and reference (r = 0.999996).
 
 Constraints:
 
@@ -447,6 +499,37 @@ Constraints:
 - A singleton spatial dimension is rejected in every mode, because the fit is degenerate there.
 - Correction runs in float32, so `-dt double` is rejected.
 - Enabled by default on every platform, including WebAssembly. `MOCO=0 make` or `-DENABLE_MOCO=OFF` omits it.
+
+### `-optcom <te_ms,te_ms,...> <echo2> [<echo3> ...]`
+
+T2*-weighted combination of multi-echo data, as tedana `t2smap` (log-linear fit, `t2s` weights). The input is echo 1, and each later echo follows as a file. Echo times must be positive and finite. Per voxel, T2* comes from a log-linear fit of the echoes' time means, clamped to 5 to 500 ms. Each echo is weighted by TE × exp(-TE/T2*). The weights are fixed over time, so you can combine echoes before motion correction. Up to 16 echoes are supported. Every echo must have the same dimensions and voxel grid as echo 1.
+
+```
+niimath echo1 -optcom 12.5,28.4,44.3 echo2 echo3 combined
+```
+
+### `-frisgo <spline|simple|runwise|lpass width>`
+
+Fuzzy-ripple correction for dual-polarity 3D EPI, whose readout polarity alternates every volume. It ports LAYNII `LN2_FRISGO` (BSD-3; Huber 2021).
+
+- `spline`: cubic interpolation between volumes. The output moves by -TR/2, to the trigger.
+- `simple`: 1/4, 1/2, 1/4 temporal smoothing.
+- `runwise`: removes the voxel's mean odd-even alternation. No shift.
+- `lpass <width>`: removes the slowly varying alternation, with a Gaussian of `width` volumes (sigma). The width must be finite and positive.
+
+The input needs at least 4 volumes.
+
+### `-mp2rage <inv1> <inv2> <factor>`
+
+Denoised MP2RAGE uniform image, using the robust combination of O'Brien et al. (2014). The input is the vendor UNI image on the 0 to 4095 scale. The sign of INV1 comes from UNI. The noise term is beta = (factor × mean INV2 on the outer 8-voxel shell)². The output stays on the UNI scale. `factor` must be finite and at least 0. UNI, INV1 and INV2 must be 3D images on one voxel grid.
+
+```
+niimath uni -mp2rage inv1 inv2 6 uni_denoised
+```
+
+`-optcom`, `-frisgo` and `-mp2rage` run in float32, so `-dt double` is rejected. They are built with `-moco`, so `MOCO=0` omits them.
+
+`-resample`, `-confounds`, `-optcom` and `-frisgo` reject input with more than four dimensions.
 
 ### `-stc --slicetiming <t0,t1,...|@file> [-tzero <sec>]`
 

@@ -253,8 +253,8 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	char *fname_in = nim->fname;
 	char *iname_in = nim->iname;
 	int nifti_type_in = nim->nifti_type;
-	char *hname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 8);
-	char *iname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 8);
+	char *hname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 16); // room for ".nii.zst" + NUL when no extension was stripped
+	char *iname = (char *)calloc(sizeof(char), strlen(nim->fname) + strlen(postfix) + 16);
 	if (hname == NULL || iname == NULL) {
 		free(hname); free(iname);
 		fprintf(stderr, "niimath: failed to allocate output filename\n");
@@ -265,7 +265,7 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	const char *ext; //input extension
 	ext = nifti_find_file_extension(nim->fname);
 	strcpy(hname, nim->fname);
-	hname[strlen(hname) - strlen(ext)] = 0;
+	hname[strlen(hname) - (ext ? strlen(ext) : 0)] = 0; /* -resample/-save pass names without extension */
 	strcat(hname, postfix);
 	strcpy(iname, hname);
 	//default extension: .nii
@@ -363,7 +363,7 @@ int nifti_save(nifti_image *nim, const char *postfix, gzModes gzMode) {
 	return write_rc ? 1 : 0;
 }
 
-mat44 xform(nifti_image *nim) {
+mat44 xform(const nifti_image *nim) {
 	if ((nim->sform_code == NIFTI_XFORM_UNKNOWN) && (nim->qform_code == NIFTI_XFORM_UNKNOWN)) {
 		mat44 m; //4x4 matrix includes translations
 		LOAD_MAT44(m, nim->dx, 0.0, 0.0, 0.0, 0.0, nim->dy, 0.0, 0.0, 0.0, 0.0, nim->dz, 0.0);
@@ -447,7 +447,7 @@ double xyz_units_to_mm(int xyz_units) {
 	}
 }
 
-float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
+float max_displacement_mm(const nifti_image *nim, const nifti_image *nim2) {
 	//examines each corner of two NIfTI images and returns the max difference in vertex location
 	// used to detect if two volumes are aligned
 	mat44 m = xform(nim);	//4x4 matrix includes translations
@@ -469,6 +469,18 @@ float max_displacement_mm(nifti_image *nim, nifti_image *nim2) {
 	mx = MAX(mx, vertexDisplacement(0, nim->ny - 1, nim->nz - 1, m, m2));
 	mx = MAX(mx, vertexDisplacement(0, 0, nim->nz - 1, m, m2));
 	return mx;
+}
+
+int nii_same_grid(const nifti_image *a, const nifti_image *b) {
+	if (a->nx != b->nx || a->ny != b->ny || a->nz != b->nz) return 0;
+	float d = max_displacement_mm(a, b);
+	return d >= 0.0f && d <= 0.001f; // NaN (unmeasurable geometry) is not the same grid
+}
+
+int nii_reject_5d(const nifti_image *nim, const char *op) {
+	if (nim->nu <= 1 && nim->nv <= 1 && nim->nw <= 1) return 0; // dim[0]=5 with dim[5..7]=1 is really 4D
+	printfx("%s: images with more than 4 dimensions are not supported\n", op);
+	return 1;
 }
 
 in_hdr set_input_hdr(nifti_image *nim) {

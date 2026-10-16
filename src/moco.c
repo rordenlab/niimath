@@ -951,7 +951,7 @@ static int moco_fit_one(const float *base, const float *mov, const moco_geom *g,
 }
 
 // ------------------------------------------------------------------ entry point
-int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file) {
+int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file, int estimate) {
 	moco_geom g;
 	size_t nvol;
 	double vmm[3], step[6];
@@ -997,14 +997,14 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		base = img + (size_t)base_idx * nvol;
 	}
 	wt = (float *)malloc(nb_vol);
-	out = (float *)malloc(nb_out);          /* fully overwritten below */
+	if (!estimate) out = (float *)malloc(nb_out);   /* fully overwritten below; -estimate never reslices */
 	par = (double *)calloc((size_t)nt * 6, sizeof(double));
 	deriv = (float *)malloc(nb_deriv);
 	pad = (float *)malloc(nb_pad);
 	rowbuf = (float *)malloc(nb_row);
 	tmpA = (float *)malloc(nb_vol);
 	tmpB = (float *)malloc(nb_vol);
-	if (!wt || !out || !par || !deriv || !pad || !rowbuf || !tmpA || !tmpB) {
+	if (!wt || (!out && !estimate) || !par || !deriv || !pad || !rowbuf || !tmpA || !tmpB) {
 		printfx("-moco: out of memory\n");
 		rc = 1;
 		goto done;
@@ -1025,7 +1025,7 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 	/* A base drawn from the series is copied through unchanged (and keeps its all-zero parameter
 	   row).  With an external reference there is no such sub-brick: the loop below writes every
 	   volume, so nothing is copied here. */
-	if (base_idx >= 0)
+	if (base_idx >= 0 && out)
 		memcpy(out + (size_t)base_idx * nvol, base, nvol * sizeof(float));
 
 	/* A worker that cannot allocate MUST NOT leave its output volume unwritten: `out` would
@@ -1071,7 +1071,9 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 			mo33 Rinv;
 			double sinv[3];
 			moco_invert(Rtot, stot, Rinv, sinv);
-			if (moco_warp_rs(mov, out + (size_t)t * nvol, &g, Rinv, sinv, lpad, lrow) == 0) {
+			if (!out) {
+				/* -estimate: parameters only, nim stays untouched */
+			} else if (moco_warp_rs(mov, out + (size_t)t * nvol, &g, Rinv, sinv, lpad, lrow) == 0) {
 				float lo = mov[0], hi = mov[0];
 				for (size_t i = 1; i < nvol; i++) { if (mov[i] < lo) lo = mov[i]; if (mov[i] > hi) hi = mov[i]; }
 				float *o = out + (size_t)t * nvol;
@@ -1118,13 +1120,16 @@ int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *re
 		        "non-finite voxel or an empty frame is the usual cause.\n",
 		        nfit_failed, (long long)(nt - (base_idx >= 0 ? 1 : 0)), first_failed);
 	}
-	if (par_path && moco_write_par(par_path, par, nt, MOCO_PAR_FMT)) {
+	/* -estimate feeds a later resampler, so it keeps the estimator's full precision */
+	if (par_path && moco_write_par(par_path, par, nt, estimate ? MOCO_REL_FMT : MOCO_PAR_FMT)) {
 		rc = 1;
 		goto done;
 	}
-	free(nim->data);
-	nim->data = out;
-	out = NULL;
+	if (out) {
+		free(nim->data);
+		nim->data = out;
+		out = NULL;
+	}
 
 done:
 	free(deriv); free(pad); free(rowbuf); free(tmpA); free(tmpB);
@@ -1268,4 +1273,174 @@ int nii_moco_relative(nifti_image *nim, const char *rel_path) {
 	if (!rc && moco_write_par(rel_path, par, nt, MOCO_REL_FMT)) rc = 1;
 	free(par);
 	return rc;
+}
+
+// ------------------------------------------------------------------ -boldref
+/* niworkflows NonsteadyStatesDetector + RobustAverage (mc_method AFNI, nonnegative): the BOLD
+   reference fMRIPrep registers to.  Constants are niworkflows defaults. */
+#define BR_NVOL 40   /* NonsteadyStatesDetector n_volumes: only these feed detection */
+#define BR_ZDM 20    /* zero_dummy_masked: volumes averaged when fewer than 2 dummies */
+
+/* k-th smallest of a[0..n-1] (reorders a); 3-way quickselect, O(n) with many ties. */
+static float br_select(float *a, size_t n, size_t k) {
+	size_t lo = 0, hi = n - 1;
+	while (lo < hi) {
+		float pivot = a[lo + ((hi - lo) >> 1)];
+		size_t lt = lo, gt = hi, i = lo;
+		while (i <= gt) {
+			if (a[i] < pivot) { float t = a[lt]; a[lt++] = a[i]; a[i++] = t; }
+			else if (a[i] > pivot) { float t = a[gt]; a[gt--] = a[i]; a[i] = t; }
+			else i++;
+		}
+		if (k < lt) hi = lt - 1; else if (k > gt) lo = gt + 1; else break;
+	}
+	return a[k];
+}
+
+/* numpy.percentile (method 'linear') over n floats; scratch is n floats and is clobbered. */
+static float br_percentile(const float *v, size_t n, double pct, float *scratch) {
+	memcpy(scratch, v, n * sizeof(float));
+	double rank = pct / 100.0 * (double)(n - 1);
+	size_t k = (size_t)rank;
+	float lo = br_select(scratch, n, k);
+	if (k + 1 >= n) return lo;
+	float hi = scratch[k + 1];   /* partition left every element above k >= lo: take their minimum */
+	for (size_t i = k + 2; i < n; i++) if (scratch[i] < hi) hi = scratch[i];
+	return (float)(lo + (rank - (double)k) * (hi - lo));
+}
+
+static double br_median(double *a, int n) {   /* tiny n: insertion sort */
+	for (int i = 1; i < n; i++) { double v = a[i]; int j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
+	return (n & 1) ? a[n / 2] : 0.5 * (a[n / 2 - 1] + a[n / 2]);
+}
+
+/* nipype is_outlier(thresh=3.5): leading volumes whose modified z-score exceeds 3.5. */
+static int br_leading_outliers(const double *gs, int n) {
+	double tmp[BR_NVOL], dev[BR_NVOL];
+	memcpy(tmp, gs, n * sizeof(double));
+	double med = br_median(tmp, n);
+	for (int i = 0; i < n; i++) dev[i] = tmp[i] = fabs(gs[i] - med);
+	double mad = br_median(tmp, n);
+	int k = 0;
+	while (k < n && 0.6745 * dev[k] / mad > 3.5) k++;   /* mad 0: inf/nan compare as numpy does */
+	return k;
+}
+
+/* Clip each volume of v (nv volumes of nvol voxels) to [0, p99.8 of all of v]; return per-volume means. */
+static int br_clip_means(float *v, size_t nvol, int nv, double *gs) {
+	size_t n = nvol * (size_t)nv;
+	float *scratch = (float *)malloc(n * sizeof(float));
+	if (!scratch) return 1;
+	float hi = br_percentile(v, n, 99.8, scratch);
+	free(scratch);
+	for (int t = 0; t < nv; t++) {
+		float *x = v + (size_t)t * nvol;
+		double sum = 0.0;
+		for (size_t i = 0; i < nvol; i++) {
+			x[i] = x[i] < 0.0f ? 0.0f : (x[i] > hi ? hi : x[i]);
+			sum += x[i];
+		}
+		gs[t] = sum / (double)nvol;
+	}
+	return 0;
+}
+
+int nii_boldref(nifti_image *nim, const char *ref_path, const char *json_path, gzModes gz) {
+	if (nim->datatype != DT_FLOAT32 || nim->nt < 2 || nim->nx * nim->ny * nim->nz * nim->nt != nim->nvox) {
+		printfx("-boldref: requires a float32 4D series\n");
+		return 1;
+	}
+	size_t nvol = (size_t)nim->nx * nim->ny * nim->nz;
+	int nt = (int)nim->nt;
+	const float *img = (const float *)nim->data;
+	double gs[BR_NVOL];
+	/* NonsteadyStatesDetector on a clipped copy of the first n_volumes */
+	int ndet = nt < BR_NVOL ? nt : BR_NVOL;
+	float *sel = (float *)malloc(nvol * (size_t)ndet * sizeof(float));
+	if (!sel) { printfx("-boldref: out of memory\n"); return 1; }
+	memcpy(sel, img, nvol * (size_t)ndet * sizeof(float));
+	if (br_clip_means(sel, nvol, ndet, gs)) { free(sel); printfx("-boldref: out of memory\n"); return 1; }
+	int ndummy = br_leading_outliers(gs, ndet);
+	int start = 0, stop = ndummy;
+	if (stop < 2) {
+		stop = ndet;
+		start = stop > BR_ZDM ? stop - BR_ZDM : 0;
+	}
+	/* RobustAverage: clip, divide out global drift, motion-correct onto the first, median */
+	int nsel = stop - start;
+	memcpy(sel, img + (size_t)start * nvol, nvol * (size_t)nsel * sizeof(float));
+	int rc = br_clip_means(sel, nvol, nsel, gs);
+	int keep = 0;   /* an empty (dropped) frame would scale as 0 * Inf = NaN into the median */
+	for (int t = 0; t < nsel && !rc; t++) {
+		if (!(gs[t] > 0.0)) continue;
+		if (keep != t) memmove(sel + (size_t)keep * nvol, sel + (size_t)t * nvol, nvol * sizeof(float));
+		gs[keep++] = gs[t];
+	}
+	nsel = keep;
+	if (!nsel) rc = 1;
+	double gmax = gs[0];
+	for (int t = 1; t < nsel; t++) if (gs[t] > gmax) gmax = gs[t];
+	for (int t = 0; t < nsel && !rc; t++) {
+		float s = (float)(gmax / gs[t]);
+		float *x = sel + (size_t)t * nvol;
+		for (size_t i = 0; i < nvol; i++) x[i] *= s;
+	}
+	/* Borrow nim's header for the selected sub-series, then for the 3D output; restored below. */
+	nifti_image saved = *nim;
+	nim->data = sel; nim->nt = nim->dim[4] = nsel; nim->nvox = nvol * (size_t)nsel;
+	if (!rc && nsel > 1) rc = nii_moco(nim, NULL, 0, NULL, 0);
+	sel = (float *)nim->data;   /* nii_moco swaps in its corrected buffer */
+	float *ref = rc ? NULL : (float *)malloc(nvol * sizeof(float));
+	if (!rc && !ref) rc = 1;
+	if (!rc) {
+#ifdef _OPENMP
+		#pragma omp parallel for
+#endif
+		for (size_t i = 0; i < nvol; i++) {
+			double v[BR_NVOL];
+			for (int t = 0; t < nsel; t++) { float x = sel[(size_t)t * nvol + i]; v[t] = x < 0.0f ? 0.0f : x; }
+			ref[i] = (float)br_median(v, nsel);
+		}
+		char *fname = (char *)ref_path;
+		nim->data = ref; nim->nt = nim->dim[4] = 1; nim->nvox = nvol;
+		nim->ndim = nim->dim[0] = 3;
+		nim->fname = nim->iname = fname;
+		rc = nifti_save(nim, "", gz);
+	}
+	free(sel); free(ref);
+	*nim = saved;
+	if (rc) { printfx("-boldref: failed\n"); return 1; }
+	char *tn = NULL;
+	FILE *f = moco_open_tmp(json_path, &tn);
+	if (!f) { printfx("-boldref: cannot write '%s'\n", json_path); return 1; }
+	int bad = fprintf(f, "{\n  \"dummy_scans\": %d,\n  \"reference_volumes\": [%d, %d]\n}\n", ndummy, start, stop) < 0;
+	if (fclose(f) != 0) bad = 1;
+	if (!bad && moco_publish_tmp(tn, json_path)) bad = 1;
+	if (bad) { remove(tn); printfx("-boldref: failed writing '%s'\n", json_path); }
+	free(tn);
+	return bad;
+}
+
+// ------------------------------------------------------------------ -resample support
+int moco_pull_affine(const nifti_image *nim, const double par[6], double M[3][4]) {
+	moco_geom g;
+	g.dim[0] = (int)nim->nx; g.dim[1] = (int)nim->ny; g.dim[2] = (int)nim->nz;
+	if (moco_geom_init(nim, &g)) return 1;
+	mo33 R, tmp, A, Ai;
+	moco_rot(par[0], par[1], par[2], R);
+	m_mul(g.mm2idx, R, tmp);
+	m_mul(tmp, g.idx2mm, A);
+	if (m_inv(A, Ai)) return 1;
+	double s_mm[3] = {par[4], par[5], par[3]}, s[3];   /* (dL, dP, dS) -> DICOM (x, y, z), as moco_warp */
+	m_vec(g.mm2idx, s_mm, s);
+	/* moco_warp_rs: corrected(p) = input(T^-1 p), T(x) = A (x - c) + c + s about the grid centre c */
+	for (int r = 0; r < 3; r++) {
+		double c = 0.5 * (g.dim[r] - 1.0), off = 0.0;
+		for (int j = 0; j < 3; j++) {
+			M[r][j] = Ai[r][j];
+			off += Ai[r][j] * (0.5 * (g.dim[j] - 1.0) + s[j]);
+		}
+		M[r][3] = c - off;
+	}
+	return 0;
 }

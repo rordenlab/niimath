@@ -1,10 +1,10 @@
 // -n4 in the WASM build: recover a known multiplicative bias field (single-threaded there).
 import { describe, test, expect } from 'bun:test';
-import { BSD_MODULE, loadModule, makeNifti } from './helpers';
+import { BSD_MODULE, loadModule, makeNifti, run } from './helpers';
 
 describe('-n4 in the WASM build', () => {
   test('recovers a known exp(0.3u + 0.2w) field and rejects a bad option', async () => {
-    const { mod } = await loadModule(BSD_MODULE);
+    const { mod, log } = await loadModule(BSD_MODULE);
     const side = 24, c = (side - 1) / 2;
     const at = (i: number) => [(i % side - c) / 10, (Math.floor(i / side) % side - c) / 10, (Math.floor(i / (side * side)) - c) / 10];
     const truth = (i: number) => { const [u, , w] = at(i); return 0.3 * u + 0.2 * w; };
@@ -23,6 +23,6 @@ describe('-n4 in the WASM build', () => {
     const cov = est.reduce((s, v, k) => s + (v - me) * (truth_vals[k] - mt), 0);
     const corr = cov / Math.sqrt(est.reduce((s, v) => s + (v - me) ** 2, 0) * truth_vals.reduce((s, v) => s + (v - mt) ** 2, 0));
     expect(corr).toBeGreaterThan(0.98);
-    expect(mod.callMain(['in.nii', '-n4', '-shrink', '0', 'bad.nii'])).not.toBe(0);
+    expect((await run(mod, log, [], ['in.nii', '-n4', '-shrink', '0', 'bad.nii'], 'bad.nii')).exitCode).not.toBe(0);
   });
 });

@@ -147,9 +147,9 @@ int write_png_scale(const char *filename, int x, int y, int comp,
 	}
 
 	/* Write scaled PNG */
-	int ret = stbi_write_png(filename, dst_w, dst_h, comp, dst->data, dst->span);
+	int ok = stbi_write_png(filename, dst_w, dst_h, comp, dst->data, dst->span); /* nonzero on success */
 	free_image(dst);
-	return ret;
+	return ok ? 0 : -1;
 }
 
 // Enumeration of predefined color lookup tables
@@ -182,6 +182,7 @@ typedef struct {
 	int isLabel;		// 1 = draw labels by default
 	int isNegativeColorMap;
 	int interpolationOrder; // 0=nearest, 1= linear, [future 2=Mitchell]
+	int isBoundary;			// -E: draw only overlay voxels that differ from an in-plane neighbour
 	float scale;			// zoom factor
 	float cal_min, cal_max, cal_min2, cal_max2;
 	float overlayRGBA[4]; // overlay color + opacity (0..1) default {1,0,0,0.5}
@@ -601,6 +602,11 @@ static int parse_args_build_tiles(const nifti_image *nim,
 			}
 			continue;
 		}
+		if (!strcmp(tok, "-E")) {
+			opts->isBoundary = 1;
+			++i;
+			continue;
+		}
 		int isCrossLines = 0;
 		// ---------- Tile-related tokens ----------
 		if (tok[0] == '-' && tok[1] != '\0') {
@@ -852,6 +858,26 @@ static inline void map_tile_coords(char axis, long long slice_idx, size_t xx, si
 		*yi = (long long)yy;
 		*zi = slice_idx;
 	}
+}
+
+/* -E: a nonzero overlay voxel whose value differs from one of its 4 neighbours in the displayed plane
+   (outside the volume counts as 0). Exact, unsmoothed and one voxel wide: the outermost voxels of a
+   mask, or every label's border in a label map. */
+static int in_plane_boundary(const float *d, char axis, long long xi, long long yi, long long zi,
+							 long long nx, long long ny, long long nz) {
+	const long long n[3] = {nx, ny, nz};
+	const float v = d[xi + nx * (yi + ny * zi)];
+	if (v == 0.0f)
+		return 0;
+	const int in_plane[2] = {axis == 'x' ? 1 : 0, axis == 'z' ? 1 : 2};
+	for (int k = 0; k < 2; ++k)
+		for (int dir = -1; dir <= 1; dir += 2) {
+			long long q[3] = {xi, yi, zi};
+			q[in_plane[k]] += dir;
+			if (q[in_plane[k]] < 0 || q[in_plane[k]] >= n[in_plane[k]] || d[q[0] + nx * (q[1] + ny * q[2])] != v)
+				return 1;
+		}
+	return 0;
 }
 
 // ------------------- Stage 3: render_and_write_png ----------------------
@@ -1216,6 +1242,8 @@ static int render_and_write_png(const nifti_image *nim,
 				if (have_nim2) {
 					float v = data[data_idx];
 					float v2 = data2[data_idx];
+					if (opts->isBoundary && !in_plane_boundary(data2, t->axis, xi, yi, zi, nx, ny, nz))
+						v2 = 0.0f;
 					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2,
 											  base_lut, negative_overlay_lut, overlay_lut, &rr, &gg, &bb, opts->isNegativeColorMap);
 				} else {
@@ -1353,6 +1381,7 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	opts.isLabel = 1;
 	opts.isNegativeColorMap = 0;
 	opts.interpolationOrder = 1;
+	opts.isBoundary = 0;
 	opts.scale = 1.0;
 	opts.LUT2 = LUT_NONE;
 	opts.LUT = LUT_NONE;

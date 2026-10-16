@@ -198,11 +198,8 @@ int fmap_unwarp(nifti_image *nim, const char *fmapfile, double dwell, const char
 
 	fm = fm_read_f32(fmapfile, "-fugue", "fieldmap");
 	if (!fm) return 1;
-	/* `!(d <= tol)`, NOT `d > tol`: under -ffast-math a NaN separation makes `d > tol` FALSE,
-	   which ACCEPTS a pair whose geometry could not be measured.  max_displacement_mm can return
-	   NaN from a malformed or all-zero transform, and this is the check that exists to catch
-	   exactly that.  medic.c and qc.c already use fail-closed forms. */
-	if (fm->nx != nx || fm->ny != ny || fm->nz != nz || !(max_displacement_mm(nim, fm) <= 0.001f)) {
+	/* nii_same_grid rejects a NaN separation: a pair whose geometry cannot be measured. */
+	if (!nii_same_grid(nim, fm)) {
 		FM_ERR("fieldmap '%s' does not share the input's grid (dimensions and world transform must match)\n",
 			fmapfile);
 		goto done;
@@ -481,7 +478,7 @@ int fmap_prepare(nifti_image *nim, const char *magfile, double delta_te_ms, int 
 
 	mg = fm_read_f32(magfile, "-fmapprep", "magnitude");
 	if (!mg) return 1;
-	if (mg->nx != nx || mg->ny != ny || mg->nz != nz || !(max_displacement_mm(nim, mg) <= 0.001f)) {  /* fail-closed on NaN; see -fugue above */
+	if (!nii_same_grid(nim, mg)) {
 		printfx("-fmapprep: magnitude '%s' does not share the phase image's grid (dimensions and world transform must match)\n",
 			magfile);
 		goto done;

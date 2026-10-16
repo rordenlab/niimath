@@ -24,6 +24,9 @@
 #ifdef HAVE_ZSTD
   #include <zstd.h>
 #endif
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
 
 /* compile-time flags from Makefile */
 /* FSLSTYLE, PIGZ, REJECT_COMPLEX are set externally */
@@ -36,8 +39,8 @@
 #define NII_COMPRESS_ZST  2
 
 /* A minimal file handle that wraps FILE* and optionally gzFile.
-   For zstd: decompresses to tmpfile on open, compresses from tmpfile on close.
-   All intermediate I/O goes through the standard FILE* path. */
+   For zstd: reads decompress into memory on open; writes stream through a ZSTD_CCtx (worker
+   threads = OpenMP threads, so -p applies) straight to the output file. */
 typedef struct {
    FILE  *nzfptr;
 #ifdef HAVE_ZLIB
@@ -45,9 +48,21 @@ typedef struct {
 #endif
    int    withz;        /* NII_COMPRESS_NONE, NII_COMPRESS_GZ, or NII_COMPRESS_ZST */
 #ifdef HAVE_ZSTD
-   char  *zst_fname;    /* target filename for zstd write (deferred compression) */
+   ZSTD_CCtx *zcctx;    /* zstd write stream (NULL when reading) */
+   FILE  *zout;         /* zstd compressed output */
+   char  *zobuf;        /* ZSTD_CStreamOutSize() staging buffer */
+   size_t zpos;         /* uncompressed bytes written */
+   char  *zdata;        /* zstd read: decompressed bytes behind nzfptr */
 #endif
 } *NIIFILE;
+
+/* gzip level for .nii.gz writes (gzopen and pigz): NIIMATH_GZ_LEVEL=1..9, else zlib's default 6 */
+static int nii_gz_level(void)
+{
+   const char *v = getenv("NIIMATH_GZ_LEVEL");
+   int l = v ? atoi(v) : 6;
+   return (l >= 1 && l <= 9) ? l : 6;
+}
 
 #define ZNZ_MAX_BLOCK_SIZE (1<<30)
 
@@ -70,8 +85,8 @@ static int nii_compression_type(const char *fname)
 }
 
 #ifdef HAVE_ZSTD
-/* Decompress a .zst file into a tmpfile, return the tmpfile handle */
-static FILE *zst_decompress_to_tmpfile(const char *path)
+/* Decompress a whole .zst file into memory; *dsize_out gets the byte count (caller frees). */
+static char *zst_decompress(const char *path, size_t *dsize_out)
 {
    FILE *fin = fopen(path, "rb");
    if (!fin) return NULL;
@@ -79,82 +94,71 @@ static FILE *zst_decompress_to_tmpfile(const char *path)
    long csize = ftell(fin);
    fseek(fin, 0, SEEK_SET);
    if (csize <= 0) { fclose(fin); return NULL; }
-
    char *cbuf = (char *)malloc(csize);
    if (!cbuf) { fclose(fin); return NULL; }
    if (fread(cbuf, 1, csize, fin) != (size_t)csize) { free(cbuf); fclose(fin); return NULL; }
    fclose(fin);
-
-   unsigned long long dsize = ZSTD_getFrameContentSize(cbuf, csize);
-   if (dsize == ZSTD_CONTENTSIZE_ERROR) {
+   unsigned long long fsz = ZSTD_getFrameContentSize(cbuf, csize);
+   if (fsz == ZSTD_CONTENTSIZE_ERROR) {
       fprintf(stderr, "** zstd: corrupt frame in '%s'\n", path);
       free(cbuf); return NULL;
    }
-   if (dsize == ZSTD_CONTENTSIZE_UNKNOWN)
-      dsize = (unsigned long long)csize * 8; /* estimate; will retry if too small */
-
-   char *dbuf = (char *)malloc(dsize);
-   if (!dbuf) { free(cbuf); return NULL; }
-
-   size_t result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
-   /* If buffer too small, retry with larger buffer (check error name to avoid zstd_errors.h) */
-   int retries = 0;
-   while (ZSTD_isError(result) && retries++ < 10 &&
-          dsize < (unsigned long long)csize * 256 &&
-          strstr(ZSTD_getErrorName(result), "too small")) {
-      dsize *= 2;
-      char *newbuf = (char *)realloc(dbuf, dsize);
-      if (!newbuf) { free(dbuf); free(cbuf); return NULL; }
-      dbuf = newbuf;
-      result = ZSTD_decompress(dbuf, dsize, cbuf, csize);
+   /* streaming decode handles frames without a content size (and multi-frame files) */
+   /* an empty or skippable leading frame reports 0: floor the capacity so doubling grows */
+   size_t cap = (fsz != ZSTD_CONTENTSIZE_UNKNOWN && fsz) ? (size_t)fsz : (size_t)csize * 4, used = 0;
+   if (cap < 4096) cap = 4096;
+   char *dbuf = (char *)malloc(cap);
+   ZSTD_DCtx *dctx = ZSTD_createDCtx();
+   ZSTD_inBuffer in = {cbuf, (size_t)csize, 0};
+   size_t ret = 1;
+   while (dbuf && dctx) {
+      if (used == cap) {
+         char *nb = (char *)realloc(dbuf, cap * 2);
+         if (!nb) { free(dbuf); dbuf = NULL; break; }
+         dbuf = nb; cap *= 2;
+      }
+      ZSTD_outBuffer out = {dbuf + used, cap - used, 0};
+      ret = ZSTD_decompressStream(dctx, &out, &in);
+      used += out.pos;
+      if (ZSTD_isError(ret)) {
+         fprintf(stderr, "** zstd decompression error: %s\n", ZSTD_getErrorName(ret));
+         free(dbuf); dbuf = NULL;
+      } else if (in.pos == in.size && (ret == 0 || out.pos < out.size)) {
+         /* input spent: done at a frame end (0); spare output with ret != 0 means the frame needs more bytes */
+         if (ret) {
+            fprintf(stderr, "** zstd: truncated frame in '%s'\n", path);
+            free(dbuf); dbuf = NULL;
+         }
+         break;
+      }
    }
+   ZSTD_freeDCtx(dctx);
    free(cbuf);
-   if (ZSTD_isError(result)) {
-      fprintf(stderr, "** zstd decompression error: %s\n", ZSTD_getErrorName(result));
-      free(dbuf); return NULL;
-   }
-
-   FILE *tmpf = tmpfile();
-   if (!tmpf) { free(dbuf); return NULL; }
-   if (fwrite(dbuf, 1, result, tmpf) != result) { free(dbuf); fclose(tmpf); return NULL; }
-   free(dbuf);
-   rewind(tmpf);
-   return tmpf;
+   *dsize_out = used;
+   return dbuf;
 }
 
-/* Compress tmpfile contents to a .zst file */
-static int zst_compress_from_tmpfile(FILE *tmpf, const char *path)
+/* Stream bytes through the write context to the output file. */
+static int zst_stream(NIIFILE f, const void *buf, size_t n, ZSTD_EndDirective mode)
 {
-   fseek(tmpf, 0, SEEK_END);
-   long dsize = ftell(tmpf);
-   fseek(tmpf, 0, SEEK_SET);
-   if (dsize <= 0) return -1;
-
-   char *dbuf = (char *)malloc(dsize);
-   if (!dbuf) return -1;
-   if (fread(dbuf, 1, dsize, tmpf) != (size_t)dsize) { free(dbuf); return -1; }
-
-   size_t cbound = ZSTD_compressBound(dsize);
-   char *cbuf = (char *)malloc(cbound);
-   if (!cbuf) { free(dbuf); return -1; }
-
-   size_t csize = ZSTD_compress(cbuf, cbound, dbuf, dsize, 3); /* level 3: fast */
-   free(dbuf);
-   if (ZSTD_isError(csize)) {
-      fprintf(stderr, "** zstd compression error: %s\n", ZSTD_getErrorName(csize));
-      free(cbuf); return -1;
+   ZSTD_inBuffer in = {buf, n, 0};
+   size_t osz = ZSTD_CStreamOutSize();
+   for (;;) {
+      ZSTD_outBuffer out = {f->zobuf, osz, 0};
+      size_t rem = ZSTD_compressStream2(f->zcctx, &out, &in, mode);
+      if (ZSTD_isError(rem)) {
+         fprintf(stderr, "** zstd compression error: %s\n", ZSTD_getErrorName(rem));
+         return -1;
+      }
+      if (out.pos && fwrite(f->zobuf, 1, out.pos, f->zout) != out.pos) return -1;
+      if (mode == ZSTD_e_end ? rem == 0 : in.pos == in.size) return 0;
    }
+}
 
-   FILE *fout = fopen(path, "wb");
-   if (!fout) { free(cbuf); return -1; }
-   size_t written = fwrite(cbuf, 1, csize, fout);
-   int close_status = fclose(fout);
-   free(cbuf);
-   if (written != csize || close_status != 0) {
-      fprintf(stderr, "** zstd write error: wrote %zu of %zu bytes\n", written, csize);
-      return -1;
-   }
-   return 0;
+/* Declare the uncompressed size before the first write, so the frame header records it. */
+static void nii_zst_pledge(NIIFILE f, size_t total)
+{
+   if (f && f->zcctx) ZSTD_CCtx_setPledgedSrcSize(f->zcctx, total);
 }
 #endif /* HAVE_ZSTD */
 
@@ -174,18 +178,36 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
    if (nii_compression_type(path) == NII_COMPRESS_ZST) {
       f->withz = NII_COMPRESS_ZST;
       if (mode[0] == 'r') {
-         f->nzfptr = zst_decompress_to_tmpfile(path);
-         if (!f->nzfptr) { free(f); return NULL; }
+         size_t n = 0;
+         f->zdata = zst_decompress(path, &n);
+#ifdef _WIN32
+         /* no fmemopen: spill to a tmpfile */
+         f->nzfptr = f->zdata ? tmpfile() : NULL;
+         if (f->nzfptr && (fwrite(f->zdata, 1, n, f->nzfptr) != n || fseek(f->nzfptr, 0, SEEK_SET))) {
+            fclose(f->nzfptr); f->nzfptr = NULL;
+         }
+         free(f->zdata); f->zdata = NULL;
+#else
+         f->nzfptr = (f->zdata && n) ? fmemopen(f->zdata, n, "rb") : NULL;
+#endif
+         if (!f->nzfptr) { free(f->zdata); free(f); return NULL; }
       } else {
-         /* Deferred write: buffer to tmpfile, compress on close */
-         f->zst_fname = nifti_strdup(path);
-         f->nzfptr = tmpfile();
-         if (!f->nzfptr || !f->zst_fname) {
-            if (f->nzfptr) fclose(f->nzfptr); // close the temp file if strdup was what failed (was leaked)
-            free(f->zst_fname);
+         f->zout = fopen(path, "wb");
+         f->zcctx = ZSTD_createCCtx();
+         f->zobuf = (char *)malloc(ZSTD_CStreamOutSize());
+         if (!f->zout || !f->zcctx || !f->zobuf) {
+            if (f->zout) fclose(f->zout);
+            ZSTD_freeCCtx(f->zcctx);
+            free(f->zobuf);
             free(f);
             return NULL;
          }
+         ZSTD_CCtx_setParameter(f->zcctx, ZSTD_c_compressionLevel, 3);
+#ifdef _OPENMP
+         /* ignored (no error path) when libzstd lacks ZSTD_MULTITHREAD */
+         int nw = omp_get_max_threads();
+         if (nw > 1) ZSTD_CCtx_setParameter(f->zcctx, ZSTD_c_nbWorkers, nw);
+#endif
       }
       return f;
    }
@@ -194,7 +216,9 @@ static NIIFILE nii_open(const char *path, const char *mode, int use_gz)
 #ifdef HAVE_ZLIB
    if (use_gz == 1) {
       f->withz = NII_COMPRESS_GZ;
-      f->zfptr = gzopen(path, mode);
+      char gzmode[8];
+      snprintf(gzmode, sizeof(gzmode), "%s%d", mode, nii_gz_level());   /* level ignored when reading */
+      f->zfptr = gzopen(path, mode[0] == 'w' ? gzmode : mode);
       if (!f->zfptr) { free(f); return NULL; }
       return f;
    }
@@ -212,11 +236,17 @@ static int nii_close(NIIFILE *fp)
    int ret = 0;
    if (!fp || !*fp) return 0;
 #ifdef HAVE_ZSTD
-   if ((*fp)->withz == NII_COMPRESS_ZST && (*fp)->zst_fname) {
-      /* Deferred zstd write: compress tmpfile contents to target */
-      ret = zst_compress_from_tmpfile((*fp)->nzfptr, (*fp)->zst_fname);
-      fclose((*fp)->nzfptr);
-      free((*fp)->zst_fname);
+   if ((*fp)->withz == NII_COMPRESS_ZST && (*fp)->zcctx) {
+      ret = zst_stream(*fp, NULL, 0, ZSTD_e_end);
+      if (fclose((*fp)->zout) != 0) ret = -1;
+      ZSTD_freeCCtx((*fp)->zcctx);
+      free((*fp)->zobuf);
+      free(*fp); *fp = NULL;
+      return ret;
+   }
+   if ((*fp)->withz == NII_COMPRESS_ZST && (*fp)->zdata) {
+      ret = fclose((*fp)->nzfptr);
+      free((*fp)->zdata);
       free(*fp); *fp = NULL;
       return ret;
    }
@@ -281,6 +311,13 @@ static size_t nii_write(const void *buf, size_t size, size_t nmemb, NIIFILE f)
       return nmemb - remain / size;
    }
 #endif
+#ifdef HAVE_ZSTD
+   if (f->zcctx) {
+      if (zst_stream(f, buf, size * nmemb, ZSTD_e_continue)) return 0;
+      f->zpos += size * nmemb;
+      return nmemb;
+   }
+#endif
    return fwrite(buf, size, nmemb, f->nzfptr);
 }
 
@@ -289,6 +326,17 @@ static long nii_seek(NIIFILE f, long offset, int whence)
    if (!f) return 0;
 #ifdef HAVE_ZLIB
    if (f->zfptr) return (long)gzseek(f->zfptr, offset, whence);
+#endif
+#ifdef HAVE_ZSTD
+   if (f->zcctx) {   /* stream: only forward seeks, zero-filled (the writer seeks to iname_offset) */
+      if (whence != SEEK_SET || offset < (long)f->zpos) return -1;
+      static const char zeros[64] = {0};
+      while ((long)f->zpos < offset) {
+         size_t n = (size_t)(offset - (long)f->zpos);
+         if (nii_write(zeros, 1, n < sizeof(zeros) ? n : sizeof(zeros), f) == 0) return -1;
+      }
+      return 0;
+   }
 #endif
    if (f->nzfptr == stdin) {
       if (whence == SEEK_SET && offset > 0) {
@@ -312,6 +360,9 @@ static long nii_tell(NIIFILE f)
    if (!f) return 0;
 #ifdef HAVE_ZLIB
    if (f->zfptr) return (long)gztell(f->zfptr);
+#endif
+#ifdef HAVE_ZSTD
+   if (f->zcctx) return (long)f->zpos;
 #endif
    return ftell(f->nzfptr);
 }
@@ -2066,10 +2117,15 @@ static int doPigz_write(nifti_image *nim, void *hdr, int hdrsize)
    if (!pigz_path_is_safe(nim->fname)) return -1;
    size_t ntot = (size_t)nim->nbyper * (size_t)nim->nvox;
    if (strlen(nim->fname) > SIZE_MAX - 32) return -1;
-   size_t cmdlen = strlen(nim->fname) + 32;
+   size_t cmdlen = strlen(nim->fname) + 48;
    char *command = (char *)malloc(cmdlen);
    if (!command) return -1;
-   snprintf(command, cmdlen, "pigz -n -f > \"%s\"", nim->fname);
+   int threads = 0;   /* pigz's own default (all cores) unless OpenMP says otherwise; -p applies */
+#ifdef _OPENMP
+   threads = omp_get_max_threads();
+#endif
+   if (threads > 0) snprintf(command, cmdlen, "pigz -n -f -%d -p %d > \"%s\"", nii_gz_level(), threads, nim->fname);
+   else snprintf(command, cmdlen, "pigz -n -f -%d > \"%s\"", nii_gz_level(), nim->fname);
 #ifdef _MSC_VER
    pigzPipe = _popen(command, "w");
 #else
@@ -2165,6 +2221,11 @@ int nifti_image_write_status(nifti_image *nim)
       fp = nii_open(nim->fname, "wb", nifti_is_gzfile(nim->fname));
    }
    if (!fp) return 1;
+#ifdef HAVE_ZSTD
+   if ((nim->nifti_type == NIFTI_FTYPE_NIFTI1_1 || nim->nifti_type == NIFTI_FTYPE_NIFTI2_1) &&
+       nim->nbyper > 0 && nim->nvox > 0)
+      nii_zst_pledge(fp, (size_t)nim->iname_offset + (size_t)nim->nbyper * (size_t)nim->nvox);
+#endif
 
    /* write header */
    size_t ss;

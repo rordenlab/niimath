@@ -42,7 +42,7 @@ build_arch() {
     # gate in skullstrip_plan.md, so the notarised release must not ship it.
     # Add "-DHAVE_SKULLSTRIP" and "skullstrip.c"
     # to the two strings below when it is promoted to default-on.
-    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC -DHAVE_FMAP -DHAVE_N4" arch_srcs="${SRCS} moco.c stc.c fmap.c n4/n4.c n4/n4_bspline.c n4/n4_fft.c"
+    local arch_dflags="${DFLAGS} -DHAVE_MOCO -DHAVE_STC -DHAVE_FMAP -DHAVE_N4" arch_srcs="${SRCS} moco.c resample.c confounds.c stc.c fmap.c n4/n4.c n4/n4_bspline.c n4/n4_fft.c"
     # Whole-program -ffast-math, matching the Makefile/CMake/WASM release contract so every
     # shipped artifact shares one FP behavior; -fno-finite-math-only preserves NaN/Inf.
     # (allineate no longer needs a separate scoped compile — everything is fast-math now.)

@@ -13,6 +13,8 @@ export interface EmscriptenModule {
   callMain(args: string[]): number;
   FS_readFile(filename: string): Uint8Array;
   FS_unlink(filename: string): void;
+  FS: { mkdirTree(path: string): void; readdir(path: string): string[] };
+  ENV: Record<string, string>;
 }
 type Factory = (overrides?: Record<string, unknown>) => Promise<EmscriptenModule>;
 

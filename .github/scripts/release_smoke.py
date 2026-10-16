@@ -113,17 +113,19 @@ def write_float32_nifti(
     tr: float = 0.0,
     time_units: int = 0,
     scale: float = 1.0,  # voxel size, for fixtures whose PHYSICAL size matters
+    xyz_units: int = 2,
+    nu: int = 1,  # dim[5]: >1 makes a 5D image (e.g. a 3-component vector field)
 ) -> None:
-    nvox = dims[0] * dims[1] * dims[2] * nt
+    nvox = dims[0] * dims[1] * dims[2] * nt * nu
     if len(data) != nvox:
         raise AssertionError(f"{path}: expected {nvox} values, got {len(data)}")
     payload = struct.pack(f"<{nvox}f", *data)
     header = bytearray(
         nifti_header(dims, datatype=16, bitpix=32, offset=offset, scl_slope=scl_slope,
-                     scl_inter=scl_inter, tr=tr, time_units=time_units, scale=scale)
+                     scl_inter=scl_inter, tr=tr, time_units=time_units, scale=scale, xyz_units=xyz_units)
     )
-    if nt > 1:
-        struct.pack_into("<8h", header, 40, 4, dims[0], dims[1], dims[2], nt, 1, 1, 1)
+    if nt > 1 or nu > 1:
+        struct.pack_into("<8h", header, 40, 5 if nu > 1 else 4, dims[0], dims[1], dims[2], nt, nu, 1, 1)
     path.write_bytes(bytes(header) + payload)
 
 
@@ -2912,6 +2914,16 @@ def exercise_n4(exe: str, tmp: Path, help_text: str) -> None:
     before, after = cv([img[i] for i in core]), cv([corrected[i] for i in core])
     if not after < 0.25 * before:
         raise AssertionError(f"-n4: bright-core CV {before:.4f} -> {after:.4f}; the bias was not removed")
+    # metre and mm headers describing the same grid give the same correction (-bspline is in mm)
+    unit_out = []
+    for units, sc in ((2, 4.0), (1, 0.004)):
+        uin, uout = tmp / f"n4_u{units}.nii", tmp / f"n4_u{units}_out.nii"
+        write_float32_nifti(uin, (nx, ny, nz), img, scale=sc, xyz_units=units)
+        require_success(run_niimath(exe, [str(uin), "-gz", "0", "-n4", "-iter", "1", "-bspline", "10", str(uout)]),
+                        f"-n4 xyz_units={units}")
+        unit_out.append(read_float32_nifti(uout))
+    if max(abs(a - b) for a, b in zip(*unit_out)) > 1e-3 * max(img):
+        raise AssertionError("-n4: metre header corrected differently from the same grid in mm")
     # contracts: each must fail cleanly
     write_float32_nifti(tmp / "n4_4d.nii", (4, 4, 4), [1.0] * 128, nt=2)
     write_float32_nifti(tmp / "n4_small.nii", (nx - 1, ny, nz), [1.0] * ((nx - 1) * ny * nz), scale=4.0)
@@ -3061,6 +3073,173 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
         )
     if abs(vals[0] - data[0]) > 1e-6:
         raise AssertionError("-moco: volume 0 must be copied through unchanged")
+
+    # -estimate: same fit as -1Dfile at full precision, and NO image (the trailing name is the .1D)
+    est_path = tmp / "moco_est.1D"
+    require_success(run_niimath(exe, [str(src_path), "-moco", "-estimate", str(est_path)]), "-moco -estimate")
+    est = [[float(v) for v in row.split()] for row in est_path.read_text().splitlines()]
+    if len(est) != nt or any(abs(a - b) > 1e-4 for ra, rb in zip(est, rows) for a, b in zip(ra, rb)):
+        raise AssertionError("-moco -estimate parameters differ from -1Dfile")
+    if any(p.name.startswith("moco_est") and p.suffix != ".1D" for p in tmp.iterdir()):
+        raise AssertionError("-moco -estimate wrote an image")
+
+    # -resample: identity onto the input's own grid reproduces the input; with the -estimate rows it
+    # aligns volume 1 onto volume 0 (side output, so the trailing name is the resampled series)
+    rs_id = tmp / "resample_id.nii"
+    rs_mc = tmp / "resample_mc.nii"
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-resample", str(src_path), str(rs_id)]),
+                    "-resample identity")
+    if max(abs(a - b) for a, b in zip(read_float32_nifti(rs_id), data)) > 1e-3:
+        raise AssertionError("-resample identity does not reproduce the input")
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-resample", str(src_path), "-hmc", str(est_path),
+                                      str(rs_mc)]), "-resample -hmc")
+    rv = read_float32_nifti(rs_mc)
+    n3v = nx * ny * nz
+    inner = [x + y * nx + z * nx * ny for z in range(4, nz - 4) for y in range(4, ny - 4) for x in range(4, nx - 4)]
+    rms = lambda a, b: math.sqrt(sum((a[i] - b[i]) ** 2 for i in inner) / len(inner))
+    if not rms(rv[n3v:2 * n3v], data[:n3v]) < 0.10 * rms(data[n3v:2 * n3v], data[:n3v]):
+        raise AssertionError("-resample -hmc did not align volume 1")
+
+    # -vsm: a constant -2 voxel shift along k pulls volume 0 onto volume 1 (= volume 0 moved +2 in k)
+    vmap = tmp / "vsm_const.nii"
+    rs_v = tmp / "resample_vsm.nii"
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-Tmean", "-mul", "0", "-sub", "2", str(vmap)]), "vsm map")
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-resample", str(src_path), "-vsm", str(vmap), "k",
+                                      str(rs_v)]), "-resample -vsm")
+    rvv = read_float32_nifti(rs_v)
+    if not rms(rvv[:n3v], data[n3v:2 * n3v]) < 1e-3 * max(data):
+        raise AssertionError("-resample -vsm did not shift volume 0 onto volume 1")
+
+    # -confounds: side output TSV; volume 1 is a 2 mm shift of volume 0, volume 2 shifts back
+    cmask = tmp / "conf_mask.nii"
+    ctsv = tmp / "conf.tsv"
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-Tmean", "-thr", "1", "-bin", str(cmask)]), "mask")
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-confounds", str(ctsv), "-tr", "2", "-hmc",
+                                      str(est_path), "-ref", str(src_path), "-brain", str(cmask), "-Tmean",
+                                      str(tmp / "conf_junk.nii")]), "-confounds")
+    head, *crow = [r.split("\t") for r in ctsv.read_text().splitlines()]
+    for need in ("global_signal", "dvars", "std_dvars", "framewise_displacement", "rmsd", "trans_z", "t_comp_cor_00"):
+        if need not in head:
+            raise AssertionError("-confounds: missing column %s" % need)
+    fdc = [r[head.index("framewise_displacement")] for r in crow]
+    if len(crow) != nt or fdc[0] != "n/a" or not all(abs(float(v) - shift) < 0.25 for v in fdc[1:]):
+        raise AssertionError("-confounds: expected FD n/a, ~%d, ~%d; got %r" % (shift, shift, fdc))
+
+    # -boldref: no dummies in this 3-volume series -> all volumes averaged; series passes through
+    bref = tmp / "boldref_ref.nii"
+    bjson = tmp / "boldref.json"
+    bout = tmp / "boldref_out.nii"
+    require_success(run_niimath(exe, [str(src_path), "-gz", "0", "-boldref", str(bref), str(bjson), str(bout)]),
+                    "-boldref")
+    meta = json.loads(bjson.read_text())
+    if meta != {"dummy_scans": 0, "reference_volumes": [0, nt]}:
+        raise AssertionError("-boldref: unexpected json %r" % meta)
+    if len(read_float32_nifti(bref)) != nx * ny * nz or len(read_float32_nifti(bout)) != nx * ny * nz * nt:
+        raise AssertionError("-boldref: wrong reference or pass-through size")
+    # a dropped (all-zero) frame is excluded, not normalized to 0 * Inf = NaN
+    drop = tmp / "boldref_drop.nii"
+    write_float32_nifti(drop, (nx, ny, nz), vol0 + [0.0] * len(vol0) + vol0, nt=3)
+    require_success(run_niimath(exe, [str(drop), "-gz", "0", "-boldref", str(bref), str(bjson), str(bout)]),
+                    "-boldref dropped frame")
+    if not all(math.isfinite(v) for v in read_float32_nifti(bref)):
+        raise AssertionError("-boldref: a zero frame produced non-finite reference voxels")
+
+    # -relative and -estimate are different parameter sets: both orders are rejected, nothing written
+    rel_est = tmp / "rel_est.1D"
+    for order in (["-relative", "-estimate"], ["-estimate", "-relative"]):
+        if run_niimath(exe, [str(src_path), "-moco"] + order + [str(rel_est)]).returncode == 0 or rel_est.exists():
+            raise AssertionError("-moco %s must be rejected" % " ".join(order))
+
+    # -resample of a constant volume thinner than the spline initializer horizon is an identity
+    ones = tmp / "resample_ones.nii"
+    ones_out = tmp / "resample_ones_out.nii"
+    write_float32_nifti(ones, (2, 2, 2), [1.0] * 8)
+    require_success(run_niimath(exe, [str(ones), "-gz", "0", "-resample", str(ones), str(ones_out)]), "-resample thin")
+    if max(abs(v - 1.0) for v in read_float32_nifti(ones_out)) > 1e-5:
+        raise AssertionError("-resample changed a constant 2x2x2 volume")
+
+    # hostile inputs fail closed: absurd -res, NaN numeric options, a sub-option in the output slot,
+    # auxiliary images on another world grid, and a motion file with surplus rows
+    shifted = tmp / "ones_shifted.nii"
+    write_float32_nifti(shifted, (2, 2, 2), [1.0] * 8, offset=(5.0, 0.0, 0.0))
+    long_1d = tmp / "long.1D"
+    long_1d.write_text("0 0 0 0 0 0\n" * (nt + 1))
+    conf = [str(src_path), "-confounds", str(tmp / "bad.tsv"), "-tr", "2", "-hmc", str(est_path), "-ref", str(src_path),
+            "-brain", str(cmask)]
+    for args in ([str(ones), "-resample", str(ones), "-res", "9.5367431640625e-07", str(tmp / "bad.nii")],
+                 [str(ones), "-resample", str(ones), "-res", "nan", str(tmp / "bad.nii")],
+                 [str(ones), "-resample", str(ones), "-jacobian"],
+                 conf + ["-jacobian"],
+                 [a if a != "2" else "nan" for a in conf] + ["-Tmean", str(tmp / "bad.nii")],
+                 [str(src_path), "-confounds", str(tmp / "bad.tsv"), "-tr", "2", "-hmc", str(long_1d), "-ref",
+                  str(src_path), "-brain", str(cmask), "-Tmean", str(tmp / "bad.nii")],
+                 [str(src_path), "-frisgo", "lpass", "nan", str(tmp / "bad.nii")],
+                 [str(ones), "-mp2rage", str(ones), str(ones), "nan", str(tmp / "bad.nii")],
+                 [str(ones), "-mp2rage", str(shifted), str(ones), "1", str(tmp / "bad.nii")],
+                 [str(ones), "-optcom", "10,20", str(shifted), str(tmp / "bad.nii")]):
+        if run_niimath(exe, args).returncode == 0:
+            raise AssertionError("must be rejected: niimath %s" % " ".join(args))
+
+    # >4D input (dim[5] > 1) is rejected, never silently flattened into time or written with a short payload
+    five = tmp / "five.nii"
+    write_float32_nifti(five, (2, 2, 2), [1.0 + i for i in range(48)], nt=2, nu=3)
+    six = tmp / "six_vols.nii"
+    write_float32_nifti(six, (2, 2, 2), [1.0] * 48, nt=6)
+    one_1d = tmp / "five.1D"
+    one_1d.write_text("0 0 0 0 0 0\n" * 6)
+    bad5 = tmp / "bad5.nii"
+    for args in ([str(five), "-gz", "0", "-resample", str(ones), str(bad5)],
+                 [str(five), "-confounds", str(tmp / "bad5.tsv"), "-tr", "2", "-hmc", str(one_1d), "-ref", str(ones),
+                  "-brain", str(ones), "-Tmean", str(bad5)],
+                 [str(six), "-confounds", str(tmp / "bad5.tsv"), "-tr", "2", "-hmc", str(one_1d), "-ref", str(ones),
+                  "-brain", str(five), "-Tmean", str(bad5)],
+                 [str(five), "-optcom", "10,20", str(six), str(bad5)],
+                 [str(six), "-optcom", "10,20", str(five), str(bad5)],
+                 [str(five), "-frisgo", "simple", str(bad5)],
+                 [str(five), "-mp2rage", str(ones), str(ones), "1", str(bad5)],
+                 [str(five), "-boldref", str(bad5), str(tmp / "bad5.json"), str(bad5)],
+                 [str(five), "-moco", "-estimate", str(tmp / "bad5.1D")]):
+        if run_niimath(exe, args).returncode == 0 or bad5.exists():
+            raise AssertionError("5D input must be rejected: niimath %s" % " ".join(args))
+
+    # -bwarp honours scl_slope: a field stored as 1 with slope 2 equals one stored as 2
+    xr = tmp / "warp_ramp.nii"
+    write_float32_nifti(xr, (8, 1, 1), [float(i) for i in range(8)])
+    wout = []
+    for k, (val, slope) in enumerate(((1.0, 2.0), (2.0, 1.0))):
+        wf, wo = tmp / ("warp_s%d.nii" % k), tmp / ("warp_o%d.nii" % k)
+        write_float32_nifti(wf, (8, 1, 1), [val] * 8 + [0.0] * 16, nu=3, scl_slope=slope)
+        require_success(run_niimath(exe, [str(xr), "-gz", "0", "-resample", str(xr), "-bwarp", str(wf), str(wo)]),
+                        "-resample -bwarp")
+        wout.append(read_float32_nifti(wo))
+    if max(abs(a - b) for a, b in zip(*wout)) > 1e-5 or max(abs(a - i) for i, a in enumerate(wout[0])) < 1.0:
+        raise AssertionError("-bwarp ignores scl_slope: %r vs %r" % tuple(wout))
+
+    # -frisgo spline shifts a temporal ramp back half a volume (volume 0 replicates its neighbour)
+    ramp = tmp / "frisgo_ramp.nii"
+    ramp_out = tmp / "frisgo_ramp_out.nii"
+    write_float32_nifti(ramp, (1, 1, 1), [float(t) for t in range(8)], nt=8)
+    require_success(run_niimath(exe, [str(ramp), "-gz", "0", "-frisgo", "spline", str(ramp_out)]), "-frisgo ramp")
+    want = [0.5] + [t - 0.5 for t in range(1, 8)]
+    if any(abs(a - b) > 1e-6 for a, b in zip(read_float32_nifti(ramp_out), want)):
+        raise AssertionError("-frisgo spline ramp: got %r" % read_float32_nifti(ramp_out))
+
+    # -tsnr on a motionless run: the constant motion columns are dropped, not a singular design
+    rng = random.Random(7)
+    still = tmp / "tsnr_still.nii"
+    still_mask = tmp / "tsnr_mask.nii"
+    still_1d = tmp / "tsnr_still.1D"
+    still_json = tmp / "tsnr_still.json"
+    write_float32_nifti(still, (4, 4, 4), [100.0 + rng.gauss(0.0, 1.0) for _ in range(64 * 30)], nt=30)
+    write_float32_nifti(still_mask, (4, 4, 4), [1.0] * 64)
+    still_1d.write_text("0 0 0 0 0 0\n" * 30)
+    require_success(run_niimath(exe, [str(still), "-gz", "0", "-confounds", str(tmp / "tsnr_still.tsv"), "-tr", "2",
+                                      "-hmc", str(still_1d), "-ref", str(still_mask), "-brain", str(still_mask),
+                                      "-tsnr", str(tmp / "tsnr_still_map.nii"), str(still_json),
+                                      str(tmp / "tsnr_junk.nii")]), "-tsnr motionless")
+    tj = json.loads(still_json.read_text())
+    if tj["regressors_used"] != 2 or not 60.0 < tj["tsnr_median_brain"] < 160.0:
+        raise AssertionError("-tsnr motionless: unexpected %r" % tj)
 
     # without -1Dfile no parameter file is produced
     out2 = tmp / "moco_out2.nii"
@@ -4808,6 +4987,25 @@ def main() -> int:
             if not zst_out.exists():
                 raise AssertionError(f"expected zstd output {zst_out}, found {sorted(p.name for p in tmp.iterdir())}")
             require_success(run_niimath(exe, [str(zst_out)]), "read zstd output")
+
+        # a hand-built zstd frame (raw blocks, no zstd module needed): complete reads, truncated is rejected
+        raw = tmp / "zraw.nii"
+        write_float32_nifti(raw, (4, 4, 4), [float(i) for i in range(64)])
+        blob = raw.read_bytes()
+        frame = (b"\x28\xb5\x2f\xfd\xa0" + struct.pack("<I", len(blob)) + struct.pack("<I", len(blob) << 3)[:3]
+                 + blob + b"\x01\x00\x00")   # descriptor: single segment, 4-byte size; last block is empty
+        zfull = tmp / "zraw_full.nii.zst"
+        ztrunc = tmp / "zraw_trunc.nii.zst"
+        zfull.write_bytes(frame)
+        ztrunc.write_bytes(frame[:-3])
+        zread = run_niimath(exe, [str(zfull), "-gz", "0", str(tmp / "zraw_full_out.nii")])
+        if zread.returncode == 0:
+            if read_float32_nifti(tmp / "zraw_full_out.nii") != read_float32_nifti(raw):
+                raise AssertionError("hand-built zstd frame did not round-trip")
+            if run_niimath(exe, [str(ztrunc), "-gz", "0", str(tmp / "zraw_trunc_out.nii")]).returncode == 0:
+                raise AssertionError("a zstd frame missing its last block was accepted")
+        elif args.expect_zstd:
+            raise AssertionError("zstd build cannot read a raw-block frame: " + zread.stderr)
 
     print("release smoke passed")
     return 0

@@ -50,7 +50,22 @@ extern "C" {
 //     parameter file with no image.  Aliasing `par_path` with the input or the output image is
 //     rejected at parse time.
 // Returns 0 on success, non-zero on failure.
-int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file);
+// `estimate` != 0 (-moco -estimate): fit and write `par_path` at full precision (%12.8f) but do NOT
+// reslice; `nim` is returned untouched and no corrected-series buffer is allocated.
+int nii_moco(nifti_image *nim, const char *par_path, int ref_vol, const char *ref_file, int estimate);
+
+// -boldref <ref> <json>: fMRIPrep's BOLD reference (niworkflows NonsteadyStatesDetector +
+// RobustAverage with AFNI-style volreg).  Detects leading non-steady-state volumes among the first
+// 40 (modified z of the clipped global mean > 3.5), averages them -- or volumes 20..39 when fewer
+// than 2 are found -- after drift normalisation and -moco onto the first, as a voxelwise median.
+// Writes the 3D reference to <ref> (format per FSLOUTPUTTYPE) and {"dummy_scans", "reference_volumes"}
+// to <json>.  `nim` is left untouched so the chain continues on the original series.
+int nii_boldref(nifti_image *nim, const char *ref_path, const char *json_path, gzModes gz);
+
+// One -moco correction row (roll pitch yaw dS dL dP) as the index-space pull it applies: the
+// corrected series at voxel p samples the input at M[:, :3] p + M[:, 3].  Same geometry as
+// -moco (storage axes, obliquity ignored, rotation about the grid centre).  Returns 0 on success.
+int moco_pull_affine(const nifti_image *nim, const double par[6], double M[3][4]);
 
 // -moco -relative: MEASUREMENT ONLY.  Fits every sub-brick t (1..nt-1) onto sub-brick t-1 and
 // writes those parameters; `nim` is NOT modified and NO image is written -- on the command line

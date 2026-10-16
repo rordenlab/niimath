@@ -112,7 +112,7 @@ static int md_axis_index(const char *s, int *sign_suffix) {
 
 /* Voxel->world (RAS) 3x3 of an image.
  *
- * Precedence MUST match core.c's xform(), because md_same_grid() validates images through
+ * Precedence MUST match core.c's xform(), because nii_same_grid() validates images through
  * max_displacement_mm() -- which uses xform() -- while md_offset_per_mm() resamples with the
  * matrix returned here.  A different rule in the two places means the grid check can pass on one
  * matrix while the physics runs on another: an image with sform_code=1, qform_code=2 and
@@ -337,15 +337,6 @@ static nifti_image *md_read_f32(const char *fn, const char *what) {
 	return n;
 }
 
-/* Do two images share a grid?  Dimensions exactly, plus the project's existing world-transform
-   metric -- max_displacement_mm() measures true 3D corner displacement AND normalises each header
-   to millimetres via xyz_units, so it covers rotation, scale, origin and units in one call.  This
-   is the same 0.001 mm gate --qc uses for its own same-grid requirement. */
-static int md_same_grid(nifti_image *a, nifti_image *b) {
-	return a->nx == b->nx && a->ny == b->ny && a->nz == b->nz &&
-		max_displacement_mm(a, b) <= 0.001f;
-}
-
 /* ============================== -unwarp ============================== */
 
 int medic_unwarp(nifti_image *nim, const char *mapfile, const char *axis) {
@@ -370,7 +361,7 @@ int medic_unwarp(nifti_image *nim, const char *mapfile, const char *axis) {
 
 	map = md_read_f32(mapfile, "displacement map");
 	if (!map) return 1;
-	if (!md_same_grid(nim, map)) {
+	if (!nii_same_grid(nim, map)) {
 		MD_ERRW("displacement map '%s' does not share the input's grid (dimensions and world transform must match)\n", mapfile);
 		goto done;
 	}
@@ -2039,7 +2030,7 @@ static int md_mindgrab_mask(md_ctx *c, const float *mag, int64_t n3, int T, uint
 	if (!mc) goto done;
 	mr = md_read_f32(fring, "mindgrab border mask");
 	if (!mr) goto done;
-	if (!md_same_grid(c->tmpl, mc) || !md_same_grid(c->tmpl, mr) ||
+	if (!nii_same_grid(c->tmpl, mc) || !nii_same_grid(c->tmpl, mr) ||
 		(int64_t)mc->nvox != n3 || (int64_t)mr->nvox != n3) {
 		MD_ERR("mindgrab returned a mask off the input grid\n");
 		goto done;
@@ -2383,7 +2374,7 @@ int nii_medic(int argc, char *argv[]) {
 		if (!ph[e]) goto done;
 		mg[e] = md_read_hdr(magf[e], "magnitude");
 		if (!mg[e]) goto done;
-		if (!md_same_grid(ph[0], ph[e]) || !md_same_grid(ph[0], mg[e])) {
+		if (!nii_same_grid(ph[0], ph[e]) || !nii_same_grid(ph[0], mg[e])) {
 			MD_ERR("echo %d does not share echo 1's grid (dimensions and world transform must match across all echoes and parts)\n", e + 1);
 			goto done;
 		}
@@ -2542,7 +2533,7 @@ int nii_medic(int argc, char *argv[]) {
 			nifti_image *mk = md_read_f32(c.maskfile, "mask");
 			int64_t q;
 			if (!mk) { goto done; }
-			if (!md_same_grid(ph[0], mk) || (int64_t)mk->nvox != n3) {
+			if (!nii_same_grid(ph[0], mk) || (int64_t)mk->nvox != n3) {
 				MD_ERR("--mask must be a single 3D volume on the input grid\n");
 				nifti_image_free(mk); goto done;
 			}
