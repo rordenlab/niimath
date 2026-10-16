@@ -34,8 +34,11 @@ if not bin_path.exists():
 bin = str(bin_path)
 
 # Make the binary executable on Unix systems
-if system != "Windows" and bin_path.exists():
-    os.chmod(bin, os.stat(bin).st_mode | 0o111)
+if system != "Windows" and bin_path.exists() and not os.access(bin, os.X_OK):
+    try:
+        os.chmod(bin, os.stat(bin).st_mode | 0o111)
+    except OSError:  # not owner / read-only install: let main() report it
+        pass
 
 
 def main(args=None, **run_kwargs):
