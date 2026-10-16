@@ -16,6 +16,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
+#ifndef M_PI // MSVC gates M_PI behind _USE_MATH_DEFINES
+#define M_PI 3.14159265358979323846
+#endif
 
 #ifdef N4_DUMP // parity-bench builds only (-DN4_DUMP): at run time N4_DUMP=<dir> receives <name>.f32 stage arrays
 void n4_dump(const char *name, const float *v, size_t n);
