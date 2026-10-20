@@ -73,8 +73,12 @@
 	#define kOS "MacOS"
 #elif (defined(__linux) || defined(__linux__))
 	#define kOS "Linux"
-#else
+#elif defined(__wasm__)
+	#define kOS "WASM"
+#elif defined(_WIN32)
 	#define kOS "Windows"
+#else
+	#define kOS "Unknown"
 #endif
 #if defined(HAVE_GPL)
 	#define kLicense " GPL"

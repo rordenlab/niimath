@@ -10,7 +10,8 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
-    "./niimath.js": "./dist/niimath.js"
+    "./niimath.js": "./dist/niimath.js",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "test": "bun test ./tests",
