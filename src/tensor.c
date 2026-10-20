@@ -1124,6 +1124,28 @@ L50:
     return 0;
 } /* rs_ */
 
+/* Unit eigenvector of the symmetric matrix [aa bb cc; bb dd ee; cc ee ff] for
+   eigenvalue lam: the largest cross product of two rows of (A - lam*I).
+   Well conditioned when lam is a simple, well separated eigenvalue. */
+static void eigvec_cross3( double aa, double bb, double cc, double dd,
+                           double ee, double ff, double lam, double *x )
+{
+   double r0[3] = { aa-lam , bb , cc } ;
+   double r1[3] = { bb , dd-lam , ee } ;
+   double r2[3] = { cc , ee , ff-lam } ;
+   double c[3][3] , n[3] ;
+   int i , best = 0 ;
+   c[0][0] = r0[1]*r1[2]-r0[2]*r1[1] ; c[0][1] = r0[2]*r1[0]-r0[0]*r1[2] ; c[0][2] = r0[0]*r1[1]-r0[1]*r1[0] ;
+   c[1][0] = r0[1]*r2[2]-r0[2]*r2[1] ; c[1][1] = r0[2]*r2[0]-r0[0]*r2[2] ; c[1][2] = r0[0]*r2[1]-r0[1]*r2[0] ;
+   c[2][0] = r1[1]*r2[2]-r1[2]*r2[1] ; c[2][1] = r1[2]*r2[0]-r1[0]*r2[2] ; c[2][2] = r1[0]*r2[1]-r1[1]*r2[0] ;
+   for( i=0 ; i < 3 ; i++ ) n[i] = c[i][0]*c[i][0]+c[i][1]*c[i][1]+c[i][2]*c[i][2] ;
+   if( n[1] > n[best] ) best = 1 ;
+   if( n[2] > n[best] ) best = 2 ;
+   n[best] = sqrt(n[best]) ;
+   if( n[best] <= 0.0 ){ x[0] = 1.0 ; x[1] = x[2] = 0.0 ; return ; }
+   for( i=0 ; i < 3 ; i++ ) x[i] = c[best][i] / n[best] ;
+}
+
 void symeig_3( double *a , double *e , int dovec )
 {
    double aa,bb,cc,dd,ee,ff ;
@@ -1242,53 +1264,41 @@ void symeig_3( double *a , double *e , int dovec )
      if( lam2 > lam3 )  SWAP(lam2,lam3) ;
      e[0] = ann*lam1 ; e[1] = ann*lam2 ; e[2] = ann*lam3 ;  /* re-scale */
 
-     /* find eigenvector for lam1 by computing Ay-lam1*y for
-        vectors y1=[1,0,0], y2=[0,1,0], and y3=[0,0,1]; the eigenvector
-        is orthogonal to all of these, so use the cross product to get it */
-
-     u1 = aa-lam1 ; u2 = bb      ; u3 = cc ;   /* A*y1 - lam1*y1 */
-     v1 = bb      ; v2 = dd-lam1 ; v3 = ee ;   /* A*y2 - lam1*y2 */
-     CROSS(u1,u2,u3 , v1,v2,v3 , t1,t2,t3 ) ;     tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-     if( tn < EPSQ*ann ){                      /* u and v were parallel? */
-       w1 = cc ; w2 = ee ; w3 = ff-lam1 ;      /* A*y3 - lam1*y3 */
-       CROSS(u1,u2,u3 , w1,w2,w3 , t1,t2,t3 ) ;   tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-       if( tn < EPSQ*ann ){                    /* u and w were parallel? */
-         CROSS(v1,v2,v3 , w1,w2,w3 , t1,t2,t3 ) ; tn = sqrt(t1*t1+t2*t2+t3*t3) ;
+     /* Eigenvectors. Get the eigenvector of the most isolated eigenvalue
+        (lam1 or lam3) from cross products of rows of (A - lam*I). Then
+        solve the 2x2 problem in the plane orthogonal to it with a Jacobi
+        rotation. This stays accurate when the other two eigenvalues are
+        nearly equal (for example a prolate tensor with L2 = L3), where
+        cross products for those eigenvalues are only rounding noise. */
+     {
+       double u[3] , p[3] , q[3] , ap[3] , aq[3] , m00 , m01 , m11 , tc , ts , tt ;
+       int iso_low = ( (lam2-lam1) > (lam3-lam2) ) ;   /* lam1 most isolated? */
+       eigvec_cross3( aa,bb,cc,dd,ee,ff , iso_low ? lam1 : lam3 , u ) ;
+       /* p: any unit vector orthogonal to u; q = u x p */
+       if( fabs(u[0]) < 0.6 ){ CROSS(u[0],u[1],u[2] , 1.0,0.0,0.0 , p[0],p[1],p[2]) ; }
+       else                  { CROSS(u[0],u[1],u[2] , 0.0,1.0,0.0 , p[0],p[1],p[2]) ; }
+       tn = sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]) ; p[0] /= tn ; p[1] /= tn ; p[2] /= tn ;
+       CROSS(u[0],u[1],u[2] , p[0],p[1],p[2] , q[0],q[1],q[2]) ;
+       /* 2x2 matrix of A in the (p,q) plane */
+       ap[0] = aa*p[0]+bb*p[1]+cc*p[2] ; ap[1] = bb*p[0]+dd*p[1]+ee*p[2] ; ap[2] = cc*p[0]+ee*p[1]+ff*p[2] ;
+       aq[0] = aa*q[0]+bb*q[1]+cc*q[2] ; aq[1] = bb*q[0]+dd*q[1]+ee*q[2] ; aq[2] = cc*q[0]+ee*q[1]+ff*q[2] ;
+       m00 = p[0]*ap[0]+p[1]*ap[1]+p[2]*ap[2] ;
+       m01 = p[0]*aq[0]+p[1]*aq[1]+p[2]*aq[2] ;
+       m11 = q[0]*aq[0]+q[1]*aq[1]+q[2]*aq[2] ;
+       tt = 0.5 * atan2( 2.0*m01 , m00-m11 ) ;   /* rotation to the larger eigenvalue */
+       tc = cos(tt) ; ts = sin(tt) ;
+       if( iso_low ){   /* u -> lam1; plane holds lam2 (smaller) and lam3 (larger) */
+         a[0] = u[0] ; a[1] = u[1] ; a[2] = u[2] ;
+         a[6] = tc*p[0]+ts*q[0] ; a[7] = tc*p[1]+ts*q[1] ; a[8] = tc*p[2]+ts*q[2] ;
+         a[3] = -ts*p[0]+tc*q[0] ; a[4] = -ts*p[1]+tc*q[1] ; a[5] = -ts*p[2]+tc*q[2] ;
+       } else {         /* u -> lam3; plane holds lam1 (smaller) and lam2 (larger) */
+         a[6] = u[0] ; a[7] = u[1] ; a[8] = u[2] ;
+         a[3] = tc*p[0]+ts*q[0] ; a[4] = tc*p[1]+ts*q[1] ; a[5] = tc*p[2]+ts*q[2] ;
+         a[0] = -ts*p[0]+tc*q[0] ; a[1] = -ts*p[1]+tc*q[1] ; a[2] = -ts*p[2]+tc*q[2] ;
        }
+       if( DET3(a) < 0.0 ){ a[6] = -a[6]; a[7] = -a[7]; a[8] = -a[8]; }
      }
-     a[0] = t1/tn ; a[1] = t2/tn ; a[2] = t3/tn ;  /* normalize */
 
-     /* do same for lam2 */
-
-     u1 = aa-lam2 ; u2 = bb      ; u3 = cc ;
-     v1 = bb      ; v2 = dd-lam2 ; v3 = ee ;
-     CROSS(u1,u2,u3 , v1,v2,v3 , t1,t2,t3 ) ;     tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-     if( tn < EPSQ*ann ){
-       w1 = cc ; w2 = ee ; w3 = ff-lam2 ;
-       CROSS(u1,u2,u3 , w1,w2,w3 , t1,t2,t3 ) ;   tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-       if( tn < EPSQ*ann ){
-         CROSS(v1,v2,v3 , w1,w2,w3 , t1,t2,t3 ) ; tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-       }
-     }
-     a[3] = t1/tn ; a[4] = t2/tn ; a[5] = t3/tn ;  /* normalize */
-
-     /* orthgonality of eigenvectors ==> can get last one by cross product */
-
-#if 1
-     CROSS( a[0],a[1],a[2] , a[3],a[4],a[5] , a[6],a[7],a[8] ) ;
-#else
-     u1 = aa-lam3 ; u2 = bb      ; u3 = cc ;
-     v1 = bb      ; v2 = dd-lam3 ; v3 = ee ;
-     CROSS(u1,u2,u3 , v1,v2,v3 , t1,t2,t3 ) ;     tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-     if( tn < EPSQ*ann ){
-       w1 = cc ; w2 = ee ; w3 = ff-lam3 ;
-       CROSS(u1,u2,u3 , w1,w2,w3 , t1,t2,t3 ) ;   tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-       if( tn < EPSQ*ann ){
-         CROSS(v1,v2,v3 , w1,w2,w3 , t1,t2,t3 ) ; tn = sqrt(t1*t1+t2*t2+t3*t3) ;
-       }
-     }
-     a[6] = t1/tn ; a[7] = t2/tn ; a[8] = t3/tn ;  /* normalize */
-#endif
 
    } else { /*---- if here, we have a double root ----*/
 
