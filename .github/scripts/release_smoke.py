@@ -4688,6 +4688,69 @@ def exercise_skullstrip(exe: str, tmp: Path, help_text: str) -> None:
     print("        -faithful kernel accepted and not swallowed as the output name, and chaining OK")
 
 
+def exercise_dtifit_small_eigenvalues(exe: str, tmp: Path, help_text: str) -> None:
+    """--dtifit keeps real eigenvalues below 1e-4 mm^2/s (issue #84).
+
+    EIG_tsfunc used to set every eigenvalue with |L| < 1e-4 to 0. That threshold is absolute,
+    and dtifit diffusivities are in mm^2/s, so a real small L3 was zeroed and FA and MD were
+    computed from the changed value. Only small negative eigenvalues (fit noise) are still
+    clamped to 0. The fixture is one voxel of noise-free signal from a diagonal tensor.
+    """
+    if "--dtifit" not in help_text:
+        print("  --dtifit: not built (DTIFIT=0) - skipping")
+        return
+
+    n = 30  # b=1000 directions on a half sphere, plus 2 b=0
+    bvecs = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    for k in range(n):
+        z = 1.0 - (k + 0.5) / n
+        phi = math.pi * (1.0 + math.sqrt(5.0)) * (k + 0.5)
+        r = math.sqrt(1.0 - z * z)
+        bvecs.append((r * math.cos(phi), r * math.sin(phi), z))
+    bvals = [0.0, 0.0] + [1000.0] * n
+    bvec_file = tmp / "dtifit_small.bvec"
+    bval_file = tmp / "dtifit_small.bval"
+    bvec_file.write_text("\n".join(" ".join(f"{g[axis]:.8f}" for g in bvecs) for axis in range(3)) + "\n")
+    bval_file.write_text(" ".join(f"{b:g}" for b in bvals) + "\n")
+    env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
+
+    def fa_md(evals: list[float]) -> tuple[float, float]:
+        md = sum(evals) / 3.0
+        ssq = sum(v * v for v in evals)
+        dsq = (evals[0] - evals[1]) ** 2 + (evals[1] - evals[2]) ** 2 + (evals[2] - evals[0]) ** 2
+        return math.sqrt(dsq / (2.0 * ssq)), md
+
+    # (true eigenvalues, expected L1..L3 after the fit)
+    cases = [
+        ("small", [1.7e-3, 0.3e-3, 0.08e-3], [1.7e-3, 0.3e-3, 0.08e-3]),
+        ("typical", [1.2e-3, 0.6e-3, 0.3e-3], [1.2e-3, 0.6e-3, 0.3e-3]),
+        # A small negative eigenvalue is still clamped to 0, and FA/MD stay finite (not 0).
+        ("negative", [1.7e-3, 0.3e-3, -0.05e-3], [1.7e-3, 0.3e-3, 0.0]),
+    ]
+    for label, evals, expect in cases:
+        signal = [1000.0 * math.exp(-b * (g[0] ** 2 * evals[0] + g[1] ** 2 * evals[1] + g[2] ** 2 * evals[2]))
+                  for b, g in zip(bvals, bvecs)]
+        dwi = tmp / f"dtifit_small_{label}.nii"
+        write_float32_nifti(dwi, (1, 1, 1), signal, nt=len(signal))
+        base = tmp / f"dtifit_small_{label}"
+        result = run_niimath(
+            exe,
+            ["--dtifit", "-k", str(dwi), "-r", str(bvec_file), "-b", str(bval_file), "-o", str(base), "-xflip", "0"],
+            env=env,
+        )
+        require_success(result, f"--dtifit small eigenvalues ({label})")
+        out = {key: read_float32_nifti(Path(f"{base}_{key}.nii"))[0] for key in ("L1", "L2", "L3", "FA", "MD")}
+        fa, md = fa_md(expect)
+        for key, want in zip(("L1", "L2", "L3"), expect):
+            if abs(out[key] - want) > 1e-3 * max(abs(want), 1e-4):
+                raise AssertionError(f"--dtifit ({label}): {key} {out[key]:.6g}, expected {want:.6g}")
+        if abs(out["FA"] - fa) > 1e-3 or abs(out["MD"] - md) > 1e-3 * md:
+            raise AssertionError(
+                f"--dtifit ({label}): FA {out['FA']:.5f} MD {out['MD']:.5g}, expected FA {fa:.5f} MD {md:.5g}"
+            )
+    print("  --dtifit: eigenvalues below 1e-4 kept, small negative eigenvalue clamped")
+
+
 def _help_line(help_text: str, tag: str) -> str:
     """The help line for one operation, so a caller can tell "absent" from "present but
     disabled" -- a platform-gated feature prints a '... NOT in this build' line rather than
@@ -4943,6 +5006,7 @@ def main() -> int:
         exercise_qc(exe, tmp)
         exercise_qc_pve(exe, tmp)
         exercise_fillh(exe, tmp)
+        exercise_dtifit_small_eigenvalues(exe, tmp, help_text)
 
         exercise_allineate(exe, tmp, help_text)
         exercise_romeo(exe, tmp, help_text)
