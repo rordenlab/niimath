@@ -1797,8 +1797,11 @@ void EIG_tsfunc(
       }
   }
 
+  /* Only clamp small NEGATIVE eigenvalues (fit noise) to 0. SMALLNUMBER is an
+     absolute threshold, and a dtifit tensor is in mm^2/s, where a real L3 can be
+     below 1e-4 (ex vivo tissue, cold phantoms), so positive values are kept. */
   for(i=0;i<3;i++) {
-    if(fabs(val[i])<SMALLNUMBER)
+    if((val[i] < 0.0) && (val[i] > -SMALLNUMBER))
        val[i] = 0.0;
   }
 
