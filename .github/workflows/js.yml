@@ -13,6 +13,9 @@ on:
 jobs:
   prebuild:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC); no token secret
     defaults:
       run:
         working-directory: js
@@ -48,3 +51,19 @@ jobs:
         run: bun run esbuild.config.ts
       - name: Run WASM runtime tests
         run: bun run test
+      # Publish when js/package.json holds a version npm does not have yet (issue #38).
+      # Runs only on master, after every check above passed on this exact build.
+      # Auth is npm trusted publishing, configured on npmjs.com for this repo and js.yml.
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'push'
+        with:
+          node-version: 24
+      - name: Publish to npm if the version is new
+        if: github.event_name == 'push'
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@niivue/niimath@$v" version 2>/dev/null)" ]; then
+            echo "@niivue/niimath@$v already published"; exit 0
+          fi
+          npm install -g npm@11 # trusted publishing needs npm >= 11.5.1
+          npm publish --access public
