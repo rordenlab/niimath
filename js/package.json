@@ -40,6 +40,11 @@
     "brain"
   ],
   "author": "NiiVue developers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rordenlab/niimath.git",
+    "directory": "js"
+  },
   "license": "BSD-2-Clause AND Apache-2.0",
   "description": "A javascript library to easily use the WASM build of Chris Rorden's niimath command line program written in C",
   "files": [

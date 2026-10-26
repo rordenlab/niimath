@@ -10,7 +10,7 @@ Each output has its own mechanism, and the three are independent. The npm versio
 |---|---|---|
 | Python wheels to PyPI | `release.yml` (cibuildwheel, `deploy-pypi`) | a `v*.*.*` tag. A push to `master` runs the same jobs but uploads nothing |
 | Standalone CLI binaries as GitHub Release assets (`niimath_{win,lnx,macos}.zip`) | `release-binaries.yml`, with the built-in `GITHUB_TOKEN` | a `v*.*.*` tag, or `workflow_dispatch` with the tag as input |
-| npm package `@niivue/niimath` (BSD-only) on npmjs | manual `npm publish` from `js/` | by hand; there is no CI publish |
+| npm package `@niivue/niimath` (BSD-only) on npmjs | `js.yml`, npm trusted publishing (OIDC) | a push to `master` whose `js/package.json` version is not yet on npm |
 
 AppVeyor only builds and tests. It publishes nothing.
 
@@ -30,13 +30,13 @@ AppVeyor only builds and tests. It publishes nothing.
 
 ### npm package
 
-Publish by hand from a clean `master`. `neurolabusc` and `thanayik` have `read-write` access through the `@niivue` org. **2FA is required to publish** (E403 otherwise).
+`js.yml` publishes on a push to `master` when `js/package.json` holds a version npm does not have. After the WASM build and every `bun` test pass, a separate publish job receives the tested tarball. Only that job has OIDC permission; publishing runs no package scripts. Registry lookup errors stop the job. Auth is npm trusted publishing: no token, no OTP. Configure the trusted publisher on npmjs.com: owner `rordenlab`, repository `niimath`, workflow `js.yml`, with direct `npm publish` allowed. Provenance requires the `repository` field in `js/package.json`.
 
-1. Bump `version` in `js/package.json`.
-2. Run `cd js && bun run build`. `dist/` is gitignored, so a fresh build is REQUIRED before you publish.
-3. Run `npm pack --dry-run --json` and check that the tarball is BSD-only, with no GPL or test artifacts. `tests/pack.test.ts` asserts this.
-4. Run `npm publish --access public`. With a configured **passkey**, bare `npm publish` succeeds interactively. Otherwise pass `--otp=<code>`, or put an npm Automation or "bypass 2FA" token in `~/.npmrc`.
-5. Keep the committed `js/package.json` version equal to the published version.
+1. Bump `version` in `js/package.json` in a pull request.
+2. Merge it. The push to `master` builds, tests and publishes.
+3. A version already on npm is skipped, so other pushes publish nothing. Do not lower the version: npm would tag the lower version `latest`.
+
+To publish by hand (a fallback), run `cd js && bun run build && npm publish --access public` from a clean `master`. `neurolabusc` and `thanayik` have `read-write` access through the `@niivue` org, and 2FA is required (E403 otherwise).
 
 ## Guards and why they exist
 

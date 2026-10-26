@@ -344,7 +344,7 @@ LeakSanitizer unavailable on Apple Silicon; ASan is libomp-deadlocked (so `make 
 - **`--compare` oracle gotcha:** its verdict and exit code are MAGNITUDE-based (`maxDiff > thresh`), and a non-finite difference has no magnitude — so non-finite mismatches must be counted separately, or an all-NaN-vs-finite pair reads as EQUAL and exits 0. Canonical/close/thread-parity CI rely on `--compare` as the oracle.
 
 ### CI
-- AppVeyor for cross-platform builds; `gpl-build.yml` for GPL `-spm_coreg` + allineate thread parity and registration quality; `js.yml` builds the WASM bundle and runs the `bun` runtime test suite; `skullstrip-build.yml` builds the off-by-default `-skullstrip` ON under both build systems on Linux, plus a `skullstrip-msvc` job that configures/builds/smokes it on `windows-latest`, and is the only workflow that runs `ctest`; `mesh-optional.yml` does the same for the off-by-default `Q2=1` half-edge simplifier.
+- AppVeyor for cross-platform builds; `gpl-build.yml` for GPL `-spm_coreg` + allineate thread parity and registration quality; `js.yml` builds the WASM bundle, runs the `bun` runtime test suite, and on a `master` push publishes the tested tarball to npm from a separate OIDC-only `publish` job when the version is new (see `RELEASING.md`; the npm trusted publisher must allow direct `npm publish`, which configurations made after 2026-09-03 do not by default); `skullstrip-build.yml` builds the off-by-default `-skullstrip` ON under both build systems on Linux, plus a `skullstrip-msvc` job that configures/builds/smokes it on `windows-latest`, and is the only workflow that runs `ctest`; `mesh-optional.yml` does the same for the off-by-default `Q2=1` half-edge simplifier.
 
 ### Release / deploy
 
