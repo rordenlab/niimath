@@ -30,7 +30,7 @@ AppVeyor only builds and tests. It publishes nothing.
 
 ### npm package
 
-`js.yml` publishes on a push to `master` when `js/package.json` holds a version npm does not have. It publishes only after the WASM build and every `bun` test, including the BSD-only `tests/pack.test.ts`, pass on that build. Auth is npm trusted publishing: no token, no OTP. The trusted publisher is set on npmjs.com under the package settings: owner `rordenlab`, repository `niimath`, workflow `js.yml`. Provenance requires the `repository` field in `js/package.json`.
+`js.yml` publishes on a push to `master` when `js/package.json` holds a version npm does not have. After the WASM build and every `bun` test pass, a separate publish job receives the tested tarball. Only that job has OIDC permission; publishing runs no package scripts. Registry lookup errors stop the job. Auth is npm trusted publishing: no token, no OTP. Configure the trusted publisher on npmjs.com: owner `rordenlab`, repository `niimath`, workflow `js.yml`, with direct `npm publish` allowed. Provenance requires the `repository` field in `js/package.json`.
 
 1. Bump `version` in `js/package.json` in a pull request.
 2. Merge it. The push to `master` builds, tests and publishes.
