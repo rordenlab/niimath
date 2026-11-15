@@ -299,3 +299,31 @@ describe('byte / Blob sources', () => {
     await runQ;
   });
 });
+
+describe('argument arrays and File results', () => {
+  test('args() appends raw options between the input and output names', async () => {
+    const { fake, niimath } = await ready();
+    const runP = niimath.image(inputNii()).args(['-s', 3, '-thr', 0.5]).args(['-bin']).run('out.nii.gz');
+    const { cmd } = fake.posted[0];
+    expect(cmd.slice(1, cmd.indexOf('out.nii.gz'))).toEqual(['-s', '3', '-thr', '0.5', '-bin']);
+    fake.emit(okMsg());
+    await runP;
+  });
+
+  test('run() names the File for what niimath wrote, gzip suffix included', async () => {
+    const { fake, niimath } = await ready();
+    const runP = niimath.image(inputNii()).run('output.nii');
+    fake.emit({ ...okMsg(), outName: 'output.nii.gz' });
+    expect((await runP).name).toBe('output.nii.gz');
+  });
+
+  test('run() resolves to a File named after the output', async () => {
+    const { fake, niimath } = await ready();
+    const runP = niimath.image(inputNii()).run('smoothed.nii.gz');
+    fake.emit(okMsg());
+    const out = await runP;
+    expect(out).toBeInstanceOf(File);
+    expect(out.name).toBe('smoothed.nii.gz');
+    expect(new Uint8Array(await out.arrayBuffer())).toEqual(new Uint8Array([0]));
+  });
+});
