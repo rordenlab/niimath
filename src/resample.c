@@ -182,6 +182,16 @@ static int pull_series(const nifti_image *src, int nt, const float *coords, int6
 		const double *M = hmcM ? hmcM[t] : NULL;
 		float *o3 = dst + (size_t)t * onv;
 		int vt = per_frame ? t : 0;
+		/* Jacobian = 1 + grad(vsm) . pe (issue #90). Per-frame map: pe = e_axis. Static (reference-space) map
+		   under motion: pe = A^-1 e_axis = row(axis+1) x row(axis+2), A = rigid linear part of M, det A = 1. */
+		double pe[3] = {0.0, 0.0, 0.0};
+		if (vsm) pe[vsm->axis] = 1.0;
+		if (vsm && vsm->jacobian && M && !per_frame) {
+			const double *r1 = M + 4 * ((vsm->axis + 1) % 3), *r2 = M + 4 * ((vsm->axis + 2) % 3);
+			pe[0] = r1[1] * r2[2] - r1[2] * r2[1];
+			pe[1] = r1[2] * r2[0] - r1[0] * r2[2];
+			pe[2] = r1[0] * r2[1] - r1[1] * r2[0];
+		}
 #ifdef _OPENMP
 		#pragma omp parallel for
 #endif
@@ -194,12 +204,15 @@ static int pull_series(const nifti_image *src, int nt, const float *coords, int6
 				double at[3];
 				memcpy(at, per_frame ? q : p, sizeof(at));
 				q[vsm->axis] += trilin(vsm->map, vt, at);
-				if (vsm->jacobian) {   /* 1 + d(vsm)/d(axis), central difference */
-					double a[3], b[3];
-					memcpy(a, at, sizeof(a)); memcpy(b, at, sizeof(b));
-					a[vsm->axis] += 0.5; b[vsm->axis] -= 0.5;
-					jac = 1.0 + trilin(vsm->map, vt, a) - trilin(vsm->map, vt, b);
-				}
+				if (vsm->jacobian)   /* central differences, only along axes pe touches */
+					for (int k = 0; k < 3; k++) {
+						if (pe[k] == 0.0) continue;
+						double a[3], b[3];
+						memcpy(a, at, sizeof(a)); memcpy(b, at, sizeof(b));
+						a[k] += 0.5; b[k] -= 0.5;
+						jac += pe[k] * trilin(vsm->map, vt, a);
+						jac -= pe[k] * trilin(vsm->map, vt, b);
+					}
 			}
 			o3[v] = (float)(jac * bspline_eval(coef, in, q));
 		}

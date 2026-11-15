@@ -460,7 +460,7 @@ One-shot resampling of a 3D or 4D series onto `<grid>`, for fastprep's "apply" s
 4. The input's voxel grid.
 5. An optional per-volume `-moco -estimate` row (`-hmc`).
 
-`-res` re-voxels the grid isotropically over the same field of view. `-vsm <map> <i|j|k> [-jacobian]` adds a susceptibility voxel-shift map along the phase-encoding axis after the motion step, as fMRIPrep's `resample_vol` does. The map is on the input grid, in voxels, with the sign already folded in (vsm = Hz × TotalReadoutTime, negated for a `-` direction). `-jacobian` scales the result by 1 + ∂vsm/∂axis. The map must share the input's voxel grid. `-res` must be a finite positive size. `-confounds` accepts `-vsm` and `-bwarp` too.
+`-res` re-voxels the grid isotropically over the same field of view. `-vsm <map> <i|j|k> [-jacobian]` adds a susceptibility voxel-shift map along the phase-encoding axis after the motion step, as fMRIPrep's `resample_vol` does. The map is on the input grid, in voxels, with the sign already folded in (vsm = Hz × TotalReadoutTime, negated for a `-` direction). `-jacobian` scales the result by 1 + ∇vsm · PE, with the gradient taken on the map grid and PE the phase-encoding axis rotated by each frame's motion. The map must share the input's voxel grid. `-res` must be a finite positive size. `-confounds` accepts `-vsm` and `-bwarp` too.
 
 The series itself is not changed, so you can repeat `-resample` to write several spaces from one read. If the last `<out>` is niimath's output name, nothing else is written:
 
