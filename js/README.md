@@ -39,8 +39,19 @@ await niimath.init();
 
 // selectedFile is a browser File object. Raw bytes (ArrayBuffer/Uint8Array) or a Blob also work:
 // they are staged as input.nii or input.nii.gz (gzip is detected); image(src, name) overrides the name.
-// run() executes the command. It returns a promise that resolves to the output file when the command succeeds.
-const outFile = await niimath.image(selectedFile).dog(2, 3.2).run();
+// run() executes the command. It returns a promise that resolves to the output File when the
+// command succeeds, named for the file niimath wrote: run()'s argument, plus .gz when niimath
+// compressed it (so the default output.nii comes back as output.nii.gz).
+const outFile = await niimath.image(selectedFile).dog(2, 3.2).run('dog.nii.gz');
+```
+
+### Pass options as an array
+
+`args()` takes options as they would follow the input on the command line, for a pipeline held as data (a menu, a saved recipe) rather than chained calls. Options that name files need their own methods, which stage those files:
+
+```javascript
+const steps = ['-s', 3, '-thr', 0.5, '-bin'];
+const mask = await niimath.image(selectedFile).args(steps).run('mask.nii.gz');
 ```
 
 ### Register and deface
@@ -84,7 +95,7 @@ Two more operations take an image operand. `resliceNN(refFile)` reslices the cur
 ```javascript
 // reslice maskFile (conformed space) onto nativeFile's grid, binarize, save
 const maskBlob = await niimath.image(maskFile).resliceNN(nativeFile).bin().run();
-// run() returns a Blob, which can be passed straight back as an operand;
+// run() returns a File (a Blob), which can be passed straight back as an operand;
 // keep only the masked region of the native image (now on the same grid)
 const brain = await niimath.image(nativeFile).mulImage(maskBlob).run();
 ```
