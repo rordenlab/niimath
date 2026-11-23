@@ -59,6 +59,9 @@ interface WorkerSuccessMessage {
   type?: undefined;
   blob: Blob;
   exitCode: number;
+  // The file niimath actually wrote: the requested name, or it plus `.gz` when
+  // niimath compressed it (the default for a `.nii` request).
+  outName?: string;
 }
 
 type WorkerMessage = WorkerReadyMessage | WorkerErrorMessage | WorkerSuccessMessage;
@@ -326,6 +329,16 @@ class ImageProcessor {
     return this._addFileCommand('-reface', [tmpl, shell, weight], opts);
   }
 
+  // Append raw niimath options, as typed on the command line between the input and
+  // output names: args(['-s', 3, '-thr', 0.5, '-bin']). The entry point for a pipeline
+  // held as data (a menu, a saved recipe) rather than as chained method calls. Options
+  // that name files (templates, masks, operand images) need their own methods, which
+  // stage those files: a plain token here names nothing in the worker's filesystem.
+  args(tokens: (string | number)[]): this {
+    this.commands.push(...tokens.map(String));
+    return this;
+  }
+
   // Nearest-neighbour reslice of the current image onto another image's grid:
   // -reslice_nn <ref>. (e.g. bring a conformed-space mask back to a native grid.)
   resliceNN(ref: ImageSource): this {
@@ -439,7 +452,10 @@ class ImageProcessor {
     });
   }
 
-  async run(outName: string = 'output.nii'): Promise<Blob> {
+  // Resolves to the output as a File named for what niimath wrote: `outName`, plus `.gz`
+  // when niimath compressed it. Ready for anything that takes a File or a Blob (a
+  // viewer's loader, a download link, the next pipeline, whose reader goes by the name).
+  async run(outName: string = 'output.nii'): Promise<File> {
     return new Promise((resolve, reject) => {
       // outName is an INTERNAL MEMFS filename (the result is returned as a Blob, not written to
       // the caller's filesystem), so require a plain basename that does not use the reserved
@@ -479,8 +495,9 @@ class ImageProcessor {
           this.handle.settle(worker);
           const { blob, exitCode } = data;
           if (exitCode === 0) {
-            // success
-            resolve(blob);
+            // success: named for the file niimath wrote, so its extension tells a
+            // reader (or the next image()) whether the bytes are gzipped
+            resolve(new File([blob], data.outName ?? outName));
           } else {
             // error
             reject(new Error(`niimath processing failed with exit code ${exitCode}`));
