@@ -3110,6 +3110,22 @@ def exercise_moco(exe: str, tmp: Path, help_text: str) -> None:
     if not rms(rvv[:n3v], data[n3v:2 * n3v]) < 1e-3 * max(data):
         raise AssertionError("-resample -vsm did not shift volume 0 onto volume 1")
 
+    # -jacobian contracts the reference-space vsm gradient with the frame's PE axis (issue #90): a ramp
+    # along j scales by 1.05 unrotated or rotated about j, but by 1.00 once a 90-degree turn moves j off-axis
+    jn = 16
+    j_img, j_vsm = tmp / "jac_img.nii", tmp / "jac_vsm.nii"
+    write_float32_nifti(j_img, (jn, jn, jn), [100.0] * (2 * jn ** 3), nt=2)
+    write_float32_nifti(j_vsm, (jn, jn, jn), [0.05 * (y - 7.5) for z in range(jn) for y in range(jn) for x in range(jn)])
+    centre = 8 + jn * (8 + jn * 8)
+    for col, want in ((0, 100.0), (1, 100.0), (2, 105.0)):   # roll, pitch, yaw (yaw turns about j)
+        j_hmc, j_out = tmp / f"jac{col}.1D", tmp / f"jac{col}.nii"
+        j_hmc.write_text("0 0 0 0 0 0\n" + " ".join("90" if c == col else "0" for c in range(6)) + "\n")
+        require_success(run_niimath(exe, [str(j_img), "-gz", "0", "-resample", str(j_img), "-hmc", str(j_hmc), "-vsm",
+                                          str(j_vsm), "j", "-jacobian", str(j_out)]), "-resample -vsm -jacobian")
+        jv = read_float32_nifti(j_out)
+        if abs(jv[centre] - 105.0) > 1e-3 or abs(jv[jn ** 3 + centre] - want) > 1e-3:
+            raise AssertionError(f"-jacobian ignores motion: column {col} gave {jv[centre]}, {jv[jn ** 3 + centre]}")
+
     # -confounds: side output TSV; volume 1 is a 2 mm shift of volume 0, volume 2 shifts back
     cmask = tmp / "conf_mask.nii"
     ctsv = tmp / "conf.tsv"

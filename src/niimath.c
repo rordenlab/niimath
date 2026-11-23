@@ -86,7 +86,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20261016"
+#define kMTHdate "v1.0.20261115"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
