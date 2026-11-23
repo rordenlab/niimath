@@ -4605,6 +4605,30 @@ def exercise_refill(exe: str, tmp: Path, help_text: str) -> None:
           " side outputs and parser rejections OK")
 
 
+def exercise_kernel_nan_neighbors(exe: str, tmp: Path) -> None:
+    """-dilM/-dilall skip non-finite neighbours (their `== NAN` guard was always false)."""
+    nan = float("nan")
+    vals = [2.0] * 27
+    vals[13] = 0.0   # centre: the voxel being filled
+    vals[12] = nan   # one face neighbour
+    src = tmp / "kernel_nan.nii"
+    write_float32_nifti(src, (3, 3, 3), vals)
+    for op in (["-dilM"], ["-dilall"]):
+        out = tmp / "kernel_nan_out.nii"
+        require_success(run_niimath(exe, [str(src)] + op + ["-gz", "0", str(out)]), " ".join(op))
+        got = read_float32_nifti(out)[13]
+        if not math.isfinite(got):
+            raise AssertionError(f"{' '.join(op)}: a NaN neighbour reached the centre voxel ({got})")
+    # Zeros enclosed only by NaN can never fill: -dilall must stop, not loop forever.
+    vals = [nan] * 27
+    vals[13] = 0.0
+    write_float32_nifti(src, (3, 3, 3), vals)
+    res = subprocess.run([exe, str(src), "-dilall", "-gz", "0", str(out)], capture_output=True, text=True, timeout=30)
+    if res.returncode != 0 or read_float32_nifti(out)[13] != 0.0:
+        raise AssertionError("-dilall on a zero enclosed by NaN must exit 0 and leave it 0:\n" + res.stdout + res.stderr)
+    print("  -dilM/-dilall: non-finite neighbours skipped OK")
+
+
 def exercise_openmp_scratch_ops(exe: str, tmp: Path) -> None:
     """-tfce/-tfceS/-bptf/-bptfm/-detrend/-sobel: the four ops whose OpenMP worker scratch was
     hardened to fail closed, plus the two whose per-voxel allocation was hoisted to per-thread.
@@ -5278,6 +5302,7 @@ def main() -> int:
         exercise_odt_scaled(exe, tmp)
         exercise_refill(exe, tmp, help_text)
         exercise_openmp_scratch_ops(exe, tmp)
+        exercise_kernel_nan_neighbors(exe, tmp)
         exercise_mesh_report(exe, tmp, help_text)
 
         # THE LOAD-BEARING COPYLEFT CHECK, and it runs for EVERY BSD-branded binary, not just

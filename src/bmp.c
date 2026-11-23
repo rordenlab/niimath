@@ -183,6 +183,8 @@ typedef struct {
 	int isNegativeColorMap;
 	int interpolationOrder; // 0=nearest, 1= linear, [future 2=Mitchell]
 	int isBoundary;			// -E: draw only overlay voxels that differ from an in-plane neighbour
+	int isZeroBaseline;		// -j: overlay colors span 0..max, so the -T minimum only thresholds
+	int colorbarHeight;		// -g: rows of colorbar appended below the tiles (0 = none)
 	float scale;			// zoom factor
 	float cal_min, cal_max, cal_min2, cal_max2;
 	float overlayRGBA[4]; // overlay color + opacity (0..1) default {1,0,0,0.5}
@@ -605,6 +607,23 @@ static int parse_args_build_tiles(const nifti_image *nim,
 		if (!strcmp(tok, "-E")) {
 			opts->isBoundary = 1;
 			++i;
+			continue;
+		}
+		if (!strcmp(tok, "-j")) {
+			opts->isZeroBaseline = 1;
+			++i;
+			continue;
+		}
+		// -g <rows> : append a colorbar
+		if (!strcmp(tok, "-g")) {
+			long h = (i + 1 < argc && is_number_token(argv[i + 1])) ? strtol(argv[i + 1], NULL, 10) : -1;
+			if (h < 1 || h > 4096) {
+				fprintf(stderr, "parse_args: -g requires a colorbar height of 1..4096 pixels\n");
+				free(tiles);
+				return -1;
+			}
+			opts->colorbarHeight = (int)h;
+			i += 2;
 			continue;
 		}
 		int isCrossLines = 0;
@@ -1063,7 +1082,7 @@ static inline void get_base_rgb_from_lut(float v, float cal_min, float cal_max,
 // Fast blend: base from base_lut, overlay from overlay_lut. overlay_lut alpha channel used.
 // If overlay intensity maps to 0 => return base directly.
 static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float cal_max,
-											 float v_overlay, float cal_min2, float cal_max2,
+											 float v_overlay, float cal_min2, float cal_max2, float lut_min2,
 											 const lut_t base_lut,
 											 const lut_t negative_overlay_lut,
 											 const lut_t overlay_lut,
@@ -1073,10 +1092,11 @@ static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float 
 	uint32_t be = base_lut[ub];
 	uint8_t br = LUT_R(be), bg = LUT_G(be), bb = LUT_B(be);
 
-	uint8_t uov = float_to_u8((double)v_overlay, (double)cal_min2, (double)cal_max2);
+	// cal_min2 thresholds; lut_min2 (cal_min2, or 0 with -j) anchors the color ramp
+	uint8_t uov = float_to_u8((double)v_overlay, (double)lut_min2, (double)cal_max2);
 	float v_overlay2 = v_overlay;
 	if ((v_overlay < 0.0) && (isNegativeColorMap) && (cal_min2 > 0)) {
-		uov = float_to_u8((double)-v_overlay, (double)cal_min2, (double)cal_max2);
+		uov = float_to_u8((double)-v_overlay, (double)lut_min2, (double)cal_max2);
 		v_overlay2 = -v_overlay;
 	}
 	if (v_overlay2 < cal_min2) {
@@ -1111,6 +1131,28 @@ static inline void get_blended_rgb_from_luts(float v_base, float cal_min, float 
 	*b = (uint8_t)clamp_u8_int(out_b);
 }
 
+/* -g: a strip of the overlay LUT (the base LUT without an overlay) across the full width, rows
+   top..H-1. With -N the left half is the negative LUT, strongest at the far left. `lo` is the LUT
+   fraction a visible voxel starts at (nonzero only with -j), so the bar shows only reachable colors. */
+static void draw_colorbar(uint8_t *rgb, size_t row_bytes, size_t W, size_t H, size_t top,
+						  const lut_t lut, const lut_t neg_lut, int two_sided, double lo) {
+	const size_t half = two_sided ? W / 2 : 0;
+	for (size_t x = 0; x < W; ++x) {
+		const uint32_t *L = lut;
+		double f;
+		if (x < half) {
+			L = neg_lut;
+			f = 1.0 - (double)x / (double)(half > 1 ? half - 1 : 1);
+		} else {
+			size_t n = W - half;
+			f = (double)(x - half) / (double)(n > 1 ? n - 1 : 1);
+		}
+		uint32_t e = L[(int)((lo + f * (1.0 - lo)) * 255.0 + 0.5)];
+		for (size_t y = top; y < H; ++y)
+			write_pixel_rgb(rgb, row_bytes, W, H, x, y, LUT_R(e), LUT_G(e), LUT_B(e));
+	}
+}
+
 // ---------- Replacement render_and_write_png() that builds LUTs and uses them ----------
 static int render_and_write_png(const nifti_image *nim,
 								nifti_image *nim2,
@@ -1124,7 +1166,7 @@ static int render_and_write_png(const nifti_image *nim,
 
 	const int channels = 3;
 	size_t W = layout->total_width;
-	size_t H = layout->total_height;
+	size_t H = layout->total_height + (size_t)opts->colorbarHeight;
 	if (W == 0 || H == 0) {
 		fprintf(stderr, "render: zero output dimension\n");
 		return -1;
@@ -1141,6 +1183,7 @@ static int render_and_write_png(const nifti_image *nim,
 
 	float cal_min2 = opts->cal_min2;
 	float cal_max2 = opts->cal_max2;
+	float lut_min2 = (opts->isZeroBaseline && cal_min2 > 0.0f) ? 0.0f : cal_min2;
 
 	int have_nim2 = 0;
 	float *data2 = NULL;
@@ -1244,7 +1287,7 @@ static int render_and_write_png(const nifti_image *nim,
 					float v2 = data2[data_idx];
 					if (opts->isBoundary && !in_plane_boundary(data2, t->axis, xi, yi, zi, nx, ny, nz))
 						v2 = 0.0f;
-					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2,
+					get_blended_rgb_from_luts(v, cal_min, cal_max, v2, cal_min2, cal_max2, lut_min2,
 											  base_lut, negative_overlay_lut, overlay_lut, &rr, &gg, &bb, opts->isNegativeColorMap);
 				} else {
 					float v = data[data_idx];
@@ -1358,6 +1401,14 @@ static int render_and_write_png(const nifti_image *nim,
 		}
 	}
 
+	if (opts->colorbarHeight > 0) {
+		if (have_nim2)
+			draw_colorbar(rgb, row_bytes, W, H, layout->total_height, overlay_lut, negative_overlay_lut,
+						  opts->isNegativeColorMap && cal_min2 > 0.0f, (cal_min2 - lut_min2) / (cal_max2 - lut_min2));
+		else
+			draw_colorbar(rgb, row_bytes, W, H, layout->total_height, base_lut, base_lut, 0, 0.0);
+	}
+
 	// write PNG (with optional scaling)
 	int ret = write_png_scale(out_png_path, (int)W, (int)H, channels, rgb, (int)row_bytes, opts->scale, opts->interpolationOrder);
 	free(rgb);
@@ -1382,6 +1433,8 @@ int nim2png(nifti_image *nim, nifti_image *nim2, int argc, const char *argv[], c
 	opts.isNegativeColorMap = 0;
 	opts.interpolationOrder = 1;
 	opts.isBoundary = 0;
+	opts.isZeroBaseline = 0;
+	opts.colorbarHeight = 0;
 	opts.scale = 1.0;
 	opts.LUT2 = LUT_NONE;
 	opts.LUT = LUT_NONE;

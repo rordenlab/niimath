@@ -360,6 +360,8 @@ int show_help( void ) {
 	printf("       -N [0|1]             : use negative colormap for overlay (blue-green for negative values)\n");
 	printf("       -e                   : apply edge detection to overlay\n");
 	printf("       -E                   : draw only the overlay's boundary: voxels that differ from an in-plane neighbour (masks, label maps)\n");
+	printf("       -j                   : overlay colors start at 0, so the -T minimum only hides voxels below it\n");
+	printf("       -g <pixels>          : append a colorbar of the given height (overlay LUT, else base LUT)\n");
 	printf("    Available color lookup tables (LUTs): gray, red, green, blue, cyan, yellow,\n");
 	printf("                                          bluegreen, redyellow, viridis, inferno, magma, plasma\n");
 	printf("    Examples:\n");
