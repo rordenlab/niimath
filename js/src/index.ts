@@ -21,11 +21,13 @@ export type {
  */
 export class Niimath extends NiimathBase {
   constructor() {
-    // The `new Worker(new URL(...))` literal must stay here so esbuild can
-    // statically discover and bundle worker.js (and its niimath.wasm) into a
-    // separate chunk.
+    // The `new Worker(new URL(...))` literals must stay here so bundlers can
+    // statically discover both workers. Threads need SharedArrayBuffer, which only
+    // cross-origin-isolated pages (COOP/COEP headers) have; others get the serial build.
     super(operators as Operators, () =>
-      new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })
+      globalThis.crossOriginIsolated
+        ? new Worker(new URL('./worker-mt.js', import.meta.url), { type: 'module' })
+        : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })
     );
   }
 }

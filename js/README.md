@@ -123,6 +123,7 @@ const outMesh = await niimath.image(selectedFile)
 - One `.run()` is in flight per instance at a time. A second overlapping `run()`, or a `run()` before `init()` has resolved, rejects immediately instead of interleaving. Serialize calls (await the previous `run()`), or use a separate instance for each concurrent stream.
 - `niimath.dispose()` terminates the worker and releases its WASM heap. It is idempotent, and it rejects any in-flight `init()` or `run()`.
 - A worker crash during a `run()` rejects that run and invalidates the worker. A later `image(...).run()` rejects with "Worker not initialized" until you call `init()` again.
+- Multithreading is automatic on a cross-origin-isolated page, one served with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`. The worker then loads the OpenMP build, which uses up to 8 threads. Other pages get the single-threaded build. `-allineate` runs about 4× faster with threads, and its output is identical at every thread count.
 
 ## SPM coregistration
 

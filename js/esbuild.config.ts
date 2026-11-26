@@ -35,6 +35,14 @@ await esbuild.build({
   external: ["./niimath.js"], // Keep niimath.js as external import
 });
 
+// Threaded worker for cross-origin-isolated pages
+await esbuild.build({
+  ...commonOptions,
+  entryPoints: ["./src/worker-mt.ts"],
+  outfile: "./dist/worker-mt.js",
+  external: ["./niimath-mt.js"],
+});
+
 // The published npm package is BSD-only and does NOT ship the optional GPL
 // spm_coreg build. The C sources (src/GPL submodule) and the `GPL=1 make` /
 // `makeWasmGpl` opt-in remain for local/historical use, but esbuild never emits
@@ -49,6 +57,8 @@ execSync("bun x tsc --project tsconfig.json --emitDeclarationOnly", { stdio: "in
 // copy BSD niimath.wasm, niimath.js, niimathOperators.json to dist folder
 copyFileSync("./src/niimath.wasm", "./dist/niimath.wasm");
 copyFileSync("./src/niimath.js", "./dist/niimath.js");
+copyFileSync("./src/niimath-mt.wasm", "./dist/niimath-mt.wasm");
+copyFileSync("./src/niimath-mt.js", "./dist/niimath-mt.js");
 copyFileSync("./src/niimathOperators.json", "./dist/niimathOperators.json");
 
 console.log("Build completed!");
