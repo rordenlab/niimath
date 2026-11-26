@@ -17,6 +17,11 @@
 #endif
 #include <string.h>
 #include <stdint.h>
+#ifdef __EMSCRIPTEN_PTHREADS__
+	#include <stdlib.h>
+	#include <omp.h>
+	#include <emscripten/threading.h>
+#endif
 #include <stdio.h>
 #include "nifti_io.h"
 #ifdef HAVE_ZLIB
@@ -86,7 +91,7 @@
 	#define kLicense " BSD"
 #endif
 
-#define kMTHdate "v1.0.20261115"
+#define kMTHdate "v1.0.20261126"
 /* The version string ENDS in " BSD" or " GPL" -- README and AGENTS.md both document that, and
    release_smoke.py's copyleft check keys on it. Any future qualifier goes BEFORE kLicense so
    the overall-binary licence stays the last word. */
@@ -768,6 +773,20 @@ int show_help( void ) {
 #endif //ifndef __EMSCRIPTEN__
 
 int main(int argc, char * argv[]) {
+#ifdef __EMSCRIPTEN_PTHREADS__
+	// A worker created on demand never starts while callMain blocks this one, so a team larger
+	// than the preallocated pool deadlocks. Cap both at min(8, cores): the wasm-mt link flag
+	// PTHREAD_POOL_SIZE uses the same formula. Above the 10 P-cores of an M4 Pro, 12-14 threads
+	// ran twice as slow as 8-10 in Chromium. OMP_THREAD_LIMIT also clamps a larger -p.
+	{
+		int cap = emscripten_num_logical_cores();
+		char lim[16];
+		if (cap > 8) cap = 8;
+		snprintf(lim, sizeof(lim), "%d", cap);
+		setenv("OMP_THREAD_LIMIT", lim, 1);
+		omp_set_num_threads(cap); // ICVs persist across callMain: reset any earlier -p
+	}
+#endif
 	//fslmaths in.nii out.nii changes datatype to float, here we retain (similar to earlier versions of fslmaths)
 	//fslmsths in.nii -rem 10 out.nii uses integer modulus not fmod
 	//fslmaths robust range not fully described, this emulation is close

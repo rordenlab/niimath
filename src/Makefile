@@ -581,9 +581,17 @@ WASM_OUT= ../js/src/niimath.js
 # FS and ENV let pipeline drivers stage nested paths, list side outputs and set FSLOUTPUTTYPE per call
 # (libc copies ENV in its startup constructors: set it in the module's preRun, one module per call).
 wasm: $(WASM_AL_PREREQ) $(WASM_ROMEO_PREREQ)
-	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(GFILES) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(FMAP_WASM) $(N4_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS", "ENV", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 -o $(WASM_OUT)
+	emcc -O3 -ffast-math -fno-finite-math-only -DEMSCRIPTEN -DFORCE_INT32_MAX $(MFLAGS) $(GFILES) $(DT_WASM) $(QC_WASM) $(MEDIC_WASM) $(MOCO_WASM) $(STC_WASM) $(FMAP_WASM) $(N4_WASM) $(WASM_AL) $(WASM_ROMEO) $(GPL_SRCS) $(UFLAGS) $(BMPFLAGS) $(WASM_ZLIB) -s STACK_SIZE=4194304 -s EXPORTED_RUNTIME_METHODS='["callMain", "ccall", "cwrap", "FS", "ENV", "FS_createDataFile", "FS_readFile", "FS_unlink", "allocateUTF8", "getValue", "stringToUTF8", "setValue"]' -s ALLOW_MEMORY_GROWTH=1 -s WASM=1 -s EXPORT_ES6=1 -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='["_main", "_malloc", "_free"]' -s INVOKE_RUN=0 $(WASM_MT_LD) -o $(WASM_OUT)
 	# hint: consider further optimizations:
 	#   wasm-opt -O3 -o output.wasm niimath.wasm; rm niimath.wasm; mv output.wasm niimath.wasm
+
+# Threaded (OpenMP) WASM for cross-origin-isolated pages; the npm loader picks it when
+# self.crossOriginIsolated, else niimath.js. EMCC_CFLAGS reaches every emcc call, so the
+# prebuilt al/pn/cf/rf/rm objects get -pthread too. The pool formula must match the cap in
+# niimath.c main(): a team larger than the pool deadlocks.
+WASM_MT_LD=
+wasm-mt:
+	EMCC_CFLAGS="-fopenmp -pthread" $(MAKE) wasm WASM_OUT=../js/src/niimath-mt.js WASM_MT_LD="-s PTHREAD_POOL_SIZE='Math.min(8,navigator.hardwareConcurrency)' -s MAXIMUM_MEMORY=4GB -Wno-pthreads-mem-growth"
 
 #WASM callMain details https://youtu.be/c8hZFtl8EuQ?si=NpAMjf7ka5XtsiYw
 

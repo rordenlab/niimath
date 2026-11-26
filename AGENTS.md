@@ -45,6 +45,7 @@ MC=0 make               # Classic table-only marching cubes (oldcubes.c) instead
 Q2=1 make               # Build the half-edge reference simplifier (-mesh -n 1, quadric2.c); OFF by default everywhere
 STB=1 make              # STB image library instead of libspng for bitmaps
 make wasm               # Emscripten/WebAssembly
+make wasm-mt            # Threaded (OpenMP) Emscripten build, js/src/niimath-mt.js
 make wasm-wasi          # Experimental zlib-free WASI compute backend (needs Zig)
 make wasm-emcc-core     # Feature-matched zlib-free Emscripten build (WASI benchmark baseline)
 ```
@@ -397,9 +398,10 @@ See **`RELEASING.md`** — wheel/PyPI, GitHub binary assets, npm, and the macOS 
 - Voxel ops are lean, SIMD-optimized, mostly memory-bandwidth limited. OpenMP is **not the primary optimization target** for core ops (typical usage runs one subject per thread across many subjects). zlib-ng (CMake release baseline, `ZLIB_IMPLEMENTATION=zlib-ng`, ZLIB_COMPAT) gives ~2× `.nii.gz` I/O over stock zlib (correct on MSVC where Cloudflare is not). The Emscripten `wasm` target links it via `WASM_ZLIB`.
 - **Allineate reproducibility:** `-allineate` is byte-reproducible **across thread counts** (nt=1/2/4/8) — preserved by the `mfac` thread-local re-apply rule. It is **NOT bit-reproducible across builds**: NEWUOA + `-ffast-math` means a codegen change can flip the optimizer to a neighboring equally-valid optimum (sub-voxel parameter shift, ~1% in a few edge voxels). Quality unchanged (cost and base-correlation match to 4+ digits) — do NOT treat `-allineate` output as a byte-stable golden across versions. `gpl-build.yml` gates registration by QUALITY (correlation floor + improvement-over-baseline via `reg_quality.py`, fails closed on empty/constant/non-finite), not a byte diff. `-deface`/`-spm_deface` reslice via `nii_reslice_affine` (not the fused path) and stay byte-stable.
 
-### WASM performance pitfalls (two hard-won rules)
+### WASM performance pitfalls (hard-won rules)
 1. **No `qsort`+comparator on large or per-voxel arrays in WASM-targeted code.** emscripten/musl `qsort` calls the comparator via `call_indirect` per comparison (~100× slower than native — can make the WASM build appear to hang). Use comparator-free: **quickselect** for a single value (`al_select_rank`, `select_kth_flt`, `uf_select`), **insertion sort** for genuinely small fixed N only (NOT a per-voxel neighborhood — O(n²) per voxel), or **heapsort** for a full order on large arrays (`heapsort_sortIdx`). The only remaining `qsort` is `qsort_floatint` on ~46-element lists.
 2. **WASM allineate MUST be compiled `-ffast-math` (matching native)**, or the cost-function reduction rounds differently and NEWUOA/Powell converges to a worse optimum (`-deface` masked 37% vs 60% native). The `wasm:` target and its prebuilt `al_wasm.o`/`pn_wasm.o`/`cf_wasm.o` use whole-program `-ffast-math -fno-finite-math-only`. (`-msimd128` adds only ~3% — not worth the golden-match risk.)
+3. **Threaded WASM (`make wasm-mt`, Emscripten's bundled libomp) deadlocks if an OpenMP team exceeds the preallocated pthread pool:** a worker created on demand never starts while `callMain` blocks niimath's worker. `main()` caps the team with `OMP_THREAD_LIMIT` at min(8, cores), the same formula as the link flag `PTHREAD_POOL_SIZE`; change both together. Measured in Chromium on an M4 Pro (EdgeReg default pair): 2.05 s serial, 0.49 s at 8-10 threads, 0.96 s at 14 (past the P-cores). The npm loader picks `worker-mt.js` when `crossOriginIsolated`, else the serial build, which a non-isolated page needs because shared memory is refused. `js/tests/mt.node.mjs` runs under Node, not Bun: Bun's workers cannot host Emscripten pthreads, and Node spawns workers on demand, so the test asserts libomp's clamp warning rather than a hang.
 
 ## Code Conventions
 - C99 with extensive `#ifdef` for conditional compilation.

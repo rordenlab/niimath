@@ -1,6 +1,6 @@
 {
   "name": "@niivue/niimath",
-  "version": "1.4.20261115",
+  "version": "1.4.20261126",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -14,12 +14,13 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "test": "bun test ./tests",
+    "test": "bun test ./tests && node tests/mt.node.mjs",
     "test:wasi:fixtures": "bun run scripts/wasi-fixtures.ts",
     "test:wasi": "make -C ../src && bun run makeWasi && bun run scripts/wasi-fixtures.ts --require-builds && bun test ./src/wasi",
     "build": "bun run esbuild.config.ts",
     "make": "make -C ../src",
     "makeWasm": "make wasm -C ../src",
+    "makeWasmMt": "make wasm-mt -C ../src",
     "makeWasi": "make wasm-wasi -C ../src",
     "makeWasmEmccCore": "make wasm-emcc-core -C ../src",
     "wasiNodeSmoke": "bun run scripts/wasi-node-run.ts",
@@ -27,7 +28,7 @@
     "makeWasmGpl": "git submodule update --init ../src/GPL && make wasm GPL=1 WASM_OUT=../js/src/niimath-gpl.js -C ../src && bun run scripts/pre-build.ts -i src/niimath-gpl.js -o src/niimath-gpl.js",
     "parseHelpText": "bun run scripts/parseNiimathHelp.ts",
     "generateTypes": "bun run scripts/generateTypeDefinitions.ts",
-    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js",
+    "prebuild": "bun run make && bun run parseHelpText && bun run generateTypes && bun run makeWasmMt && bun run scripts/pre-build.ts -i src/niimath-mt.js -o src/niimath-mt.js && bun run makeWasm && bun run scripts/pre-build.ts -i src/niimath.js -o src/niimath.js",
     "dev": "bun run build && bun run server.ts",
     "pub": "bun run build && npm publish --access public"
   },
