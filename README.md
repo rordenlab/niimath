@@ -698,6 +698,9 @@ Color and intensity:
 | `-b <R> <G> <B> <A>` | Background RGBA color (values 0.0 to 1.0). |
 | `-N [0\|1]` | Use a negative colormap for the overlay (blue-green for negative values). |
 | `-e` | Apply edge detection to the overlay. |
+| `-E` | Draw only the overlay boundary: voxels that differ from an in-plane neighbor. |
+| `-j` | Start overlay colors at 0. The `-T` minimum then only hides weaker voxels. |
+| `-g <pixels>` | Append a colorbar of this height. It shows the overlay LUT, or the base LUT without an overlay. With `-N` the left half shows negative values. |
 
 Color lookup tables: `gray`, `red`, `green`, `blue`, `cyan`, `yellow`, `bluegreen`, `redyellow`, `viridis`, `inferno`, `magma`, `plasma`.
 

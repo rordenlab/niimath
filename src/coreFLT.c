@@ -3236,9 +3236,11 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 	flt *inf32 = (flt *)malloc(nVox3D * sizeof(flt));
 	xmemcpy(inf32, f32, nVox3D * sizeof(flt)); // memcpy(dest, src, sz)
 	int nxy = nim->nx * nim->ny;
-	size_t nZero = 1;
-	while (nZero > 0) {
+	size_t nZero = 1, nFilled = 1;
+	// stop when a pass fills nothing: zeros enclosed by NaN/Inf, an all-zero volume, or a neighbour mean of exactly 0
+	while (nZero > 0 && nFilled > 0) {
 		nZero = 0;
+		nFilled = 0;
 		for (int z = 0; z < nim->nz; z++) {
 			int i = (z * nxy) - 1; // offset
 			for (int y = 0; y < nim->ny; y++) {
@@ -3250,7 +3252,7 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (!isfinite(inf32[vx]))) // skip zero + NaN/inf (was `== NAN`, always false)
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3264,6 +3266,8 @@ staticx void kernel3D_dilall(nifti_image *nim, int *kernel, int nkernel, int vol
 					} // for k
 					if (nNot0 > 0)
 						f32[i] = sum / nNot0;
+					if (f32[i] != 0.0)
+						nFilled++;
 					nZero++;
 				} // for x
 			} // for y
@@ -3720,7 +3724,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, nv
 					flt sum = 0.0f;
 					for (size_t k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == 0.0) || (!isfinite(inf32[vx]))) // skip zero + NaN/inf (was `== NAN`, always false)
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
@@ -3764,7 +3768,7 @@ staticx int kernel3D(nifti_image *nim, enum eOp op, int *kernel, int nkernel, nv
 					flt wtNeg = 0.0f;
 					for (int k = 0; k < nkernel; k++) {
 						int64_t vx = i + kernel[k];
-						if ((vx < 0) || (vx >= nVox3D) || (inf32[vx] == NAN))
+						if ((vx < 0) || (vx >= nVox3D) || (!isfinite(inf32[vx]))) // skip NaN/inf (was `== NAN`, always false)
 							continue;
 						// next handle edge cases
 						int dx = x + kernel[k + nkernel];
